@@ -6,6 +6,8 @@
   "cleanUrls": true,
   "redirects": [
     { "source": "/skill.md", "has": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }], "destination": "/skill-preview", "permanent": false },
+    { "source": "/sell", "destination": "/market#sell", "permanent": false },
+    { "source": "/sell.html", "destination": "/market#sell", "permanent": false },
     { "source": "/challenges", "destination": "/swarm", "permanent": true },
     { "source": "/challenges.html", "destination": "/swarm", "permanent": true },
     { "source": "/.well-known/skills/challenge-join/skill.md", "destination": "/.well-known/skills/swarm-join/skill.md", "permanent": true },
@@ -24,6 +26,11 @@
     { "source": "/join/:token", "destination": "/join.md" }
   ],
   "headers": [
+    {
+      "source": "/(.*)\\.(css|js|woff2|webp|png|jpg|svg)",
+      "has": [{ "type": "query", "key": "v", "value": "^[0-9a-f]{12}$" }],
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }]
+    },
     {
       "source": "/(.*)",
       "headers": [

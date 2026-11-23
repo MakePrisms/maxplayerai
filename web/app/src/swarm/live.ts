@@ -6,7 +6,7 @@ export interface Job { id: string; seller: string; start: number; deadline: numb
 export interface Reported { tasksDone: number; minutesToday: number|null }
 export interface Seller { pubkey: string; npub: string; name: string; minutesOffered: number; minutesUsed: number; minutesRemaining: number; state: string; eligible: boolean; decision: string; currentJobStart: number|null; reported?: Reported|null; }
 // Untrusted pending joins (no buyer decision yet). Display only; never eligible.
-export interface Applicant { pubkey: string; npub: string; minutesOffered: number; since: number; joinedAt: number; note: string; }
+export interface Applicant { pubkey: string; npub: string; name?: string; minutesOffered: number; since: number; joinedAt: number; note: string; }
 export type SwarmJobStatus = 'scheduled'|'in_progress'|'completed'|'cancelled';
 export interface SwarmInfo { buyer: string; buyerNpub: string; buyerName: string; id: string; name: string; purpose: string; status: 'open'|'closed'; tasks: 'public'|'private'; address: string }
 export interface SwarmJobRow { id: string; title: string; starts: number; ends: number; status: SwarmJobStatus; budgetSats: number; tasks: number }
@@ -15,7 +15,7 @@ export interface SwarmJobRow { id: string; title: string; starts: number; ends: 
 export interface Snapshot {
   asOf: number;
   swarm?: SwarmInfo|null;
-  swarmJob: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: SwarmJobStatus; result: string }|null;
+  swarmJob: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: SwarmJobStatus; result: string; updatedAt?: number }|null;
   swarmJobs?: SwarmJobRow[];
   sellers: Seller[]; jobs: Job[]; updates: string[]; applicants?: Applicant[];
   budget: {totalSats: number; committedSats: number; paidSats: number; estimated: boolean; unknownAmounts: number; note: string}|null;
@@ -61,7 +61,7 @@ export function parseSnapshot(value: unknown): Snapshot {
   if(s.swarmJobs!==undefined&&(!Array.isArray(s.swarmJobs)||!s.swarmJobs.every(j=>[j.id,j.title,j.status].every(v=>typeof v==='string')&&[j.starts,j.ends,j.budgetSats,j.tasks].every(finite))))throw Error('Invalid swarm jobs');
   if(s.swarmJob) {
     const c=s.swarmJob;
-    if(![c.id,c.title,c.goal,c.result,c.buyer,c.buyerNpub].every(v=>typeof v==='string')||!/^[0-9a-f]{64}$/.test(c.buyer)||npubEncode(c.buyer)!==c.buyerNpub||![c.starts,c.ends].every(finite)||!['scheduled','in_progress','completed','cancelled'].includes(c.status))throw Error('Invalid swarm job');
+    if(![c.id,c.title,c.goal,c.result,c.buyer,c.buyerNpub].every(v=>typeof v==='string')||!/^[0-9a-f]{64}$/.test(c.buyer)||npubEncode(c.buyer)!==c.buyerNpub||![c.starts,c.ends].every(finite)||(c.updatedAt!==undefined&&!finite(c.updatedAt))||!['scheduled','in_progress','completed','cancelled'].includes(c.status))throw Error('Invalid swarm job');
     if(!s.budget||![s.budget.totalSats,s.budget.committedSats,s.budget.paidSats,s.budget.unknownAmounts].every(finite)||typeof s.budget.note!=='string')throw Error('Invalid budget');
   } else if(s.swarmJob!==null)throw Error('Missing swarm job');
   for(const a of s.sellers)if(![a.pubkey,a.npub,a.name,a.state,a.decision].every(v=>typeof v==='string')||![a.minutesOffered,a.minutesUsed,a.minutesRemaining].every(finite)||typeof a.eligible!=='boolean'||!validReported(a.reported))throw Error('Invalid seller');
@@ -172,7 +172,7 @@ export function observe(t: Tracker,r: Relay,nowMs: number,run?: Run): Observed {
 }
 // The section eyebrow says "Live" only while the section is live; it keeps its space otherwise.
 export function renderLiveState(doc: Document,state: LiveState): void {
-  doc.getElementById('agents-eyebrow')!.classList.toggle('is-off',state!=='live');
+  doc.getElementById('agents-eyebrow')?.classList.toggle('is-off',state!=='live');   // /swarm no longer has it (Bob, 2026-11-21)
 }
 export function connectionLine(r: Relay,status: string,wasLive=false,run?: Run): string {
   if(liveState(r,wasLive,run)!=='live')return UPDATING;
@@ -199,8 +199,16 @@ export function listedSellers(s: Snapshot,roster=false): Seller[] {
 // disconnected): no rows and no counts, so nothing reads as current; only "Updating…" shows.
 // 'roster': swarm data only (see ROSTER_ONLY): rows with placeholder job states. 'live' (or false): everything.
 export type SellersMode='loading'|'roster'|'live';
+// A member's name: a link to its market profile (Bob, 2026-11-21). A new tab goes to /market; a click opens the profile
+// in the swarm's own panel (swarm.ts). No npub line under it: the profile has the npub to copy.
+function profileLink(doc: Document,pubkey: string|undefined,npub: string,label: string): HTMLElement {
+  const link=doc.createElement(npub?'a':'strong');link.className='c-who';link.textContent=label;
+  if(npub){link.setAttribute?.('href',`/market?expert=${npub}`);if(pubkey)link.setAttribute?.('data-pk',pubkey);}
+  return link;
+}
 const skel=(doc: Document,cls: string)=>{const span=doc.createElement('span');span.className=`skel ${cls}`;return span;};
-// Placeholder rows are rebuilt only when what they show changes, so the 1s tick doesn't restart their sheen.
+// Rows are rebuilt only when what they show changes: the 1s tick restarted the placeholders' sheen and rebuilt every
+// live row every second (speed review of #1361, #9).
 const rosterShown=new WeakMap<object,string>();
 export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boolean|SellersMode=false): void {
   const mode: SellersMode=loading===true?'loading':loading===false?'live':loading;
@@ -209,23 +217,23 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
   if(mode==='loading'){rosterShown.delete(list);list.replaceChildren();doc.getElementById('seller-summary')!.textContent='';return;}
   const roster=mode==='roster';
   const shown=listedSellers(s,roster);
-  const key=roster?JSON.stringify([shown.map(a=>[a.name,a.npub,a.minutesOffered,a.state]),s.applicants??[],!!s.relay?.applicantsIncomplete]):null;
-  if(key!==null&&rosterShown.get(list)===key)return;
-  if(key===null)rosterShown.delete(list);else rosterShown.set(list,key);
+  const key=JSON.stringify([mode,privateTasks(s),shown.map(a=>roster?[a.pubkey,a.name,a.npub,a.minutesOffered,a.state]
+    :[a.pubkey,a.name,a.npub,sellerLine(s,a,now),sellerState(s,a,now),reportedLine(s,a)]),s.applicants??[],!!s.relay?.applicantsIncomplete]);
+  if(rosterShown.get(list)===key)return;
+  rosterShown.set(list,key);
   const fragment=doc.createDocumentFragment();
   for(const a of shown) {
     // Roster only: every state, and the minutes used, need the trade data and stay placeholders
     // (no leaver is listed yet, see listedSellers).
     const row=doc.createElement('li');const state=roster?null:sellerState(s,a,now);
     if(state==='Done'||state==='Left')row.className='off';
-    const name=doc.createElement('strong');name.textContent=a.name||shortNpub(a.npub);
+    const name=profileLink(doc,a.pubkey,a.npub,a.name||shortNpub(a.npub));
     const mins=doc.createElement('span');mins.className='c-mins';
     if(roster){const of=doc.createElement('span');of.textContent=` / ${a.minutesOffered} min`;mins.append(skel(doc,'c-skel-used'),of);}
     else mins.textContent=sellerLine(s,a,now);
-    const id=doc.createElement('span');id.className='c-id';id.textContent=shortNpub(a.npub);
     const st=doc.createElement('span');st.className='c-state';
     if(state===null)st.append(skel(doc,'c-skel-state'));else st.textContent=state;
-    row.append(name,mins,id,st);
+    row.append(name,mins,st);
     const reported=roster?null:reportedLine(s,a);
     if(reported!==null){const r=doc.createElement('span');r.className='c-reported';r.textContent=reported;row.append(r);}
     fragment.append(row);
@@ -234,11 +242,10 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
   const waiting=s.applicants??[],partial=!!s.relay?.applicantsIncomplete;
   for(const a of waiting) {
     const row=doc.createElement('li');row.className='off';
-    const name=doc.createElement('strong');name.textContent=shortNpub(a.npub);
+    const name=profileLink(doc,a.pubkey,a.npub,a.name||shortNpub(a.npub));
     const mins=doc.createElement('span');mins.className='c-mins';mins.textContent=`${a.minutesOffered} min offered`;
-    const id=doc.createElement('span');id.className='c-id';id.textContent=shortNpub(a.npub);
     const st=doc.createElement('span');st.className='c-state';st.textContent='Waiting for approval';
-    row.append(name,mins,id,st);fragment.append(row);
+    row.append(name,mins,st);fragment.append(row);
   }
   list.replaceChildren(fragment);
   // A private swarm's running tasks aren't public: no "working now" count there.

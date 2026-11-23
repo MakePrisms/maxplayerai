@@ -1,95 +1,141 @@
-/* /swarm reuses the /sell layout (styles.css h-*). Only the bits /sell doesn't have live here. */
-.c-facts { display: flex; justify-content: center; flex-wrap: wrap; gap: 14px 44px; margin: 34px 0 0; }
-.c-facts dt { font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
-.c-facts dd { margin: 6px 0 0; font-family: var(--sans); font-size: 16px; color: var(--ink); }
-/* Hero fact skeletons (styles.css .skel): shorter than one line of each font, so the line box,
-   and the block's height, is the same before and after the reveal. */
-.c-facts .skel { display: inline-block; vertical-align: middle; height: 0.8em; }
-.c-facts .c-skel-dt { width: 72px; }
-.c-facts .c-skel-dd { width: 96px; }
-.c-sellers { list-style: none; margin: 36px 0 0; padding: 0; text-align: left; }
-.c-sellers li {
-  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 18px; align-items: baseline;
-  padding: 16px 2px; border-bottom: 1px solid var(--line); font-family: var(--sans);
-}
-.c-sellers li:first-child { border-top: 1px solid var(--line); }
-.c-sellers strong { font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
-.c-sellers .c-mins { font-family: var(--mono); font-size: 13px; color: var(--neon); white-space: nowrap; }
-.c-sellers .c-id, .c-sellers .c-state { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
-.c-sellers .c-mins, .c-sellers .c-state { text-align: right; }
-.c-sellers li.off .c-mins { color: var(--muted); }
-/* private swarms: the buyer's reported task count under the row (live.ts reportedLine) */
-.c-sellers .c-reported { grid-column: 1 / -1; font-size: 12.5px; color: var(--muted); }
-/* Agent rows before the job states are in (live.ts 'roster'): one-line placeholders. */
-.c-sellers .skel { display: inline-block; vertical-align: middle; height: 0.8em; }
-.c-sellers .c-skel-used { width: 2ch; }
-.c-sellers .c-skel-state { width: 84px; }
-.c-note { margin: 22px 0 0; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
-.h-faq details p code { font-size: 12px; overflow-wrap: anywhere; }
-@media (max-width: 760px) {
-  .c-facts { gap: 14px 28px; }
-  .c-sellers li { grid-template-columns: 1fr; }
-  .c-sellers .c-mins, .c-sellers .c-state { text-align: left; }
-}
-/* swarm titles are dynamic: let them wrap instead of the wordmark's single line */
-.h-hero h1#swarm-title { white-space: normal; text-wrap: balance; max-width: 980px; margin: 18px auto 0; font-size: clamp(32px, 6vw, 80px); overflow-wrap: anywhere; }
-/* the job: the swarm event's content, read like an article */
-.c-job .h-in { text-align: left; }
-.c-job .eyebrow, .c-job h2 { display: block; text-align: center; }
-.c-job h2 { margin-bottom: 34px; text-wrap: balance; }
-.c-job-body p, .c-job-body li { font-family: var(--sans); font-size: 17px; line-height: 1.65; color: var(--ink-2); }
-.c-job-body p { margin: 0 0 20px; }
-.c-job-body ul { margin: 0 0 20px; padding-left: 22px; }
-.c-job-body li { margin: 4px 0; }
-.c-job-body li::marker { color: var(--neon); }
-.c-job-body a { color: var(--neon); overflow-wrap: anywhere; }
-/* hero: once the run is on, "Running now" links down to the live list (bob) */
-.c-facts dd a { color: var(--neon); text-decoration: underline; text-underline-offset: 4px; text-decoration-thickness: 1px; }
-.c-facts dd a:hover { color: var(--ink); }
-/* while the live list loads only "Updating…" shows; the empty summary keeps no gap */
-.c-summary:empty { display: none; }
-.c-summary:empty ~ .c-sellers { margin-top: 28px; }
-/* the job is capped at about one screen (the viewport minus the nav, the section padding,
-   heading and button) with a fade, and "See more" opens it (bob). src/swarm/more.ts adds
-   .is-clamped only when JS runs, so without JS the whole job is readable. */
-.c-job-body.is-clamped {
-  max-height: max(240px, calc(100vh - var(--nav-h) - 380px));
-  max-height: max(240px, calc(100svh - var(--nav-h) - 380px));
-  overflow: hidden;
-  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 110px), transparent);
-  mask-image: linear-gradient(to bottom, #000 calc(100% - 110px), transparent);
-}
-.c-more {
-  display: block; margin: 22px auto 0; min-height: 44px; padding: 0 24px; box-sizing: border-box;
-  background: none; border: 1px solid var(--line); border-radius: 2px; color: var(--ink); cursor: pointer;
-  font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
-}
-.c-more:hover { color: var(--neon); border-color: var(--neon); }
-.c-more:focus-visible { outline: 2px solid var(--neon); outline-offset: 3px; }
-.c-more[hidden] { display: none; }
-@media (max-width: 760px) {
-  .c-job-body.is-clamped {
-    max-height: max(220px, calc(100vh - var(--nav-h) - 330px));
-    max-height: max(220px, calc(100svh - var(--nav-h) - 330px));
-  }
-}
-.eyebrow.is-off { visibility: hidden; }
+/* /swarm (and /swarm/<naddr>, the same page with one swarm open in the panel), in the look of /market: it loads
+   site.css and market.css (html.mk: the sections, the lead numbers, the list rows, the panel, the FAQ, the footer).
+   What only /swarm has is here, scoped by html.sw. The ids the panel paints come from src/swarm/page.ts and hero.ts. */
 
-/* One page, two views (src/swarm.ts sets the body class from the path): /swarm lists every
-   buyer's swarms, /swarm/<naddr> shows one swarm. Until the script runs the index shows. */
-body:not(.view-swarm) [data-view="swarm"], body.view-swarm [data-view="index"] { display: none !important; }
-.c-buyer { margin: 14px 0 0; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
-.c-buyer code { color: var(--ink); }
-.c-swarms { list-style: none; margin: 36px 0 0; padding: 0; text-align: left; }
-.c-swarms li { padding: 18px 4px; border-bottom: 1px solid var(--line); display: grid; gap: 6px; }
-.c-swarms li:first-child { border-top: 1px solid var(--line); }
-.c-swarms a { font-family: var(--sans); font-size: 18px; font-weight: 600; color: var(--ink); text-decoration: none; overflow-wrap: anywhere; }
-.c-swarms a:hover { color: var(--neon); }
-.c-swarms .c-purpose { margin: 0; color: var(--ink); opacity: 0.85; overflow-wrap: anywhere; }
-.c-swarms .c-meta { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
-.c-swarms .c-meta .c-on { color: var(--neon); }
-.c-swarms .skel { display: block; height: 0.9em; width: 60%; }
-.c-jobs { list-style: none; margin: 18px 0 0; padding: 0; text-align: left; font-size: 13px; color: var(--muted); }
-.c-jobs li { padding: 6px 0; overflow-wrap: anywhere; }
-/* A /swarm/<naddr> that names no swarm: the hero says so and links the index; nothing else shows. */
-body.view-missing main > section:not(.h-hero), body.view-missing #job-float, body.view-missing .nav-cta { display: none !important; }
+/* the hero. Bob (2026-11-21): it loads in the same place as /market's, so switching tabs moves nothing: the same
+   section height (one screen), the lead numbers on the same baseline (an empty line where /market says "this week"),
+   and the box starting and ending where /market's boxes do (a row the height of /market's period buttons above it,
+   and it takes the rest of the screen). Measured in Chrome at 1280, 1440 and 1920 wide. */
+html.sw .sw-top{padding-bottom:28px}
+html.sw .lead dt::after{content:"\a0";display:block;font-size:12.5px}
+/* the closing call: market.css gives a lone .btn there a top margin; in a row with the link it pushed the button
+   below the link (Bob, 2026-11-21). The row carries the gap instead. */
+html.sw .mend-c .cta-row .btn{margin-top:0}
+
+/* the board: one list, in the rows of /market's */
+.swb{flex:1;min-height:0;display:flex;flex-direction:column;margin-top:calc(min(34px,4vh) + 48px);border-radius:22px;background:#101010;box-shadow:inset 0 0 0 1px rgba(255,255,255,.09);overflow:hidden}
+.swb-h{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:17px 18px 0}
+.swb-h h2{font-size:19px;font-weight:500;letter-spacing:-.02em}
+.swb-h span{font-size:13px;color:var(--mut);white-space:nowrap}
+.g-s{grid-template-columns:8px minmax(0,1fr) minmax(0,190px) 70px 76px 44px}
+.swb .rows{flex:1}
+.swb .rows .row{height:auto;min-height:62px;padding-top:10px;padding-bottom:10px}
+.swb .rows .row.sk{min-height:62px}
+.swb .rows .row:last-child{border-bottom:0}
+.swb .nm{display:flex;flex-direction:column;gap:3px}
+.swb .who{overflow:hidden;text-overflow:ellipsis}
+.swb .pp{overflow:hidden;text-overflow:ellipsis;font-size:13.5px;color:var(--mut)}
+.swb .st{min-width:0;overflow:hidden;text-overflow:ellipsis;font-size:14px;color:var(--mut)}
+.swb .st.on{color:var(--green)}
+.swb .age{font-size:13px;color:var(--dim)}
+.swb .rows .note{padding:18px}
+.sw-status{padding:10px 18px 14px;font-size:12.5px;color:var(--dim)}
+/* the bottom bar (Bob, 2026-11-21: like /market's boxes): always there, with "See all" in it once there are more */
+.swb-f{border-top:1px solid rgba(255,255,255,.08)}
+.swb-f .more{display:block;width:100%;margin:0;border-top:0}
+.swb-f .more[hidden]{visibility:hidden}
+
+/* how it works: the heading on the left, the steps on the right (the steps are /market's) */
+.sw-how{display:grid;grid-template-columns:minmax(0,.6fr) minmax(0,1.4fr);gap:clamp(32px,5vw,80px);align-items:start;border-top:1px solid rgba(255,255,255,.1)}
+.sw-how .steps{margin-top:0}
+.sw-how .steps b{color:#fff}
+.sw-run .lede{margin-top:14px;font-size:clamp(16px,1.25vw,18px);line-height:1.4;color:var(--mut)}
+.sw-run .copy{margin-top:22px}
+/* the Copy button is as wide as "Copied" from the start, so the line beside it never reflows (Bob, 2026-11-21) */
+html.sw .copy button{display:inline-flex;flex-direction:column;align-items:center;justify-content:center}
+html.sw .copy button::after{content:"Copied";height:0;overflow:hidden;visibility:hidden}
+.steps code{font-family:var(--mono);font-size:.88em;color:#fff;overflow-wrap:anywhere}
+.sw-status:empty{display:none}
+.fa code{font-family:var(--mono);font-size:.88em;color:#fff;overflow-wrap:anywhere}
+.fa a{color:#fff;border-bottom:1px solid rgba(255,255,255,.35)}
+
+/* one swarm, in /market's panel; a member's or the buyer's profile replaces it (data-mode="profile") */
+.sheet[data-mode="swarm"] .pf,.sheet[data-mode="profile"] .swp{display:none}
+.swp{flex:1;min-height:0;padding:6px 20px 28px}
+.swp[data-state="wait"] .sw-body,.swp[data-state="wait"] .sw-none,.swp[data-state="ok"] .pf-wait,.swp[data-state="ok"] .sw-none,.swp[data-state="none"] .pf-wait,.swp[data-state="none"] .sw-body{display:none}
+.sw-none{padding-top:8px;font-size:15.5px;line-height:1.5;color:var(--mut)}
+.sw-by{margin-left:auto;font-size:13px;color:var(--dim)}
+.sw-by a{color:var(--ink2);text-decoration:underline;text-decoration-color:rgba(255,255,255,.3);text-underline-offset:3px;transition:color .2s,text-decoration-color .2s}
+.sw-by a:hover{color:#fff;text-decoration-color:var(--giallo)}
+.sw-about{margin-top:14px}
+.sw-about p,.c-job-body p,.c-job-body li{font-size:15.5px;line-height:1.55;letter-spacing:-.01em;color:var(--ink2);overflow-wrap:anywhere}
+.sw-about p + p,.c-job-body p + p,.c-job-body ul{margin-top:10px}
+.c-job-body ul,.sw-about ul{padding-left:20px}
+.c-job-body a,.sw-about a{color:#fff;border-bottom:1px solid rgba(255,255,255,.35)}
+.sw-sec{margin-top:6px}
+.sw-sec[hidden]{display:none}
+.sw-h{display:flex;align-items:center;gap:10px}
+.sw-job-t{margin-top:8px;font-size:18px;font-weight:500;letter-spacing:-.015em;color:#fff}
+.c-job-body{margin-top:8px}
+.c-job-body.is-clamped{max-height:220px;overflow:hidden;-webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 70px),transparent);mask-image:linear-gradient(to bottom,#000 calc(100% - 70px),transparent)}
+.c-more{margin-top:8px;height:32px;padding:0 12px;border-radius:16px;background:rgba(255,255,255,.09);font-size:13.5px;color:#fff}
+.c-more:hover{background:rgba(255,255,255,.16)}
+.c-more[hidden]{display:none}
+
+/* the facts: the current job's start (or Running now) and its budget; grey bars until both are known (hero.ts) */
+.c-facts{display:grid;grid-template-columns:1fr 1fr;margin:18px 0 0;border-top:1px solid rgba(255,255,255,.09);border-bottom:1px solid rgba(255,255,255,.09)}
+.c-facts div{padding:12px 0}
+.c-facts div + div{padding-left:16px;border-left:1px solid rgba(255,255,255,.09)}
+.c-facts dt{font-size:13px;color:var(--mut)}
+.c-facts dd{margin:4px 0 0;font-size:16.5px;letter-spacing:-.012em;color:#fff}
+.c-facts dd a{color:var(--green)}
+.skel{display:inline-block;vertical-align:middle;height:.8em;border-radius:4px;background:rgba(255,255,255,.07)}
+.c-facts .c-skel-dt{width:72px}
+.c-facts .c-skel-dd{width:110px}
+
+/* join */
+.sw-join .copy{margin-top:8px}
+.sw-join .copy code{font-size:13px}
+.sw-cli{margin-top:10px;font-size:13px;line-height:1.5;color:var(--dim)}
+.sw-cli code{font-family:var(--mono);font-size:12px;color:var(--ink2);overflow-wrap:anywhere}
+.sw-cli button{margin-left:4px;font-size:13px;color:var(--ink2);text-decoration:underline;text-decoration-color:rgba(255,255,255,.3);text-underline-offset:3px}
+.sw-cli button.ok{color:var(--green)}
+
+/* members (live.ts renderSellers) */
+.eyebrow{font-size:11px;font-weight:500;padding:1px 6px;border-radius:5px;background:rgba(18,184,134,.16);color:var(--green)}
+.eyebrow.is-off{visibility:hidden}
+.sw-sum{margin-top:4px;font-size:14px;color:var(--ink2)}
+.sw-sum:empty{display:none}
+.c-sellers{list-style:none;margin:8px 0 0;padding:0}
+.c-sellers li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:2px 16px;align-items:baseline;padding:11px 0;border-top:1px solid rgba(255,255,255,.07);font-size:15px}
+.c-sellers li:last-child{border-bottom:1px solid rgba(255,255,255,.07)}
+.c-sellers .c-who{font-weight:500;color:#fff;overflow-wrap:anywhere;justify-self:start}
+.c-sellers a.c-who:hover{text-decoration:underline;text-decoration-color:rgba(255,255,255,.5);text-underline-offset:3px}
+.c-sellers .c-state{order:1}
+.c-sellers .c-mins{order:2}
+.c-sellers .c-reported{order:3}
+.c-sellers .c-mins{font-size:14px;color:var(--ink2);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}
+.c-sellers .c-state{font-size:13px;color:var(--mut);text-align:right}
+.c-sellers li.off .c-who,.c-sellers li.off .c-mins{color:var(--mut)}
+.c-sellers .c-reported{grid-column:1 / -1;font-size:12.5px;color:var(--dim)}
+.c-sellers .c-skel-used{width:2ch}
+.c-sellers .c-skel-state{width:84px}
+.c-note{margin-top:10px;font-size:12.5px;color:var(--dim)}
+.c-note:empty{display:none}
+
+/* past jobs (index.ts renderSwarmJobs) */
+.c-jobs{list-style:none;margin:6px 0 0;padding:0}
+.c-jobs li{padding:10px 0;border-top:1px solid rgba(255,255,255,.07);font-size:14px;line-height:1.45;color:var(--ink2);overflow-wrap:anywhere}
+.c-jobs li.empty{color:var(--mut)}
+
+@media (max-width:899px){
+  html.sw .lead dt::after{font-size:10.5px}
+  .swb{display:block;margin:16px calc(var(--px) * -1) 0;border-radius:0;background:none;box-shadow:none}
+  .swb-h{padding:0 var(--px)}
+  /* fixed widths: the header and the rows are separate grids, so "auto" put Status at a different place in each,
+     and "Members" did not fit a 30px column (Bob, 2026-11-22: fix the spacing) */
+  .g-s{grid-template-columns:8px minmax(0,1fr) 124px 64px}
+  .g-s > :nth-child(5),.g-s > :nth-child(6){display:none}
+  .swb .st{font-size:13px}
+  /* Bob (2026-11-22): on a phone a row is the swarm's name only, no purpose line under it, at the lists' row height */
+  .swb .pp{display:none}
+  .swb .nm{gap:0}
+  .swb .rows .row,.swb .rows .row.sk{min-height:var(--rh);padding-top:0;padding-bottom:0}
+  .swb-f .more:not([hidden]){display:block}          /* market.css hides .more on a phone; here it is the only way to the rest */
+  .swb-f:has(.more[hidden]){display:none}
+  .sw-how{display:block}
+  .sw-run .copy{margin-top:18px}
+  .sw-how .steps{margin-top:18px}
+  .swp{padding:6px var(--px) 28px}
+  .sw-by{margin-left:0;flex-basis:100%}
+}

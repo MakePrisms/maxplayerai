@@ -193,7 +193,9 @@ export interface Engine {
 }
 
 export function createEngine(
-  { windowKey = DEFAULT_WINDOW, now = () => Math.floor(Date.now() / 1000) } = {},
+  // shifts: rank climbs and overtakes, which only the terminal board shows; they are over half of a recompute, so the
+  // new site turns them off (speed review of #1361, #1).
+  { windowKey = DEFAULT_WINDOW, now = () => Math.floor(Date.now() / 1000), shifts = true } = {},
 ): Engine {
   const cache = createCache();
   const listeners = new Set<(view: MarketView) => void>();
@@ -209,8 +211,9 @@ export function createEngine(
     const buyers = buyerBoard(events, t, allEvents);
     const sellers = sellerBoard(events, t, allEvents);
     const active = activeTradeJobs(allEvents, t);
-    const buyerShifts = rankShifts(buyerBoard, allEvents, t);
-    const sellerShifts = rankShifts(sellerBoard, allEvents, t);
+    const none = (): RankShifts => ({ climbs: new Map(), overtakes: [] });
+    const buyerShifts = shifts ? rankShifts(buyerBoard, allEvents, t) : none();
+    const sellerShifts = shifts ? rankShifts(sellerBoard, allEvents, t) : none();
     const feed = events.map(parseEvent)
       .filter((e): e is ParsedEvent => e != null && e.kind in TRADE_STAGES)
       .sort((a, b) => b.created_at - a.created_at || feedStageRank(b) - feedStageRank(a) || b.id.localeCompare(a.id));

@@ -59,7 +59,8 @@ function render(s, now = NOW) {
   const doc = { getElementById: id => (ids[id] ??= new El(id)), createElement: t => new El(t), createDocumentFragment: () => new El('#f') };
   renderSellers(doc, s, now);
   const rows = ids['swarm-sellers'].children[0]?.children ?? [];
-  return { summary: ids['seller-summary'].textContent, rows: rows.map(r => r.children.map(c => c.textContent)) };
+  // Bob (2026-11-21): no npub line under a member; its name links to its profile (data-pk is its key).
+  return { summary: ids['seller-summary'].textContent, rows: rows.map(r => r.children.map(c => c.textContent)), keys: rows.map(r => r.children[0]?.attrs['data-pk']) };
 }
 const allText = r => [r.summary, ...r.rows.flat()].join('\n');
 
@@ -133,11 +134,11 @@ test('private swarm: rows show buyer-reported tasks and minutes for listed membe
   assert.ok(!('reported' in s.applicants[0]), 'an applicant in the tally gets nothing');
   assert.equal(s.sellers.some(x => x.pubkey === pub(STRANGER)), false, 'a non-member in the tally is not listed');
   const r = render(s);
-  const row = k => r.rows.find(x => x[2] && by(s, k).npub.startsWith(x[2].slice(0, 12)));
+  const row = k => r.rows[r.keys.indexOf(pub(k))];
   assert.equal(row(S1)[1], '42 / 60 min');
-  assert.equal(row(S1)[4], '3 tasks in this job · reported by the buyer');
+  assert.equal(row(S1)[3], '3 tasks in this job · reported by the buyer');
   assert.equal(row(S2)[1], '7 / 60 min');
-  assert.equal(row(S2)[4], '1 task in this job · reported by the buyer');
+  assert.equal(row(S2)[3], '1 task in this job · reported by the buyer');
   assert.equal(r.rows.length, 3, 'two members + one applicant');
   assert.ok(!allText(r).includes('99'), 'applicant/stranger tally values never shown');
   assert.equal(r.summary, '2 agents · 1 waiting for approval', 'no "working now" count without public tasks');
@@ -180,9 +181,9 @@ test('private swarm: only the buyer-signed swarm job is read', () => {
 test('private swarm: a leaver with reported work is listed as Left; without, not listed', () => {
   const events = [swarmEvent('private'), member(S1), member(S2, 'left'), accept(S1), accept(S2)];
   const worked = project([...events, job(tally({ [pub(S1)]: entry(0, 0), [pub(S2)]: entry(1, 12) }))]);
-  assert.deepEqual(render(worked).rows.map(x => x[3]).sort(), ['Left', 'Ready']);
+  assert.deepEqual(render(worked).rows.map(x => x[2]).sort(), ['Left', 'Ready']);
   const idle = project([...events, job(tally({ [pub(S1)]: entry(0, 0), [pub(S2)]: entry(0, 0) }))]);
-  assert.deepEqual(render(idle).rows.map(x => x[3]), ['Ready']);
+  assert.deepEqual(render(idle).rows.map(x => x[2]), ['Ready']);
 });
 
 test('the snapshot parser refuses malformed reported figures', () => {
@@ -196,7 +197,16 @@ test('demo: ?demo=private renders the tally rows through the same parser', () =>
   const s = parseSnapshot(demoSnapshot(1_792_100_000, { privateTasks: true }));
   assert.equal(s.swarm.tasks, 'private');
   const r = render(s, 1_792_100_000);
-  assert.ok(r.rows.some(x => x[4] === '3 tasks in this job · reported by the buyer'));
-  assert.ok(r.rows.some(x => x[4] === 'No report from the buyer yet'));
+  assert.ok(r.rows.some(x => x[3] === '3 tasks in this job · reported by the buyer'));
+  assert.ok(r.rows.some(x => x[3] === 'No report from the buyer yet'));
   assert.equal(parseSnapshot(demoSnapshot(1_792_100_000)).swarm.tasks, 'public', 'plain ?demo unchanged');
+});
+
+// Bob (2026-11-21): an agent waiting for approval shows its profile name, like an accepted member, not its npub.
+test('an applicant waiting for approval is listed by its profile name', () => {
+  const profile = sign(APPLICANT, 0, D - 950, [], JSON.stringify({ name: 'io-seller' }));
+  const s = project([...base('public'), profile]);
+  assert.equal(s.applicants.find(x => x.pubkey === pub(APPLICANT))?.name, 'io-seller');
+  const r = render(s);
+  assert.ok(r.rows.some(x => x[0] === 'io-seller' && x[2] === 'Waiting for approval'));
 });

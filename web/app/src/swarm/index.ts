@@ -5,7 +5,7 @@ import { SWARM } from "../model/kinds.js";
 
 export interface SwarmRow {
   buyer: string; buyerNpub: string; buyerName: string; id: string; name: string; purpose: string;
-  status: string; tasks: string; members: number; openJobs: number;
+  status: string; tasks: string; members: number; openJobs: number; createdAt?: number; jobsDone?: number;
   running: { id: string; title: string; starts: number; ends: number } | null;
   next: { id: string; title: string; starts: number; ends: number } | null;
 }
@@ -42,36 +42,79 @@ export function jobLine(r: SwarmRow, when: (secs: number) => string): string {
   return "No job scheduled";
 }
 
-// mode 'loading': skeleton rows only, no counts (nothing reads as current before the relay is read).
-export function renderIndex(doc: Document, rows: SwarmRow[], mode: "loading" | "live", when: (secs: number) => string, relay: string): void {
+/**
+ * The board's order (Bob, 2026-11-21): swarms with a job running now first, then the rest; newest swarm first in
+ * each group (swarmIndex already sorts by the swarm event's time, newest first, and the sort is stable).
+ */
+export const boardOrder = (rows: SwarmRow[]): SwarmRow[] => [...rows].sort((a, b) => Number(!!b.running) - Number(!!a.running));
+
+/** The four numbers over the board. */
+export function indexTotals(rows: SwarmRow[]): { live: number; open: number; members: number; done: number } {
+  return { live: rows.filter((r) => r.running).length, open: rows.length,
+    members: rows.reduce((n, r) => n + r.members, 0), done: rows.reduce((n, r) => n + (r.jobsDone ?? 0), 0) };
+}
+
+/** A swarm's age, as on /market's activity list: now, 5m, 3h, 12d. */
+export function age(createdAt: number | undefined, now: number): string {
+  if (!createdAt) return "";
+  const s = Math.max(0, now - createdAt);
+  return s < 60 ? "now" : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86400)}d`;
+}
+
+/** The status column: Live, the next job's start, or nothing scheduled. */
+export function statusText(r: SwarmRow, when: (secs: number) => string): string {
+  if (r.running) return "Live";
+  if (r.next) return `Starts ${when(r.next.starts)}`;
+  return "No job scheduled";
+}
+
+// The board, in the rows of /market's lists. mode 'loading': grey placeholder rows only, no counts (nothing reads as
+// current before the relay is read). A row is a link to the swarm (a real address: it opens in a new tab and can be
+// shared); a click opens it in the panel instead (swarm.ts).
+// limit: how many rows to show (the rest behind "See all", swarm.ts).
+export function renderIndex(doc: Document, rows: SwarmRow[], mode: "loading" | "live", when: (secs: number) => string, relay: string, now = Math.floor(Date.now() / 1000), limit = Infinity): void {
   const list = doc.getElementById("swarm-list")!;
   list.setAttribute("aria-busy", String(mode === "loading"));
   const count = doc.getElementById("swarm-count")!;
+  const el = (tag: string, cls: string, text?: string) => { const e = doc.createElement(tag); e.className = cls; if (text !== undefined) e.textContent = text; return e; };
   if (mode === "loading") {
-    if (!list.querySelector(".skel")) {
+    (list as unknown as { _key?: string })._key = undefined;
+    if (!list.querySelector(".sk")) {
       const fragment = doc.createDocumentFragment();
-      for (let i = 0; i < 3; i++) { const li = doc.createElement("li"); const s = doc.createElement("span"); s.className = "skel"; li.append(s); fragment.append(li); }
+      for (let i = 0; i < 4; i++) { const li = el("li", "row sk"); li.setAttribute("aria-hidden", "true"); li.append(el("i", `sk${i % 3}`)); fragment.append(li); }
       list.replaceChildren(fragment);
     }
     count.textContent = "";
     return;
   }
+  // Bob (2026-11-21): the list is rebuilt only when what it shows changes. Rebuilding the same rows on every relay
+  // update replaced the row under the pointer, so its hover highlight blinked off and on.
+  const shown = boardOrder(rows).slice(0, limit);
+  const key = JSON.stringify(shown.map((r) => [swarmPath(r.buyer, r.id, relay), r.name, firstLine(r.purpose, 140), !!r.running, statusText(r, when), r.members, r.jobsDone ?? 0, age(r.createdAt, now)]));
+  const drawn = list as unknown as { _key?: string };
+  count.textContent = rows.length ? `${rows.length} open ${rows.length === 1 ? "swarm" : "swarms"}` : "No open swarms yet. Check back soon.";
+  if (drawn._key === key) return;
+  drawn._key = key;
   const fragment = doc.createDocumentFragment();
-  for (const r of rows) {
-    const li = doc.createElement("li");
-    const a = doc.createElement("a");
+  for (const r of shown) {
+    const li = el("li", "row g-s go");
+    const lamp = el("i", r.running ? "lamp on" : "lamp");
+    lamp.setAttribute("role", "img");
+    lamp.setAttribute("aria-label", r.running ? "Live: a job is running" : "No job running");
+    const nm = el("span", "nm");
+    const a = doc.createElement("a") as HTMLAnchorElement;
+    a.className = "who";
     a.href = swarmPath(r.buyer, r.id, relay);
     a.textContent = r.name;
-    const purpose = doc.createElement("p"); purpose.className = "c-purpose"; purpose.textContent = firstLine(r.purpose);
-    const meta = doc.createElement("span"); meta.className = "c-meta";
-    const job = doc.createElement("span"); job.textContent = jobLine(r, when);
-    if (r.running) job.className = "c-on";
-    meta.append(job, doc.createTextNode(` · ${r.members} ${r.members === 1 ? "member" : "members"} · by ${r.buyerName || shortNpub(r.buyerNpub)}${r.tasks === "private" ? " · private tasks" : ""}`));
-    li.append(a, purpose, meta);
+    nm.append(a);
+    const purpose = firstLine(r.purpose, 140);
+    if (purpose) nm.append(el("span", "pp", purpose));
+    li.append(lamp, nm, el("span", r.running ? "st on" : "st", statusText(r, when)), el("span", "num", String(r.members)),
+      el("span", "num", String(r.jobsDone ?? 0)), el("span", "num age", age(r.createdAt, now)));
     fragment.append(li);
   }
+  if (!rows.length) fragment.append(el("li", "note", "No open swarms yet. Check back soon."));
   list.replaceChildren(fragment);
-  count.textContent = rows.length ? `${rows.length} open ${rows.length === 1 ? "swarm" : "swarms"}` : "No open swarms yet. Check back soon.";
 }
 
 /** This swarm's jobs, newest first: title, window, status and task count. */
@@ -81,8 +124,10 @@ export function renderSwarmJobs(doc: Document, jobs: { id: string; title: string
   const status: Record<string, string> = { scheduled: "Scheduled", in_progress: "Running", completed: "Done", cancelled: "Cancelled" };
   for (const j of jobs.slice(0, 20)) {
     const li = doc.createElement("li");
-    li.textContent = `${when(j.starts)} · ${j.title} · ${status[j.status] ?? j.status} · ${j.tasks} ${j.tasks === 1 ? "task" : "tasks"}`;
+    // Bob (2026-11-21): no task count (it read "0 tasks" on finished jobs); "Done" is said by the heading.
+    li.textContent = j.status === "completed" ? `${when(j.starts)} · ${j.title}` : `${when(j.starts)} · ${j.title} · ${status[j.status] ?? j.status}`;
     fragment.append(li);
   }
+  if (!jobs.length) { const li = doc.createElement("li"); li.className = "empty"; li.textContent = "No finished jobs yet."; fragment.append(li); }
   list.replaceChildren(fragment);
 }

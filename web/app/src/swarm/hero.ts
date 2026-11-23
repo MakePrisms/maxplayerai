@@ -1,6 +1,9 @@
 // The hero's first fact. Before the day's work starts it is the start time; while the run is
 // on it reads "Running now" and links to the live agents list on the same page (bob). After the
-// run it goes back to the start time.
+// run: "Work ended" and the end time once the job is over (completed, cancelled or past its window; Bob,
+// 2026-11-21), else "Work started" and the start time (started but not on, e.g. a stale view).
+// A job closed early ends when the buyer closed it: updatedAt, the shown job event's created_at. Kind 30341 has no
+// ended_at, so a later republish of a closed job moves that time later (never past ends); the date can only err late.
 //
 // "On" matches the swarm engine: status in_progress (a scheduled day is not on) and the
 // half-open window starts <= now < ends, read from swarm data that was ready within
@@ -17,7 +20,7 @@ export const AGENTS_ANCHOR = "#agents";
 export const FRESH_S = 5;
 export const SPOT_WAIT_MS = 4000;
 export interface StartFact { label: string; value: string; href: string | null }
-type Run = { starts: number; ends: number; status: string };
+type Run = { starts: number; ends: number; status: string; updatedAt?: number };
 
 const fresh = (readyAgeS: number | null) => readyAgeS !== null && readyAgeS <= FRESH_S;
 export interface Facts { start: StartFact; budget: string }
@@ -39,7 +42,16 @@ export function isRunning(c: Run, now: number, readyAgeS: number | null): boolea
 export function startFact(c: Run | null, now: number, when: (secs: number) => string, readyAgeS: number | null): StartFact {
   if (!c) return { label: "Work starts", value: "To be announced", href: null };
   if (isRunning(c, now, readyAgeS)) return { label: "Running now", value: "See the agents", href: AGENTS_ANCHOR };
-  return { label: "Work starts", value: when(c.starts), href: null };
+  const closed = c.status === "completed" || c.status === "cancelled";
+  const closedAt = closed && c.updatedAt !== undefined && Number.isFinite(c.updatedAt) ? c.updatedAt : null;
+  // Called off before it began (the daemon lets a buyer cancel a scheduled job early; review of #1361, r3 #2).
+  if (c.status === "cancelled" && (closedAt !== null ? closedAt < c.starts : now < c.starts))
+    return { label: "Cancelled", value: when(closedAt ?? c.starts), href: null };
+  if (closed || now >= c.ends) {
+    const end = closedAt !== null ? Math.max(c.starts, Math.min(c.ends, closedAt)) : c.ends;
+    return { label: "Work ended", value: when(end), href: null };
+  }
+  return { label: now >= c.starts ? "Work started" : "Work starts", value: when(c.starts), href: null };
 }
 
 // Called every tick; touches the DOM only when the fact changes.

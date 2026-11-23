@@ -10,7 +10,7 @@
 //   job are complete before older history backfills: the window opens TRADE_WINDOW_MARGIN_S before
 //   the earlier of today's UTC midnight and the shown job's start, once the swarm jobs are read.
 import { OFFER, CLAIM, RESULT, AWARD, ACCEPT, FOLLOW_UP, SWARM, SWARM_JOB, SWARM_MEMBERSHIP, SWARM_DECISION } from '../../model/kinds.ts';
-import { RelayReader } from '../../challenge/shared/relay.mjs';
+import { RelayReader, METADATA_CAP } from '../../challenge/shared/relay.mjs';
 import { dayStart, shownJob } from './model.mjs';
 import { Decisions, latestMemberships, latestSwarmJobs, latestSwarms, swarmAddress } from './wire.mjs';
 
@@ -31,6 +31,13 @@ export function swarmFilters(buyer, swarm) {
 export const taskFilters = buyer => [OFFER, CLAIM, AWARD, RESULT, ACCEPT, FOLLOW_UP].map(kind =>
   [CLAIM, RESULT].includes(kind) ? { kinds: [kind], '#p': [buyer] } : { kinds: [kind], authors: [buyer] });
 
+// Whose names a swarm page reads (review of #1361, r2 #1): the buyer and the accepted members first; applicants are
+// anyone who publishes a join, so they only fill the room left under the profile cap and can never push out a member.
+export function nameKeys(buyer, accepted, applicants, cap = METADATA_CAP) {
+  const first = [...new Set([buyer, ...accepted])];
+  return [...first, ...[...new Set(applicants)].filter(k => !first.includes(k)).sort().slice(0, Math.max(0, cap - first.length))];
+}
+
 export class SwarmReader {
   /**
    * swarm: { buyer, swarm } for one swarm's page, null for the index. Other options go to RelayReader.
@@ -44,14 +51,17 @@ export class SwarmReader {
       filters: swarm ? swarmFilters(swarm.buyer, swarm.swarm) : indexFilters() });
     this.trade = swarm ? new RelayReader({ ...common, buyer: swarm.buyer, metadata: false, window: true, filters: taskFilters(swarm.buyer) }) : null;
   }
-  // Profile names: the buyers on the index; the buyer and the members on a swarm page.
+  // Profile names: the buyers on the index; the buyer, the members and (Bob, 2026-11-21) the applicants waiting for
+  // approval on a swarm page. Denied sellers are never listed, so their names are not read.
   updateNames() {
     const events = [...this.store.events.values()];
     let keys;
     if (!this.target) keys = latestSwarms(events).map(([, s]) => s.buyer);
     else {
       const { buyer, swarm } = this.target, d = new Decisions(buyer, events);
-      keys = [buyer, ...latestMemberships(events).filter(([, m]) => m.buyer === buyer && m.swarm === swarm && d.allows(m.seller, swarm)).map(([, m]) => m.seller)];
+      const ms = latestMemberships(events).filter(([, m]) => m.buyer === buyer && m.swarm === swarm && !d.denies(m.seller, swarm)).map(([, m]) => m);
+      keys = nameKeys(buyer, ms.filter(m => d.allows(m.seller, swarm)).map(m => m.seller),
+        ms.filter(m => !d.allows(m.seller, swarm) && m.status === 'joined').map(m => m.seller));
     }
     this.swarm.setRoster(keys);
   }

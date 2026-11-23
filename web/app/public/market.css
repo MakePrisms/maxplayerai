@@ -1,0 +1,315 @@
+/* Maxplayer Market page (market.html). Loaded after site.css, which gives it the Teams page's colours, type, nav,
+   buttons, phone mock-up, chat bubbles, copy box, FAQ rows and footer columns. Everything here is scoped by the
+   page's own class names (html.mk, .ms, .board ...); nothing here changes the Teams page.
+
+   An ordinary page the browser scrolls, at every width (Bob's choices for this page: the Teams page keeps its
+   fixed stage on wide screens and its one-screen-per-section feed on phones). No scroll snapping anywhere here. */
+
+html.mk{overscroll-behavior-y:auto;scroll-snap-type:none;scroll-padding-top:calc(var(--nav) - 6px);color-scheme:dark;
+  --px:max(var(--pad),calc(50vw - 660px));--rh:44px}
+html.mk body{background:none}        /* the page colour is on <html>; a colour on <body> too would hide the glow, which sits under the content (z-index -1) */
+html.mk body:not(.ready) .mk-main{visibility:hidden}
+html.mk body.ready .mk-main{animation:stagein .35s ease backwards}
+html.mk .nav{background:rgba(26,26,26,.86);-webkit-backdrop-filter:saturate(1.4) blur(14px);backdrop-filter:saturate(1.4) blur(14px)}
+html.mk .navfade{display:none}
+html.mk :focus-visible{outline:2px solid var(--giallo);outline-offset:3px}     /* keyboard only; a click or a tap never shows it */
+html.mk .quiet:focus-visible{outline:none}     /* focus given back after a panel used with a pointer (src/site/refocus.ts) */
+.copysrc{position:fixed;left:0;top:0;opacity:0;pointer-events:none;white-space:pre;-webkit-user-select:text;user-select:text}   /* market.js copyText */
+html.mk .phone .msgs{overflow:hidden}                     /* the page scrolls, not the chat in the mock-up */
+html.mk .phone .msgs.tight{--fb:12px}
+
+.ms{position:relative;padding:clamp(64px,11vh,124px) var(--px)}
+.ms-h{font-weight:400;font-size:clamp(32px,4vw,60px);line-height:1.05;letter-spacing:-.02em;text-wrap:balance}
+.ms .ey + .ms-h{margin-top:8px}
+.ms .lede{font-size:clamp(16px,1.35vw,20px);line-height:1.38;letter-spacing:-.015em}
+.ms-h + .lede{margin-top:12px}
+
+/* ---------- 1 · the market, live ---------- */
+/* One screen: the headline and the call to hire on the left, the two lead numbers on the right, the board below.
+   The board takes what is left of the screen and each list shows as many whole rows as fit (market.js). */
+.ms-top{display:flex;flex-direction:column;min-height:min(100vh,1040px);padding-top:calc(var(--nav) + min(4.4vh,40px));padding-bottom:28px}
+.top-head{display:flex;justify-content:space-between;align-items:flex-end;gap:clamp(28px,4vw,64px)}
+.top-l{flex:0 1 780px;min-width:0}
+.top-l h1{font-weight:400;font-size:clamp(38px,4.5vw,64px);line-height:1.02;letter-spacing:-.022em;text-wrap:balance}
+.top-l .lede{margin-top:14px;max-width:540px}
+.top-l .cta-row{justify-content:flex-start;margin-top:min(26px,3vh)}
+.lead{flex:none;display:flex;gap:clamp(22px,3vw,52px);margin:0 0 4px}
+.lead div{display:flex;flex-direction:column-reverse;justify-content:flex-end}
+.lead dd{margin:0;font-size:clamp(34px,3.5vw,52px);line-height:1;letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+.lead dt{margin-top:9px;font-size:14px;line-height:1.3;color:var(--ink2);white-space:nowrap}
+/* a number that is not known yet: a grey bar where it will be, the height of the number, so nothing moves */
+/* and a number of up to three digits takes the same room as the bar did: the row of numbers does not shift when
+   they arrive (the block was 9 px narrower with numbers than with bars) */
+.lead dd{min-height:1em;min-width:1.74em}
+.lead dd.sk{position:relative;clip-path:inset(.14em calc(100% - 1.5em) .14em 0 round .14em)}     /* the number's box, cut to the bar */
+.lead dd.sk::before{content:"";display:block;width:1.5em;height:.72em;margin-top:.14em;border-radius:.14em;background:rgba(255,255,255,.07)}
+.lead dd.sk.sk::after{top:.14em;bottom:auto;height:.72em}   /* (.sk twice: this must win over the shared light rule further down) */
+.lead .per{display:block;font-size:12.5px;color:var(--dim)}
+.lead .s{display:none}
+/* the two numbers that lead (Bob): experts online and jobs delivered. The other two are quieter. */
+.lead div:nth-child(n+3) dd{color:var(--mut)}
+.lead div:nth-child(n+3) dt{color:var(--mut)}
+/* no dot beside the experts-online number (Bob) */
+
+.board{flex:1;min-height:0;display:flex;flex-direction:column;margin-top:min(34px,4vh)}
+.board-h{flex:none;display:flex;align-items:center;gap:14px;min-height:36px}
+.seg{display:inline-flex;padding:3px;border-radius:12px;background:rgba(255,255,255,.07)}
+.seg button{height:30px;padding:0 13px;border-radius:9px;font-size:14px;letter-spacing:-.01em;color:var(--mut);white-space:nowrap;transition:color .2s,background-color .2s}
+.seg button:hover{color:#fff}
+.seg button[aria-pressed="true"]{background:#3b3b39;color:#fff}
+.win{margin-left:auto}
+.tab3,.see-all{display:none}                              /* phone-size pages: one list at a time */
+
+.cols{flex:1;min-height:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:clamp(12px,1.4vw,22px);margin-top:12px}
+.col{display:flex;flex-direction:column;min-width:0;min-height:0;border-radius:22px;background:#101010;box-shadow:inset 0 0 0 1px rgba(255,255,255,.09);overflow:hidden}
+.col-h{flex:none;display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:17px 18px 0}
+.col-h h2{font-size:19px;font-weight:500;letter-spacing:-.02em}
+.col-h span{font-size:13px;color:var(--mut);white-space:nowrap}
+.ch,.row{display:grid;align-items:center;column-gap:10px;padding:0 18px}
+.ch{flex:none;margin-top:9px;height:28px;font-size:12px;color:var(--dim);border-bottom:1px solid rgba(255,255,255,.08)}
+.g-x{grid-template-columns:18px 8px minmax(0,1fr) 40px 46px 56px}
+.g-b{grid-template-columns:18px 8px minmax(0,1fr) 56px}
+.g-a{grid-template-columns:8px minmax(0,1fr) auto}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.rows{list-style:none;margin:0;padding:0}
+.col .rows{flex:1 1 0;min-height:calc(var(--rh) * 5);max-height:calc(var(--rh) * 10);overflow:hidden}
+.row{height:var(--rh);border-bottom:1px solid rgba(255,255,255,.06);font-size:15px;letter-spacing:-.012em;color:var(--ink2);white-space:nowrap}
+.row .num{font-size:14.5px}
+.pos{font-size:13px;color:var(--dim);font-variant-numeric:tabular-nums}
+.lamp{width:8px;height:8px;border-radius:50%;box-shadow:inset 0 0 0 1.5px #4a4a48}
+.lamp.on{background:var(--green);box-shadow:0 0 4px rgba(18,184,134,.28)}
+.lamp.busy{background:var(--giallo);box-shadow:0 0 4px rgba(255,223,0,.3)}
+.lamp.post{background:#fff;box-shadow:none}   /* a job posted: white (Bob: no blue) */ .lamp.step{background:var(--mut);box-shadow:none}   /* other steps: filled light gray */ .lamp.hire{background:var(--giallo);box-shadow:none}
+.lamp.done{background:var(--green);box-shadow:none} .lamp.stop{background:var(--rosso);box-shadow:none}
+.nm{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.who{font-weight:500;color:#fff}
+/* an expert's row and name open its profile */
+.row.go{cursor:pointer;transition:background-color .15s}
+.row.go:hover{background:rgba(255,255,255,.045)}
+a.who:hover{text-decoration:underline;text-decoration-color:rgba(255,255,255,.5);text-underline-offset:3px}
+.row.go a.who:hover{text-decoration:none}
+.who.hex{font-family:var(--mono);font-size:.86em;font-weight:400;color:var(--ink2)}
+.z{color:var(--dim)}
+.ev{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.ev .amt{color:#fff;font-variant-numeric:tabular-nums}
+.ev .rd{color:var(--dim)}
+.row .age{font-size:13px;color:var(--dim);font-variant-numeric:tabular-nums}
+.row.new{animation:rowin .7s ease backwards}
+@keyframes rowin{from{opacity:0;background-color:rgba(255,255,255,.07)}40%{opacity:1;background-color:rgba(255,255,255,.07)}to{background-color:rgba(255,255,255,0)}}
+.row.sk{display:flex}
+.row.sk i{position:relative;overflow:hidden;height:9px;width:58%;border-radius:5px;background:rgba(255,255,255,.06)}
+/* Moving placeholders (Bob): ONE soft light crosses the page from left to right while the market loads, and every
+   grey bar shows the part of it that is over that bar: the numbers, then the lists, as one wave. (The first try gave
+   each bar a light of its own, as wide as the bar: short bars and long bars ran at different speeds and the board
+   flickered in zig-zag; Bob: it does not flow.) Each bar's light is as wide as the window and starts at the window's
+   left edge: market.js tells the bar how far it is from that edge (--skx). It is a band that MOVES (transform), not
+   a background that is repainted: the browser moves it without the page's script thread, so it stays smooth in the
+   moments that thread is busy reading the market. Without --skx (script off) a bar's light simply starts at the bar. */
+.row.sk i::after,.pf-wait i::after,.lead dd.sk::after{content:"";position:absolute;top:0;bottom:0;left:calc(var(--skx,0px) * -1);width:100vw;
+  background:linear-gradient(90deg,rgba(255,255,255,0) 32%,rgba(255,255,255,.12) 50%,rgba(255,255,255,0) 68%);
+  transform:translate3d(-68%,0,0);will-change:transform;animation:skmove 1.7s linear infinite}
+@keyframes skmove{from{transform:translate3d(-68%,0,0)}to{transform:translate3d(68%,0,0)}}
+.row.sk .sk1{width:42%} .row.sk .sk2{width:50%}
+.rows .note{padding:16px 18px;font-size:14.5px;line-height:1.45;color:var(--mut);white-space:normal}
+.rows .note a{color:var(--ink2);border-bottom:1px solid rgba(255,255,255,.3)}
+.more{flex:none;margin-top:auto;height:44px;border-top:1px solid rgba(255,255,255,.08);font-size:14px;color:var(--ink2);text-align:center;transition:color .2s,background-color .2s}
+.more:hover{color:#fff;background:rgba(255,255,255,.04)}
+/* its room is kept when it is not shown (placeholders; a list that fits whole): the list above keeps one height, so
+   the number of rows does not change when the button appears (the first draw had 9 rows, the next 8) */
+.more[hidden]{display:block;visibility:hidden}
+
+/* the full list of one column: a dialog on a wide screen, a sheet from the bottom on a phone */
+.sheet-bg{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.6);opacity:0;visibility:hidden;transition:opacity .2s ease,visibility 0s .2s}
+.sheet{position:fixed;z-index:71;left:50%;top:50%;width:min(640px,calc(100vw - 48px));height:min(780px,calc(100vh - 96px));display:flex;flex-direction:column;border-radius:24px;background:#151515;box-shadow:inset 0 0 0 1px rgba(255,255,255,.1),0 30px 80px rgba(0,0,0,.5);overflow:hidden;
+  opacity:0;visibility:hidden;transform:translate3d(-50%,calc(-50% + 14px),0);transition:opacity .2s ease,transform .2s ease,visibility 0s .2s}
+html.mk .sheet:focus{outline:none}
+html.sheet-open,html.sheet-open body{overflow:hidden}
+html.sheet-open .sheet-bg{opacity:1;visibility:visible;transition-delay:0s}
+html.sheet-open .sheet{opacity:1;visibility:visible;transform:translate3d(-50%,-50%,0);transition-delay:0s}
+.sheet-h{flex:none;display:flex;align-items:center;justify-content:space-between;padding:18px 20px 0}
+.sheet-h{gap:12px}
+.sheet-h h2{flex:1;min-width:0;font-size:22px;font-weight:500;letter-spacing:-.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sheet-h h2.hex{font-family:var(--mono);font-size:18px;font-weight:400}
+.sheet-back{flex:none;height:34px;padding:0 13px 0 11px;border-radius:17px;background:rgba(255,255,255,.09);font-size:14.5px;color:#fff}
+.sheet-back::before{content:"‹";margin-right:6px}
+.sheet-back:hover{background:rgba(255,255,255,.16)}
+.sheet-back[hidden]{display:none}
+.sheet-x{height:34px;padding:0 14px;border-radius:17px;background:rgba(255,255,255,.09);font-size:14.5px;color:#fff}
+.sheet-x:hover{background:rgba(255,255,255,.16)}
+.sheet-w{flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 20px 0}
+.sheet-w .win{margin:0}
+.sheet-w span{font-size:13px;color:var(--mut)}
+.sheet .ch,.sheet .row{padding:0 20px}
+.sheet .rows{flex:1;min-height:0}
+html.mk .sheet .scrollable{overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+/* one expert's profile, in the same panel */
+.sheet[data-mode="expert"] .sheet-w,.sheet[data-mode="expert"] #sheet-ch,.sheet[data-mode="expert"] #sheet-rows,.sheet[data-mode="list"] .pf{display:none}
+.pf{flex:1;min-height:0;padding:10px 20px 26px}
+.pf[data-state="ok"] .pf-note,.pf[data-state="ok"] .pf-wait,.pf[data-state="none"] .pf-wait,.pf[data-state="none"] .pf-body,.pf[data-state="wait"] .pf-body,.pf[data-state="wait"] .pf-note{display:none}
+.pf-note{font-size:15.5px;line-height:1.5;color:var(--mut)}
+.pf-wait i{position:relative;overflow:hidden;display:block;height:11px;margin-top:16px;border-radius:6px;background:rgba(255,255,255,.07)}
+.pf-wait i:nth-child(1){width:34%} .pf-wait i:nth-child(2){width:88%} .pf-wait i:nth-child(3){width:64%}
+.pf-st{display:flex;align-items:center;flex-wrap:wrap;gap:4px 9px;font-size:14.5px;color:var(--ink2)}
+/* the npub: short, quiet, at the end of the status line; a click copies the whole key */
+.pf-npub{margin:-5px -4px -5px auto;display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 4px;border-radius:8px;color:var(--dim);transition:color .2s}
+.pf-npub code{font-family:var(--mono);font-size:12.5px;font-variant-ligatures:none}
+.pf-npub svg{flex:none;width:14px;height:14px}
+.pf-npub:hover{color:var(--ink2)}
+.pf-npub.ok{color:var(--green)}
+.pf-npub.full{height:auto;color:var(--ink2)}
+.pf-npub.full code{user-select:all;overflow-wrap:anywhere;text-align:left}
+.pf-npub.full svg{display:none}
+.pf-about{margin-top:14px;font-size:16px;line-height:1.5;letter-spacing:-.01em;color:var(--ink2);overflow-wrap:anywhere}
+.pf-about[hidden]{display:none}
+.pf-kv{margin:18px 0 0;border-bottom:1px solid rgba(255,255,255,.09)}
+.pf-kv div{display:flex;justify-content:space-between;align-items:baseline;gap:20px;padding:12px 0;border-top:1px solid rgba(255,255,255,.09);font-size:15.5px;letter-spacing:-.012em}
+.pf-kv dt{flex:none;color:var(--mut)}
+.pf-kv dd{margin:0;min-width:0;text-align:right;color:#fff;overflow-wrap:anywhere}
+.pf-kv small{margin-left:6px;font-size:13px;color:var(--dim)}
+.pf-h{margin:24px 0 2px;font-size:13px;font-weight:400;color:var(--dim)}
+.sheet .pf .row{padding:0}
+
+/* ---------- 2 · how hiring works ---------- */
+.ms-how{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:clamp(32px,5vw,80px);align-items:center}
+.steps{list-style:none;margin-top:clamp(24px,3.6vh,40px);border-bottom:1px solid rgba(255,255,255,.1)}
+.steps li{padding:17px 0 18px;border-top:1px solid rgba(255,255,255,.1)}
+.steps b{display:block;font-weight:500;font-size:clamp(17px,1.4vw,20px);letter-spacing:-.02em;color:var(--ink2);transition:color .3s}
+.steps p{text-wrap:pretty;margin-top:5px;font-size:clamp(15px,1.12vw,16.5px);line-height:1.42;letter-spacing:-.01em;color:var(--mut)}
+/* no status dots on the steps (Bob). The step the chat has reached is white; the ones to come are a shade quieter. */
+.steps li.run b,.steps li.done b{color:#fff}
+/* The phone stands on the page with no box round it, and its glow flows across the page behind everything: under
+   the steps' text and into the sections above and below (Bob: the glow should not be in the box). The glow is under
+   all content (z-index -1; nothing between it and <html> may make a stacking context) and is cut only at the
+   window's sides, by `overflow-x:clip` on the page, so it adds no sideways scroll. A browser without `clip` gets no
+   glow rather than a page that scrolls sideways. The phone still ends above the next section: .mcut cuts it, with a
+   fade, where the box's bottom edge used to be. No blur filter: the fade is in the gradients (generated: 48 stops per colour on a bell curve, exp(-4.5 t^2) shifted to end at 0). */
+.mk-main{overflow-x:clip}
+.mdemo{position:relative;height:min(640px,calc(100vh - var(--nav) - 72px));min-height:420px;--dtop:36px;--dps:.82}
+.mdemo::before{content:"";position:absolute;z-index:-1;left:50%;top:calc(var(--dtop) + 300px * var(--dps));width:1500px;height:1100px;margin:-550px 0 0 -750px;pointer-events:none;opacity:.5;background:radial-gradient(440px 330px at 38% 36%,rgba(255,40,0,0.340) 0%,rgba(255,40,0,0.339) 2.08%,rgba(255,40,0,0.337) 4.17%,rgba(255,40,0,0.334) 6.25%,rgba(255,40,0,0.329) 8.33%,rgba(255,40,0,0.324) 10.42%,rgba(255,40,0,0.317) 12.50%,rgba(255,40,0,0.309) 14.58%,rgba(255,40,0,0.300) 16.67%,rgba(255,40,0,0.290) 18.75%,rgba(255,40,0,0.279) 20.83%,rgba(255,40,0,0.268) 22.92%,rgba(255,40,0,0.256) 25%,rgba(255,40,0,0.243) 27.08%,rgba(255,40,0,0.231) 29.17%,rgba(255,40,0,0.218) 31.25%,rgba(255,40,0,0.205) 33.33%,rgba(255,40,0,0.192) 35.42%,rgba(255,40,0,0.179) 37.50%,rgba(255,40,0,0.166) 39.58%,rgba(255,40,0,0.154) 41.67%,rgba(255,40,0,0.141) 43.75%,rgba(255,40,0,0.130) 45.83%,rgba(255,40,0,0.119) 47.92%,rgba(255,40,0,0.108) 50%,rgba(255,40,0,0.098) 52.08%,rgba(255,40,0,0.088) 54.17%,rgba(255,40,0,0.079) 56.25%,rgba(255,40,0,0.071) 58.33%,rgba(255,40,0,0.063) 60.42%,rgba(255,40,0,0.055) 62.50%,rgba(255,40,0,0.049) 64.58%,rgba(255,40,0,0.043) 66.67%,rgba(255,40,0,0.037) 68.75%,rgba(255,40,0,0.032) 70.83%,rgba(255,40,0,0.028) 72.92%,rgba(255,40,0,0.024) 75%,rgba(255,40,0,0.020) 77.08%,rgba(255,40,0,0.017) 79.17%,rgba(255,40,0,0.014) 81.25%,rgba(255,40,0,0.011) 83.33%,rgba(255,40,0,0.009) 85.42%,rgba(255,40,0,0.007) 87.50%,rgba(255,40,0,0.005) 89.58%,rgba(255,40,0,0.004) 91.67%,rgba(255,40,0,0.003) 93.75%,rgba(255,40,0,0.002) 95.83%,rgba(255,40,0,0.001) 97.92%,rgba(255,40,0,0.000) 100%),radial-gradient(480px 300px at 64% 49%,rgba(255,138,28,0.400) 0%,rgba(255,138,28,0.399) 2.08%,rgba(255,138,28,0.397) 4.17%,rgba(255,138,28,0.393) 6.25%,rgba(255,138,28,0.388) 8.33%,rgba(255,138,28,0.381) 10.42%,rgba(255,138,28,0.373) 12.50%,rgba(255,138,28,0.363) 14.58%,rgba(255,138,28,0.352) 16.67%,rgba(255,138,28,0.341) 18.75%,rgba(255,138,28,0.328) 20.83%,rgba(255,138,28,0.315) 22.92%,rgba(255,138,28,0.301) 25%,rgba(255,138,28,0.286) 27.08%,rgba(255,138,28,0.271) 29.17%,rgba(255,138,28,0.256) 31.25%,rgba(255,138,28,0.241) 33.33%,rgba(255,138,28,0.226) 35.42%,rgba(255,138,28,0.210) 37.50%,rgba(255,138,28,0.195) 39.58%,rgba(255,138,28,0.181) 41.67%,rgba(255,138,28,0.166) 43.75%,rgba(255,138,28,0.153) 45.83%,rgba(255,138,28,0.139) 47.92%,rgba(255,138,28,0.127) 50%,rgba(255,138,28,0.115) 52.08%,rgba(255,138,28,0.104) 54.17%,rgba(255,138,28,0.093) 56.25%,rgba(255,138,28,0.083) 58.33%,rgba(255,138,28,0.074) 60.42%,rgba(255,138,28,0.065) 62.50%,rgba(255,138,28,0.057) 64.58%,rgba(255,138,28,0.050) 66.67%,rgba(255,138,28,0.044) 68.75%,rgba(255,138,28,0.038) 70.83%,rgba(255,138,28,0.032) 72.92%,rgba(255,138,28,0.028) 75%,rgba(255,138,28,0.023) 77.08%,rgba(255,138,28,0.020) 79.17%,rgba(255,138,28,0.016) 81.25%,rgba(255,138,28,0.013) 83.33%,rgba(255,138,28,0.011) 85.42%,rgba(255,138,28,0.008) 87.50%,rgba(255,138,28,0.006) 89.58%,rgba(255,138,28,0.005) 91.67%,rgba(255,138,28,0.003) 93.75%,rgba(255,138,28,0.002) 95.83%,rgba(255,138,28,0.001) 97.92%,rgba(255,138,28,0.000) 100%),radial-gradient(520px 240px at 40% 53.5%,rgba(255,223,0,0.300) 0%,rgba(255,223,0,0.299) 2.08%,rgba(255,223,0,0.298) 4.17%,rgba(255,223,0,0.295) 6.25%,rgba(255,223,0,0.291) 8.33%,rgba(255,223,0,0.286) 10.42%,rgba(255,223,0,0.279) 12.50%,rgba(255,223,0,0.272) 14.58%,rgba(255,223,0,0.264) 16.67%,rgba(255,223,0,0.256) 18.75%,rgba(255,223,0,0.246) 20.83%,rgba(255,223,0,0.236) 22.92%,rgba(255,223,0,0.226) 25%,rgba(255,223,0,0.215) 27.08%,rgba(255,223,0,0.204) 29.17%,rgba(255,223,0,0.192) 31.25%,rgba(255,223,0,0.181) 33.33%,rgba(255,223,0,0.169) 35.42%,rgba(255,223,0,0.158) 37.50%,rgba(255,223,0,0.147) 39.58%,rgba(255,223,0,0.136) 41.67%,rgba(255,223,0,0.125) 43.75%,rgba(255,223,0,0.115) 45.83%,rgba(255,223,0,0.105) 47.92%,rgba(255,223,0,0.095) 50%,rgba(255,223,0,0.086) 52.08%,rgba(255,223,0,0.078) 54.17%,rgba(255,223,0,0.070) 56.25%,rgba(255,223,0,0.062) 58.33%,rgba(255,223,0,0.055) 60.42%,rgba(255,223,0,0.049) 62.50%,rgba(255,223,0,0.043) 64.58%,rgba(255,223,0,0.038) 66.67%,rgba(255,223,0,0.033) 68.75%,rgba(255,223,0,0.028) 70.83%,rgba(255,223,0,0.024) 72.92%,rgba(255,223,0,0.021) 75%,rgba(255,223,0,0.018) 77.08%,rgba(255,223,0,0.015) 79.17%,rgba(255,223,0,0.012) 81.25%,rgba(255,223,0,0.010) 83.33%,rgba(255,223,0,0.008) 85.42%,rgba(255,223,0,0.006) 87.50%,rgba(255,223,0,0.005) 89.58%,rgba(255,223,0,0.004) 91.67%,rgba(255,223,0,0.002) 93.75%,rgba(255,223,0,0.001) 95.83%,rgba(255,223,0,0.001) 97.92%,rgba(255,223,0,0.000) 100%)}
+@supports not (overflow-x:clip){ .mdemo::before{display:none} }
+.mcut{position:absolute;inset:0;overflow:hidden;-webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 110px),transparent 100%);mask-image:linear-gradient(to bottom,#000 calc(100% - 110px),transparent 100%)}
+.mphone{position:absolute;left:50%;top:var(--dtop);z-index:2;width:444px;height:912px;margin-left:-222px;transform-origin:50% 0;transform:scale(var(--dps))}
+
+/* ---------- 3 · get started ---------- */
+/* its own section, with the same line above it as Become an expert and FAQs (Bob: it read as the end of How it works) */
+/* It fills the window, with its content in the middle (Bob: like the other sections; it was 406 px of a 900 px
+   window). The height is the window less the nav, so that it fills exactly what shows under the nav when the
+   Hire an expert button brings the reader here (the scroll stops with the section's top just under the nav). */
+.ms-hire{display:grid;grid-template-columns:minmax(0,.86fr) minmax(0,1.14fr);gap:clamp(32px,5vw,80px);align-items:center;border-top:1px solid rgba(255,255,255,.1);min-height:calc(min(100vh,1040px) - var(--nav) + 6px)}
+.hire-r .copy{margin-top:0}
+
+/* ---------- 4 · selling ---------- */
+.ms-sell{border-top:1px solid rgba(255,255,255,.1)}
+.sell-head{max-width:760px}
+.facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:clamp(12px,1.4vw,22px);margin-top:clamp(26px,4vh,44px)}
+.fact{border-radius:24px;background:var(--panel);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08);padding:26px 24px 28px}
+.fact .gi{display:block;width:26px;height:26px;color:var(--green)}
+.fact h3{margin:18px 0 0;font-weight:500;font-size:clamp(18px,1.5vw,22px);line-height:1.15;letter-spacing:-.02em}
+.fact p{margin-top:9px;font-size:clamp(14px,1.08vw,16px);line-height:1.42;letter-spacing:-.01em;color:var(--mut)}
+.sell-go{margin-top:clamp(20px,3vh,30px)}
+.sell-go .copy{max-width:760px;margin-top:0}
+
+/* ---------- 5 · FAQ ---------- */
+.ms-faq{display:grid;grid-template-columns:minmax(0,.6fr) minmax(0,1.4fr);gap:clamp(32px,5vw,80px);align-items:start;border-top:1px solid rgba(255,255,255,.1)}
+
+/* ---------- 6 · the closing call to action and the footer ---------- */
+.ms-end{padding:0}
+.mend-c{display:flex;flex-direction:column;align-items:center;text-align:center;padding:clamp(84px,15vh,160px) var(--px);border-top:1px solid rgba(255,255,255,.1)}
+.mend-c .btn{margin-top:min(30px,3.2vh)}
+.mfoot{display:flex;justify-content:space-between;align-items:flex-start;gap:48px;padding:38px var(--px) 56px;border-top:1px solid rgba(255,255,255,.1)}
+
+@media (min-width:900px){ html.mk{scroll-behavior:smooth} }
+/* a mid-width window: three lists side by side left a name 80 px (it read "worker-m…"). Experts and Activity share
+   the first row; Buyers is a full-width list under them. */
+@media (min-width:900px) and (max-width:1179px){
+  .lead div:nth-child(4){display:none}
+  .cols{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:minmax(0,1fr) auto}
+  .col[data-col="buyers"]{grid-column:1 / -1}
+  .col[data-col="buyers"] .rows{flex:none;height:calc(var(--rh) * 5)}
+  .hire-r .gets{grid-template-columns:minmax(0,1fr)}
+}
+
+/* ---------- phone-size pages (below 900 px wide): the same ordinary page, in one column ---------- */
+/* Free scrolling, with no snapping (Bob, 2026-11-20: "remove the stickiness on mobile, it should just be free
+   scroll"). It was a feed, one screen per section, as the Teams page still is. Now a section is as tall as its
+   content, and nothing here depends on the height of the screen or on the browser's bars. */
+@media (max-width:899px){
+  html.mk{scrollbar-width:none;--px:max(var(--pad),calc(50vw - 290px));--rh:42px}
+  html.mk .nav{background:var(--bg);-webkit-backdrop-filter:none;backdrop-filter:none}
+  .ms{padding:52px var(--px)}
+  .ms-h{font-size:30px}
+  .ms .lede,.ms-h + .lede{margin-top:8px;font-size:15px}
+  .ms .btn{height:44px;padding:0 19px;font-size:16px}
+
+  .ms-top{display:block;min-height:0;padding-top:calc(var(--nav) + 14px);padding-bottom:36px}
+  .top-head{display:block}
+  .top-l h1{font-size:min(38px,9.4vw)}
+  .top-l .lede{margin-top:8px}
+  .top-l .cta-row{margin-top:14px;gap:18px}
+  .top-l .lnk{font-size:15px}
+  .lead{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;margin:16px 0 0;border-top:1px solid rgba(255,255,255,.1);border-bottom:1px solid rgba(255,255,255,.1)}
+  .lead div{padding:9px 0 9px 10px;border-left:1px solid rgba(255,255,255,.1)}
+  .lead div:first-child{padding-left:0;border-left:0}
+  .lead dd{font-size:23px}
+  .lead dt{margin-top:4px;font-size:11.5px;line-height:1.25}
+  .lead .l{display:none}
+  .lead .per{font-size:10.5px}
+  .lead .s{display:inline}
+  .lead div:nth-child(n+3) dd{color:var(--ink2)}
+  /* one list at a time, eight rows of it (market.js); "See all" opens the rest */
+  .board{display:block;margin-top:12px}
+  .board-h{flex-wrap:wrap;gap:6px 10px}
+  .tab3{display:inline-flex}
+  .tab3 button{height:32px;padding:0 12px;font-size:14.5px}
+  .see-all{display:block;margin-left:auto;height:34px;padding:0 2px;font-size:14.5px;color:var(--ink2);border-bottom:0;text-decoration:underline;text-decoration-color:rgba(255,255,255,.3);text-underline-offset:4px}
+  .board-h .win{display:none}
+  .cols{display:block;margin:6px calc(var(--px) * -1) 0}
+  .col{display:none;border-radius:0;background:none;box-shadow:none}
+  .board[data-tab="experts"] .col[data-col="experts"],.board[data-tab="activity"] .col[data-col="activity"],.board[data-tab="buyers"] .col[data-col="buyers"]{display:block}
+  .col-h,.more,.more[hidden]{display:none}       /* (.more[hidden] too: the wide page keeps that button's room) */
+  .ch,.row{padding:0 var(--px);column-gap:7px}
+  .ch{margin-top:0;height:26px}
+  .g-x{grid-template-columns:16px 8px minmax(0,1fr) 34px 38px 48px}
+  .g-b{grid-template-columns:16px 8px minmax(0,1fr) 50px}
+  .col .rows{min-height:0;max-height:none;overflow:visible}
+  .row{font-size:14.5px} .row .num{font-size:14px}
+
+  .sheet{left:0;right:0;top:calc(var(--nav) + 6px);bottom:0;width:auto;height:auto;border-radius:22px 22px 0 0;padding-bottom:env(safe-area-inset-bottom,0px);transform:translate3d(0,26px,0)}
+  html.sheet-open .sheet{transform:none}
+  .sheet-h{padding:16px var(--px) 0} .sheet-w{padding:10px var(--px) 0}
+  .pf{padding:8px var(--px) 28px}
+  .pf-about{font-size:15.5px}
+  .sheet .ch,.sheet .row{padding:0 var(--px)}
+  .sheet .ch{margin-top:8px}
+
+  /* How it works on a phone-size page: the words only, in full; no phone and no glow (Bob). */
+  .ms-how{display:block}
+  .steps{margin-top:18px}
+  .steps li{padding:14px 0 15px}
+  .steps b{font-size:18px;color:#fff}
+  .steps p{font-size:15.5px}
+  .mdemo{display:none}
+
+  /* the window with the browser's bars showing (svh), less the nav. Less padding than the other sections: with
+     52 px above and below, its content was 46 px taller than a 375 x 621 screen and it could not fill it exactly. */
+  .ms-hire{display:flex;flex-direction:column;justify-content:center;padding-top:24px;padding-bottom:24px;min-height:calc(100vh - var(--nav) + 6px);min-height:calc(100svh - var(--nav) + 6px)}
+  .hire-r{margin-top:22px}
+  .facts{grid-template-columns:minmax(0,1fr);gap:0;margin-top:16px;border-bottom:1px solid rgba(255,255,255,.09)}
+  .fact{position:relative;border-radius:0;background:none;box-shadow:none;border-top:1px solid rgba(255,255,255,.09);padding:12px 0 13px 36px}
+  .fact .gi{position:absolute;left:0;top:13px;width:22px;height:22px}
+  .fact h3{margin:0;font-size:16.5px}
+  .fact p{margin-top:3px;font-size:14.5px;line-height:1.4}
+  .sell-go{margin-top:18px}
+
+  .ms-faq{display:block}
+  .ms-faq .faq-list{margin-top:14px}
+
+  .mend-c{padding:64px var(--px)}
+  .mfoot{flex-direction:column;gap:22px;padding:26px var(--px) calc(30px + env(safe-area-inset-bottom,0px))}
+}
+@media (max-width:359px){
+  .g-x{grid-template-columns:14px 8px minmax(0,1fr) 34px 38px 46px}
+  .g-b{grid-template-columns:14px 8px minmax(0,1fr) 46px}
+  .row{font-size:13.5px} .row .num{font-size:13px}
+  .tab3 button{padding:0 9px;font-size:13.5px}
+}

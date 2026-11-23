@@ -227,6 +227,34 @@ test("rankClimbs diffs all-time standings now vs 24h ago; new entrants are not c
   assert.equal(climbs.get(SELLER2), undefined, "the seller passed does not climb");
 });
 
+// Speed review of #1361, #1 (and r5): the new site's engine (shifts: false) skips exactly this work.
+test("createEngine shifts:false computes no climbs or overtakes where shifts:true does", () => {
+  const o1 = offer(T0, { amount: 5 }), o0 = offer(T0 - 10, { amount: 5 }), o2 = offer(T0 - 9, { amount: 5 });
+  const t = T0 + 86400 + 100;
+  const all = [o0, claim(o0.id, SELLER2, T0 - 8), award(o0.id, SELLER2, T0 - 7), result(o0.id, SELLER2, T0 - 6),
+    o2, claim(o2.id, SELLER, T0 - 5), o1, claim(o1.id, SELLER, T0 + 1), award(o1.id, SELLER, T0 + 2), result(o1.id, SELLER, T0 + 3),
+    result(o1.id, SELLER, t - 50), result(o2.id, SELLER, t - 40)];
+  const view = (shifts: boolean) => {
+    const engine = createEngine({ windowKey: "all", now: () => t, shifts });
+    for (const e of all) engine.ingest(e);
+    engine.flush();
+    return engine.view()!;
+  };
+  const on = view(true), off = view(false);
+  assert.ok((on.sellerClimbs.get(SELLER) ?? 0) >= 1 && on.overtakes.length > 0, "the fixture does make a climb");
+  assert.equal(off.sellerClimbs.size + off.buyerClimbs.size, 0);
+  assert.deepEqual(off.overtakes, []);
+  assert.deepEqual(off.sellers, on.sellers, "the boards themselves are the same");
+});
+
+test("parseEvent: a cached parse is never handed out for another author; a non-hex id is never parsed", () => {
+  const o = offer(T0 + 7, { amount: 5 });
+  assert.equal(parseEvent(o)?.pubkey, o.pubkey);
+  const forged = { ...o, pubkey: hex("e") };
+  assert.equal(parseEvent(forged)?.pubkey, forged.pubkey, "same id, other author: parsed again");
+  assert.equal(parseEvent({ ...o, id: "zz" }), null);
+});
+
 test("windowed views include only in-window events", () => {
   const oldEvent = offer(T0);
   const newEvent = offer(T0 + 100_000);
@@ -394,4 +422,17 @@ test("current work can still add a seller whose award predates the window", () =
   const rows = sellerBoard(withinWindow(events, "week", now), now, events);
   assert.equal(rows.length, 1);
   assert.equal(rows[0]!.workingJobs.length, 1);
+});
+
+test("overdue historical jobs do not put a buyer on a window it did nothing in", () => {
+  const o = offer(T0, { deadline: T0 + 1000 });
+  const events = [o, claim(o.id, SELLER, T0 + 1), award(o.id, SELLER, T0 + 2)];
+  const now = T0 + 30 * 86400;
+  for (const window of ["24h", "week"]) {
+    assert.equal(buyerBoard(withinWindow(events, window, now), now, events).length, 0);
+  }
+  assert.equal(buyerBoard(events, now, events)[0]!.inProgressJobs[0]!.state, JOB_OVERDUE, "all-time history keeps it");
+  const live = offer(T0, { deadline: now + 1000 });
+  const current = [live, claim(live.id, SELLER, T0 + 1), award(live.id, SELLER, T0 + 2)];
+  assert.equal(buyerBoard([], now, current).length, 1, "current work still adds the buyer, as on the seller board");
 });

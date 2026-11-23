@@ -139,13 +139,14 @@ export function swarmIndex(events, now, { all = false } = {}) {
   return latestSwarms(list).filter(([, s]) => all || s.status === 'open')
     .sort(([a], [b]) => b.created_at - a.created_at || (a.id < b.id ? -1 : 1))
     .map(([e, s]) => {
-      const own = jobs.filter(j => j.buyer === s.buyer && j.swarm === s.id && ['scheduled', 'in_progress'].includes(j.status));
+      const all = jobs.filter(j => j.buyer === s.buyer && j.swarm === s.id);
+      const own = all.filter(j => ['scheduled', 'in_progress'].includes(j.status));
       const running = own.filter(j => j.status === 'in_progress' && j.starts <= now && now < j.ends).sort((a, b) => b.ends - a.ends)[0] ?? null;
       const next = own.filter(j => j.starts > now).sort((a, b) => a.starts - b.starts)[0] ?? null;
       const d = decisionsOf(s.buyer);
       return { ...s, address: swarmAddress(s.buyer, s.id), buyerNpub: npubEncode(s.buyer), buyerName: names.get(s.buyer) ?? '', createdAt: e.created_at,
         members: members.filter(m => m.buyer === s.buyer && m.swarm === s.id && m.status === 'joined' && d.allows(m.seller, m.swarm)).length,
-        openJobs: own.length, running: running && { id: running.id, title: running.title, starts: running.starts, ends: running.ends },
+        openJobs: own.length, jobsDone: all.filter(j => j.status === 'completed').length, running: running && { id: running.id, title: running.title, starts: running.starts, ends: running.ends },
         next: next && { id: next.id, title: next.title, starts: next.starts, ends: next.ends } };
     });
 }
@@ -225,7 +226,7 @@ export function swarmSnapshot(events, { buyer, swarm: slug }, now) {
     const allowed = decisions.allows(m.seller, slug), denied = decisions.denies(m.seller, slug);
     if (denied) continue; // denied members are never listed publicly
     if (!allowed) {
-      if (m.status === 'joined') applicants.push({ pubkey: m.seller, npub: npubEncode(m.seller), minutesOffered: m.minutes, since: m.since, joinedAt: e.created_at, note: m.note });
+      if (m.status === 'joined') applicants.push({ pubkey: m.seller, npub: npubEncode(m.seller), name: names.get(m.seller) ?? '', minutesOffered: m.minutes, since: m.since, joinedAt: e.created_at, note: m.note });
       continue;
     }
     const own = today.filter(t => t.seller === m.seller), running = own.filter(t => t.running);
@@ -244,7 +245,7 @@ export function swarmSnapshot(events, { buyer, swarm: slug }, now) {
   return {
     asOf: now,
     swarm: { ...s, address: swarmAddress(buyer, slug), buyerNpub: npubEncode(buyer), buyerName: names.get(buyer) ?? '' },
-    swarmJob: c && { id: c.id, buyer, buyerNpub: npubEncode(buyer), title: c.title, goal: c.goal, starts: c.starts, ends: c.ends, status: c.status, result: c.result ?? '' },
+    swarmJob: c && { id: c.id, buyer, buyerNpub: npubEncode(buyer), title: c.title, goal: c.goal, starts: c.starts, ends: c.ends, status: c.status, result: c.result ?? '', updatedAt: shown[0].created_at },
     swarmJobs: jobPairs.map(([e, j]) => ({ id: j.id, title: j.title, starts: j.starts, ends: j.ends, status: j.status, budgetSats: j.budgetSats, createdAt: e.created_at, tasks: facts.filter(f => f.job === j.id && f.turn === 1).length }))
       .sort((a, b) => b.starts - a.starts || b.createdAt - a.createdAt),
     sellers, applicants,

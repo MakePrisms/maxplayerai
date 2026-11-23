@@ -22,7 +22,6 @@ const ORIGIN = "https://www.maxplayer.ai";
 // Route each page is served at (cleanUrls; legal pages via vercel.json rewrites).
 const ROUTES = {
   "index.html": "/",
-  "sell.html": "/sell",
   "market.html": "/market",
   "chat.html": "/chat",
   "mint.html": "/mint",

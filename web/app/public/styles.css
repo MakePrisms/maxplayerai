@@ -48,6 +48,7 @@ button { font: inherit; color: inherit; }
 a { color: var(--neon); }
 ::selection { background: var(--neon); color: #0a0a0b; }
 :focus-visible { outline: 2px solid var(--neon); outline-offset: 2px; }
+.copysrc { position: fixed; left: 0; top: 0; opacity: 0; pointer-events: none; white-space: pre; -webkit-user-select: text; user-select: text; } /* ui/clipboard.ts */
 
 /* ---------- status bar ---------- */
 .nav {

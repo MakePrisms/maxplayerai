@@ -1,0 +1,38 @@
+/* The legal pages (/terms/<date>, /privacy/<date>, /fees/<date>), in the look of / and /market: site.css gives them
+   the colours, type, nav and footer columns; this file lays out the document. Loaded after site.css, scoped by
+   html.lg, so nothing here changes another page. The document text itself is rendered from the legal drafts
+   (Maxplayer legal docs skill) into <div class="h-in narrow legal-doc">; keep that wrapper. */
+
+html.lg{overscroll-behavior-y:auto;color-scheme:dark}
+html.lg .nav{background:rgba(26,26,26,.86);-webkit-backdrop-filter:saturate(1.4) blur(14px);backdrop-filter:saturate(1.4) blur(14px)}
+html.lg :focus-visible{outline:2px solid var(--giallo);outline-offset:3px}
+
+.lg-main{padding:calc(var(--nav) + clamp(40px,8vh,88px)) var(--pad) clamp(72px,12vh,128px)}
+.legal-doc{max-width:760px;margin:0 auto}
+.legal-doc h1{font-weight:400;font-size:clamp(36px,4.6vw,60px);line-height:1.05;letter-spacing:-.02em}
+.legal-doc h2{margin:52px 0 0;font-weight:500;font-size:clamp(20px,1.7vw,24px);line-height:1.25;letter-spacing:-.015em;color:#fff;scroll-margin-top:calc(var(--nav) + 20px)}
+.legal-doc h3{margin:30px 0 0;font-weight:500;font-size:17.5px;line-height:1.35;letter-spacing:-.01em;color:#fff}
+.legal-doc p{margin:16px 0 0;font-size:16px;line-height:1.7;letter-spacing:-.005em;color:var(--ink2)}
+.legal-doc ul,.legal-doc ol{margin:12px 0 0;padding-left:22px;font-size:16px;line-height:1.7;color:var(--ink2)}
+.legal-doc li{margin:6px 0 0}
+.legal-doc li p{margin:6px 0 0}
+.legal-doc strong{font-weight:600;color:#fff}
+.legal-doc a{color:#fff;text-decoration:underline;text-decoration-color:rgba(255,255,255,.35);text-underline-offset:3px;transition:text-decoration-color .2s}
+.legal-doc a:hover{text-decoration-color:var(--giallo)}
+.legal-doc code{font-family:var(--mono);font-size:.875em;color:#fff}
+.legal-doc hr{margin:28px 0 0;border:0;border-top:1px solid rgba(255,255,255,.1)}
+.legal-doc table{margin:20px 0 0;border-collapse:collapse;width:100%;font-size:15px;line-height:1.6;color:var(--ink2)}
+.legal-doc th,.legal-doc td{padding:10px 12px;border:1px solid rgba(255,255,255,.12);text-align:left;vertical-align:top}
+.legal-doc th{font-weight:500;color:#fff}
+
+/* the footer of /market (market.css .mfoot), for a page without its sections */
+.lfoot{display:flex;justify-content:space-between;align-items:flex-start;gap:48px;padding:38px var(--pad) 56px;border-top:1px solid rgba(255,255,255,.1)}
+
+@media (max-width:899px){
+  html.lg .nav{background:var(--bg);-webkit-backdrop-filter:none;backdrop-filter:none}
+  .lg-main{padding:calc(var(--nav) + 32px) var(--pad) 64px}
+  .legal-doc h2{margin-top:40px}
+  .legal-doc p,.legal-doc ul,.legal-doc ol{font-size:15.5px;line-height:1.65}
+  .legal-doc table{display:block;overflow-x:auto}
+  .lfoot{flex-direction:column;gap:22px;padding:26px var(--pad) calc(30px + env(safe-area-inset-bottom,0px))}
+}

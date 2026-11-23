@@ -6,6 +6,8 @@ const when = (secs: number) => `t=${secs}`;
 const run = { starts: 1000, ends: 2000, status: "in_progress" };
 const ready = 0; // relay fully ready this second
 const starts = { label: "Work starts", value: "t=1000", href: null };
+const started = { ...starts, label: "Work started" };
+const ended = (t: number) => ({ label: "Work ended", value: `t=${t}`, href: null });
 
 test("before the work window the hero keeps 'Work starts' and the time", () => {
   assert.deepEqual(startFact(run, 999, when, ready), starts);
@@ -27,7 +29,7 @@ test("with ready data and no challenge published, the start is to be announced; 
 });
 
 test("a scheduled day inside its window is not running (the coordinator does not assign work)", () => {
-  assert.deepEqual(startFact({ ...run, status: "scheduled" }, 1500, when, ready), starts);
+  assert.deepEqual(startFact({ ...run, status: "scheduled" }, 1500, when, ready), started);
   assert.equal(isRunning({ ...run, status: "scheduled" }, 1500, ready), false);
 });
 
@@ -48,9 +50,9 @@ test("budget: dollars once the rate is in; sats after SPOT_WAIT_MS without a rat
 });
 
 test("a finished or cancelled run never says 'Running now'; it shows what it showed before", () => {
-  assert.deepEqual(startFact(run, 2000, when, ready), starts, "window over");
-  assert.deepEqual(startFact({ ...run, status: "completed" }, 1500, when, ready), starts, "completed early");
-  assert.deepEqual(startFact({ ...run, status: "cancelled" }, 1500, when, ready), starts, "cancelled");
+  assert.deepEqual(startFact(run, 2000, when, ready), ended(2000), "window over");
+  assert.deepEqual(startFact({ ...run, status: "completed", updatedAt: 1400 }, 1500, when, ready), ended(1400), "completed early: ended when closed");
+  assert.deepEqual(startFact({ ...run, status: "cancelled", updatedAt: 1400 }, 1500, when, ready), ended(1400), "cancelled");
   assert.equal(isRunning({ ...run, status: "cancelled" }, 1500, ready), false);
 });
 
@@ -76,7 +78,26 @@ test("renderStart swaps the label and puts an in-page link in the value, then ba
   assert.equal(a.getAttribute("href"), "#agents");
   assert.ok(a.textContent.length > 0);
   renderStart(doc, startFact(run, 2500, when, ready));
-  assert.equal(label.textContent, "Work starts");
+  assert.equal(label.textContent, "Work ended");
   assert.equal(dd.querySelector("a"), null);
-  assert.equal(dd.textContent, "t=1000");
+  assert.equal(dd.textContent, "t=2000");
+});
+
+// Bob (2026-11-21): before the start "Work starts"; started but not on "Work started"; over "Work ended" + the end.
+test("a swarm that is over says 'Work ended' and the end; one started but not on says 'Work started'", () => {
+  for (const c of [{ ...run, status: "completed" }, { ...run, status: "cancelled" }, run, { ...run, status: "scheduled" }])
+    assert.deepEqual(startFact(c, 2500, when, ready), ended(2000), c.status);
+  assert.deepEqual(startFact({ ...run, status: "completed", updatedAt: 2600 }, 2700, when, ready), ended(2000), "closed after the window: the window's end");
+  assert.deepEqual(startFact({ ...run, status: "scheduled" }, 1000, when, ready), started);
+  assert.deepEqual(startFact(run, 1500, when, null), started, "in the window, data not fresh");
+  assert.deepEqual(startFact(run, 999, when, ready), starts, "before the start it still says Work starts");
+});
+
+// Review of #1361, r3 #2: a job cancelled before it began says so; the end is never before the start; a bad time is ignored.
+test("a job cancelled before its start says Cancelled; a closed job's end is clamped to its window", () => {
+  assert.deepEqual(startFact({ ...run, status: "cancelled", updatedAt: 900 }, 950, when, ready), { label: "Cancelled", value: "t=900", href: null });
+  assert.deepEqual(startFact({ ...run, status: "cancelled", updatedAt: 900 }, 2500, when, ready), { label: "Cancelled", value: "t=900", href: null });
+  assert.deepEqual(startFact({ ...run, status: "cancelled" }, 950, when, ready), { label: "Cancelled", value: "t=1000", href: null }, "no close time");
+  assert.deepEqual(startFact({ ...run, status: "completed", updatedAt: 900 }, 950, when, ready), ended(1000), "completed before the start: the start");
+  assert.deepEqual(startFact({ ...run, status: "completed", updatedAt: Number.NaN }, 1500, when, ready), ended(2000), "a non-finite close time is ignored");
 });

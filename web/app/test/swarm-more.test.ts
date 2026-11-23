@@ -65,3 +65,15 @@ test("update() re-measures when the job text arrives or the window resizes", () 
   assert.equal(button.hidden, true);
   assert.equal(classes.has("is-clamped"), false);
 });
+
+// Review of #1361, r2 #4: a swarm opened after one left expanded starts collapsed again.
+test("reset collapses an expanded job", () => {
+  const { body, button, classes } = fixture(900);
+  const more = wireMore(body as unknown as HTMLElement, button as unknown as HTMLButtonElement);
+  button.click();
+  assert.equal(more.expanded(), true);
+  more.reset();
+  assert.equal(more.expanded(), false);
+  assert.equal(button.textContent, "See more");
+  assert.equal(classes.has("is-clamped"), true);
+});

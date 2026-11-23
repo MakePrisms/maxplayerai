@@ -1,7 +1,7 @@
 // The job section is capped at about one screen with a fade and a "See more" button (bob).
 // The cap is a class JS adds, so without JS the whole job is readable. The button only shows
 // when the capped text actually overflows; expanded, it reads "See less".
-export interface More { update(): void; expanded(): boolean }
+export interface More { update(): void; expanded(): boolean; reset(): void }
 
 export function wireMore(body: HTMLElement, button: HTMLButtonElement, onCollapse: () => void = () => {}): More {
   let open = false;
@@ -23,5 +23,6 @@ export function wireMore(body: HTMLElement, button: HTMLButtonElement, onCollaps
     if (!open) onCollapse();
   });
   update();
-  return { update, expanded: () => open };
+  // a new job in the panel starts collapsed (review of #1361, r2 #4)
+  return { update, expanded: () => open, reset: () => { open = false; update(); } };
 }

@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createRelaySource } from "../src/source/relay.js";
+import { createRelaySource, PAGE_SIZE } from "../src/source/relay.js";
 import type { RawEvent } from "../src/model/events.js";
 
 /** A socket the test drives by hand. Records every frame the source sends. */
@@ -192,4 +192,49 @@ test("the since-hint is used only when the cached store is known complete", () =
   // its way to the relay. The exact trailing distance is pinned in
   // lamp-recovery.test.ts; here only the direction matters.
   assert.ok(since <= T0 + 500, `the forward read must not start above the hint (asked since ${since})`);
+});
+
+/** Drain every history stream with empty pages until the source goes live and sends its first poll. */
+function goLive(h: ReturnType<typeof harness>): string {
+  for (let i = 0; i < 50; i++) {
+    const last = h.latest().reqs.at(-1)!;
+    if (last.sub.startsWith("p")) return last.sub;
+    h.latest().eose(last.sub);
+  }
+  throw new Error("never went live");
+}
+
+// Speed review of #1361, #9 and r5 #2.
+test("a hidden tab sends no polls; a poll that comes back full is not trusted and is read forward page by page", () => {
+  const g = globalThis as { document?: { hidden: boolean } };
+  const had = g.document;
+  g.document = { hidden: false };
+  try {
+    const h = harness({ sinceHint: T0 + 500, storeComplete: true });
+    h.source.start();
+    h.latest().onopen!();
+    const poll = goLive(h);
+    h.latest().deliver(poll, ev(T0 + 600));
+    h.latest().eose(poll);
+    assert.equal(h.sockets.length, 1, "an ordinary poll changes nothing");
+
+    g.document.hidden = true;
+    const asked = h.latest().reqs.length;
+    h.runTimer();
+    assert.equal(h.latest().reqs.length, asked, "no ask while hidden");
+
+    g.document.hidden = false;
+    h.runTimer();
+    const next = h.latest().reqs.at(-1)!;
+    assert.ok(next.sub.startsWith("p") && (next.filter.since as number) <= T0 + 600, "the first visible poll asks from the mark");
+    for (let i = 1; i <= PAGE_SIZE; i++) h.latest().deliver(next.sub, ev(T0 + 100_000 + i));
+    h.latest().eose(next.sub);
+    assert.equal(h.sockets.length, 2, "a full poll starts a fresh read");
+    h.latest().onopen!();
+    const walk = h.latest().reqs[0]!;
+    assert.ok(walk.sub.startsWith("h") && (walk.filter.since as number) <= T0 + 600, `forward from the old mark, paged (since ${walk.filter.since})`);
+    assert.equal(walk.filter.limit, PAGE_SIZE);
+  } finally {
+    if (had === undefined) delete g.document; else g.document = had;
+  }
 });

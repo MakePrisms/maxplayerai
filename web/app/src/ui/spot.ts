@@ -61,7 +61,10 @@ export async function fetchSpot(fetchImpl: typeof fetch = fetch): Promise<void> 
   } catch { /* keep the last known rate; the next interval retries */ }
 }
 
+let spotStarted = false;
 export function startSpot(): void {
+  if (spotStarted) return;      // /swarm starts it, and so does the market reader it opens for a profile
+  spotStarted = true;
   void fetchSpot();
   setInterval(fetchSpot, 300000);
 }
