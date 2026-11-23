@@ -1,6 +1,6 @@
 //! Session jobs, buyer side (docs/specs/session-jobs.md §8.1, §8.4, §10): `reply`, the turn view
 //! `get_job.session`, turn collection, `no_response` release and the seller's per-turn feedback.
-//! Every entry point is inert unless `[sessions] enabled = true`.
+//! Every entry point is inert with `[sessions] enabled = false` (unset reads as on).
 use super::store::BuyerTurn;
 use super::*;
 use crate::session::{FollowUp, FollowUpStatus, ReplyPreflight, UncollectedTurn};

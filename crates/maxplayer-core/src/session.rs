@@ -2,7 +2,7 @@
 //!
 //! This module holds the wire shapes (§2) and every pure decision rule the spec names (§4–§10),
 //! so each money-path and security invariant is a function with its own failure test. Nothing
-//! here performs I/O. Everything is inert unless `[sessions] enabled = true`: [`advertise_on_claim`]
+//! here performs I/O. Everything is inert with `[sessions] enabled = false` (unset reads as on): [`advertise_on_claim`]
 //! is the only place a `session` tag can enter a claim, and it is a no-op when disabled, which is
 //! what keeps every claim/offer/result/accept byte identical to today's (failure test 13).
 use crate::gateway::{EventDraft, TagSpec};

@@ -126,7 +126,8 @@ A reader MUST ignore a follow-up whose author is not the buyer that authored the
 
 `["session", "1"]` on CLAIM (3402), 0..1, **absent ⇒ no session support**. Absent is the fail-closed
 direction: every claim on the wire today reads as single-turn. A seat emits it only when
-`[sessions] enabled = true` **and** it is a docker seat on the container-delivery path (§5.1). Protocol
+`[sessions] enabled` is on (unset reads as on since sessions became the default; `false` turns it
+off) **and** it is a docker seat on the container-delivery path (§5.1). Protocol
 §6.2 says a claim carries the three filterable tags "and no others" (`docs/protocol-v1.md:607
 @e0262420`); that sentence gains `session`. It is **not** an award filter: every job stays awardable to
 every seller (input 1); it only decides whether `reply` works after turn 1.
@@ -320,7 +321,8 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
   (`run_expiry_sweep`, `core/seller_node/run.rs:5051 @e0262420`): a parked session past
   `last_turn_at + lifetime_secs` is expired — `docker rm --force` the container and the holder, remove
   the workdir and the resolver file, `state = expired`.
-- `[sessions] disk_budget_bytes` (default §0 item 12). After each park, measure the session
+- `[sessions] disk_budget_bytes` (default §0 item 12: 20 GiB with `enabled = true`; 5 GiB when
+  `enabled` is unset and sessions are on only by default). After each park, measure the session
   (`docker container inspect --size` → `SizeRw`, plus `du` of the workdir) into `disk_bytes`; while the
   sum over parked sessions exceeds the budget, expire the oldest `last_turn_at` first. A running session
   is never evicted.
@@ -375,8 +377,11 @@ at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker
 - **Doctor** reports the same verdict as `sandbox runsc sessions`: PASS when open; **FAIL** with the fix
   when docker answered and shows the seat cannot keep a session (`runsc` without the flag, another
   overlay value, or no `runsc` registered: `Closed { misconfigured: true }`); WARN when docker could not
-  confirm (unreadable, timed out, unparseable: `misconfigured: false`). FAIL is part of the seller boot
-  gate, so a runsc seat with `[sessions] enabled` and no flag **does not start** until the operator sets
+  confirm (unreadable, timed out, unparseable: `misconfigured: false`). The FAIL applies only when the
+  operator wrote `[sessions] enabled = true`; a seat on by default (`enabled` unset) gets a WARN for the
+  same verdict and runs single-turn, so the default-on upgrade never stops a runsc seat from booting.
+  FAIL is part of the seller boot
+  gate, so a runsc seat with `[sessions] enabled = true` and no flag **does not start** until the operator sets
   the flag (and restarts docker) or turns `[sessions]` off — operator intent the seat cannot honour is
   surfaced, not silently degraded (Petar, 2026-11-07). WARN keeps a daemon hiccup at boot from blocking
   the seat; it starts single-turn and the heartbeat re-probes. A gate that closes at runtime (heartbeat)

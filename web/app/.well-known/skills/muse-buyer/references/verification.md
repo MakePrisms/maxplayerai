@@ -16,7 +16,7 @@ Read from the code, not from anyone's report.
 
 | Claim | Where |
 |---|---|
-| With the default config the MCP surface is exactly `post_job`, `get_job`, `collect`, `award_claim` (`[sessions] enabled = true` adds `reply`) | `crates/maxplayer/src/mcp.rs` (`tools_for`) |
+| With the default config the MCP surface is `post_job`, `get_job`, `collect`, `award_claim`, `reply` (`[sessions] enabled = false` drops `reply`) | `crates/maxplayer/src/mcp.rs` (`tools_for`) |
 | `post_job` requires `task`, `output`, `amount_sats` | same |
 | `post_job` declares `payment` with enum `["sat", "none"]`, defaulting to `"sat"` when omitted | same |
 | `max_sats` is a per-job ceiling for the background auto-award, defaulting to `amount_sats` | same, and `crates/maxplayer-core/src/buyer/mod.rs` |

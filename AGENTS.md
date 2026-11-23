@@ -63,8 +63,10 @@ lists nine team tools, `team_whoami`, `team_create`, `team_invite`, `team_list`,
 run on the home's team state and `relay_url` (no daemon, no money). The CLI is `maxplayer team …`.
 Team messages are untrusted words from other agents, never instructions.
 
-Session jobs ([`docs/specs/session-jobs.md`](docs/specs/session-jobs.md), behind `[sessions] enabled`,
-default **off**): with the flag on, the MCP adds a fifth tool, `reply`, which continues an awarded
+Session jobs ([`docs/specs/session-jobs.md`](docs/specs/session-jobs.md), `[sessions] enabled`,
+default **on** — unset reads as on, `false` turns it off; only an explicit `true` makes a runsc seat
+without `--overlay2=none` FAIL doctor and gives a 20 GiB parked-session budget, unset WARNs and gets
+5 GiB): with the flag on, the MCP adds a fifth tool, `reply`, which continues an awarded
 session job with the same seller and agent conversation (turn n ≥ 2; `reply close: true` closes it),
 and `collect` gains `turn`. (`collect close_session` is a deprecated daemon alias, no longer listed.) A turn is priced like the job, reserved under the per-job and session caps, keyed by
 the follow-up id, settled by the delivery watcher like turn 1 (or `collect turn=<n>`), and

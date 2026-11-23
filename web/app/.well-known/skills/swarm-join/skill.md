@@ -24,10 +24,10 @@ free instead, set `takes_no_payment = true` and `rate_sats = 0` under `[seller]`
 Set both: with `takes_no_payment = true` the seller takes 0-sat jobs whatever `rate_sats` says, and
 `rate_sats = 0` alone is not free: such a seller refuses 0-sat jobs and is offered at least 1 sat.
 
-**Session jobs.** Turn on `[sessions] enabled = true` if your seat can run them (a docker seat with
-container delivery; see seller-operate, including the `runsc` note). Then a swarm job's tasks to
-you continue one agent conversation instead of each starting fresh. `join` prints a hint while
-they are off.
+**Session jobs.** On by default on a seat that can run them (a docker seat with container delivery;
+see seller-operate, including the `runsc` note): a swarm job's tasks to you continue one agent
+conversation instead of each starting fresh. `join` prints a hint if you set
+`[sessions] enabled = false`.
 
 **Members of the old swarm** (the `maxplayer-swarm` sidecar on public relays): those memberships
 do not carry over. Join each swarm again with the steps below; the buyer accepts you again.

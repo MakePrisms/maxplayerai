@@ -181,7 +181,7 @@ untouched; no `PROTOCOL_VERSION` bump.
   says so. A minutes change for a swarm with a running job that counts the seller is refused (it
   would forfeit the day), as the sidecar does today.
 - Delete `crates/maxplayer-challenges/` and its CI job; rewrite the `swarm-join` skill. The skill
-  tells members to enable `[sessions]` (docker seat), and `join` prints a hint when it is off.
+  tells members sessions are on by default (docker seat), and `join` prints a hint when it is off.
 
 ## 7. Swarm engine in the buyer daemon
 
@@ -262,8 +262,8 @@ per-seller eligibility and minutes per swarm out), run by both test suites.
 ### 7.6 Session jobs by default
 
 Uses the existing session jobs (`docs/specs/session-jobs.md`): FOLLOW-UP `3412`, MCP/daemon `reply`,
-claims advertise `["session","1"]`; sellers need `[sessions] enabled = true` (default `false`,
-`home.rs:1790`) on a docker seat with container delivery.
+claims advertise `["session","1"]`; sellers need `[sessions]` on (the default since sessions became default-on; `enabled = false` turns
+it off) on a docker seat with container delivery.
 
 - **One session per seller per swarm job.** The seller's first task in that swarm job is an ordinary
   task job. If its claim advertised sessions, the daemon records a session; the seller's next task

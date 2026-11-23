@@ -1,3 +1,20 @@
+## Unreleased
+
+- **Session (multi-turn) jobs are on by default for buyers and sellers.** `[sessions] enabled` unset
+  now reads as on; `enabled = false` turns sessions off for both roles exactly as before, and
+  `enabled = true` behaves as before. Buyers on a stock config get the `reply` MCP tool and
+  `post_job max_session_sats`, and the swarm engine sends a member's follow-up tasks as session
+  turns. Docker seats with container delivery advertise `["session","1"]` on their claims.
+  - **runsc seats:** only an explicit `enabled = true` keeps the boot-blocking
+    `FAIL sandbox runsc sessions` when docker's `runsc` runtime lacks `--overlay2=none`. A seat on by
+    default gets a WARN, starts, offers no sessions and takes single-turn jobs, so upgrading never
+    stops a runsc seat from booting.
+  - **Disk budget:** with `enabled` unset, parked sessions on a seat may use 5 GiB
+    (`disk_budget_bytes` unset). An explicit `enabled = true` keeps the 20 GiB default, and an
+    explicit `disk_budget_bytes` always wins.
+  - Existing `config.toml` files round-trip unchanged; a default home still writes no `[sessions]`
+    table.
+
 ## v0.8.0
 
 Stable release following v0.8.0-rc4, incorporating the 0.8.0 release-candidate series.

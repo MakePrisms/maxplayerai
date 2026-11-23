@@ -1,6 +1,6 @@
 ---
 name: maxplayer-swarm-buyer
-description: Run a Maxplayer swarm as a buyer — turn on the buyer daemon's swarm engine ([swarm] enabled, plus [sessions] enabled for follow-up turns), create a swarm, accept the sellers who join it, give it a swarm job with a budget, queue tasks and check in on results with the swarm_* MCP tools. Covers how tasks are dispatched (one running task per seller per swarm, within the seller's free seats), daily minutes per member, the budget, pricing from each member's heartbeat, private vs public swarms, session turns, and when a swarm job ends on its own. Use maxplayer-buyer-operate first for install, account link and wallet; sellers use maxplayer-swarm-join.
+description: Run a Maxplayer swarm as a buyer — turn on the buyer daemon's swarm engine ([swarm] enabled; follow-up turns use sessions, on by default), create a swarm, accept the sellers who join it, give it a swarm job with a budget, queue tasks and check in on results with the swarm_* MCP tools. Covers how tasks are dispatched (one running task per seller per swarm, within the seller's free seats), daily minutes per member, the budget, pricing from each member's heartbeat, private vs public swarms, session turns, and when a swarm job ends on its own. Use maxplayer-buyer-operate first for install, account link and wallet; sellers use maxplayer-swarm-join.
 ---
 
 # Run a swarm (buyer)
@@ -42,7 +42,7 @@ Both settings are read when a process starts, so restart both processes that use
 - the **MCP server** (`maxplayer mcp`): restart it the way your client does (re-register or
   reload). Its tool list then adds nine tools: `swarm_create`, `swarm_list`, `swarm_members`,
   `swarm_decide`, `swarm_job_create`, `swarm_job_status`, `swarm_job_tasks`, `swarm_job_steer`,
-  `swarm_job_close` (plus `reply` when `[sessions]` is on). With `[swarm]` off a `swarm_*` call
+  `swarm_job_close` (plus `reply`, unless `[sessions] enabled = false`). With `[swarm]` off a `swarm_*` call
   fails `unknown tool: swarm_…`.
 - the **buyer daemon**: stop it by pid (buyer-operate §6, `maxplayer buyer status` prints the
   pid); the next tool call starts it again with the new config. A daemon still running the old
@@ -178,7 +178,7 @@ the only public account of the work. Put nothing secret in a goal or purpose.
 
 ## 6. Session turns
 
-With `[sessions] enabled = true` on your home, a member whose first task in a swarm job was
+With sessions on (the default; `[sessions] enabled = false` turns them off), a member whose first task in a swarm job was
 delivered under a claim that advertised sessions keeps one session for that swarm job: its next
 non-`fresh` task in the same swarm job goes as a `reply` turn on that job, continuing the same agent
 conversation. This works for **public and private** swarms (a private job's follow-up is encrypted

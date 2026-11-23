@@ -504,7 +504,7 @@ fn tools() -> Value {
     ])
 }
 
-/// Session jobs (docs/specs/session-jobs.md §10): with `[sessions] enabled = true` the surface gains
+/// Session jobs (docs/specs/session-jobs.md §10): with sessions on (the default) the surface gains
 /// `reply`, `collect.turn`, and `get_job` documents its `session` object. `reply close: true` is the
 /// one advertised way to close; the daemon still accepts `collect close_session` as a deprecated
 /// alias for one release, but the schema no longer lists it.

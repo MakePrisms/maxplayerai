@@ -122,9 +122,9 @@ Grok Bot registers MCP servers through its own add-server step. Give it:
 - **env:** `MAXPLAYER_HOME=/home/USER/.maxplayer` — the same home you set in §3b.
 
 Tools appear on the **next** turn, not the current one: `post_job`, `get_job`, `collect` and
-`award_claim`. A home whose `config.toml` has `[sessions] enabled = true` also gets `reply`
-(follow-up turns on a session job), and `[swarm] enabled = true` adds the nine `swarm_*` tools
-([swarm-buyer](/.well-known/skills/swarm-buyer/skill.md)); both default to off. The server reads
+`award_claim`, plus `reply` (follow-up turns on a session job) unless `config.toml` has
+`[sessions] enabled = false`. `[swarm] enabled = true` adds the nine `swarm_*` tools
+([swarm-buyer](/.well-known/skills/swarm-buyer/skill.md)); swarm defaults to off. The server reads
 these settings when it starts, so restart `maxplayer mcp` after changing them. The count is the server's tool list and can grow over
 releases. "Connected · N tools" means the registration worked. It does **not** mean setup is
 finished (§1).
@@ -280,10 +280,11 @@ boundary and the launcher→docker switch all live in
   run `doctor` from, or the two talk to different engines, or to none.
 - **Start order.** The engine must be up before the seller starts, and whatever keeps the seller
   alive (§6b) should check the engine first.
-- **Sessions on runsc need `--overlay2=none`.** With `[sessions] enabled = true` and
-  `runtime = "runsc"`, `doctor` adds a `sandbox runsc sessions` check, and the seller refuses to
+- **Sessions on runsc need `--overlay2=none`.** With `runtime = "runsc"`, `doctor` adds a
+  `sandbox runsc sessions` check. If you set `[sessions] enabled = true`, the seller refuses to
   start (`FAIL sandbox runsc sessions`) until docker's runtime **named** `runsc` carries
-  `"runtimeArgs": ["--overlay2=none"]`; or turn `[sessions]` off. Edit the daemon config file your
+  `"runtimeArgs": ["--overlay2=none"]`; or turn `[sessions]` off. With `enabled` unset (the default)
+  it is a WARN: the seat starts and runs single-turn jobs. Edit the daemon config file your
   dockerd actually reads, then restart the engine between jobs (it stops running containers). If a
   script writes that file at engine start, change the script, not the file: otherwise the next engine
   start drops the flag and the running seller logs `seller node sessions DISABLED on this runsc seat`.
@@ -424,7 +425,7 @@ missing engine or `runsc` instead of restarting the seller in a loop.
 |---------|-------|
 | `wallet balance` is 0 after paying the invoice | You ran `wallet setup` but not `wallet mint-complete QUOTE_ID` (§3c) |
 | MCP shows connected but no tools | Tools appear on the **next** turn (§3d) |
-| No `reply` tool | `[sessions] enabled = true` is not set in that home, or `maxplayer mcp` started before you set it (§3d) |
+| No `reply` tool | `[sessions] enabled = false` is set in that home, or `maxplayer mcp` started before you set it (§3d) |
 | MCP tools error about the wallet or home | The server's `MAXPLAYER_HOME` is not the home you set up (§3b, §3d) |
 | Buyer side behaves like the old version after an upgrade | `maxplayer mcp` or the buyer daemon is still the old process: `ls -l /proc/PID/exe` shows `(deleted)`. Restart both (§6a) |
 | `cp` onto the binary fails with `Text file busy` | A maxplayer process is running it. Copy to a temporary name and `mv -f` (§6a) |
@@ -435,7 +436,7 @@ missing engine or `runsc` instead of restarting the seller in a loop.
 | Doctor green, seat never advertises | Pre-advertise probe failed: `cursor-agent login`, or the sandbox is starving the agent |
 | `harness: unnamed (argv hatch)` | `agents = ["cursor"]` is missing (footgun 3) |
 | Advertising but idle forever | Reachability is still closed — set `accept_open_targeted` or an `accept_offers_only_from` list |
-| Seller won't boot: `FAIL sandbox runsc sessions` | Sessions on + runsc without `--overlay2=none`. Set the flag (in the script, if one writes the daemon config) and restart the engine, or turn `[sessions]` off (§4c) |
+| Seller won't boot: `FAIL sandbox runsc sessions` | `[sessions] enabled = true` + runsc without `--overlay2=none`. Set the flag (in the script, if one writes the daemon config) and restart the engine, or turn `[sessions]` off (§4c) |
 | `sessions DISABLED` after an engine restart | Something rewrote the daemon config without the flag (§4c) |
 | `doctor` cannot reach docker or sees no `runsc` | `DOCKER_HOST` does not point at your engine's socket in that shell or in the seller's environment, or the engine is not running (§4c) |
 | Keep-alive wants to restart a seller that just "went stale" | The VM may have just resumed. Re-check after about a minute; restart only if the process is gone (§6b) |
