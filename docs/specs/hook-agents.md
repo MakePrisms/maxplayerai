@@ -23,8 +23,10 @@ payment, settlement, sessions — is the machinery that runs today.
 From the design discussion of 20–23 Nov 2026:
 
 1. **No new job type.** A hook serves the existing inline (non-contribution) jobs: offers carrying
-   `["param","accepts-delivery","inline"]`. Nothing changes on the wire; a buyer cannot tell a hook
-   job from any other inline job.
+   `["param","accepts-delivery","inline"]`. No new event kinds or tags; the only new public values
+   are `usage_transport=hook` on the result and, on a session turn 1, a `turn_status` other than
+   `done` on an inline result (§7). See §5.0 for what "inline job" means given that buyers declare
+   `inline` by default.
 2. **The seller owns their safety.** No answer scan, no content filter, no control over which tools
    the agent uses. The daemon only sees text in and text out.
 3. **Config only.** A hook is a custom agent preset, `[agents.<name>] hook = [...]`, like the
@@ -125,8 +127,11 @@ model = "claude-opus-5"                  # optional, self-reported; requires fam
   name is refused.
 - `RegisteredAgent` gains `kind: AgentKind`, `Acp` (today) or `Hook { family, model }`. The hook
   argv is stored in `argv`.
-- `maxplayer seller serve --agent my-hook` works for a first run because `--agent` already resolves
-  custom presets.
+- First run with `--agent my-hook`: the first-run path today writes the resolved argv into
+  `[seller] agent_command` (the unlabelled ACP fallback). For a hook it must not: it writes
+  `agents = ["my-hook"]` and leaves `agent_command` as it was.
+- `hook = ` in config makes an older binary refuse the home (`deny_unknown_fields`); the release
+  notes say so.
 
 **Boot checks for a hook-only seat** (every entry is a hook): the sandbox and nix readiness checks
 (`cli/doctor.rs:3093 @4caf510`) report "not applicable: hook-only seat" instead of failing. Nothing
@@ -223,7 +228,9 @@ sealed for review, which a git-capable entry handles today by delivering through
   preset, and a family/model request whose preset has no built-in family
   (`core/buyer/lifecycle.rs:311`, `:325 @4caf510`). So a hook named `my-hook` can be awarded by
   name, or by `harness_family` alone; a `harness` + `model` request matches a hook only when the
-  hook is named after the built-in (`[agents.claude] hook = …`). The skill page says so.
+  hook is named after the built-in (`[agents.claude] hook = …`). The skill page says so. A hook's
+  model is read from its entry at `advertisement()` time, never from the roster's observed-model
+  slot, which job and probe writers overwrite.
 - `["session","1"]`: when the selected entry is a hook, the claim advertises sessions iff
   `[sessions] enabled`. The docker/runsc conditions are about parking containers and do not
   apply. A container entry keeps today's rule.
@@ -237,18 +244,52 @@ relative path refused at config load), writes ONE JSON object followed by `\n` t
 stdin, and reads stdout and stderr concurrently until the process exits. Every event carries
 `"v": 1`. A hook must ignore unknown fields and exit non-zero on an unknown `event`.
 
+### 5.0 What a hook may deliver, and the protocol amendment (review H1)
+
+`accepts-delivery=inline` is a capability the buyer declares, **by default on every offer**
+(`core/buyer/mod.rs:734 @4caf510`); git is always accepted. So "inline job" is not a job class: a
+hook entry is eligible for nearly every non-contribution offer, including ones whose natural
+deliverable is files. Three rules keep a hook honest about that:
+
+1. **The agent is told the delivery contract.** The `job` event carries
+   `"answer_max_bytes": <cap>` and `"files_delivered": false`, and both shipped adapters and the
+   skill page pass them to the agent ("your reply is the whole deliverable; files you write are not
+   delivered; keep it under N bytes").
+2. **An honest exit.** `{"status":"cannot_deliver","reason":"…"}` at exit 0 fails the job
+   `delivery_failed` with no strike, and the reason goes to the seller log only. The only other
+   options would be a strike or a paid non-answer.
+3. **Single-turn statuses.** When the claim did not advertise a session, `needs_input` and
+   `out_of_time` fail the job `delivery_failed` (no strike) and publish nothing — protocol §6.4
+   allows those inline cases on session turns only.
+
+**Protocol amendment (same PR as the code).** `docs/protocol-v1.md` §6.4 requires git whenever the
+job's tree is non-empty and §8.3 requires the `MAXPLAYER-ANSWER-V1` marker before any inline
+delivery. A hook has no tree of ours and no agent message of ours. The amendment adds: *for a hook
+entry, the exit-0 envelope with `status = done` is the success opt-in that stands in for the
+marker; a hook job has no work tree, and files the seller's agent writes are not part of any
+delivery.* The marker's purpose — never publish a vendor error as a deliverable — is carried by
+the envelope: an adapter that wraps an error string as `answer` is breaking the contract, and the
+shipped `claude -p` adapter uses the CLI's structured output and its error flag, never free text.
+
+**Open for the team:** whether this is enough, or whether a hook entry should additionally be
+limited to offers that are explicitly answer-shaped. The default above keeps the settled §0.1.
+
 ### 5.1 `job` — one call per turn
 
 ```json
-{"v":1,"event":"job","invocation":"<hex>","job_id":"<hex>","turn":1,"session":true,
+{"v":1,"event":"job","invocation":"<hex>","attempt":1,"job_id":"<hex>","turn":1,"session":true,
  "prompt":"<the buyer's task, or the follow-up text for turn ≥ 2>",
- "output":"text/markdown","inputs_dir":"/abs/path","deadline_unix":1795200000}
+ "output":"text/markdown","inputs_dir":"/abs/path","answer_max_bytes":4076,
+ "files_delivered":false,"deadline_unix":1795200000}
 ```
 
 - `invocation` identifies ONE accepted request: the job id for turn 1, the follow-up event id for
   turn n. A retry of the same request after a daemon restart carries the same value (§7.1); a new
   follow-up always carries a new one. Adapters that keep state key it by `invocation`, and an
-  adapter that cannot answer the same `invocation` twice exits non-zero.
+  adapter that cannot answer the same `invocation` twice exits non-zero. `attempt` counts calls for
+  the same invocation (at-least-once: a restart before the outcome was staged calls again).
+- `deadline_unix` is the time by which stdout must be complete: the offer deadline (turn 1) or the
+  follow-up's own deadline (turn n), minus the publish margin.
 - `prompt` is the buyer's own text, verbatim. None of the container prompt (git remote, markers,
   sentinel instructions) applies.
 - `session` is true when the claim advertised sessions (more turns may follow).
@@ -263,10 +304,11 @@ allowed; a duplicate key is a violation):
 {"status":"done","answer":"..."}
 ```
 
-`status` is `done` | `needs_input` | `out_of_time`. The answer is delivered byte-for-byte as
+`status` is `done` | `needs_input` | `out_of_time` | `cannot_deliver` (§5.0; `reason` instead of
+`answer`). The answer is delivered byte-for-byte as
 decoded; it must contain a non-whitespace character. On a session turn `needs_input` and
 `out_of_time` become the result's `turn_status` (`core/session.rs:337 @4caf510`), exactly as for a
-container turn; on a single-turn job the status is ignored and the answer delivered.
+container turn; on a single-turn job they fail the job (§5.0 rule 3).
 
 **Outcomes:**
 
@@ -274,6 +316,7 @@ container turn; on a single-turn job the status is ignored and the answer delive
 |---|---|---|---|
 | exit 0, valid object, answer ≤ cap | deliver (§7) | — | — |
 | exit 0, decoded answer over `INLINE_ANSWER_MAX_BYTES` | fail, never truncated | `delivery_failed` | no |
+| exit 0, `cannot_deliver`; or `needs_input`/`out_of_time` on a single-turn job | fail | `delivery_failed` | no |
 | exit 0, anything else on stdout (not JSON, extra keys allowed but wrong types, empty answer, unknown status, stdout > 1 MiB) | fail | `execution_failed` | yes |
 | non-zero exit, death by signal | fail | `execution_failed` | yes |
 | still running at the cutoff | kill group, fail | `execution_failed` | no |
@@ -293,17 +336,26 @@ container turn; on a single-turn job the status is ignored and the answer delive
 - A hook that wants a long-lived worker must start it outside its own process group (that is the
   adapter's business, e.g. the channel adapter's `serve`, started by Claude Code, not by us).
 - Environment: the daemon's environment with every `MAXPLAYER_*` variable removed (config
-  overrides may carry credentials), plus `MAXPLAYER_HOOK_V=1`. Nothing else is added or removed;
-  the hook is the seller's own program running as the seller.
+  overrides may carry credentials), plus `MAXPLAYER_HOOK_V=1`, which is added to the reserved
+  env names (`core/home.rs:2438 @4caf510`) so a `maxplayer` command run by the agent does not
+  refuse it. `MAXPLAYER_HOME` is removed too: an agent that runs `maxplayer` uses its own home.
+  The hook is the seller's own program running as the seller.
+- An unknown event: exit code 64 means "unsupported" and is never a strike, so new events can be
+  added without breaking old adapters.
+- On daemon shutdown every running hook group gets the same SIGTERM/grace/SIGKILL. The group id is
+  journaled while the hook runs, and a restart kills a stale group before re-running.
 
 ### 5.2 `ping`
 
 ```json
-{"v":1,"event":"ping"}
+{"v":1,"event":"ping","reason":"boot"}
 ```
 
-Exit 0 before the cutoff = healthy. Stdout is ignored. cwd is the seller home. What a ping checks
-is the adapter's decision (a socket, a login, a tiny model call).
+`reason` is `boot` | `interval` | `restore`. Exit 0 before the cutoff = healthy. Stdout is ignored. cwd is the seller home. What a ping checks
+is the adapter's decision (a socket, a login, a tiny model call); the skill page asks `boot` and
+`restore` pings to prove the agent can answer, since a passing `restore` puts the entry back in
+front of paying buyers. The shipped `claude -p` adapter makes a one-token model call for those
+two.
 
 ### 5.3 `close`
 
@@ -332,8 +384,12 @@ as its only cleanup.
   bit. A missing or corrupt cache fails the job `execution_failed` without spawning (no strike).
 - The per-job directory is `job_workdir(home, job_id)` (`<home>/seller-jobs/<job_id>`), 0700.
   The adapter may write there; the daemon owns only `inputs/`.
-- **Every turn re-materializes** `inputs/` from the pin (the previous copy is removed first), so a
+- **Every call re-materializes** `inputs/` from the pin (the previous copy is removed first; a
+  re-drive after a restart included, since `materialize` refuses an existing destination), so a
   hook that changed its inputs on turn 1 sees the buyer's files again on turn 2.
+- The per-job directory sits under the seller home, which also holds the wallet. The hook runs as
+  the seller and can read the home anyway; the skill page says to run the agent as another user
+  if that matters.
 - The directory is removed when the job reaches a terminal state (delivered and not a session,
   failed) or when the session ends. A restart removes the directory of any job it finds terminal.
   The input cache keeps today's lifetime.
@@ -354,7 +410,10 @@ returns before the container branch (`run.rs:9708 @4caf510`). Steps:
    to step 8 with it.
 7. Run the hook (§5) on a blocking task; map the result (§5.1 table). A deliverable outcome is
    journaled (§7.1) BEFORE anything is signed or bound.
-8. Deliver through `deliver_inline` (`run.rs:11027 @4caf510`) with the journaled answer. Exec
+8. Deliver through `deliver_inline` (`run.rs:11027 @4caf510`) with the journaled answer.
+   `deliver_inline` gains a `turn_status` parameter (`None` = today's callers, byte-identical) and
+   returns a typed outcome (`Delivered` | `Refused(reason)`), so the hook path knows whether to
+   clean up. No `fail_job*` call is ever made for a job whose delivery was journaled. Exec
    metadata: a hook variant of `seller_exec_metadata` (`core/seller_exec.rs:2575 @4caf510`) emits
    `harness` = the entry label, `usage_transport` = `hook`, `metadata_trust` = `seller-claimed`,
    `model` = the configured model when set, and the daemon-measured wall time. When the claim
@@ -419,10 +478,15 @@ session lookup. For a `hook` record it skips the holder gate and calls `run_hook
 - `end_session` (`core/seller_node/session_gc.rs:871 @4caf510`) skips every docker call for a
   `hook` record, removes the per-job directory and the staged outcomes, and the caller sends
   `close` (§5.3) off the loop. Buyer close, lifetime expiry and eviction all go through it.
-- Lifetime expiry today runs only on the container sweep tick, which needs the sandbox network
-  (`run.rs:6535 @4caf510`). Hook sessions are expired by the same GC lifetime rule on the drain
-  tick, which every seat runs; the disk measurement (`session_gc.rs:955 @4caf510`) is skipped for
-  hook records.
+- Lifetime expiry today runs only on the container sweep tick, which is enabled only with a
+  sandbox network (`run.rs:6378`, `:6535 @4caf510`), so on a hook-only seat sessions would never
+  expire. The session GC gets its own tick whenever `[sessions] enabled`; only the docker sweep
+  stays behind `sweep_enabled`. Hook records are excluded from disk eviction (they hold no
+  container); their directories are bounded by the input caps and removed at session end.
+- `close` is sent BEFORE the directory is removed, detached from the caller's slot, at most four
+  at a time; `end_session` compares-and-sets `parked → ended` before any destructive step.
+- Turn n's start margin for a hook is the publish margin only, not the container margins of
+  `turn_can_start` (`core/session.rs:407 @4caf510`).
 - `recover_sessions` (`session_run.rs:1433 @4caf510`) stops containers only for `container`
   records; unfinished hook turns are re-driven as today and land on §7.1.
 
@@ -438,9 +502,13 @@ session lookup. For a `hook` record it skips the holder gate and calls `run_hook
   and nix checks (`cli/doctor.rs:3093 @4caf510`) report "not applicable: hook-only seat". The seat
   advertises no capability tokens. A mixed seat keeps every gate, and its tokens describe its
   `Acp` entries only (§3).
-- **Running.** On each heartbeat tick, every serving hook entry with no ping in flight is pinged
-  off the loop. A failed ping faults it (`Fault::Unproven`); the beat then advertises without it,
-  and `accepting=n` if nothing else serves.
+- **Running.** Every serving hook entry is pinged (`interval`) off the loop on the lane tick that
+  already starts due probes, every heartbeat interval, independent of whether beats are published.
+  Two consecutive failed interval pings fault it (`Fault::Unproven`); the beat then advertises
+  without it, and `accepting=n` if nothing else serves. A passing interval ping never restores.
+- **Restore loop.** After three consecutive job strikes with no successful job between them, a
+  hook entry is no longer restored by pings; it stays dropped until the daemon restarts, with one
+  operator line saying so.
 - **Restore.** A dropped hook entry's due probe (`run.rs:9180 @4caf510`) is a ping; a passing ping
   restores it, with the roster's backoff and strike history.
 - **Races.** A ping result is applied only if the entry's state has not changed since the ping
