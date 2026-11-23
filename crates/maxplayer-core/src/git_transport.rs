@@ -1465,14 +1465,70 @@ impl HttpStream {
 /// reqwest's Display stops at "error sending request for url (..)"; the cause (a proxy's 407, a
 /// refused connect, a TLS failure) is only in the source chain, so name all of it.
 fn http_request_error(error: reqwest::Error) -> io::Error {
-    let mut message = format!("http request: {error}");
-    let mut source = std::error::Error::source(&error);
-    while let Some(cause) = source {
-        message.push_str(&format!(": {cause}"));
-        source = cause.source();
-    }
-    io::Error::other(message)
+    io::Error::other(format!(
+        "http request: {}",
+        crate::error_chain::chain(&error)
+    ))
 }
+
+/// A response body read that failed mid-stream: reqwest wraps its error in an `io::Error` whose
+/// Display is again only reqwest's top line, so name the whole chain. The kind is kept (read loops
+/// retry `Interrupted`); an error with no inner error (an OS error) is returned unchanged.
+pub(crate) fn body_read_error(error: io::Error) -> io::Error {
+    if error.get_ref().is_none() {
+        return error;
+    }
+    io::Error::new(error.kind(), crate::error_chain::chain(&error))
+}
+
+/// A transport error as an operator may read it: server-written text is withheld, never echoed
+/// (an HTTP refusal excerpt, a push status message, libgit2's `remote error:` / `Error
+/// reported:` text), URL credentials are redacted, and what is left is printable ASCII on one
+/// line, at most [`OPERATOR_CAUSE_MAX`] characters.
+#[cfg(feature = "wallet")]
+pub(crate) fn operator_cause(error: &TransportError) -> String {
+    let text = match error {
+        // `require_status_report` builds `<refname>: <server message>`; keep the ref name only.
+        TransportError::Rejected(message) => match message.split_once(": ") {
+            Some((refname, _)) => {
+                format!("remote rejected ref: {refname} (server message withheld)")
+            }
+            None => error.to_string(),
+        },
+        _ => error.to_string(),
+    };
+    let mut text = text
+        .split(REFUSAL_MARKER)
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    for marker in SERVER_TEXT_MARKERS {
+        if let Some(at) = text.find(marker) {
+            text.truncate(at + marker.len());
+            text.push_str("(server text withheld)");
+        }
+    }
+    let text = crate::error_chain::redact_userinfo(&text);
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { ' ' })
+        .collect();
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(OPERATOR_CAUSE_MAX)
+        .collect()
+}
+
+/// libgit2 formats a server's `ERR` packet as `remote error: <text>` and a report-status
+/// failure as `report-status: Error reported: <text>`; the text after either is the server's.
+#[cfg(feature = "wallet")]
+const SERVER_TEXT_MARKERS: [&str; 2] = ["remote error: ", "Error reported: "];
+
+/// Longest transport cause shown to an operator.
+#[cfg(feature = "wallet")]
+const OPERATOR_CAUSE_MAX: usize = 600;
 
 /// Marker before a server-supplied refusal excerpt. Text after it is server data,
 /// not transport evidence, so error classification ignores it.
@@ -1550,13 +1606,13 @@ impl Read for HttpStream {
                     budget.check()?;
                     let remaining = budget.remaining.load(std::sync::atomic::Ordering::Relaxed);
                     let len = buf.len().min(remaining);
-                    let n = response.read(&mut buf[..len])?;
+                    let n = response.read(&mut buf[..len]).map_err(body_read_error)?;
                     budget
                         .remaining
                         .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
                     Ok(n)
                 } else {
-                    response.read(buf)
+                    response.read(buf).map_err(body_read_error)
                 }
             }
             None => Ok(0),
@@ -1591,6 +1647,48 @@ impl Write for HttpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Server-written text never reaches an operator line: not a push status message, not
+    /// libgit2's `remote error:` / `Error reported:` text; control characters and length are
+    /// bounded and credentials redacted.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn operator_cause_withholds_server_written_text() {
+        let rejected = operator_cause(&TransportError::Rejected(
+            "refs/heads/input/ab12: hook says EVIL\x1b[31m text".into(),
+        ));
+        assert_eq!(
+            rejected,
+            "remote rejected ref: refs/heads/input/ab12 (server message withheld)"
+        );
+        let fixed = TransportError::Rejected(
+            "private input push did not acknowledge unpack and exactly the intended ref".into(),
+        );
+        assert_eq!(operator_cause(&fixed), fixed.to_string());
+        for (message, kept) in [
+            (
+                "unexpected http status 500: remote error: EVIL server text",
+                "remote error:",
+            ),
+            (
+                "report-status: Error reported: EVIL server text",
+                "Error reported:",
+            ),
+        ] {
+            let shown = operator_cause(&TransportError::Io(message.into()));
+            assert!(!shown.contains("EVIL"), "{shown}");
+            assert!(
+                shown.contains(&format!("{kept} (server text withheld)")),
+                "{shown}"
+            );
+        }
+        let shown = operator_cause(&TransportError::Io(
+            "connect\nfailed\u{7} for http://u:secret@h/x".into(),
+        ));
+        assert_eq!(shown, "io error: connect failed for http://***@h/x");
+        let long = operator_cause(&TransportError::Io("x".repeat(5_000)));
+        assert_eq!(long.chars().count(), OPERATOR_CAUSE_MAX);
+    }
 
     // RUSTSEC-2026-0183: `git2::Remote::list()` passed a NULL pointer to `slice::from_raw_parts` when
     // the remote advertises no refs — undefined behaviour in release builds, and on git2 0.19 a
@@ -1674,6 +1772,55 @@ mod tests {
             message.contains("proxy authorization required"),
             "{message}"
         );
+    }
+
+    // A body cut off mid-stream: reqwest's io error Display is its top line only; the read must
+    // name the cause too, with the same kind.
+    #[test]
+    fn http_body_read_errors_name_their_source_chain() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
+                .unwrap();
+        });
+        let mut stream = HttpStream {
+            mint: None,
+            authority: None,
+            lifetime: None,
+            short: true,
+            read_budget: None,
+            url: format!("http://{addr}/git/o/r.git/info/refs?service=git-upload-pack"),
+            destination: String::new(),
+            service: "git-upload-pack",
+            is_post: false,
+            sent: false,
+            request_body: vec![],
+            streaming_body: None,
+            response: None,
+            timeout_override: None,
+        };
+        let mut body = Vec::new();
+        let error = stream.read_to_end(&mut body).unwrap_err();
+        server.join().unwrap();
+        let message = error.to_string();
+        // reqwest's own Display is "request or response body error"; hyper's cause follows it.
+        assert!(
+            message.starts_with("request or response body error: "),
+            "{message}"
+        );
+        assert!(
+            message.contains("error reading a body from connection"),
+            "{message}"
+        );
+        // `pack_forward::response` maps its body read through the same helper.
+        let os = io::Error::from(io::ErrorKind::ConnectionReset);
+        assert_eq!(body_read_error(os).kind(), io::ErrorKind::ConnectionReset);
     }
 
     #[test]

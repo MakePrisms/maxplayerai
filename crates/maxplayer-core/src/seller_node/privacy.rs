@@ -270,7 +270,7 @@ pub async fn preflight(
     signer: &super::signer::SignerHandle,
     event: &Event,
     resolved: &pc::lifecycle::ResolvedOffer,
-) -> pc::Result<()> {
+) -> Result<(), pc::hosting::SendError> {
     if resolved.attachments.is_empty() && resolved.contribution.is_none() {
         return Ok(());
     }
@@ -367,7 +367,9 @@ pub async fn preflight(
                 &[&pin.base_oid],
                 base_auth.as_deref(),
             )
-            .map_err(|_| pc::Error("pinned contribution input unavailable"))?;
+            .map_err(|e| {
+                pc::hosting::SendError::transport("pinned contribution input unavailable", &e)
+            })?;
             pc::repositories::check_objects(&repo)?;
             let commit = repo
                 .find_commit(
@@ -405,7 +407,7 @@ pub async fn preflight(
                         || p.starts_with(&(entry.path.clone() + "/"))
                         || entry.path.starts_with(&(p.to_string() + "/"))
                 }) {
-                    return Err(pc::Error("input path conflicts with pinned base"));
+                    return Err(pc::Error("input path conflicts with pinned base").into());
                 }
                 let bytes = std::fs::read(scratch.path().join("files").join(&entry.path))
                     .map_err(|_| pc::Error("verified input unavailable"))?;
@@ -449,7 +451,7 @@ pub async fn preflight(
         pc::repositories::check_objects(&repo)?;
         if let Ok(old) = repo.find_reference("refs/heads/input-baseline") {
             if old.target() != Some(oid) {
-                return Err(pc::Error("private input baseline changed"));
+                return Err(pc::Error("private input baseline changed").into());
             }
         } else {
             repo.reference(
@@ -460,7 +462,7 @@ pub async fn preflight(
             )
             .map_err(|_| pc::Error("input baseline persistence failed"))?;
         }
-        Ok(())
+        Ok::<(), pc::hosting::SendError>(())
     })
     .await
     .map_err(|_| pc::Error("input preflight worker unavailable"))?

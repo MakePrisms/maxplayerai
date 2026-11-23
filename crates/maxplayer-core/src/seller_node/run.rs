@@ -9053,9 +9053,9 @@ impl SellerNodeRunner {
         };
         match match_award(&award.claim_id, our_claim_id.as_deref(), &award_author, &buyer) {
             AwardMatch::Execute => {
-                let private = async {
+                let private: Result<(), crate::private_content::hosting::SendError> = async {
                     let Some((mut ctx, offer)) = super::privacy::known(self.node.home(), &self.seller_pubkey.to_hex(), &job_id)? else {
-                        if super::privacy::is_private(&draft) { return Err(crate::private_content::Error("private award context missing")); }
+                        if super::privacy::is_private(&draft) { return Err(crate::private_content::Error("private award context missing").into()); }
                         if let Some((mut public,offer)) = crate::private_content::public_v2::known(self.node.home(),&job_id)? {
                             let claim=public.store.event(&award.claim_id)?.ok_or(crate::private_content::Error("public awarded claim missing"))?;
                             public.select(&offer,&claim,event)?;

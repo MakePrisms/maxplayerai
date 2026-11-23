@@ -49,6 +49,7 @@ pub mod driver;
 pub mod durable;
 pub mod engine;
 pub mod env_provision;
+pub mod error_chain;
 pub mod episode;
 pub mod event;
 /// Paying the accrued platform fee: the ONE remit path in the product, behind an effects trait so
