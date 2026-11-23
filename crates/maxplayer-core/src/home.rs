@@ -2986,6 +2986,47 @@ mod tests {
         assert_eq!(reloaded.sessions.enabled, Some(false));
     }
 
+    /// A `[sessions]` table that sets neither `enabled` nor `disk_budget_bytes` is written back by
+    /// `save_config` without them, and re-reads as on by default with the 5 GiB budget.
+    #[test]
+    fn a_partial_sessions_table_is_written_back_without_unset_keys() {
+        let root = temp_home("sessions-partial");
+        let _ = fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        fs::write(home.root.join(CONFIG_FILE), "[sessions]\nlifetime_secs = 60\n").expect("write");
+        save_config(&mut home, |_| {}).expect("save");
+        let raw = fs::read_to_string(home.root.join(CONFIG_FILE)).expect("read config.toml");
+        let table = raw.split("[sessions]").nth(1).expect("[sessions] written back");
+        let table = table.split("\n[").next().unwrap();
+        assert!(table.contains("lifetime_secs = 60"), "{raw}");
+        assert!(!table.contains("enabled"), "{raw}");
+        assert!(!table.contains("disk_budget_bytes"), "{raw}");
+        let sessions = load_config(&home.root.join(CONFIG_FILE)).expect("reload").sessions;
+        assert_eq!(sessions.enabled, None);
+        assert_eq!(sessions.disk_budget(), 5 * 1024 * 1024 * 1024);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `MAXPLAYER_SESSIONS__ENABLED` overrides both ways; without it `enabled` stays unset through
+    /// the env layer's JSON bridge.
+    #[test]
+    fn sessions_enabled_env_override_reads_both_ways() {
+        let base = MaxplayerConfig::default();
+        let unset = apply_env_layer(&base, env(&[])).expect("no env").sessions;
+        assert_eq!(unset.enabled, None);
+        assert_eq!(unset.disk_budget(), 5 * 1024 * 1024 * 1024);
+        let off = apply_env_layer(&base, env(&[("MAXPLAYER_SESSIONS__ENABLED", "false")]))
+            .expect("env off")
+            .sessions;
+        assert_eq!(off.enabled, Some(false));
+        assert!(!off.enabled());
+        let on = apply_env_layer(&base, env(&[("MAXPLAYER_SESSIONS__ENABLED", "true")]))
+            .expect("env on")
+            .sessions;
+        assert!(on.explicitly_enabled());
+        assert_eq!(on.disk_budget(), 20 * 1024 * 1024 * 1024);
+    }
+
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(

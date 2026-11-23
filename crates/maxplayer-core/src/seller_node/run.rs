@@ -1399,13 +1399,14 @@ fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter 
 /// Bound on the §5.6 `docker info` read. A daemon that does not answer in time closes the gate.
 const RUNSC_GATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The §5.6 runsc overlay gate for this config. A seat it does not apply to (not docker + runsc +
-/// `[sessions] enabled`) runs NO docker command ([`crate::session::resolve_runsc_gate`] awaits the
+/// The §5.6 runsc overlay gate for this config. A seat it does not apply to (not a docker
+/// container-delivery seat on runsc with sessions on) runs NO docker command ([`crate::session::resolve_runsc_gate`] awaits the
 /// read only when it applies); otherwise one bounded `docker info --format '{{json .Runtimes}}'`.
 async fn probe_runsc_gate(
     config: &crate::home::MaxplayerConfig,
 ) -> crate::session::RunscOverlayGate {
-    crate::session::resolve_runsc_gate(config.sandbox.as_ref(), &config.sessions, || {
+    let uid = crate::seller_exec::job_identity().0;
+    crate::session::resolve_runsc_gate(config.sandbox.as_ref(), &config.sessions, uid, || {
         bounded_runtimes_read(RUNSC_GATE_PROBE_TIMEOUT, || {
             use crate::seller_exec::DockerCli as _;
             crate::seller_exec::RealDockerCli
@@ -5566,13 +5567,11 @@ impl SellerNodeRunner {
     }
 
     fn session_gc(&self) -> Option<super::session_gc::SessionGc> {
-        let config = &self.node.home().config.sessions;
-        config.enabled().then(|| super::session_gc::SessionGc {
-            store: self.node.store().clone(),
-            home_root: self.node.home().root.clone(),
-            lifetime_secs: config.lifetime_secs,
-            disk_budget_bytes: config.disk_budget(),
-        })
+        super::session_gc::SessionGc::for_config(
+            &self.node.home().config.sessions,
+            self.node.store().clone(),
+            self.node.home().root.clone(),
+        )
     }
 
     pub fn seller_pubkey(&self) -> String {

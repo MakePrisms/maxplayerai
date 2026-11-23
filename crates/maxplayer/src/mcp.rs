@@ -1545,7 +1545,7 @@ mod tests {
         );
         assert_eq!(
             listed["result"]["tools"],
-            with_team_tools(tools_for(state.home.config.sessions.enabled()))
+            with_team_tools(tools_for(true))
         );
         let called = dispatch(
             &state,
@@ -1989,6 +1989,39 @@ mod tests {
             .unwrap()
             .remove("max_session_sats");
         assert_eq!(on_post, post(&off));
+    }
+
+    /// `[sessions] enabled = false` in config.toml, through the real dispatch: `tools/list` has no
+    /// `reply` and `post_job` no `max_session_sats`, and a `reply` call is an unknown tool.
+    #[test]
+    fn sessions_off_in_config_hides_and_refuses_reply() {
+        let root = temp_home("sessions-off");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.toml"), "[sessions]\nenabled = false\n").unwrap();
+        let state = state_at(&root);
+        assert!(!state.home.config.sessions.enabled());
+        let request = |id: u64, method: &str, params: Value| McpRequest {
+            id: Some(json!(id)),
+            method: method.into(),
+            params,
+        };
+        let listed = dispatch(&state, &request(1, "tools/list", json!({})));
+        assert_eq!(listed["result"]["tools"], with_team_tools(tools_for(false)));
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().all(|tool| tool["name"] != "reply"));
+        let post_job = tools.iter().find(|tool| tool["name"] == "post_job").unwrap();
+        assert!(
+            post_job["inputSchema"]["properties"]
+                .get("max_session_sats")
+                .is_none()
+        );
+        let reply = json!({"name": "reply", "arguments": {"job_id": "00"}});
+        let called = dispatch(&state, &request(2, "tools/call", reply));
+        assert_eq!(called["result"]["isError"], true);
+        let text = called["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("unknown tool: reply"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

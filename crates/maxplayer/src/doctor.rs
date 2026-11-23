@@ -1734,10 +1734,14 @@ mod checks {
         use maxplayer_core::session::{
             RunscOverlayGate, runsc_overlay_gate, runsc_overlay_gate_applies,
         };
-        if !runsc_overlay_gate_applies(sandbox.as_ref(), &sessions) {
+        if !runsc_overlay_gate_applies(
+            sandbox.as_ref(),
+            &sessions,
+            maxplayer_core::seller_exec::job_identity().0,
+        ) {
             return Check::pass(
                 SANDBOX_RUNSC_SESSIONS_CHECK,
-                "not a docker + runsc seat with [sessions] enabled; no runsc overlay gate",
+                "not a docker + runsc container-delivery seat with sessions on; no runsc overlay gate",
             );
         }
         let probed = probe();
@@ -1768,7 +1772,7 @@ mod checks {
                 SANDBOX_RUNSC_SESSIONS_CHECK,
                 format!(
                     "[sessions] enabled = true but this runsc seat cannot keep a session past turn 1: \
-                     {reason}. Set the flag, or turn [sessions] off to run single-turn only"
+                     {reason}. Set the flag, or set [sessions] enabled = false to run single-turn only"
                 ),
                 fix,
             ),
@@ -2934,13 +2938,15 @@ fn build_checks_with_environment(
         checks::check_sandbox_engine_floor(sandbox_for_engine, serves_strangers)
     }));
     // Session jobs §5.6 (bug 2): the seller's own runsc `--overlay2=none` gate, reported here with
-    // the daemon.json fix. BLOCKING when docker shows the flag missing (sessions are on and cannot
-    // work past turn 1); advisory WARN when docker cannot be read.
-    // Pushed ONLY on a runsc seat with sessions on: every other seat's doctor output is exactly
-    // main's (no new row, no docker read).
+    // the daemon.json fix. BLOCKING when docker shows the flag missing and the operator set
+    // `[sessions] enabled = true`; WARN when `enabled` is unset (on by default: the seat starts and
+    // runs single-turn) or docker cannot be read.
+    // Pushed ONLY on a runsc container-delivery seat with sessions on: every other seat's doctor
+    // output is exactly main's (no new row, no docker read).
     if maxplayer_core::session::runsc_overlay_gate_applies(
         sandbox_for_runsc_sessions.as_ref(),
         &sessions_for_runsc,
+        maxplayer_core::seller_exec::job_identity().0,
     ) {
         checks.push(Box::new(move || {
             checks::check_sandbox_runsc_sessions(sandbox_for_runsc_sessions, sessions_for_runsc)
@@ -5097,6 +5103,7 @@ mod tests {
         let runsc = SandboxConfig {
             mode: SandboxMode::Docker,
             runtime: Some("runsc".into()),
+            container_delivery: Some(true),
             ..Default::default()
         };
         let reported = |json: &'static str| {
@@ -5121,7 +5128,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("turn [sessions] off"),
+            rendered.contains("set [sessions] enabled = false to run single-turn only"),
             "names the other way out: {rendered}"
         );
         assert!(
@@ -5264,6 +5271,7 @@ mod tests {
             mode: SandboxMode::Docker,
             image: Some("maxplayer-sandbox:test".into()),
             runtime: Some("runsc".into()),
+            container_delivery: Some(true),
             ..Default::default()
         });
         home.config.sessions.enabled = Some(true);
@@ -5276,6 +5284,15 @@ mod tests {
                 .any(|check| check.name == "sandbox runsc sessions"),
             "build_checks must run the runsc sessions check; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
+        );
+        // Sessions on by default (`enabled` unset) run it too.
+        home.config.sessions.enabled = None;
+        let results = run_checks(build_checks(&home, false));
+        assert!(
+            results
+                .iter()
+                .any(|check| check.name == "sandbox runsc sessions"),
+            "enabled unset must run the runsc sessions check too"
         );
 
         // Non-runsc seats (Petar, 15:33): the row is ABSENT — no new WARN/FAIL/PASS line, no docker
@@ -5316,6 +5333,14 @@ mod tests {
                 true,
             ),
             ("no sandbox", None, true),
+            (
+                "runsc, host delivery",
+                Some(SandboxConfig {
+                    container_delivery: Some(false),
+                    ..docker.clone()
+                }),
+                true,
+            ),
             ("runsc, sessions off", Some(docker.clone()), false),
         ] {
             home.config.sandbox = sandbox;

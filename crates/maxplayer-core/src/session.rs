@@ -1042,14 +1042,18 @@ pub fn runs_as_session(
     cfg.enabled() && runsc_gate.allows_sessions() && claim_advertised
 }
 
-/// Whether the gate applies: `[sessions] enabled`, `mode = "docker"` and `runtime = "runsc"`
-/// (trimmed, as the seat resolves it). Every other seat is [`RunscOverlayGate::NotApplicable`] and
-/// never asks docker anything.
+/// Whether the gate applies: sessions on, `mode = "docker"` with container delivery for
+/// `container_uid` (the only seats that advertise sessions, §2.2) and `runtime = "runsc"` (trimmed,
+/// as the seat resolves it). Every other seat is [`RunscOverlayGate::NotApplicable`] and never asks
+/// docker anything.
 pub fn runsc_overlay_gate_applies(
     sandbox: Option<&SandboxConfig>,
     sessions: &SessionsConfig,
+    container_uid: u32,
 ) -> bool {
-    sessions.enabled() && seat_runs_runsc(sandbox)
+    sessions.enabled()
+        && seat_runs_runsc(sandbox)
+        && sandbox.is_some_and(|sandbox| sandbox.container_delivery_enabled(container_uid))
 }
 
 /// Whether this seat's jobs run under gVisor: `[sandbox] mode = "docker"` and `runtime` trims to
@@ -1070,13 +1074,14 @@ pub fn seat_runs_runsc(sandbox: Option<&SandboxConfig>) -> bool {
 pub async fn resolve_runsc_gate<F, Fut>(
     sandbox: Option<&SandboxConfig>,
     sessions: &SessionsConfig,
+    container_uid: u32,
     read_runtimes: F,
 ) -> RunscOverlayGate
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
-    if !runsc_overlay_gate_applies(sandbox, sessions) {
+    if !runsc_overlay_gate_applies(sandbox, sessions, container_uid) {
         return RunscOverlayGate::NotApplicable;
     }
     let probed = read_runtimes().await;
