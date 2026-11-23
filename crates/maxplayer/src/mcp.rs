@@ -556,7 +556,7 @@ fn tools_for(sessions: bool) -> Value {
 /// swarm tools with `[swarm] enabled`, then the team tools on every `wallet` build.
 fn listed_tools(state: &McpState) -> Value {
     with_team_tools(with_swarm_tools(
-        tools_for(state.home.config.sessions.enabled),
+        tools_for(state.home.config.sessions.enabled()),
         state.home.config.swarm.enabled,
     ))
 }
@@ -678,7 +678,7 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
         "get_job" => route_tool(state, "get_job", "get_job", arguments).await?,
         "collect" => route_tool(state, "collect", "collect", arguments).await?,
         "award_claim" => route_tool(state, "award_claim", "award", arguments).await?,
-        "reply" if state.home.config.sessions.enabled => {
+        "reply" if state.home.config.sessions.enabled() => {
             route_tool(state, "reply", "reply", arguments).await?
         }
         swarm if state.home.config.swarm.enabled && SWARM_TOOLS.contains(&swarm) => {
@@ -1545,7 +1545,7 @@ mod tests {
         );
         assert_eq!(
             listed["result"]["tools"],
-            with_team_tools(tools_for(state.home.config.sessions.enabled))
+            with_team_tools(tools_for(state.home.config.sessions.enabled()))
         );
         let called = dispatch(
             &state,
@@ -1574,10 +1574,10 @@ mod tests {
                 params: json!({}),
             },
         );
-        assert_eq!(
-            names(listed["result"]["tools"].clone())[4..4 + SWARM_TOOLS.len()],
-            *SWARM_TOOLS
-        );
+        // Sessions are on by default (`[sessions]` unset), so `reply` sits before the swarm tools.
+        let listed = names(listed["result"]["tools"].clone());
+        assert_eq!(listed[4], "reply");
+        assert_eq!(listed[5..5 + SWARM_TOOLS.len()], *SWARM_TOOLS);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1622,7 +1622,7 @@ mod tests {
     // END swarm tests
 
     // BEGIN team tests
-    /// The team tools are listed on every `wallet` build, after the trade loop and any swarm
+    /// The team tools are listed on every `wallet` build, after the trade loop, `reply` and any swarm
     /// tools, each with a closed object schema and the untrusted-text warning.
     #[cfg(feature = "wallet")]
     #[test]
@@ -1647,6 +1647,7 @@ mod tests {
                 "get_job",
                 "collect",
                 "award_claim",
+                "reply",
                 "team_whoami",
                 "team_create",
                 "team_invite",
@@ -1658,8 +1659,9 @@ mod tests {
                 "team_delete"
             ]
         );
-        assert_eq!(&names[4..], team::TEAM_TOOLS);
-        for tool in &tools[4..] {
+        // `reply` is listed because sessions are on by default (`[sessions]` unset).
+        assert_eq!(&names[5..], team::TEAM_TOOLS);
+        for tool in &tools[5..] {
             assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
             assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{tool}");
             let description = tool["description"].as_str().unwrap();

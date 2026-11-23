@@ -1709,11 +1709,14 @@ mod checks {
     /// `--overlay2=none`; otherwise it fails closed and keeps taking single-turn jobs.
     ///
     /// FAIL when docker ANSWERED and shows the seat cannot keep a session (`runsc` without the flag,
-    /// or no `runsc` registered): the operator turned sessions on, and a seat that silently runs
-    /// without them is a misconfiguration nobody notices (Petar, 2026-11-07). FAIL blocks the seller
-    /// boot until the flag is set or `[sessions]` is turned off. WARN when docker could not confirm
-    /// either way (unreadable, timed out, unparseable): that can be a passing daemon hiccup, so the
-    /// seat starts single-turn and the heartbeat re-probes.
+    /// or no `runsc` registered) AND the operator wrote `[sessions] enabled = true`: they asked for
+    /// sessions, and a seat that silently runs without them is a misconfiguration nobody notices.
+    /// FAIL blocks the seller boot until the flag is set or `[sessions]` is turned off. The same
+    /// verdict on a seat where sessions are on only because `enabled` is unset (the default) is a
+    /// WARN: the operator never chose sessions, so an upgrade must not stop the seat from booting;
+    /// it runs single-turn jobs. WARN too when docker could not confirm either way (unreadable,
+    /// timed out, unparseable): that can be a passing daemon hiccup, so the seat starts single-turn
+    /// and the heartbeat re-probes.
     pub(super) fn check_sandbox_runsc_sessions(
         sandbox: Option<SandboxConfig>,
         sessions: maxplayer_core::home::SessionsConfig,
@@ -1738,6 +1741,7 @@ mod checks {
             );
         }
         let probed = probe();
+        let chosen = sessions.explicitly_enabled();
         match runsc_overlay_gate(true, probed.as_deref().map_err(String::as_str)) {
             RunscOverlayGate::NotApplicable | RunscOverlayGate::Open => Check::pass(
                 SANDBOX_RUNSC_SESSIONS_CHECK,
@@ -1747,10 +1751,23 @@ mod checks {
                 reason,
                 fix,
                 misconfigured: true,
+            } if !chosen => Check::warn(
+                SANDBOX_RUNSC_SESSIONS_CHECK,
+                format!(
+                    "session jobs are NOT advertised on this runsc seat (single-turn jobs continue): \
+                     {reason}. Sessions are on by default; set the flag to offer them, or set \
+                     [sessions] enabled = false to silence this"
+                ),
+                fix,
+            ),
+            RunscOverlayGate::Closed {
+                reason,
+                fix,
+                misconfigured: true,
             } => Check::fail(
                 SANDBOX_RUNSC_SESSIONS_CHECK,
                 format!(
-                    "[sessions] is enabled but this runsc seat cannot keep a session past turn 1: \
+                    "[sessions] enabled = true but this runsc seat cannot keep a session past turn 1: \
                      {reason}. Set the flag, or turn [sessions] off to run single-turn only"
                 ),
                 fix,
@@ -5074,7 +5091,7 @@ mod tests {
         use checks::check_sandbox_runsc_sessions_with;
         use maxplayer_core::home::{SandboxConfig, SandboxMode, SessionsConfig};
         let on = SessionsConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         };
         let runsc = SandboxConfig {
@@ -5134,6 +5151,34 @@ mod tests {
             let check = reported(json);
             assert_eq!(check.status, Status::Fail, "{json}: {}", check.render());
         }
+
+        // Sessions on only because `enabled` is unset (the default): the same misconfigured verdicts
+        // WARN instead of FAIL, so upgrading a runsc seat without the flag never blocks its boot. It
+        // still probes, still names the fix, and still advertises no session.
+        for json in [
+            r#"{"runsc":{"path":"/usr/bin/runsc"}}"#,
+            r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=root:memory"]}}"#,
+            r#"{"runc":{"path":"runc"}}"#,
+        ] {
+            let mut probed = false;
+            let check =
+                check_sandbox_runsc_sessions_with(Some(runsc.clone()), SessionsConfig::default(), || {
+                    probed = true;
+                    Ok(json.to_owned())
+                });
+            assert!(probed, "{json}: unset enabled still probes docker");
+            assert_eq!(check.status, Status::Warn, "{json}: {}", check.render());
+            let rendered = check.render();
+            assert!(rendered.contains("single-turn jobs continue"), "{rendered}");
+            assert!(rendered.contains("[sessions] enabled = false"), "{rendered}");
+            assert!(rendered.contains("--overlay2=none"), "names the fix: {rendered}");
+        }
+        let unset_open = check_sandbox_runsc_sessions_with(
+            Some(runsc.clone()),
+            SessionsConfig::default(),
+            || Ok(r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=none"]}}"#.into()),
+        );
+        assert_eq!(unset_open.status, Status::Pass, "{}", unset_open.render());
         // Docker could not confirm either way: a possible hiccup, so WARN (boot continues
         // single-turn and the heartbeat re-probes), never PASS.
         let unreadable = check_sandbox_runsc_sessions_with(Some(runsc.clone()), on.clone(), || {
@@ -5163,7 +5208,13 @@ mod tests {
         for (sandbox, sessions) in [
             (Some(runc), on.clone()),
             (None, on.clone()),
-            (Some(runsc.clone()), SessionsConfig::default()),
+            (
+                Some(runsc.clone()),
+                SessionsConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            ),
         ] {
             let mut probed = false;
             let check = check_sandbox_runsc_sessions_with(sandbox.clone(), sessions, || {
@@ -5201,7 +5252,7 @@ mod tests {
             runtime: Some("runsc".into()),
             ..Default::default()
         });
-        home.config.sessions.enabled = true;
+        home.config.sessions.enabled = Some(true);
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
         let results = run_checks(build_checks(&home, false));
@@ -5254,7 +5305,7 @@ mod tests {
             ("runsc, sessions off", Some(docker.clone()), false),
         ] {
             home.config.sandbox = sandbox;
-            home.config.sessions.enabled = sessions;
+            home.config.sessions.enabled = Some(sessions);
             let results = run_checks(build_checks(&home, false));
             assert!(
                 !results

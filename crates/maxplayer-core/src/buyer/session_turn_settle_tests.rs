@@ -30,7 +30,7 @@ impl Daemon {
         let root = tempfile::tempdir().expect("tempdir");
         let mut home = bootstrap_home(root.path()).expect("bootstrap home");
         home.config.relay_url = relay_url.clone();
-        home.config.sessions.enabled = true;
+        home.config.sessions.enabled = Some(true);
         home.config.review.buyer_delivery = buyer_review;
         let (lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         // Counterparty events come from a client that is NOT the daemon's (one nostr-sdk client

@@ -268,7 +268,7 @@ pub fn advertise_on_claim(
     runsc_gate: &RunscOverlayGate,
 ) {
     if draft.kind != JOB_CLAIM_KIND
-        || !cfg.enabled
+        || !cfg.enabled()
         || !docker_container_seat
         || !runsc_gate.allows_sessions()
     {
@@ -1039,7 +1039,7 @@ pub fn runs_as_session(
     runsc_gate: &RunscOverlayGate,
     claim_advertised: bool,
 ) -> bool {
-    cfg.enabled && runsc_gate.allows_sessions() && claim_advertised
+    cfg.enabled() && runsc_gate.allows_sessions() && claim_advertised
 }
 
 /// Whether the gate applies: `[sessions] enabled`, `mode = "docker"` and `runtime = "runsc"`
@@ -1049,7 +1049,7 @@ pub fn runsc_overlay_gate_applies(
     sandbox: Option<&SandboxConfig>,
     sessions: &SessionsConfig,
 ) -> bool {
-    sessions.enabled && seat_runs_runsc(sandbox)
+    sessions.enabled() && seat_runs_runsc(sandbox)
 }
 
 /// Whether this seat's jobs run under gVisor: `[sandbox] mode = "docker"` and `runtime` trims to

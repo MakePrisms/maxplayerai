@@ -319,7 +319,7 @@ pub(super) fn disabled() -> String {
 }
 
 pub(super) async fn reply(context: &Arc<BuyerContext>, id: Value, params: Value) -> Response {
-    if !context.home.config.sessions.enabled {
+    if !context.home.config.sessions.enabled() {
         return Response::err(id, CODE_REFUSED, disabled());
     }
     let params: ReplyParams = match serde_json::from_value(params) {
@@ -658,7 +658,7 @@ pub(super) fn turn_status_for(
 
 /// `get_job.session` (§10). `None` unless sessions are enabled and the job is a session job.
 pub(super) async fn view(context: &BuyerContext, view: &job_lifecycle::JobView) -> Option<Value> {
-    if !context.home.config.sessions.enabled {
+    if !context.home.config.sessions.enabled() {
         return None;
     }
     let job_id = view.job_id.as_str();
@@ -735,7 +735,7 @@ pub(super) async fn collect_target(
     job_id: &str,
     turn: Option<u32>,
 ) -> Result<Option<BuyerTurn>, String> {
-    if !context.home.config.sessions.enabled || turn == Some(1) {
+    if !context.home.config.sessions.enabled() || turn == Some(1) {
         return Ok(None);
     }
     let turns = context
@@ -967,7 +967,7 @@ pub(super) async fn settle_delivered_turns(
     wake: Option<&nostr_sdk::Event>,
     pay: &dyn TurnPay,
 ) {
-    if !context.home.config.sessions.enabled {
+    if !context.home.config.sessions.enabled() {
         return;
     }
     let jobs = match context.store.unsettled_turn_job_ids() {
@@ -1105,7 +1105,7 @@ async fn settle_job_turns(
 /// failed turn frees its reservation and its number; `session_expired` also ends the session.
 /// Author-gated on the awarded seller. Returns true when the event named a turn.
 pub(super) async fn on_turn_feedback(context: &BuyerContext, event: &nostr_sdk::Event) -> bool {
-    if !context.home.config.sessions.enabled {
+    if !context.home.config.sessions.enabled() {
         return false;
     }
     let tag = |name: &str| {

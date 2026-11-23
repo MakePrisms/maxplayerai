@@ -172,7 +172,7 @@ fn now_secs() -> u64 {
 
 impl SellerNodeRunner {
     fn sessions_enabled(&self) -> bool {
-        self.node.home().config.sessions.enabled
+        self.node.home().config.sessions.enabled()
     }
 
     /// A kind-3412 FOLLOW-UP (§2.1, §6.1 step 1): parse, admit, and either close the session or
@@ -1592,7 +1592,7 @@ mod tests {
             holder_proxy_ports: None,
         };
         let mut config = crate::home::MaxplayerConfig::default();
-        config.sessions.enabled = true;
+        config.sessions.enabled = Some(true);
         let docker = SandboxConfig {
             mode: SandboxMode::Docker,
             ..Default::default()

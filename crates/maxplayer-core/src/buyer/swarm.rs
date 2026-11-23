@@ -1376,7 +1376,7 @@ pub(super) fn spawn(context: Arc<BuyerContext>) -> bool {
         let engine = Engine {
             store: context.store.clone(),
             buyer: buyer.clone(),
-            sessions: context.home.config.sessions.enabled,
+            sessions: context.home.config.sessions.enabled(),
         };
         let io = DaemonIo::new(context.clone(), buyer);
         crate::opline!("buyer: swarm engine started (no planner: check-in mode)");

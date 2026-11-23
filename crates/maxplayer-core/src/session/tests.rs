@@ -23,7 +23,13 @@ fn turn2() -> FollowUp {
 }
 fn on() -> SessionsConfig {
     SessionsConfig {
-        enabled: true,
+        enabled: Some(true),
+        ..SessionsConfig::default()
+    }
+}
+fn off() -> SessionsConfig {
+    SessionsConfig {
+        enabled: Some(false),
         ..SessionsConfig::default()
     }
 }
@@ -133,8 +139,8 @@ fn followup_from_wrong_author_seat_or_turn_is_ignored() {
 /// today's. `advertise_on_claim` is the only path a `session` tag enters a claim.
 #[test]
 fn disabled_sessions_leave_claim_bytes_identical() {
-    let off = SessionsConfig::default();
-    assert!(!off.enabled);
+    let off = off();
+    assert!(!off.enabled());
     for payment in [ClaimPayment::Sat("creqAtest"), ClaimPayment::None] {
         let before = gateway::claim_draft(
             OFFER,
@@ -1074,7 +1080,7 @@ fn runsc_gate_leaves_other_seats_alone() {
         ("non-runsc runtime", Some(&other), on()),
         ("launcher mode", Some(&launcher), on()),
         ("no sandbox", None, on()),
-        ("sessions off", Some(&runsc), SessionsConfig::default()),
+        ("sessions off", Some(&runsc), off()),
     ] {
         let applies = runsc_overlay_gate_applies(sandbox, &sessions);
         assert!(!applies, "{label}");
@@ -1130,11 +1136,11 @@ fn closed_runsc_gate_runs_an_advertised_job_single_turn() {
         !runs_as_session(&on(), &RunscOverlayGate::Open, false),
         "not advertised"
     );
-    assert!(!runs_as_session(
-        &SessionsConfig::default(),
-        &RunscOverlayGate::Open,
-        true
-    ));
+    assert!(!runs_as_session(&off(), &RunscOverlayGate::Open, true));
+    assert!(
+        runs_as_session(&SessionsConfig::default(), &RunscOverlayGate::Open, true),
+        "unset enabled is on"
+    );
 }
 
 // ───────────── Non-runsc seats are unchanged (Petar, 15:33): no probe, no log, main's claims ─────────────
@@ -1257,7 +1263,7 @@ async fn runsc_seat_probes_once_only_with_sessions_on() {
     assert_eq!(calls.get(), 1);
     assert_eq!(gate, RunscOverlayGate::Open);
     assert!(runsc_gate_log_line(&gate).is_some());
-    let off = resolve_runsc_gate(Some(&runsc), &SessionsConfig::default(), || async {
+    let off = resolve_runsc_gate(Some(&runsc), &off(), || async {
         panic!("sessions off: no probe")
     })
     .await;

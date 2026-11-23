@@ -5567,11 +5567,11 @@ impl SellerNodeRunner {
 
     fn session_gc(&self) -> Option<super::session_gc::SessionGc> {
         let config = &self.node.home().config.sessions;
-        config.enabled.then(|| super::session_gc::SessionGc {
+        config.enabled().then(|| super::session_gc::SessionGc {
             store: self.node.store().clone(),
             home_root: self.node.home().root.clone(),
             lifetime_secs: config.lifetime_secs,
-            disk_budget_bytes: config.disk_budget_bytes,
+            disk_budget_bytes: config.disk_budget(),
         })
     }
 
@@ -6117,7 +6117,7 @@ impl SellerNodeRunner {
             AWARD_SUB_ID => award_filter_with(
                 self.seller_pubkey,
                 self.claim_open_pool(),
-                self.node.home().config.sessions.enabled,
+                self.node.home().config.sessions.enabled(),
             ),
             WRAP_SUB_ID => Filter::new()
                 .kind(Kind::GiftWrap)
@@ -17370,7 +17370,7 @@ mod tests {
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
         home.config.relay_url = relay_url;
         home.config.review.seller_offer = false;
-        home.config.sessions.enabled = true;
+        home.config.sessions.enabled = Some(true);
         let mut seller = seller_cfg(1, true);
         seller.claim_award_timeout_secs = Some(3_600);
         home.config.seller = Some(seller);
@@ -21606,7 +21606,7 @@ mod tests {
     fn drain_session_home(root: &std::path::Path, fixture: &PGateRelay) -> crate::home::MaxplayerHome {
         let mut home = lane_home(root, fixture);
         home.config.seller_heartbeat.interval_secs = 3600;
-        home.config.sessions.enabled = true;
+        home.config.sessions.enabled = Some(true);
         home
     }
 

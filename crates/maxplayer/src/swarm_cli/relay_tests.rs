@@ -311,7 +311,8 @@ fn join_publishes_per_swarm_membership_and_appends_the_buyer() {
 #[test]
 fn join_without_a_seller_section_says_where_to_add_the_buyer() {
     let net = net();
-    let (buyer, seller) = (home(&net, ""), home(&net, ""));
+    // Sessions are on by default; the hint is for a home that turned them off.
+    let (buyer, seller) = (home(&net, ""), home(&net, "[sessions]\nenabled = false\n"));
     let math = create(&buyer, "Math", &[]);
     let o = swarm(&seller, &["join", &math, "--minutes", "30"]);
     assert_eq!(o.code, 0, "{}", o.err);
@@ -321,6 +322,11 @@ fn join_without_a_seller_section_says_where_to_add_the_buyer() {
         o.err
     );
     assert!(o.err.contains("[sessions] enabled = false"), "{}", o.err);
+    // Default home (sessions unset = on): no hint.
+    let other = home(&net, "");
+    let o = swarm(&other, &["join", &math, "--minutes", "30"]);
+    assert_eq!(o.code, 0, "{}", o.err);
+    assert!(!o.err.contains("[sessions] enabled = false"), "{}", o.err);
 }
 
 #[test]
