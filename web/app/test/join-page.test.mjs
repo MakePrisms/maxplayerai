@@ -91,4 +91,8 @@ test("the browser page carries join.md's steps for an agent that lands there, an
   assert.doesNotMatch(html, /\sstyle="|<style\b/, "no inline style (the CSP drops it)");
   assert.ok(html.includes('<details class="jn-agent">'), "the steps are closed until asked for");
   assert.match(css, /\.copysrc\{/, "the clipboard fallback's hidden span is styled");
+  // Bob (2026-11-23): clicking Copy moves no text: the button is as wide as "Copied" from the start.
+  assert.match(css, /\.jn-main \.copy button::after\{content:"Copied";height:0;overflow:hidden;visibility:hidden\}/);
+  const js = readFileSync(join(root, "src", "join.ts"), "utf8");
+  assert.ok(!js.includes("Select and copy"), "the button never says anything longer than Copied");
 });

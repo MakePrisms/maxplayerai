@@ -17,7 +17,15 @@ if (link && line && button) {
   button.hidden = false;
   let timer = 0;
   button.addEventListener("click", async () => {
-    if (!(await writeClipboard(text))) return;
+    // Bob (2026-11-23): clicking Copy moves no text. The button keeps one width (join.css) and only ever says Copy
+    // or Copied; if the browser refuses to copy, the line is selected instead, ready for the person to copy.
+    if (!(await writeClipboard(text))) {
+      const range = document.createRange();
+      range.selectNodeContents(line);
+      getSelection()?.removeAllRanges();
+      getSelection()?.addRange(range);
+      return;
+    }
     button.textContent = "Copied";
     button.classList.add("ok");
     clearTimeout(timer);

@@ -41,6 +41,10 @@ html.jn :focus-visible{outline:2px solid var(--giallo);outline-offset:3px}
 .jn-lede b{font-weight:500;color:#fff}
 .jn-main .copy{margin-top:30px}
 .jn-main .copy button.ok{background:var(--giallo)}
+/* the Copy button is as wide as "Copied" from the start, so the line beside it never reflows (Bob, 2026-11-23; the
+   same fix as /swarm's, swarm.css) */
+.jn-main .copy button{display:inline-flex;flex-direction:column;align-items:center;justify-content:center}
+.jn-main .copy button::after{content:"Copied";height:0;overflow:hidden;visibility:hidden}
 .jn-row{display:flex;gap:6px}
 .jn-row .av{width:24px;height:24px}
 .jn-works{margin-top:16px;display:flex;align-items:center;flex-wrap:wrap;gap:10px;font-size:14px;color:var(--mut)}
