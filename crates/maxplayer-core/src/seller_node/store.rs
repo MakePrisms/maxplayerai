@@ -2276,6 +2276,22 @@ impl SellerStore {
         Ok(n == 1)
     }
 
+    /// #1203: claim the ONE ended-session refusal a follow-up may get. `true` exactly once per
+    /// follow-up id, and never for a follow-up that already has a turn row (it was answered while the
+    /// session was live). The marker is keyed on the follow-up alone and nothing evicts it, so
+    /// replaying any number of stale follow-ups for one turn (boot, backfill) publishes nothing new.
+    /// Deliberately NOT a `session_turns` row: `record_turn` evicts other refused rows of the same
+    /// turn, which is what let two stale follow-ups resurrect each other's refusal on every replay.
+    pub fn mark_ended_refusal(&self, followup_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO seller_meta (key, value) SELECT ?1, '1'
+             WHERE NOT EXISTS (SELECT 1 FROM session_turns WHERE followup_id = ?2)",
+            params![format!("ended-refusal:{followup_id}"), followup_id],
+        )?;
+        Ok(n == 1)
+    }
+
     pub fn set_turn_state(
         &self,
         followup_id: &str,
@@ -3835,6 +3851,16 @@ mod tests {
             (t.state, t.result_id.as_deref(), t.delivery_oid.as_deref()),
             (TurnState::Paid, Some("res"), Some("oid"))
         );
+
+        // #1203: an ended session's refusal is claimed once per follow-up, never for one that holds
+        // a turn row, and claiming it leaves every turn row alone.
+        assert!(!store.mark_ended_refusal(&f2).unwrap(), "a recorded turn is not refused again");
+        let (s1, s2) = ("5".repeat(64), "6".repeat(64));
+        assert!(store.mark_ended_refusal(&s1).unwrap());
+        assert!(store.mark_ended_refusal(&s2).unwrap());
+        assert!(!store.mark_ended_refusal(&s1).unwrap(), "once per follow-up, ever");
+        assert!(!store.mark_ended_refusal(&s2).unwrap());
+        assert!(store.turn(&f2).unwrap().is_some());
 
         // A refused turn releases its number: the buyer's retry for the same turn is recorded.
         let f3 = "3".repeat(64);

@@ -251,21 +251,13 @@ impl SellerNodeRunner {
             record.state.is_live(),
         ) {
             opline!("seller node follow-up ignore id={fid} job_id={job_id}: {why:?}");
-            // An ended session answers its buyer's turn once (the refused row dedups re-sends).
+            // An ended session answers each follow-up once, ever (#1203): the marker is keyed on the
+            // follow-up id and never evicted, so replays of stale follow-ups publish nothing new.
             if why == session::Ignore::SessionEnded
                 && followup.status == FollowUpStatus::Turn
-                && let (Some(turn), Some(deadline)) = (followup.turn, followup.deadline_unix)
-                && matches!(
-                    store.record_turn(
-                        &fid,
-                        &job_id,
-                        turn,
-                        deadline,
-                        TurnState::Refused,
-                        now_secs()
-                    ),
-                    Ok(true)
-                )
+                && followup.turn.is_some()
+                && followup.deadline_unix.is_some()
+                && matches!(store.mark_ended_refusal(&fid), Ok(true))
             {
                 self.turn_feedback(&job_id, &award_buyer, &fid, ReasonCode::SessionExpired)
                     .await;

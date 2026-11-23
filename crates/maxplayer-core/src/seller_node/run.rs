@@ -21892,6 +21892,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// #1203 — two stale follow-ups for one turn of an ENDED session are answered once each, ever:
+    /// replaying both (a seat restart, a backfill) publishes no new refusal.
+    /// RED ON REVERT: put back the `record_turn(.., Refused, ..)` dedup in the ended-session branch
+    /// and every replay of the pair publishes two more kind-3404s (each evicts the other's row).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1203_an_ended_session_refuses_each_follow_up_once_across_replays() {
+        use crate::session::{FollowUpStatus, SessionState};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("1203-ended-replay");
+        let runner = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture)).await.expect("boot"),
+        );
+        let buyer = Keys::generate();
+        let job_id = park_session_1299(&runner, &buyer);
+        assert!(runner
+            .node
+            .store()
+            .set_session_state(&job_id, SessionState::Closed, now_unix() as u64)
+            .expect("close"));
+        // Two distinct follow-ups for the same turn 2 (different text, so different ids).
+        let stale = |text: &str| {
+            let draft = crate::session::followup_draft(&crate::session::FollowUp {
+                offer_id: job_id.clone(),
+                seller_pubkey: runner.seller_pubkey.to_hex(),
+                status: FollowUpStatus::Turn,
+                prev_result_id: Some("c".repeat(64)),
+                turn: Some(2),
+                deadline_unix: Some(now_unix() as u64 + 3_600),
+                text: Some(text.to_owned()),
+            })
+            .expect("follow-up draft");
+            crate::gateway::nostr::event_builder(&draft)
+                .expect("builder")
+                .sign_with_keys(&buyer)
+                .expect("sign follow-up")
+        };
+        let (a, b) = (stale("#1203 first try"), stale("#1203 second try"));
+        assert_ne!(a.id, b.id);
+        let feedback = crate::kinds::JOB_FEEDBACK_KIND as u64;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.on_followup(&a).await;
+                runner.on_followup(&b).await;
+                assert!(
+                    fixture
+                        .wait_until_published(Duration::from_secs(5), |events| {
+                            events.iter().filter(|e| e.kind == feedback).count() >= 2
+                        })
+                        .await,
+                    "harness check: each stale follow-up is answered once"
+                );
+                // Replays, in both orders, as a restart and a backfill would deliver them.
+                for _ in 0..3 {
+                    runner.on_followup(&a).await;
+                    runner.on_followup(&b).await;
+                    runner.on_followup(&b).await;
+                    runner.on_followup(&a).await;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert_eq!(
+                    fixture.event_kind_count(feedback).await,
+                    2,
+                    "replays of an ended session's follow-ups must publish nothing new"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// #1299 N4 — a turn waiting for the previous turn's payment does not hold a drain until its
     /// deadline: it returns, left `waiting_payment` for the restarted seller to re-drive.
     /// RED ON REVERT: drop the drain check in the `PaymentGate::Wait` branch and the turn task keeps
