@@ -146,6 +146,56 @@ async fn link_flow_sends_code_links_key_sends_9030_and_welcome() {
     assert_eq!(other.body, json!({ "registered": false }));
 }
 
+// 20261123 is the current Terms/Privacy version, and CLIs released before it
+// still send 20261029. The default config must link both and record what each key accepted.
+#[tokio::test]
+async fn both_published_legal_versions_link_and_are_recorded() {
+    let app = TestApp::start().await;
+    for (i, version) in ["20261029", "20261123"].into_iter().enumerate() {
+        let agent = Keys::generate();
+        let email = format!("v{i}@example.com");
+        let r = app
+            .post(
+                &agent,
+                api::PATH_LINK_REQUEST,
+                json!({ "email": email, "label": "a", "terms_version": version, "privacy_version": version }),
+            )
+            .await;
+        assert_eq!(r.status, 202, "{version}: {:?}", r.body);
+        assert_eq!(
+            r.body["terms_url"],
+            format!("https://www.maxplayer.ai/terms/{version}")
+        );
+        assert_eq!(
+            r.body["privacy_url"],
+            format!("https://www.maxplayer.ai/privacy/{version}")
+        );
+        let code = app.emails().last().unwrap().var("CODE").to_string();
+        let r = app.confirm(&agent, &code).await;
+        assert_eq!(r.status, 200, "{version}: {:?}", r.body);
+        assert_eq!(r.body["terms_version"], version);
+        assert_eq!(r.body["privacy_version"], version);
+        let reg = db::get_registration(&app.db, &agent.public_key().to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (reg.terms_version.as_str(), reg.privacy_version.as_str()),
+            (version, version)
+        );
+    }
+    // A date that was never published is still refused.
+    let r = app
+        .post(
+            &Keys::generate(),
+            api::PATH_LINK_REQUEST,
+            json!({ "email": EMAIL, "label": "a", "terms_version": "20261231", "privacy_version": "20261123" }),
+        )
+        .await;
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body["error"], "unknown_terms_version");
+}
+
 #[tokio::test]
 async fn codes_are_stored_only_as_keyed_hashes() {
     let app = TestApp::start().await;

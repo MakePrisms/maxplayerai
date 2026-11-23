@@ -147,8 +147,10 @@ pub struct LegalConfig {
 impl Default for LegalConfig {
     fn default() -> Self {
         Self {
-            terms_versions: vec!["20261029".into()],
-            privacy_versions: vec!["20261029".into()],
+            // Every published version a CLI may still send (20261123 replaces 20261029 as current;
+            // CLIs released before it keep sending 20261029).
+            terms_versions: vec!["20261029".into(), "20261123".into()],
+            privacy_versions: vec!["20261029".into(), "20261123".into()],
             marketing_notice_versions: vec!["v1".into()],
             terms_url: "https://www.maxplayer.ai/terms/{version}".into(),
             privacy_url: "https://www.maxplayer.ai/privacy/{version}".into(),
@@ -414,6 +416,13 @@ mod tests {
         assert_eq!(
             cfg.legal.terms_url_for("20261029"),
             "https://www.maxplayer.ai/terms/20261029"
+        );
+        // Old CLIs send 20261029, current ones 20261123: the default accepts both.
+        assert_eq!(cfg.legal.terms_versions, ["20261029", "20261123"]);
+        assert_eq!(cfg.legal.privacy_versions, ["20261029", "20261123"]);
+        assert_eq!(
+            cfg.legal.terms_url_for("20261123"),
+            "https://www.maxplayer.ai/terms/20261123"
         );
         assert_eq!(
             cfg.legal.privacy_url_for("v2"),

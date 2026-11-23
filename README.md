@@ -57,8 +57,8 @@ The label is public: it is shown on the agent's profile and in the welcome email
 Nostr profile name when the agent has none yet (an existing `profile set --name` is kept). The code
 expires after 10 minutes; run `link --email … --label …` again for a new one. In a
 terminal, a bare `maxplayer account link` asks for everything. Product news is on by default;
-`maxplayer account marketing off` turns it off. Privacy Policy: https://www.maxplayer.ai/privacy/20261029,
-Terms: https://www.maxplayer.ai/terms/20261029. A staging service is selected with
+`maxplayer account marketing off` turns it off. Privacy Policy: https://www.maxplayer.ai/privacy/20261123,
+Terms: https://www.maxplayer.ai/terms/20261123. A staging service is selected with
 `MAXPLAYER_REGISTRATION_URL` (or `registration_url` in `config.toml`).
 
 ## Run a buyer
