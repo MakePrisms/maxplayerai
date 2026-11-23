@@ -356,9 +356,7 @@ mod tests {
             .map(|(name, argv)| {
                 (
                     (*name).to_owned(),
-                    AgentPresetConfig {
-                        argv: argv.iter().map(|a| (*a).to_owned()).collect(),
-                    },
+                    AgentPresetConfig::acp(argv.iter().map(|a| (*a).to_owned()).collect()),
                 )
             })
             .collect()

@@ -24065,9 +24065,7 @@ mod tests {
             // real ACP adapter would make this a test of the CI image rather than of the wiring.
             config.agents.insert(
                 "claude".to_owned(),
-                crate::home::AgentPresetConfig {
-                    argv: vec!["true".to_owned()],
-                },
+                crate::home::AgentPresetConfig::acp(vec!["true".to_owned()]),
             );
             config.relay_url = fixture.url();
         })
@@ -24362,9 +24360,7 @@ mod tests {
             config.seller = Some(seller);
             config.agents.insert(
                 "claude".to_owned(),
-                crate::home::AgentPresetConfig {
-                    argv: stub_argv(&script),
-                },
+                crate::home::AgentPresetConfig::acp(stub_argv(&script)),
             );
             config.relay_url = fixture.url();
         })

@@ -5514,9 +5514,7 @@ mod tests {
         let mut presets = BTreeMap::new();
         presets.insert(
             "myabsent".to_owned(),
-            AgentPresetConfig {
-                argv: vec!["maxplayer-doctor-absent-adapter-x7q".to_owned()],
-            },
+            AgentPresetConfig::acp(vec!["maxplayer-doctor-absent-adapter-x7q".to_owned()]),
         );
 
         let seller = SellerConfig {
@@ -5768,9 +5766,7 @@ mod tests {
         let mut presets = std::collections::BTreeMap::new();
         presets.insert(
             "claude".to_owned(),
-            maxplayer_core::home::AgentPresetConfig {
-                argv: vec![existing],
-            },
+            maxplayer_core::home::AgentPresetConfig::acp(vec![existing]),
         );
         presets
     }
@@ -5801,9 +5797,7 @@ mod tests {
         let mut presets = std::collections::BTreeMap::new();
         presets.insert(
             "cursor".to_owned(),
-            maxplayer_core::home::AgentPresetConfig {
-                argv: vec![existing],
-            },
+            maxplayer_core::home::AgentPresetConfig::acp(vec![existing]),
         );
         let seller = seller_for_agents(vec!["cursor".into()], vec!["ignored".into()]);
         let check = checks::check_harness_credential_permissions(
@@ -5862,9 +5856,7 @@ mod tests {
         let mut presets = std::collections::BTreeMap::new();
         presets.insert(
             "cursor".to_owned(),
-            maxplayer_core::home::AgentPresetConfig {
-                argv: vec![existing],
-            },
+            maxplayer_core::home::AgentPresetConfig::acp(vec![existing]),
         );
         let seller = seller_for_agents(vec!["cursor".into()], vec!["ignored".into()]);
         let check = checks::check_harness_credential_permissions(
@@ -5950,9 +5942,7 @@ mod tests {
         let mut presets = std::collections::BTreeMap::new();
         presets.insert(
             "grok".to_owned(),
-            maxplayer_core::home::AgentPresetConfig {
-                argv: vec![existing],
-            },
+            maxplayer_core::home::AgentPresetConfig::acp(vec![existing]),
         );
         let seller = seller_for_agents(vec!["grok".into()], vec!["ignored".into()]);
         let check = checks::check_harness_credential_permissions(

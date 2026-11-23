@@ -64,6 +64,18 @@ pub const HARNESS_FAMILIES: [&str; 4] = ["claude-code", "codex", "cursor", "goos
 /// A custom preset spelled EXACTLY as a spec family maps to that family. That is exact equality
 /// against the closed vocabulary, never a nearest match, and it is how `goose` reaches the wire
 /// without a code change once someone configures a goose preset.
+/// The family a BUILT-IN preset name implies (`claude` ⇒ `claude-code`, …), or `None` for any other
+/// name. Unlike [`harness_family_for_preset`] this never matches a bare family name, so a custom
+/// preset called `codex-mine` or `goose` is not mistaken for a built-in.
+pub fn builtin_family_for_name(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "claude" => Some("claude-code"),
+        "codex" => Some("codex"),
+        "cursor" => Some("cursor"),
+        _ => None,
+    }
+}
+
 pub fn harness_family_for_preset(preset: &str) -> Option<&'static str> {
     let key = preset.trim().to_ascii_lowercase();
     match key.as_str() {
@@ -277,9 +289,7 @@ mod tests {
             .map(|(name, argv)| {
                 (
                     (*name).to_owned(),
-                    AgentPresetConfig {
-                        argv: argv.iter().map(|a| (*a).to_owned()).collect(),
-                    },
+                    AgentPresetConfig::acp(argv.iter().map(|a| (*a).to_owned()).collect()),
                 )
             })
             .collect()

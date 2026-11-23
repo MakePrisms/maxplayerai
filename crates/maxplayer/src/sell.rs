@@ -1025,9 +1025,7 @@ mod tests {
         let mut custom = std::collections::BTreeMap::new();
         custom.insert(
             "codex".to_owned(),
-            home::AgentPresetConfig {
-                argv: vec!["/opt/not-codex".to_owned()],
-            },
+            home::AgentPresetConfig::acp(vec!["/opt/not-codex".to_owned()]),
         );
 
         let mut err = Vec::new();
@@ -1053,9 +1051,7 @@ mod tests {
         let mut custom = std::collections::BTreeMap::new();
         custom.insert(
             "mine".to_owned(),
-            home::AgentPresetConfig {
-                argv: vec![argv0.clone()],
-            },
+            home::AgentPresetConfig::acp(vec![argv0.clone()]),
         );
 
         let options = SellOptions::parse(&["--agent".into(), "mine".into()]).expect("parse");
