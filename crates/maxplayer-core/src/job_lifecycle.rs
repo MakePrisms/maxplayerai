@@ -1318,7 +1318,8 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// When the relay is slow or stalled, the window is ONE wall-clock budget for the whole view read
 /// ([`fetch_job_view_async`] shares it across connect, offer read, probe, recheck and the
 /// claim/result reads), so a wait ends at most this much (plus a few [`VIEW_SUB_READ_FLOOR`]s)
-/// past its cap: 10 s + 2 s, inside the 15 s MCP tool deadline.
+/// past its cap: 10 s + 2 s, inside the 15 s MCP tool deadline. A private offer's flush/backfill
+/// adds at most half of each read's window ([`private_sync_budget`]): at worst about 13 s.
 const MIN_WAIT_READ: Duration = Duration::from_secs(2);
 
 /// The window for one view read inside a `wait_for` long-poll: the normal fetch timeout, cut to
@@ -3676,9 +3677,11 @@ fn serialize_accepted_view<S: serde::Serializer>(bind: &Option<AcceptedBind>, se
 ///
 /// `timeout` is ONE wall-clock budget for the relay reads of this view, not a per-REQ window: the
 /// connect wait, offer read, liveness probe, offer recheck and claim/result (or v2 history) reads
-/// each get the time left, never less than [`VIEW_SUB_READ_FLOOR`]. Not covered, and not charged
-/// to the budget: the outbox flush/backfill of a locally queued private offer, which runs first
-/// and keeps its own I/O bounds.
+/// each get the time left, never less than [`VIEW_SUB_READ_FLOOR`]. The outbox flush/backfill of a
+/// private offer (run first for a locally queued one, or after the reads for one the relay
+/// returned that this home has no record of) is not charged to that budget: it gets its own
+/// [`private_sync_budget`], half of `timeout`, so a whole view read takes at most 1.5 x `timeout`
+/// plus a few floors.
 pub(crate) async fn fetch_job_view_async(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
@@ -3695,12 +3698,33 @@ pub(crate) async fn fetch_job_view_async(
     // publication before any absence decision; retain its exact signed identity.
     let mut local_private = crate::seller_node::privacy::known(home, &keys.public_key().to_hex(), job_id)
         .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    // Bounded by `private_sync_budget`: cutting it short is safe (unsent copies stay in the
+    // outbox, the backfill cursor keeps only finished windows) and the relay reads below then
+    // decide, an absent offer reading as pending and unconfirmed.
     if let Some((ctx, _)) = &mut local_private {
-        if let Ok(mut transport) = crate::private_content::session::AuthenticatedContentRelay::connect(keys, &home.config.relay_url).await {
-            let _ = crate::private_content::session::flush(&mut ctx.store, keys, &mut transport, 64).await;
+        let budget = private_sync_budget(timeout);
+        let sync = async {
+            let mut transport = crate::private_content::session::AuthenticatedContentRelay::connect(
+                keys,
+                &home.config.relay_url,
+            )
+            .await
+            .ok()?;
+            let _ = crate::private_content::session::flush(&mut ctx.store, keys, &mut transport, 64)
+                .await;
             let refreshed = transport.backfill(&mut ctx.store, keys, now).await;
             transport.disconnect().await;
-            refreshed.map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
+            Some(refreshed)
+        };
+        match tokio::time::timeout(budget, sync).await {
+            Ok(Some(refreshed)) => {
+                refreshed.map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
+            }
+            Ok(None) => {}
+            Err(_) => crate::opline!(
+                "buyer private offer {job_id}: outbox flush/backfill did not finish within {}ms; reading the relay anyway (retried next read)",
+                budget.as_millis()
+            ),
         }
     }
     // The budget starts AFTER the private-offer pre-step above: that step keeps its own I/O
@@ -3868,14 +3892,30 @@ pub(crate) async fn fetch_job_view_async(
             let mut context = if let Some((context, _)) = local_private.take() { context } else {
                 let mut context = crate::private_content::channel::ContentContext::open(home, &keys.public_key().to_hex())
                     .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
-                let mut transport = crate::private_content::session::AuthenticatedContentRelay::connect(keys, &home.config.relay_url).await
-                    .map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
-                let refreshed = async {
-                    crate::private_content::session::flush(&mut context.store, keys, &mut transport, 64).await?;
-                    transport.backfill(&mut context.store, keys, now).await
-                }.await;
-                transport.disconnect().await;
-                refreshed.map_err(|e: crate::private_content::Error| JobLifecycleError::Relay(e.to_string()))?;
+                // Same bound as the pre-step above. Here the private view needs the synced
+                // content, so running out of time is an error the caller retries.
+                let budget = private_sync_budget(timeout);
+                let synced = tokio::time::timeout(budget, async {
+                    let mut transport = crate::private_content::session::AuthenticatedContentRelay::connect(keys, &home.config.relay_url).await
+                        .map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
+                    let refreshed = async {
+                        crate::private_content::session::flush(&mut context.store, keys, &mut transport, 64).await?;
+                        transport.backfill(&mut context.store, keys, now).await
+                    }.await;
+                    transport.disconnect().await;
+                    refreshed.map_err(|e: crate::private_content::Error| JobLifecycleError::Relay(e.to_string()))
+                }).await;
+                match synced {
+                    Ok(refreshed) => {
+                        refreshed?;
+                    }
+                    Err(_) => {
+                        return Err(JobLifecycleError::Relay(format!(
+                            "private content sync for {job_id} did not finish within {}ms; retry",
+                            budget.as_millis()
+                        )));
+                    }
+                }
                 context
             };
             return private_view_from_events(home, &mut context, event, feedback_events.into_iter().collect(),
@@ -4037,6 +4077,13 @@ pub(crate) async fn fetch_job_view_async(
 const VIEW_SUB_READ_FLOOR: Duration = Duration::from_millis(20);
 
 /// The time left on a view read's shared budget, never below [`VIEW_SUB_READ_FLOOR`].
+/// The private-offer outbox flush/backfill's bound inside one view read: half the view's budget.
+/// Each of its steps (connect and NIP-42 sign-in, flush, backfill windows) otherwise waits up to
+/// 20 s on its own, which put a `get_job` wait on a private offer past the 15 s MCP tool deadline.
+fn private_sync_budget(timeout: Duration) -> Duration {
+    (timeout / 2).max(VIEW_SUB_READ_FLOOR)
+}
+
 fn view_read_left(read_deadline: tokio::time::Instant) -> Duration {
     read_deadline
         .saturating_duration_since(tokio::time::Instant::now())
@@ -7400,6 +7447,56 @@ mod tests {
                 "{wait_loop:?}: wait took {elapsed:?}, past the {bound:?} bound (MCP tool deadline 15 s)"
             );
         }
+    }
+
+    // TOOTH — a locally queued private offer runs an outbox flush/backfill before the relay reads.
+    // This local relay never sends a NIP-42 challenge, so that step's connect waits out its own
+    // 20 s sign-in window: unbounded, one view read on the default (private) visibility took past
+    // the 15 s MCP tool deadline. The pre-step is cut at `private_sync_budget`, and the view read
+    // then ends within 1.5 x its budget plus slack, whatever it returns.
+    //
+    // BITE: drop the `tokio::time::timeout` around the pre-step and this read takes ~20 s.
+    #[cfg(feature = "wallet")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_private_offer_sync_stays_inside_the_view_budget() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::JsonUtil;
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let (root, mut home) = temp_job_home("private-sync-stall");
+        home.config.relay_url = relay.url().await.to_string();
+        let buyer = nostr_sdk::Keys::generate();
+        let offer = nostr_sdk::EventBuilder::text_note("locally queued private offer")
+            .sign_with_keys(&buyer)
+            .expect("sign");
+        let job_id = offer.id.to_hex();
+        let store = home.root.join("private-content.sqlite");
+        drop(crate::private_content::store::ContentStore::open(&store).expect("content store"));
+        rusqlite::Connection::open(&store)
+            .expect("open content store")
+            .execute(
+                "INSERT INTO content_events(id,root,event) VALUES(?1,?1,?2)",
+                rusqlite::params![job_id, offer.as_json()],
+            )
+            .expect("queue the offer locally");
+        assert!(
+            crate::seller_node::privacy::known(&home, &buyer.public_key().to_hex(), &job_id)
+                .expect("known")
+                .is_some(),
+            "the fixture must take the private pre-step"
+        );
+
+        let timeout = Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+        let _ = fetch_job_view_async(&home, &buyer, &job_id, timeout, now_unix()).await;
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_dir_all(&root);
+        let bound = timeout + private_sync_budget(timeout) + Duration::from_secs(2);
+        assert!(
+            elapsed <= bound,
+            "a stalled private sync held the view read for {elapsed:?}, past {bound:?}"
+        );
     }
 
     // NETWORK (#720): same shape as the wait test above — the relay is local, but the
