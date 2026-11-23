@@ -14,13 +14,17 @@ pub(crate) const NIP44_MAX: usize = 65_408;
 /// NIP-44 pads to 1/8 of the next power of two, so above 32 KiB the seal grows in 8 KiB steps:
 /// every rumor of 40,961..=49,152 bytes seals to the same 65,971 bytes (#1349). Size guards on
 /// anything that rides in a rumor derive from this, never from a round 60 KiB.
+// The size model's only non-test users are the review lane's (`wallet`) guards.
+#[cfg_attr(not(feature = "wallet"), allow(dead_code))]
 pub(crate) const MAX_SEALABLE_RUMOR: usize = max_sealable_rumor();
 
 /// Seal JSON minus its content: fixed-width id, pubkey, sig, a 10-digit created_at, kind 13 and
 /// empty tags. Pinned against a real seal by `seal_size_model_matches_wrap`.
+#[cfg_attr(not(feature = "wallet"), allow(dead_code))]
 const SEAL_JSON_OVERHEAD: usize = 343;
 
 /// nostr 0.44 `nip44::v2::calc_padding`.
+#[cfg_attr(not(feature = "wallet"), allow(dead_code))]
 const fn nip44_padded_len(len: usize) -> usize {
     if len <= 32 {
         return 32;
@@ -32,10 +36,12 @@ const fn nip44_padded_len(len: usize) -> usize {
 
 /// Seal JSON bytes for a rumor of `rumor` bytes: base64(version + nonce + u16 length + padded
 /// plaintext + MAC) plus the fixed fields. Deterministic: keys change bytes, never lengths.
+#[cfg_attr(not(feature = "wallet"), allow(dead_code))]
 pub(crate) const fn seal_json_len(rumor: usize) -> usize {
     SEAL_JSON_OVERHEAD + (1 + 32 + 2 + nip44_padded_len(rumor) + 32).div_ceil(3) * 4
 }
 
+#[cfg_attr(not(feature = "wallet"), allow(dead_code))]
 const fn max_sealable_rumor() -> usize {
     let mut len = NIP44_MAX;
     while len > 0 && seal_json_len(len) > NIP44_MAX {
@@ -46,7 +52,9 @@ const fn max_sealable_rumor() -> usize {
 
 /// The checks [`wrap_checked`] applies to its two NIP-44 layers, without encrypting: builds the
 /// same rumor (only its length matters) and predicts the seal from it. For trimming a message
-/// to what will actually seal; [`wrap_checked`] stays the authority at send time.
+/// to what will actually seal; [`wrap_checked`] stays the authority at send time. Tests only:
+/// production trims on [`sealed_len`].
+#[cfg(test)]
 pub(crate) fn check_sealable(
     recipient: PublicKey,
     message: String,
@@ -57,11 +65,13 @@ pub(crate) fn check_sealable(
 }
 
 /// Seal JSON bytes [`wrap_checked`] would produce for `message` (also past the limit).
+#[cfg_attr(not(feature = "wallet"), allow(dead_code))]
 pub(crate) fn sealed_len(recipient: PublicKey, message: String) -> usize {
     seal_json_len(rumor_json_len(recipient, message))
 }
 
 /// The rumor [`wrap_checked`] builds; the author is any fixed-width key, so the recipient serves.
+#[cfg_attr(not(feature = "wallet"), allow(dead_code))]
 fn rumor_json_len(recipient: PublicKey, message: String) -> usize {
     let mut rumor = EventBuilder::private_msg_rumor(recipient, message)
         .allow_self_tagging()
@@ -171,7 +181,8 @@ mod size_tests {
     }
 
     /// #1349: the seal grows in NIP-44 padding steps, so the sealable rumor ceiling is 40,960
-    /// bytes, well below `NIP44_MAX`. A library change to padding or seal shape fails here.
+    /// bytes, well below `NIP44_MAX`. This pins our own const model only; a library change to
+    /// padding or seal shape fails `seal_size_model_matches_wrap`, which seals at both ceilings.
     #[test]
     fn sealable_rumor_ceiling_is_pinned() {
         assert_eq!(MAX_SEALABLE_RUMOR, 40_960);
@@ -193,6 +204,46 @@ mod size_tests {
             rumor.as_json().len()
         };
         let overhead = rumor_len("");
+        let recipient_keys = Keys::generate();
+        // The exact ceilings against real seals, unescaped so every message byte is a rumor byte:
+        // the seal layer at MAX_SEALABLE_RUMOR and the rumor layer at NIP44_MAX, a byte each side.
+        for (rumor, refused) in [
+            (MAX_SEALABLE_RUMOR, None),
+            (MAX_SEALABLE_RUMOR + 1, Some(("seal", 65_971))),
+            (NIP44_MAX, Some(("seal", 87_815))),
+            (NIP44_MAX + 1, Some(("rumor", NIP44_MAX + 1))),
+        ] {
+            let message = "x".repeat(rumor - overhead);
+            assert_eq!(rumor_len(&message), rumor);
+            let to = recipient_keys.public_key();
+            let wrapped = wrap_checked(&keys, to, message.clone()).await;
+            let predicted = check_sealable(to, message);
+            match refused {
+                None => {
+                    predicted.unwrap();
+                    let outer = wrapped.unwrap();
+                    let seal =
+                        nip44::decrypt(recipient_keys.secret_key(), &outer.pubkey, &outer.content)
+                            .unwrap();
+                    assert_eq!(seal.len(), 55_047, "{rumor}");
+                    assert_eq!(seal.len(), seal_json_len(rumor), "{rumor}");
+                }
+                Some((layer, actual)) => {
+                    for result in [wrapped.map(|_| ()), predicted] {
+                        match result {
+                            Err(WrapError::Size {
+                                layer: l,
+                                actual: a,
+                                allowed,
+                            }) => {
+                                assert_eq!((l, a, allowed), (layer, actual, NIP44_MAX), "{rumor}")
+                            }
+                            other => panic!("{rumor}: {other:?}"),
+                        }
+                    }
+                }
+            }
+        }
         for len in [
             1, 100, 255, 1_000, 30_000, 40_000, 40_681, 40_682, 40_683, 45_000, 60_000,
         ] {
@@ -226,7 +277,6 @@ mod size_tests {
             }
         }
         // Exact seal length on a sealing size: decrypt the real wrapper as the recipient.
-        let recipient_keys = Keys::generate();
         for len in [500, 20_000, 40_000] {
             let message = "x".repeat(len);
             let outer = wrap_checked(&keys, recipient_keys.public_key(), message.clone())

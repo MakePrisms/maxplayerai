@@ -144,6 +144,28 @@ fn setup<E: std::fmt::Display>(error: E) -> (ReasonCode, String) {
     (ReasonCode::ExecutionFailed, error.to_string())
 }
 
+/// The one constructor of a `turn_too_large` failure (#1349): sizes only, never buyer text.
+fn too_large(needed: usize, limit: usize) -> (ReasonCode, String) {
+    (
+        ReasonCode::TurnTooLarge,
+        format!("needs {needed} sealed bytes; limit {limit}"),
+    )
+}
+
+/// The detail a failure may show the buyer: only a `turn_too_large` whose detail has exactly the
+/// digits-only shape [`too_large`] builds. Every other detail is log-only, so a future error string
+/// returned under this code cannot reach the buyer.
+fn buyer_sizes(code: ReasonCode, detail: &str) -> Option<&str> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if code != ReasonCode::TurnTooLarge {
+        return None;
+    }
+    let (needed, limit) = detail
+        .strip_prefix("needs ")?
+        .split_once(" sealed bytes; limit ")?;
+    (digits(needed) && digits(limit)).then_some(detail)
+}
+
 fn now_secs() -> u64 {
     now_unix().max(0) as u64
 }
@@ -689,7 +711,7 @@ impl SellerNodeRunner {
                     code.as_str()
                 );
                 let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
-                let sizes = (code == ReasonCode::TurnTooLarge).then_some(detail.as_str());
+                let sizes = buyer_sizes(code, &detail);
                 self.turn_feedback_with(&job_id, &buyer, fid, code, sizes)
                     .await;
             }
@@ -817,10 +839,7 @@ impl SellerNodeRunner {
                 &deliveries,
             ) {
                 Err(crate::review::private::FollowUpRequestError::TooLarge { needed, limit }) => {
-                    return Err((
-                        ReasonCode::TurnTooLarge,
-                        format!("needs {needed} sealed bytes; limit {limit}"),
-                    ));
+                    return Err(too_large(needed, limit));
                 }
                 Err(error) => Some(Err(error.to_string())),
                 Ok(request) => Some(Ok(request)),
@@ -1651,6 +1670,30 @@ mod tests {
             text.contains("too large") && text.contains("post a new job"),
             "{text}"
         );
+    }
+
+    /// Only the sizes `too_large` builds reach the buyer; any other detail stays in the log.
+    #[test]
+    fn only_too_large_sizes_reach_the_buyer() {
+        let (code, detail) = too_large(65_971, 65_408);
+        assert_eq!(
+            buyer_sizes(code, &detail),
+            Some("needs 65971 sealed bytes; limit 65408")
+        );
+        assert_eq!(buyer_sizes(ReasonCode::ExecutionFailed, &detail), None);
+        for leaked in [
+            "needs 1 sealed bytes; limit 2 and the buyer said hi",
+            "needs hi sealed bytes; limit 2",
+            "needs  sealed bytes; limit 2",
+            "the buyer's text",
+            "",
+        ] {
+            assert_eq!(
+                buyer_sizes(ReasonCode::TurnTooLarge, leaked),
+                None,
+                "{leaked}"
+            );
+        }
     }
 
     /// Failure test 5 (host half): a refused review writes `abort` and never the buyer's text;

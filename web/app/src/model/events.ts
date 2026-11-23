@@ -330,6 +330,9 @@ const REASON_CODE_CLASS = new Map<string, string>([
   ["execution_failed", "error"],
   ["delivery_failed", "error"],
   ["no_sentinel", "refusal"],
+  ["session_expired", "refusal"],
+  ["turn_too_large", "refusal"],
+  ["capability_missing", "refusal"],
 ]);
 
 /** protocol-v1 §7.2. `progress` is explicitly non-terminal; the rest end an attempt. */

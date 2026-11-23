@@ -307,7 +307,6 @@ mod tests {
         assert!(error.contains("private message is"), "{error}");
         assert!(error.contains("limit 40960 bytes"), "{error}");
         assert!(super::super::permanent_error(&error));
-        assert!(super::super::permanent_error(&error));
         assert!(!error.contains("xxxx"));
     }
     #[test]

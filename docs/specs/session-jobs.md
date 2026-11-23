@@ -148,6 +148,10 @@ plus content (git), §7.2.
 not count against the seller. Protocol §7.1 already makes the reason vocabulary extensible
 (`docs/protocol-v1.md:807 @e0262420`).
 
+`turn_too_large` (#1349) has the same shape and the same `refusal` class: a private follow-up whose
+minimal review request does not fit one NIP-59 seal (§9). Nothing ran or was charged, and the session
+stays parked.
+
 ### 2.4 Accept — binds a turn
 
 A session ACCEPT (3406) carries `["e", result_id, "", "reply"]`. Protocol §6.5 calls ACCEPT
@@ -187,7 +191,8 @@ is a new kind or a new optional tag. Protocol §2.1 lists the maxplayer-owned ki
    - `3403` allowed (`:353`): add `"reply"`, `"turn_status"`, `"context"`, `"creq"` (the existing
      16 KiB creq bound at `:440` applies).
    - `3406` (`:344`): add `"reply"`.
-   - Feedback reasons (`ppp/wire.rs:170 @e0262420`): add `"session_expired"`.
+   - Feedback reasons (`ppp/wire.rs:170 @e0262420`): add `"session_expired"` (and `"turn_too_large"`,
+     #1349).
    - `3404` allowed (`:345`): add `"reply"` — §2.3's `session_expired` FEEDBACK carries
      `["e", followup_id, "", "reply"]`, which the private allowlist would otherwise refuse.
      (Found while implementing; the list above omitted it.)
