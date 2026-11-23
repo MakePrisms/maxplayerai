@@ -114,10 +114,13 @@ pub fn resolve_agent_preset_in(
         .get_key_value(trimmed)
         .or_else(|| custom.get_key_value(key.as_str()))
     {
-        if preset.argv.is_empty() {
+        // A hook preset launches its hook argv (run by the hook runner, never the ACP driver; the
+        // registry records which).
+        let argv = preset.hook.clone().unwrap_or_else(|| preset.argv.clone());
+        if argv.is_empty() {
             return Err(format!("agent preset {configured:?} has an empty argv"));
         }
-        return Ok((configured.clone(), preset.argv.clone()));
+        return Ok((configured.clone(), argv));
     }
     match key.as_str() {
         "claude" => resolve_claude(host).map(|argv| ("claude".into(), argv)),
@@ -174,7 +177,8 @@ pub fn detect_available_agents(custom: &BTreeMap<String, AgentPresetConfig>) -> 
 }
 
 fn custom_preset_available(preset: &AgentPresetConfig) -> bool {
-    match preset.argv.first() {
+    let argv = preset.hook.as_ref().unwrap_or(&preset.argv);
+    match argv.first() {
         Some(argv0) => which(argv0).is_some() || Path::new(argv0).is_file(),
         None => false,
     }

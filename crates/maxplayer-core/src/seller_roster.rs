@@ -632,6 +632,7 @@ mod tests {
                 .map(|name| RegisteredAgent {
                     name: name.map(str::to_owned),
                     argv: vec![format!("{}-acp", name.unwrap_or("hatch"))],
+                    kind: Default::default(),
                 })
                 .collect(),
         ))

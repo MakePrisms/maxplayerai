@@ -53,8 +53,72 @@ pub struct RegisteredAgent {
     /// a job's request. `None` for the raw `--agent-argv` hatch: an argv with no preset label has
     /// no harness name we can honestly publish.
     pub name: Option<String>,
-    /// The launch argv for the ACP driver (no shell).
+    /// The launch argv: for the ACP driver (`Acp`) or the hook runner (`Hook`). No shell.
     pub argv: Vec<String>,
+    /// What runs behind `argv` (docs/specs/hook-agents.md §2).
+    pub kind: AgentKind,
+}
+
+/// Whether an entry is an ACP harness we run in our sandbox, or the seller's own agent behind a
+/// hook command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AgentKind {
+    #[default]
+    Acp,
+    /// Self-reported `family`/`model` from the preset, both optional.
+    Hook {
+        family: Option<String>,
+        model: Option<String>,
+    },
+}
+
+impl AgentKind {
+    pub fn is_hook(&self) -> bool {
+        matches!(self, Self::Hook { .. })
+    }
+    /// `acp` | `hook`, as journaled on the claim pin.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Acp => "acp",
+            Self::Hook { .. } => "hook",
+        }
+    }
+}
+
+impl RegisteredAgent {
+    /// The harness family this entry advertises: a hook's configured family, else the family a
+    /// built-in name implies (`claude` ⇒ `claude-code`), else for an ACP entry the existing
+    /// name-based mapping. `None` ⇒ no family/model tags for it.
+    pub fn family(&self) -> Option<String> {
+        let name = self.name.as_deref()?;
+        match &self.kind {
+            AgentKind::Hook { family, .. } => family
+                .clone()
+                .or_else(|| crate::agent_presets::builtin_family_for_name(name).map(str::to_owned)),
+            AgentKind::Acp => {
+                crate::agent_presets::harness_family_for_preset(name).map(str::to_owned)
+            }
+        }
+    }
+
+    /// A stable fingerprint of everything that decides what runs: kind, argv, family, model.
+    /// Pinned on the claim so a restart with a changed entry fails closed instead of running
+    /// something the claim did not describe.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let (family, model) = match &self.kind {
+            AgentKind::Hook { family, model } => (family.clone(), model.clone()),
+            AgentKind::Acp => (None, None),
+        };
+        let canonical = serde_json::json!({
+            "kind": self.kind.as_str(),
+            "name": self.name,
+            "argv": self.argv,
+            "family": family,
+            "model": model,
+        });
+        hex::encode(Sha256::digest(canonical.to_string().as_bytes()))
+    }
 }
 
 /// One listed preset's boot verdict. A FAIL never names an argv — it names the reason, so the
@@ -284,9 +348,20 @@ pub fn resolve(
                     .iter()
                     .any(|e: &RegisteredAgent| e.name.as_deref() == Some(label.as_str()))
                 {
+                    let kind = match presets
+                        .get(label.as_str())
+                        .filter(|preset| preset.is_hook())
+                    {
+                        Some(preset) => AgentKind::Hook {
+                            family: preset.family.clone(),
+                            model: preset.model.clone(),
+                        },
+                        None => AgentKind::Acp,
+                    };
                     entries.push(RegisteredAgent {
                         name: Some(label),
                         argv,
+                        kind,
                     });
                 }
             }
@@ -318,6 +393,7 @@ fn fallback_registry(seller: &SellerConfig) -> Result<ResolvedRegistry, Registry
         registry: AgentRegistry::new(vec![RegisteredAgent {
             name: None,
             argv: seller.agent_command.clone(),
+            kind: Default::default(),
         }]),
         verdicts: Vec::new(),
     })
@@ -369,6 +445,7 @@ mod tests {
                 .map(|name| RegisteredAgent {
                     name: Some((*name).to_owned()),
                     argv: vec![format!("{name}-acp")],
+                    kind: Default::default(),
                 })
                 .collect(),
         )
@@ -507,6 +584,7 @@ mod tests {
         RegisteredAgent {
             name: Some(name.to_owned()),
             argv: vec![format!("{name}-acp")],
+            kind: Default::default(),
         }
     }
 
@@ -524,6 +602,7 @@ mod tests {
                 "claude-agent-acp".into(),
                 "/home/seat/.claude/bin/claude".into(),
             ],
+            kind: Default::default(),
         };
         assert_eq!(
             harness_credential_dirs(&hatch, home),

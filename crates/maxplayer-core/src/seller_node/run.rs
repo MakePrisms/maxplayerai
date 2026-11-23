@@ -13055,6 +13055,7 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
         ]))
     }
@@ -14440,10 +14441,12 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
             crate::seller_agents::RegisteredAgent {
                 name: Some("codex".to_owned()),
                 argv: vec!["codex-acp".to_owned()],
+                kind: Default::default(),
             },
         ]));
         assert_eq!(
@@ -14470,6 +14473,7 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
         ]));
         let untargeted = offer(5, Some(SELLER), NOW + 600);
@@ -14856,10 +14860,12 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
             crate::seller_agents::RegisteredAgent {
                 name: Some("codex".to_owned()),
                 argv: vec!["codex-acp".to_owned()],
+                kind: Default::default(),
             },
         ]);
         let dispatched = registry
@@ -24691,6 +24697,7 @@ mod supervised_probe_tests {
         let roster = Arc::new(LiveRoster::new(AgentRegistry::new(vec![RegisteredAgent {
             name: Some("claude".to_owned()),
             argv: vec!["claude-acp".to_owned()],
+            kind: Default::default(),
         }])));
         roster.fault(0, Fault::Unproven, now);
         let due = now + Duration::from_secs(24 * 60 * 60);
@@ -24810,6 +24817,7 @@ mod supervised_probe_tests {
         let roster = Arc::new(LiveRoster::new(AgentRegistry::new(vec![RegisteredAgent {
             name: Some("claude".to_owned()),
             argv: vec!["claude-acp".to_owned()],
+            kind: Default::default(),
         }])));
         let now = Instant::now();
         roster.fault(0, Fault::Unproven, now);
