@@ -3,8 +3,8 @@
 - **Session (multi-turn) jobs are on by default for buyers and sellers.** `[sessions] enabled` unset
   now reads as on; `enabled = false` turns sessions off for both roles exactly as before, and
   `enabled = true` behaves as before. Buyers on a stock config get the `reply` MCP tool and
-  `post_job max_session_sats`, and the swarm engine sends a member's follow-up tasks as session
-  turns. Docker seats with container delivery advertise `["session","1"]` on their claims.
+  `post_job max_session_sats`, and the swarm engine sends a member's follow-up tasks of 15 minutes
+  or more as session turns (shorter tasks stay one-off jobs). Docker seats with container delivery advertise `["session","1"]` on their claims.
   - **Buyers:** an agent can now call `reply` without any opt-in, and each turn costs the job's
     price, up to a session cap of 10× the job price by default. The cap counts turn 1, so it covers
     turn 1 plus up to 9 follow-ups. Lower it with `[sessions] session_cap_sats` or
@@ -15,7 +15,8 @@
     6 hours (within a 5 GiB disk budget) so the buyer can send another turn, and run turn 1 with one
     agent attempt instead of 3. Turn 1 is asked to wrap up `wrap_up_secs` (300 s) before its
     deadline and may deliver `out_of_time` or `needs_input`; a job with too little time left at
-    launch (under `wrap_up_secs` + 420 s) runs single-turn. Change this with `[sessions]
+    launch (under `wrap_up_secs` + 420 s) runs single-turn; a follow-up to such a job is answered
+  `session_expired` and costs nothing. Change this with `[sessions]
     wrap_up_secs` or `enabled = false`.
   - Restart a running `maxplayer mcp` and `maxplayer buyer serve` to pick this up.
   - **runsc seats:** only an explicit `enabled = true` keeps the boot-blocking

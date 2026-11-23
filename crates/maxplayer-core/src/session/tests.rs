@@ -1172,6 +1172,9 @@ fn a_short_deadline_runs_turn_one_single_turn() {
     assert!(!runs_turn_one_as_session(&cfg, &open, true, 1_000, 1_120));
     assert!(runs_turn_one_as_session(&cfg, &open, true, 1_000, 4_600));
     assert!(!runs_turn_one_as_session(&off(), &open, true, 1_000, 4_600));
+    // Boundary: wrap_up_secs (300) + 420 s = 720 s left starts a session; 719 s does not.
+    assert!(runs_turn_one_as_session(&cfg, &open, true, 1_000, 1_720));
+    assert!(!runs_turn_one_as_session(&cfg, &open, true, 1_000, 1_719));
 }
 
 // ───────────── Non-runsc seats are unchanged (Petar, 15:33): no probe, no log, main's claims ─────────────

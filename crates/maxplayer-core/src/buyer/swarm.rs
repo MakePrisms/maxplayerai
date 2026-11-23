@@ -32,6 +32,9 @@ pub(crate) const TICK: Duration = Duration::from_secs(5);
 pub(crate) const UPDATE_EVERY_SECS: u64 = 180;
 /// Shortest task the engine posts (§7.3).
 pub(crate) const MIN_TASK_SECS: u64 = 300;
+/// Shortest task sent as a session turn (§7.6); shorter ones go out as one-off jobs. The buyer cannot
+/// see the seller's `wrap_up_secs`, and a seller on the default needs 720 s left to start a turn.
+pub(crate) const MIN_SESSION_TURN_SECS: u64 = 900;
 /// A posted task with no delivery this long after its deadline is `failed` and frees its seller.
 /// The seller stops executing by deadline + 420 s (container kill) plus teardown; the runner used
 /// the same 600 s (`scripts/challenges/swarm.mjs` EXPIRED_SLOT_GRACE_SECONDS).
@@ -1014,7 +1017,8 @@ impl Engine {
         let deadline = now + task.duration_secs;
         // Private swarms use session turns too: `reply` encrypts a private job's follow-up like its
         // offer (session-jobs §2.1), proven live on free and paid private jobs (§7.6 last bullet).
-        let session = if self.sessions && !task.fresh {
+        let session = if self.sessions && !task.fresh && task.duration_secs >= MIN_SESSION_TURN_SECS
+        {
             self.store
                 .swarm_session(&job.d, seller)
                 .map_err(es)?

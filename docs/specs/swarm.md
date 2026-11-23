@@ -270,7 +270,8 @@ it off) on a docker seat with container delivery.
   from that swarm job goes as a `reply` turn on it (same agent conversation), with self-contained
   task text, so the turn stands on its own if memory is lost.
 - **Falls back to a new one-off task** when: the claim did not advertise sessions; the task is
-  `fresh`; the session is `dead` (reply refused, or the turn never started before its deadline —
+  `fresh`; the task is shorter than 900 s (a seller on the default `wrap_up_secs` needs 720 s left to
+  start a turn, and the buyer cannot see that setting); the session is `dead` (reply refused, or the turn never started before its deadline —
   parked sessions expire after 6 h or a seller host/Docker restart, and can be evicted for disk);
   or the seller is not the pinned/selected seller for that task anyway. A turn that reports
   `["context","reset"]` is still a valid result; the session continues without memory and the lead

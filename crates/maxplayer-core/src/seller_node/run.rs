@@ -21614,6 +21614,35 @@ mod tests {
         home
     }
 
+    /// A default home (`[sessions] enabled` unset) puts kind-3412 follow-ups on the award REQ it
+    /// actually sends. RED ON REVERT: read `explicitly_enabled()` for the award filter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_home_award_subscription_carries_followups() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("default-award-3412");
+        let home = drain_session_home(&root, &fixture);
+        assert_eq!(home.config.sessions.enabled, None, "default [sessions]");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot");
+        runner
+            .subscribe_one(AWARD_SUB_ID, None)
+            .await
+            .expect("award REQ");
+        let filters = runner
+            .client
+            .subscription(&nostr_sdk::SubscriptionId::new(AWARD_SUB_ID))
+            .await;
+        let followup = Kind::Custom(crate::kinds::SESSION_FOLLOWUP_KIND);
+        assert!(
+            filters
+                .values()
+                .flatten()
+                .any(|f| f.kinds.as_ref().is_some_and(|k| k.contains(&followup))),
+            "{filters:?}"
+        );
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// #1299 follow-up: a priced session job parked after turn 1 (turn 1 unpaid): offer row, our
     /// claim journaled with `["session","1"]` (already expired, so the outbox holds no drain), the
     /// buyer's award, and the parked session record. Returns the job id.
