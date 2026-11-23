@@ -251,24 +251,30 @@ impl SellerNodeRunner {
             record.state.is_live(),
         ) {
             opline!("seller node follow-up ignore id={fid} job_id={job_id}: {why:?}");
-            // An ended session answers its buyer's turn once (the refused row dedups re-sends).
+            // An ended session answers each follow-up for a turn it never reached once, ever
+            // (#1203). The marker is written only after the refusal is out (or, private, durably
+            // queued), so a failed publish is retried by the next replay instead of silencing it.
             if why == session::Ignore::SessionEnded
                 && followup.status == FollowUpStatus::Turn
-                && let (Some(turn), Some(deadline)) = (followup.turn, followup.deadline_unix)
-                && matches!(
-                    store.record_turn(
-                        &fid,
-                        &job_id,
-                        turn,
-                        deadline,
-                        TurnState::Refused,
-                        now_secs()
-                    ),
-                    Ok(true)
-                )
+                && let Some(turn) = followup.turn.filter(|turn| *turn > record.turn)
             {
-                self.turn_feedback(&job_id, &award_buyer, &fid, ReasonCode::SessionExpired)
-                    .await;
+                match store.ended_refusal_due(&fid, &job_id, turn) {
+                    Ok(true) => {
+                        if self
+                            .turn_feedback(&job_id, &award_buyer, &fid, ReasonCode::SessionExpired)
+                            .await
+                            && let Err(error) = store.mark_ended_refusal(&fid, &job_id, now_secs())
+                        {
+                            opline!(
+                                "seller node follow-up id={fid}: refusal marker write failed ({error})"
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        opline!("seller node follow-up id={fid}: refusal check failed ({error})")
+                    }
+                }
             }
             return;
         }
@@ -484,7 +490,8 @@ impl SellerNodeRunner {
         }
     }
 
-    async fn turn_feedback(&self, job_id: &str, buyer: &str, fid: &str, code: ReasonCode) {
+    /// Whether it went out (see [`SellerNodeRunner::publish_buyer_feedback`]).
+    async fn turn_feedback(&self, job_id: &str, buyer: &str, fid: &str, code: ReasonCode) -> bool {
         self.turn_feedback_with(job_id, buyer, fid, code, None)
             .await
     }
@@ -497,7 +504,7 @@ impl SellerNodeRunner {
         fid: &str,
         code: ReasonCode,
         sizes: Option<&str>,
-    ) {
+    ) -> bool {
         // The follow-up id makes each turn's encrypted feedback a distinct content intent.
         let reason = match sizes {
             Some(sizes) => format!("{} ({sizes}; follow-up {fid})", feedback_text(code)),
@@ -513,7 +520,7 @@ impl SellerNodeRunner {
             status,
             vec![gateway::TagSpec::new(["e", fid, "", "reply"])],
         )
-        .await;
+        .await
     }
 
     /// One follow-up end to end: §8.3 payment gate, slot, §4 start margin, §5.5 holder gate, the

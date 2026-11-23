@@ -50,6 +50,9 @@ use crate::gateway::EventDraft;
 /// `[sessions] enabled = false`.
 pub const SCHEMA_VERSION: i64 = 15;
 
+/// #1203: the most follow-ups of one ENDED session job that are ever answered with a refusal.
+pub const ENDED_REFUSALS_PER_JOB: i64 = 8;
+
 /// The platform fee as journaled so far: what is owed on paper, what has been remitted, and the
 /// figures around them. Returned by [`SellerStore::accrued_fees`]. A query and nothing more — the
 /// only things that move the unremitted balance are the remittance writes
@@ -2241,8 +2244,10 @@ impl SellerStore {
         Ok(())
     }
 
-    /// Record a received follow-up. Idempotent on `followup_id`; a second follow-up for the same
-    /// `(job, turn)` is refused by the UNIQUE constraint and reported as `false`.
+    /// Record a received follow-up. Idempotent on `followup_id`; reported as `false` when the
+    /// follow-up was already refused (#1203) or another live follow-up holds `(job, turn)` (the
+    /// UNIQUE constraint). A REFUSED row of another follow-up for that turn is evicted first, so a
+    /// buyer can retry a released turn with a new follow-up.
     pub fn record_turn(
         &self,
         followup_id: &str,
@@ -2253,6 +2258,18 @@ impl SellerStore {
         now_unix: u64,
     ) -> Result<bool, StoreError> {
         let conn = self.lock()?;
+        // #1203: a follow-up this seat already refused never takes its turn back. Checked BEFORE
+        // the eviction below, so a replay of an old refused follow-up cannot delete a newer refused
+        // retry's row and re-run itself (two refused follow-ups used to evict each other forever).
+        let refused: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM seller_meta WHERE key = ?1)
+                 OR EXISTS (SELECT 1 FROM session_turns WHERE followup_id = ?2 AND state = 'refused')",
+            params![format!("turn-refused:{followup_id}"), followup_id],
+            |row| row.get(0),
+        )?;
+        if refused {
+            return Ok(false);
+        }
         conn.execute(
             "DELETE FROM session_turns WHERE job_id = ?1 AND turn = ?2 AND state = 'refused'
                  AND followup_id != ?3",
@@ -2276,6 +2293,60 @@ impl SellerStore {
         Ok(n == 1)
     }
 
+    /// #1203: whether an ENDED session still owes `followup_id` its one refusal. Not when it was
+    /// already answered (an `ended-refusal:` or `turn-refused:` marker, or a turn row of its own), nor
+    /// when another follow-up holds that turn (delivered, paid or in flight): a duplicate or an
+    /// evicted earlier attempt of a taken turn is owed nothing. Read-only: the caller marks it with
+    /// [`Self::mark_ended_refusal`] only once the refusal is out, so a failed publish is retried.
+    /// At most [`ENDED_REFUSALS_PER_JOB`] follow-ups of one ended job are ever answered, so a buyer
+    /// cannot make the seat sign refusals (and grow `seller_meta`) without bound.
+    pub fn ended_refusal_due(
+        &self,
+        followup_id: &str,
+        job_id: &str,
+        turn: u32,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn.query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM seller_meta WHERE key IN (?1, ?2))
+                 AND NOT EXISTS (SELECT 1 FROM session_turns WHERE followup_id = ?3
+                     OR (job_id = ?4 AND turn = ?5 AND state != 'refused'))
+                 AND (SELECT COUNT(*) FROM seller_meta WHERE key >= ?6 AND key < ?7) < ?8",
+            params![
+                format!("ended-refusal:{job_id}:{followup_id}"),
+                format!("turn-refused:{followup_id}"),
+                followup_id,
+                job_id,
+                turn,
+                // The job's markers, as a primary-key range (';' sorts right after ':').
+                format!("ended-refusal:{job_id}:"),
+                format!("ended-refusal:{job_id};"),
+                ENDED_REFUSALS_PER_JOB
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// #1203: record that an ended session answered `followup_id` of `job_id`. Never evicted
+    /// (deliberately not a `session_turns` row, whose refused rows `record_turn` evicts), so replays
+    /// of stale follow-ups publish nothing new. Keyed `ended-refusal:<job>:<follow-up>` so the
+    /// per-job cap is a key-range count. The value is when it was sent.
+    pub fn mark_ended_refusal(
+        &self,
+        followup_id: &str,
+        job_id: &str,
+        now_unix: u64,
+    ) -> Result<(), StoreError> {
+        self.lock()?.execute(
+            "INSERT OR IGNORE INTO seller_meta (key, value) VALUES (?1, ?2)",
+            params![
+                format!("ended-refusal:{job_id}:{followup_id}"),
+                now_unix.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_turn_state(
         &self,
         followup_id: &str,
@@ -2297,6 +2368,14 @@ impl SellerStore {
                 now_unix as i64
             ],
         )?;
+        // #1203: a refusal outlives the row a buyer's retry evicts, so `record_turn` never lets a
+        // replay of this follow-up take the turn back.
+        if state == crate::session::TurnState::Refused {
+            conn.execute(
+                "INSERT OR IGNORE INTO seller_meta (key, value) VALUES (?1, ?2)",
+                params![format!("turn-refused:{followup_id}"), now_unix.to_string()],
+            )?;
+        }
         Ok(())
     }
 
@@ -3836,6 +3915,45 @@ mod tests {
             (TurnState::Paid, Some("res"), Some("oid"))
         );
 
+        // #1203: an ended session owes a refusal only to a follow-up it never answered, for a turn
+        // nobody holds; once marked, never again, and marking leaves every turn row alone.
+        assert!(
+            !store.ended_refusal_due(&f2, "job-a", 2).unwrap(),
+            "a recorded turn is not refused again"
+        );
+        let (s1, s2) = ("5".repeat(64), "6".repeat(64));
+        assert!(
+            !store.ended_refusal_due(&s1, "job-a", 2).unwrap(),
+            "turn 2 is paid: a duplicate for it is owed nothing"
+        );
+        assert!(store.ended_refusal_due(&s1, "job-a", 9).unwrap());
+        assert!(store.ended_refusal_due(&s2, "job-a", 9).unwrap());
+        store.mark_ended_refusal(&s1, "job-a", 50).unwrap();
+        assert!(
+            !store.ended_refusal_due(&s1, "job-a", 9).unwrap(),
+            "once per follow-up, ever"
+        );
+        assert!(
+            store.ended_refusal_due(&s2, "job-a", 9).unwrap(),
+            "the marker is per follow-up"
+        );
+        assert!(store.turn(&f2).unwrap().is_some());
+        // ... and at most ENDED_REFUSALS_PER_JOB follow-ups of one ended job are ever answered.
+        // RED ON REVERT: drop the per-job count from `ended_refusal_due`.
+        for n in 0..ENDED_REFUSALS_PER_JOB {
+            let fid = format!("{n:064x}");
+            assert!(store.ended_refusal_due(&fid, "job-c", 2).unwrap());
+            store.mark_ended_refusal(&fid, "job-c", 51).unwrap();
+        }
+        assert!(
+            !store.ended_refusal_due(&s2, "job-c", 2).unwrap(),
+            "the per-job cap is reached"
+        );
+        assert!(
+            store.ended_refusal_due(&s2, "job-b", 9).unwrap(),
+            "the cap is per job"
+        );
+
         // A refused turn releases its number: the buyer's retry for the same turn is recorded.
         let f3 = "3".repeat(64);
         let f3b = "4".repeat(64);
@@ -3888,6 +4006,51 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        // #1203: the refused attempt of a turn its retry delivered is owed nothing once the
+        // session ends.
+        assert!(!store.ended_refusal_due(&f3, "job-a", 3).unwrap());
+        // #1203 (live session): two refused follow-ups for one turn never evict each other on
+        // replay. RED ON REVERT: drop the refused check at the top of `record_turn` and the replay
+        // of g1 deletes g2's row and takes turn 4 back.
+        let (g1, g2) = ("7".repeat(64), "8".repeat(64));
+        assert!(
+            store
+                .record_turn(&g1, "job-a", 4, 3_000, TurnState::Received, 90)
+                .unwrap()
+        );
+        store
+            .set_turn_state(&g1, TurnState::Refused, None, None, 91)
+            .unwrap();
+        assert!(
+            store
+                .record_turn(&g2, "job-a", 4, 3_000, TurnState::Received, 92)
+                .unwrap(),
+            "a new follow-up still retries the released turn"
+        );
+        store
+            .set_turn_state(&g2, TurnState::Refused, None, None, 93)
+            .unwrap();
+        assert!(
+            !store
+                .record_turn(&g1, "job-a", 4, 3_000, TurnState::Received, 94)
+                .unwrap(),
+            "a replayed refused follow-up does not take its turn back"
+        );
+        assert_eq!(
+            store.turn(&g2).unwrap().map(|t| t.state),
+            Some(TurnState::Refused),
+            "nor evict the newer refusal"
+        );
+        assert!(
+            !store
+                .record_turn(&g2, "job-a", 4, 3_000, TurnState::Received, 95)
+                .unwrap()
+        );
+        // Once the session ends, g1 (refused live, its row evicted by g2) is owed nothing either.
+        // RED ON REVERT: drop the `turn-refused:` key from `ended_refusal_due`.
+        assert!(store.turn(&g1).unwrap().is_none(), "harness check: g1's row was evicted");
+        assert!(!store.ended_refusal_due(&g1, "job-a", 4).unwrap());
+        assert!(!store.ended_refusal_due(&g2, "job-a", 4).unwrap());
         assert!(!store.session_close_requested("job-a").unwrap());
         store.request_session_close("job-a").unwrap();
         assert!(store.session_close_requested("job-a").unwrap());
