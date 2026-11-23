@@ -32,6 +32,8 @@ const ROUTES = {
   "fees-20261029.html": "/fees/20261029",
   // The link-preview page bots get for /skill.md (vercel.json); not linked, noindex.
   "skill-preview.html": "/skill-preview",
+  // The link-preview page bots get for /join/<token> (vercel.json rewrite); not linked, noindex.
+  "join-preview.html": "/join-preview",
 };
 
 const decode = (s) => s.replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
@@ -118,6 +120,17 @@ test("the preview image is 1200×630, small enough for every unfurler, and rende
   assert.match(render, /"og\/card\.html", "public\/og\/maxplayer-card\.png", 1200, 630/, "npm run og writes the shipped card");
 });
 
+test("the invite card is 1200×630, small enough for WhatsApp, and rendered from its template", () => {
+  const card = join(dist, "og", "invite-card.png");
+  assert.deepEqual(pngSize(card), [1200, 630]);
+  assert.ok(statSync(card).size < 300 * 1024, `invite card is ${statSync(card).size} bytes`);
+  const template = readFileSync(join(root, "og", "invite-card.html"), "utf8");
+  assert.match(template, /width: 1200px; height: 630px/, "the template renders at 1200×630");
+  assert.match(template, /You’re invited<br \/>to a Maxplayer<br \/>team/, "the card says it (Bob, 2026-11-22)");
+  const render = readFileSync(join(root, "scripts", "render-og.mjs"), "utf8");
+  assert.match(render, /"og\/invite-card\.html", "public\/og\/invite-card\.png", 1200, 630/, "npm run og writes the invite card");
+});
+
 // bob (2026-11-10): https://www.maxplayer.ai/skill.md must unfurl too. It is markdown, which no
 // unfurler reads, so vercel.json sends link-preview bots (only them) to /skill-preview.
 const BOTS = [
@@ -178,5 +191,39 @@ test("/skill.md sends only link-preview bots to its preview page; agents and bro
   assert.equal(one(html, "property", "og:url", "skill-preview.html"), `${ORIGIN}/skill-preview`);
   for (const page of readdirSync(dist).filter((f) => f.endsWith(".html") && f !== "skill-preview.html")) {
     assert.ok(!readFileSync(join(dist, page), "utf8").includes("/skill-preview"), `${page} does not link /skill-preview`);
+  }
+});
+
+// Bob (2026-11-22): a pasted team join link (/join/<token>) unfurls with the invite card. join.md is
+// plain text, so vercel.json rewrites (not redirects: the token stays in the URL) link-preview bots,
+// and only them, to /join-preview; agents, curl and browsers keep getting the plain-text page.
+test("/join/<token> sends only link-preview bots to its preview page; agents and browsers get join.md", () => {
+  const vercel = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
+  const rules = vercel.rewrites.filter((r) => r.source === "/join/:token");
+  assert.equal(rules.length, 2, "the bot rule, then the plain-text rule");
+  const [bot, plain] = rules;
+  assert.ok(vercel.rewrites.indexOf(bot) < vercel.rewrites.indexOf(plain), "the bot rule comes first");
+  assert.equal(bot.destination, "/join-preview");
+  assert.deepEqual(plain, { source: "/join/:token", destination: "/join.md" });
+  const skill = vercel.redirects.find((r) => r.source === "/skill.md");
+  assert.deepEqual(bot.has, skill.has, "the same bot list as /skill.md");
+  const re = new RegExp(bot.has[0].value.re);
+  for (const ua of BOTS) assert.ok(re.test(ua), `bot gets the preview: ${ua}`);
+  for (const ua of READERS) assert.ok(!re.test(ua), `reader keeps join.md: ${ua || "(no UA)"}`);
+  // The text/plain Content-Type must not reach the bots' HTML, or no card shows.
+  const hdr = vercel.headers.filter((h) => h.source === "/join/:token");
+  assert.equal(hdr.length, 1);
+  assert.deepEqual(hdr[0].missing, bot.has, "text/plain applies to everyone except the bots");
+  const robots = vercel.headers.find((h) => h.source === "/join-preview");
+  assert.deepEqual(robots?.headers, [{ key: "X-Robots-Tag", value: "noindex, nofollow" }]);
+
+  const html = readFileSync(join(dist, "join-preview.html"), "utf8");
+  assert.match(html, /<meta name="robots" content="noindex, nofollow" \/>/, "the preview page is noindex");
+  assert.doesNotMatch(html, /<script|<form|fetch\(/i, "the preview runs nothing");
+  assert.equal(one(html, "property", "og:title", "join-preview.html"), "Give this link to your agent to join", "Bob, 2026-11-22");
+  assert.equal(one(html, "property", "og:image", "join-preview.html"), `${ORIGIN}/og/invite-card.png`);
+  assert.equal(one(html, "property", "og:url", "join-preview.html"), `${ORIGIN}/join-preview`, "og:url needs no token");
+  for (const page of readdirSync(dist).filter((f) => f.endsWith(".html") && f !== "join-preview.html")) {
+    assert.ok(!readFileSync(join(dist, page), "utf8").includes("/join-preview"), `${page} does not link /join-preview`);
   }
 });

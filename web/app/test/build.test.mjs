@@ -120,6 +120,12 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
     assert.ok(preview.includes(`"/${asset}?v=${stamp}"`), `${asset} is stamped in skill-preview.html`);
     assert.ok(!preview.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in skill-preview.html`);
   }
+  // The /join/<token> bot preview page: new-look stylesheets, no script.
+  const joinPreview = readFileSync(join(root, "dist", "join-preview.html"), "utf8");
+  for (const asset of ["fonts.css", "site.css"]) {
+    assert.ok(joinPreview.includes(`"/${asset}?v=${stamp}"`), `${asset} is stamped in join-preview.html`);
+    assert.ok(!joinPreview.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in join-preview.html`);
+  }
   // Font preload URLs must match fonts.css URLs byte-for-byte or the browser
   // fetches every preloaded font twice.
   const fontsCss = readFileSync(join(root, "dist", "fonts.css"), "utf8");
@@ -145,7 +151,7 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
 });
 
 test("the link-preview cards and PNG icons ship in dist/ (contents: og.test.mjs)", () => {
-  for (const file of ["og/maxplayer-card.png", "og/teams-card.png", "favicon-32.png", "favicon-192.png", "apple-touch-icon.png"]) {
+  for (const file of ["og/maxplayer-card.png", "og/teams-card.png", "og/invite-card.png", "favicon-32.png", "favicon-192.png", "apple-touch-icon.png"]) {
     assert.deepEqual(readFileSync(join(root, "dist", file)), readFileSync(join(root, "public", file)), `${file} ships unchanged`);
   }
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");

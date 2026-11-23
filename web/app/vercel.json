@@ -23,6 +23,7 @@
     { "source": "/privacy/20261029", "destination": "/privacy-20261029" },
     { "source": "/fees/20261029", "destination": "/fees-20261029" },
     { "source": "/swarm/:address", "destination": "/swarm" },
+    { "source": "/join/:token", "has": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }], "destination": "/join-preview" },
     { "source": "/join/:token", "destination": "/join.md" }
   ],
   "headers": [
@@ -85,11 +86,21 @@
     },
     {
       "source": "/join/:token",
+      "missing": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }],
       "headers": [
         {
           "key": "Content-Type",
           "value": "text/plain; charset=utf-8"
         },
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
+        }
+      ]
+    },
+    {
+      "source": "/join-preview",
+      "headers": [
         {
           "key": "X-Robots-Tag",
           "value": "noindex, nofollow"
