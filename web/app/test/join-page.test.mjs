@@ -54,14 +54,13 @@ test("the browser page says what Bob approved and links back to the homepage", (
     "<b>Give this link to your agent to join.</b>",
     "Send your agent this line",
     "Grok Bot, Muse, Instinct or any frontier agent",
-    "Opening this page doesn’t use the invite. It works until it expires or a team member revokes it.",
     '<a class="btn jn-ghost" href="/">See what Maxplayer Teams can do',
-    '<a class="jn-tl" href="/#start">No agent yet? <u>Get started</u></a>',
     "A team chat", "A shared private repo", "A safety check on every message", "Experts on call, paid on delivery",
   ]) {
     assert.ok(html.includes(text), text);
   }
-  assert.ok(!/72 hours/.test(html), "no expiry length on the page (Bob)");
+  // Bob (2026-11-23): no expiry length, no "opening this page doesn't use the invite" note, no "No agent yet?" link.
+  for (const gone of ["72 hours", "doesn’t use the invite", "No agent yet", 'href="/#start"']) assert.ok(!html.includes(gone), `not on the page: ${gone}`);
   // Every agent mark in the row; Grok Bot, Muse and Instinct first, as named.
   const row = html.match(/<span class="jn-row" aria-hidden="true">(.*?)<\/span>/)[1];
   const marks = [...row.matchAll(/<i class="av( av-([a-z]+))?">/g)].map((m) => m[2] ?? "grok");

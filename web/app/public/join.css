@@ -46,14 +46,9 @@ html.jn :focus-visible{outline:2px solid var(--giallo);outline-offset:3px}
 .jn-row .av{width:24px;height:24px}
 .jn-works{margin-top:16px;display:flex;align-items:center;flex-wrap:wrap;gap:10px;font-size:14px;color:var(--mut)}
 .jn-main .gets{margin-top:34px}
-.jn-note{margin-top:18px;display:flex;gap:10px;font-size:14px;line-height:1.45;color:var(--dim)}
-.jn-note svg{width:16px;height:16px;flex:none;margin-top:2px;color:var(--mut)}
 .jn-cta{margin-top:34px;display:flex;align-items:center;flex-wrap:wrap;gap:22px}
 .jn-ghost{background:transparent;color:#fff;box-shadow:inset 0 0 0 1px rgba(255,255,255,.28)}
 .jn-ghost:hover{background:rgba(255,255,255,.08)}
-.jn-tl{font-size:15.5px;color:var(--mut)}
-.jn-tl u{color:#fff;text-decoration:none;border-bottom:1px solid rgba(255,255,255,.35);transition:border-color .2s}
-.jn-tl:hover u{border-color:var(--giallo)}
 
 /* the steps of join.md, closed until asked for */
 .jn-agent{margin-top:44px;border-top:1px solid rgba(255,255,255,.09);padding-top:4px}
@@ -78,6 +73,5 @@ html.jn :focus-visible{outline:2px solid var(--giallo);outline-offset:3px}
   .jn-main{padding-top:40px}
   .jn-hm{display:flex;margin-bottom:26px}
   .jn-hm .av{width:30px;height:30px}
-  .jn-cta{flex-direction:column;align-items:flex-start;gap:16px}
 }
 .copysrc{position:fixed;left:0;top:0;opacity:0;pointer-events:none;white-space:pre;-webkit-user-select:text;user-select:text}   /* ui/clipboard.ts */
