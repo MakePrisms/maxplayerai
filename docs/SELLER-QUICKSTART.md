@@ -625,6 +625,8 @@ single-turn jobs. The seat re-reads this at boot and on every heartbeat.
 **Session disk budget.** Parked sessions on one seat may use up to `[sessions] disk_budget_bytes`;
 the oldest parked session is evicted first when the sum goes over. Unset, the budget is 5 GiB, or
 20 GiB when you set `[sessions] enabled = true`. Set `enabled = false` to run single-turn jobs only.
+A `[sessions]` table written by an older build carries an explicit
+`disk_budget_bytes = 21474836480` (20 GiB), which still wins; delete that line for the default.
 
 Register the runtime with the overlay off, **keeping its name `runsc`**. The one-liner is
 `sudo -- runsc install -- --overlay2=none`; it rewrites the whole `runsc` entry, so list any other

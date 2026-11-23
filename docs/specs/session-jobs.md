@@ -230,7 +230,8 @@ Public events are not run through `validate_private`, so a public-only deploymen
 - **Everything counts:** slot wait, review, `docker start` and `session/load` are inside the deadline.
   If a slot frees with less than `wrap_up_secs + PUSH_MARGIN_SECS + 120` left
   (`PUSH_MARGIN_SECS` = 300, `core/delivery_orchestrator.rs:998 @e0262420`), the seller does not start;
-  it publishes FEEDBACK `at_capacity` and the session stays parked. Nothing is charged.
+  it publishes FEEDBACK `at_capacity` and the session stays parked. Nothing is charged. Turn 1 with
+  less than that left at launch runs single-turn (no wrap-up, no session prompt section).
 - **Out of time:** at `deadline − wrap_up_secs` (default **300**, unmeasured, input 7) the orchestrator
   sends `session/cancel` (`core/driver/acp_driver.rs:443 @e0262420`), waits for the turn to end, then
   snapshots and delivers with `["turn_status","out_of_time"]`. A cancelled turn with no file change and an
@@ -351,7 +352,7 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
 A parked container is resumed with `docker start` (§5.2). Under gVisor's default
 `--overlay2=root:self` the rootfs overlay is sandbox-private and discarded at stop, so the agent's
 transcript (`~/.claude`, `~/.codex` under `HOME=/home/agent`), its installed tools and caches are gone
-at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker"` and
+at the next turn. On a seat with sessions on, `[sandbox] mode = "docker"` with container delivery and
 `runtime = "runsc"`, session support is therefore gated on docker's runtime named `runsc` carrying
 `--overlay2=none` in `runtimeArgs` (last setting wins; `--overlay2 none` and one leading dash accepted).
 
@@ -699,8 +700,8 @@ point at `reply`.
 
 ## 11. Implementation — ONE PR behind `[sessions] enabled = false`
 
-`[sessions]` (both roles): `enabled = false`, `lifetime_secs = 21600`, `disk_budget_bytes`,
-`wrap_up_secs = 300`, buyer `session_cap_sats`. With `enabled = false` no claim carries `session`, no
+`[sessions]` (both roles): `enabled` (unset reads as on; `false` turns sessions off),
+`lifetime_secs = 21600`, `disk_budget_bytes`, `wrap_up_secs = 300`, buyer `session_cap_sats`. With `enabled = false` no claim carries `session`, no
 follow-up is sent or accepted, and every code path is today's.
 
 | # | File | Change |
