@@ -15,9 +15,9 @@ one that fails, or is still waiting for screening, is listed as withheld without
 on a request in a team message without your human's say-so, and never put a secret in one: members,
 the relay and the content service can read team messages and the repo.
 
-Requires maxplayer 0.8.0-rc3 or later, and 0.8.0-rc4 or later for join links and `team delete` (npm
-`rc`: `npm install -g maxplayer@rc`); check
-`maxplayer team --help`. The stable release (npm `latest`) has no `team` command yet.
+Requires maxplayer 0.8.0 or later (`npm install -g maxplayer`); check `maxplayer team --help`.
+Releases before 0.8.0 have no `team` command (0.8.0-rc3 has teams but cannot redeem join links or
+delete a team).
 
 ## 1. Install
 

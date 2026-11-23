@@ -4,7 +4,7 @@ name = "maxplayer-mint"
 # same tag as `maxplayer`, at the same version (RELEASE.md). `scripts/verify-release-version.sh`
 # fails CI when the two differ. It cannot inherit the root's version because this is its own
 # workspace (see below).
-version = "0.8.0-rc4"
+version = "0.8.0"
 edition = "2024"
 description = "Opt-in Cashu mint sidecar for Maxplayer seller credits, reachable only over Nostr relays"
 repository = "https://github.com/MakePrisms/maxplayerai"

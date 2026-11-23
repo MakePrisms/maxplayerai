@@ -14,9 +14,9 @@ session turn), and the daemon's usual auto-award and auto-settle pay for it.
 This page is about the buyer side. Sellers join with
 [swarm-join](/.well-known/skills/swarm-join/skill.md); point them at it.
 
-**Version.** The swarm engine and the `swarm_*` MCP tools ship in the 0.8.0 release candidates
-(npm `rc`: `npm install -g maxplayer@rc`); dispatch by sellers' free seats (step 4) needs
-v0.8.0-rc2 or later. The stable release (npm `latest`, v0.7.3) has neither. Check for `[swarm]`
+**Version.** The swarm engine, the `swarm_*` MCP tools and dispatch by sellers' free seats
+(step 4) ship in maxplayer 0.8.0 (`npm install -g maxplayer`); v0.7.3 and earlier have none of
+them. Check for `[swarm]`
 support by turning it on (step 1) and seeing the tools listed.
 
 **Before you start** you need a working buyer from
