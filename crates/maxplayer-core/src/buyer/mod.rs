@@ -3434,6 +3434,13 @@ fn release_reservation_on_failure_feedback(
 /// state-guarded inside its transaction ([`BuyerStore::reconcile`] re-reads each row and acts only
 /// on the state it expects), so a disposition that went stale during gather is a no-op rather than a
 /// wrong write.
+/// Reconcile's claim-liveness reading of one view. A view with no offer that the relay never
+/// confirmed (`read_confirmed: false`: timeout, stall, refused read) is unknown, not dead: it
+/// counts as live so the reservation is kept, exactly like a read that returned `Err`.
+fn reconcile_claim_live(view: &job_lifecycle::JobView) -> bool {
+    view.live_claim_id.is_some() || (view.offer.is_none() && !view.read_confirmed)
+}
+
 async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileReport, String> {
     let reserved = context
         .store
@@ -3496,7 +3503,7 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
         )
         .await
         {
-            Ok(view) => view.live_claim_id.is_some(),
+            Ok(view) => reconcile_claim_live(&view),
             Err(_) => true,
         };
         payable.insert(job_id.clone(), claim_live || has_bind);
@@ -7123,6 +7130,29 @@ mod tests {
     // a peer of the flattened JobView, carrying the 3405 identity + amount; with no award the field
     // is absent (never a false empty object). Pins the wire shape the handler relies on, free of any
     // relay. Red-on-revert: drop `awarded` from GetJobResponse and the Some case loses the field.
+    /// An unanswered relay read is not evidence the claim is gone: reconcile keeps the
+    /// reservation. Only a confirmed read with no live claim lets it go.
+    #[test]
+    fn reconcile_keeps_a_reservation_when_the_read_was_not_confirmed() {
+        let view = |read_confirmed: bool, live: bool| job_lifecycle::JobView {
+            job_id: "a".repeat(64),
+            offer: None,
+            claims: vec![],
+            results: vec![],
+            live_claim_id: live.then(|| "c".repeat(64)),
+            accepted: None,
+            pending: false,
+            read_confirmed,
+            publish_refused: None,
+        };
+        assert!(reconcile_claim_live(&view(false, false)), "unanswered read");
+        assert!(
+            !reconcile_claim_live(&view(true, false)),
+            "confirmed absent"
+        );
+        assert!(reconcile_claim_live(&view(true, true)), "live claim");
+    }
+
     #[test]
     fn get_job_response_serializes_a_committed_award_beside_the_flattened_view() {
         let view = job_lifecycle::JobView {

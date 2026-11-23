@@ -3676,8 +3676,9 @@ fn serialize_accepted_view<S: serde::Serializer>(bind: &Option<AcceptedBind>, se
 ///
 /// `timeout` is ONE wall-clock budget for the relay reads of this view, not a per-REQ window: the
 /// connect wait, offer read, liveness probe, offer recheck and claim/result (or v2 history) reads
-/// each get the time left, never less than [`VIEW_SUB_READ_FLOOR`]. Not covered: the outbox
-/// flush/backfill of a locally queued private offer, which keeps its own I/O bounds.
+/// each get the time left, never less than [`VIEW_SUB_READ_FLOOR`]. Not covered, and not charged
+/// to the budget: the outbox flush/backfill of a locally queued private offer, which runs first
+/// and keeps its own I/O bounds.
 pub(crate) async fn fetch_job_view_async(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
@@ -3686,9 +3687,6 @@ pub(crate) async fn fetch_job_view_async(
     now: u64,
 ) -> Result<JobView, JobLifecycleError> {
     use nostr_sdk::prelude::{EventId, Filter, Kind};
-
-    let read_deadline = tokio::time::Instant::now() + timeout;
-    let left = || view_read_left(read_deadline);
 
     let offer_id = EventId::from_hex(job_id)
         .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
@@ -3705,6 +3703,11 @@ pub(crate) async fn fetch_job_view_async(
             refreshed.map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
         }
     }
+    // The budget starts AFTER the private-offer pre-step above: that step keeps its own I/O
+    // bounds, and charging it to this budget could leave the relay reads below only the floor,
+    // the empty-view symptom the long-poll window exists to prevent.
+    let read_deadline = tokio::time::Instant::now() + timeout;
+    let left = || view_read_left(read_deadline);
     let (client, history_wire) = crate::private_content::history_wire::WireHistory::client(keys);
     // Same discipline as `award_presence_async` / `presence_of_filter`: auto-auth ON so a
     // NIP-42-gated read re-issues after the handshake, and WAIT for the socket before the first
@@ -7277,11 +7280,11 @@ mod tests {
     // as the relay or the SDK dropping the award loop's reads.
     //
     // The relay here answers each REQ after 150 ms. The job is genuinely not ready (claim + award,
-    // no result), so each wait loop runs out its 1 s cap and returns its FINAL read. That read must
+    // no result), so each wait loop runs out its 2 s cap and returns its FINAL read. That read must
     // still see the offer the relay holds. The relay's log of offer REQs proves the final read
     // really ran after the deadline (a loop that exited on its first pass would prove nothing).
     // 150 ms makes that deterministic: the first view read is four serial REQs (offer + three v2
-    // history reads), so it ends with under 400 ms left, and both loops then wait out the deadline
+    // history reads), so it ends with well over a second left, and both loops then wait out the deadline
     // exactly (the poll loop's pause is cut to the time left) before their final read.
     //
     // BITE: give either loop's read `fetch_timeout.min(remaining)` again (events:
@@ -7298,7 +7301,7 @@ mod tests {
                 GetJobRequest {
                     job_id: job_id.clone(),
                     wait_for: Some(WaitFor::Result),
-                    timeout_secs: Some(1),
+                    timeout_secs: Some(2),
                     include_display_names: false,
                 },
             )
@@ -7314,7 +7317,7 @@ mod tests {
                 reads.len() >= 2
                     && reads
                         .iter()
-                        .any(|at| *at >= started + Duration::from_secs(1)),
+                        .any(|at| *at >= started + Duration::from_secs(2)),
                 "{wait_loop:?}: the wait must end on an offer read made after its deadline: {:?}",
                 reads
                     .iter()
