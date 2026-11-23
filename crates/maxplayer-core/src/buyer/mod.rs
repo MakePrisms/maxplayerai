@@ -95,6 +95,14 @@ const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// floor is half a fix. What this bound must NOT do is smuggle the old conclusion back in: it parks
 /// on "we could not read", never on "the offer is gone", and the recorded reason says so.
 const AUTO_AWARD_MAX_UNCONFIRMED_READS: u32 = 12;
+/// The budget for ONE job-view read in the daemon's background loops (auto-award, reconcile).
+/// [`job_lifecycle::fetch_job_view_async`] bounds the WHOLE read (connect, offer, probe, recheck,
+/// claim/result or v2 history reads) by the budget it is given, so these loops pass what one read
+/// could take when each REQ had its own [`RELAY_TIMEOUT`] (four legacy REQs): a relay that answers
+/// each REQ in a few seconds still yields a full view, reconcile's claim-liveness read is not cut
+/// shorter than before, and the [`AUTO_AWARD_MAX_UNCONFIRMED_READS`] park keeps its old span on a
+/// stalled relay. MCP-facing reads keep [`RELAY_TIMEOUT`] so they stay inside the tool deadline.
+const BACKGROUND_VIEW_BUDGET: Duration = Duration::from_secs(20);
 /// How often the delivery watcher re-checks awarded-unsettled jobs with no event to wake it. The
 /// subscription is the fast path; this backstop is what makes a dropped or missed result event a
 /// latency cost rather than a stranded payment.
@@ -1982,7 +1990,7 @@ async fn drive_auto_award(
             &context.home,
             &keys,
             job_id,
-            RELAY_TIMEOUT,
+            BACKGROUND_VIEW_BUDGET,
             now_unix() as u64,
         )
         .await
@@ -3483,7 +3491,7 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
             &context.home,
             &keys,
             job_id,
-            RELAY_TIMEOUT,
+            BACKGROUND_VIEW_BUDGET,
             now_unix() as u64,
         )
         .await
