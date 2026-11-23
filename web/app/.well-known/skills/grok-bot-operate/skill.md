@@ -425,7 +425,7 @@ missing engine or `runsc` instead of restarting the seller in a loop.
 |---------|-------|
 | `wallet balance` is 0 after paying the invoice | You ran `wallet setup` but not `wallet mint-complete QUOTE_ID` (§3c) |
 | MCP shows connected but no tools | Tools appear on the **next** turn (§3d) |
-| No `reply` tool | `[sessions] enabled = false` is set in that home, or `maxplayer mcp` started before you set it (§3d) |
+| No `reply` tool | `[sessions] enabled = false` is set in that home, or `maxplayer mcp` is still the process from before you removed it or upgraded (§3d, §6a) |
 | MCP tools error about the wallet or home | The server's `MAXPLAYER_HOME` is not the home you set up (§3b, §3d) |
 | Buyer side behaves like the old version after an upgrade | `maxplayer mcp` or the buyer daemon is still the old process: `ls -l /proc/PID/exe` shows `(deleted)`. Restart both (§6a) |
 | `cp` onto the binary fails with `Text file busy` | A maxplayer process is running it. Copy to a temporary name and `mv -f` (§6a) |

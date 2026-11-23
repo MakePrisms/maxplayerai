@@ -5,6 +5,14 @@
   `enabled = true` behaves as before. Buyers on a stock config get the `reply` MCP tool and
   `post_job max_session_sats`, and the swarm engine sends a member's follow-up tasks as session
   turns. Docker seats with container delivery advertise `["session","1"]` on their claims.
+  - **Buyers:** an agent can now call `reply` without any opt-in, and each turn costs the job's
+    price, up to a session cap of 10× the job price. Lower it with `[sessions] session_cap_sats` or
+    `max_session_sats`, or turn sessions off with `enabled = false`. `get_job` now returns a
+    `session` object and `collect` takes `turn`.
+  - **Sellers:** docker seats with container delivery now park a finished job's container for up to
+    6 hours (within a 5 GiB disk budget) so the buyer can send another turn, and run turn 1 with one
+    agent attempt instead of 3.
+  - Restart a running `maxplayer mcp` and `maxplayer buyer serve` to pick this up.
   - **runsc seats:** only an explicit `enabled = true` keeps the boot-blocking
     `FAIL sandbox runsc sessions` when docker's `runsc` runtime lacks `--overlay2=none`. A seat on by
     default gets a WARN, starts, offers no sessions and takes single-turn jobs, so upgrading never

@@ -225,6 +225,10 @@ without offering sessions. If the flag disappears while the seller runs, it logs
 `sessions DISABLED` line with the reason and the fix, stops offering sessions and keeps taking
 single-turn jobs. The seat re-reads this at boot and on every heartbeat.
 
+**Session disk budget.** Parked sessions on one seat may use up to `[sessions] disk_budget_bytes`;
+the oldest parked session is evicted first when the sum goes over. Unset, the budget is 5 GiB, or
+20 GiB when you set `[sessions] enabled = true`. Set `enabled = false` to run single-turn jobs only.
+
 Register the runtime with the overlay off, **keeping its name `runsc`**. The one-liner is
 `sudo -- runsc install -- --overlay2=none`; it rewrites the whole `runsc` entry, so list any other
 `runtimeArgs` you already have after `--` too. Or edit `/etc/docker/daemon.json` by hand (merge into

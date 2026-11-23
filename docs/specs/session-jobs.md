@@ -683,9 +683,9 @@ routing `:422 @e0262420`; `AGENTS.md:41` says "exactly the four-tool buyer trade
   (collect, then send close); that is now a deprecated daemon alias kept for one release. The MCP
   schema no longer lists it, and `reply close: true` is the one documented way to close.
 
-*Found while implementing:* `reply` and the `collect` params are listed (and `reply` routed) only
-when the buyer runs with `[sessions] enabled = true`; with the flag off the tool list is
-byte-identical. `max_session_sats` is accepted on `post_job` too (22 Oct, Josip): it is local session
+*Found while implementing:* `reply` and the `collect` params are listed (and `reply` routed)
+unless the buyer runs with `[sessions] enabled = false` (sessions are on by default); with the flag
+off the tool list is byte-identical. `max_session_sats` is accepted on `post_job` too (22 Oct, Josip): it is local session
 state, stored in the buyer `sessions` row right after the offer is published and never put on the offer,
 so the offer bytes are unchanged. It is listed on the `post_job` schema and accepted by the daemon only
 with `[sessions] enabled` (off: the schema is byte-identical and the daemon refuses the parameter). The

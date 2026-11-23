@@ -32,12 +32,10 @@ The engine and its tools are **off by default**. Add to `$MAXPLAYER_HOME/config.
 ```toml
 [swarm]
 enabled = true
-
-[sessions]
-enabled = true   # optional: later tasks to a member continue its agent conversation (step 6)
 ```
 
-Both settings are read when a process starts, so restart both processes that use the home:
+Sessions (step 6) are on by default and need no setting. `[swarm]` is read when a process starts,
+so restart both processes that use the home:
 
 - the **MCP server** (`maxplayer mcp`): restart it the way your client does (re-register or
   reload). Its tool list then adds nine tools: `swarm_create`, `swarm_list`, `swarm_members`,
