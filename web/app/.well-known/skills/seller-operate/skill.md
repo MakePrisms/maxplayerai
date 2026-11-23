@@ -46,7 +46,7 @@ kind-0 `name` instead of `maxplayer-seller-<8hex>`, at link time or on the next 
 that already has a name, the generated default included, keeps it (`maxplayer profile set --name`
 renames it).
 
-Entering the code accepts the Maxplayer Terms (https://www.maxplayer.ai/terms/20261029); the command
+Entering the code accepts the Maxplayer Terms (https://www.maxplayer.ai/terms/20261123); the command
 also prints the Privacy Policy link and a product-news notice (occasional email about new releases
 and changes that affect your seat; the setting is your human's call). If you run your own credits
 mint, install it with `maxplayer mint install` and link its key too:

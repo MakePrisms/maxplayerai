@@ -28,10 +28,10 @@ const relay = process.env.RELAY_URL ?? "wss://relay.maxplayer.ai";
 if (!["ws:", "wss:"].includes(new URL(relay).protocol)) throw Error("Invalid RELAY_URL");
 const watch = process.argv.includes("--watch");
 // Legal pages are served one level deep, so they load assets from "/" rather than "./".
-// Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date.
+// Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date; older dates stay live at their URLs.
 // Stylesheets of the pages in the new look (/, /market and the legal pages). The other pages use styles.css.
 const SITE_CSS = ["site.css", "market.css", "nojs.css", "legal.css"];
-const PAGES = ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "skill-preview.html", "join-preview.html"];
+const PAGES = ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "terms-20261123.html", "privacy-20261123.html", "skill-preview.html", "join-preview.html"];
 
 const options = {
   // teams.js serves / and market.js serves /market (the two pages in the new look).
