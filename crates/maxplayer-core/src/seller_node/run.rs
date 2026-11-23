@@ -10525,14 +10525,17 @@ impl SellerNodeRunner {
         // seat's claim carried `["session","1"]`. Otherwise `None`, and the inputs file is today's.
         let sessions_config = &self.node.home().config.sessions;
         // §5.6: a gate that closed after the claim (the daemon lost `--overlay2=none`) runs the
-        // job single-turn rather than parking a container whose rootfs would not survive.
-        let session_job = crate::session::runs_as_session(
+        // job single-turn rather than parking a container whose rootfs would not survive. §4: so
+        // does a job with too little time left for the wrap-up (its cancel would fire at once).
+        let session_job = crate::session::runs_turn_one_as_session(
             sessions_config,
             &self.runsc_gate(),
             self.node
                 .store()
                 .claim_advertised_session(job_id)
                 .unwrap_or(false),
+            now_unix().max(0) as u64,
+            deadline,
         );
         let prompt = if session_job {
             format!("{prompt}\n\n{}", crate::session::prompt_session_section())
@@ -12899,11 +12902,13 @@ mod tests {
         );
         assert_eq!(
             production
-                .matches("crate::session::runs_as_session(")
+                .matches("crate::session::runs_turn_one_as_session(")
                 .count(),
             1
         );
-        let execute = production.find("crate::session::runs_as_session(").unwrap();
+        let execute = production
+            .find("crate::session::runs_turn_one_as_session(")
+            .unwrap();
         assert!(
             production[execute..]
                 .chars()
@@ -21601,11 +21606,11 @@ mod tests {
         assert!(outcome.is_ok(), "{outcome:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
-    /// #1299 follow-up: a seller home with sessions on, for the session drain tests.
+    /// #1299 follow-up: a seller home for the session drain tests, on the default `[sessions]`
+    /// (sessions on because `enabled` is unset).
     fn drain_session_home(root: &std::path::Path, fixture: &PGateRelay) -> crate::home::MaxplayerHome {
         let mut home = lane_home(root, fixture);
         home.config.seller_heartbeat.interval_secs = 3600;
-        home.config.sessions.enabled = Some(true);
         home
     }
 

@@ -1163,6 +1163,17 @@ fn closed_runsc_gate_runs_an_advertised_job_single_turn() {
     );
 }
 
+/// Turn 1 on a default config: a 120 s deadline leaves no time for the wrap-up, so the job runs
+/// single-turn; a 3600 s deadline still runs as a session.
+#[test]
+fn a_short_deadline_runs_turn_one_single_turn() {
+    let cfg = SessionsConfig::default();
+    let open = RunscOverlayGate::Open;
+    assert!(!runs_turn_one_as_session(&cfg, &open, true, 1_000, 1_120));
+    assert!(runs_turn_one_as_session(&cfg, &open, true, 1_000, 4_600));
+    assert!(!runs_turn_one_as_session(&off(), &open, true, 1_000, 4_600));
+}
+
 // ───────────── Non-runsc seats are unchanged (Petar, 15:33): no probe, no log, main's claims ─────────────
 
 /// Every seat whose `[sandbox] runtime` does not trim to exactly `runsc` — unset (runc), another

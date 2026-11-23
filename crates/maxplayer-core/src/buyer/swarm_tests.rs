@@ -918,6 +918,10 @@ async fn default_off_daemon_starts_no_engine_and_knows_no_swarm_method() {
         assert!(!home.config.swarm.enabled, "default off");
         home.config.swarm.enabled = enabled;
         let (_lock, context, _socket) = bootstrap(home).await.unwrap();
+        assert!(
+            engine_for(&context, String::new()).sessions,
+            "default [sessions]: the engine sends session turns"
+        );
         assert_eq!(
             spawn(context.clone()),
             enabled,

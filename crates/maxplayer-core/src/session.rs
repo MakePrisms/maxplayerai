@@ -1042,6 +1042,20 @@ pub fn runs_as_session(
     cfg.enabled() && runsc_gate.allows_sessions() && claim_advertised
 }
 
+/// Turn 1 of an awarded job: [`runs_as_session`], and only with the time a follow-up needs to start
+/// ([`turn_can_start`], §4). With less left the wrap-up cancel would fire at once, so the job runs
+/// single-turn (no wrap-up, no session prompt section, the normal agent attempts).
+pub fn runs_turn_one_as_session(
+    cfg: &SessionsConfig,
+    runsc_gate: &RunscOverlayGate,
+    claim_advertised: bool,
+    now_unix: u64,
+    deadline_unix: u64,
+) -> bool {
+    runs_as_session(cfg, runsc_gate, claim_advertised)
+        && turn_can_start(now_unix, deadline_unix, cfg.wrap_up_secs)
+}
+
 /// Whether the gate applies: sessions on, `mode = "docker"` with container delivery for
 /// `container_uid` (the only seats that advertise sessions, §2.2) and `runtime = "runsc"` (trimmed,
 /// as the seat resolves it). Every other seat is [`RunscOverlayGate::NotApplicable`] and never asks

@@ -1360,6 +1360,15 @@ impl SwarmIo for DaemonIo {
     }
 }
 
+/// The engine [`spawn`] runs for this daemon.
+fn engine_for(context: &BuyerContext, buyer: String) -> Engine {
+    Engine {
+        store: context.store.clone(),
+        buyer,
+        sessions: context.home.config.sessions.enabled(),
+    }
+}
+
 /// Start the engine when `[swarm] enabled`; `false` (nothing started) otherwise.
 pub(super) fn spawn(context: Arc<BuyerContext>) -> bool {
     if !context.home.config.swarm.enabled {
@@ -1373,11 +1382,7 @@ pub(super) fn spawn(context: Arc<BuyerContext>) -> bool {
                 return;
             }
         };
-        let engine = Engine {
-            store: context.store.clone(),
-            buyer: buyer.clone(),
-            sessions: context.home.config.sessions.enabled(),
-        };
+        let engine = engine_for(&context, buyer.clone());
         let io = DaemonIo::new(context.clone(), buyer);
         crate::opline!("buyer: swarm engine started (no planner: check-in mode)");
         let mut ticker = tokio::time::interval(TICK);

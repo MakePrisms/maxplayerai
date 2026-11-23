@@ -3034,6 +3034,10 @@ mod tests {
             .sessions;
         assert!(on.explicitly_enabled());
         assert_eq!(on.disk_budget(), 20 * 1024 * 1024 * 1024);
+        let budget = apply_env_layer(&base, env(&[("MAXPLAYER_SESSIONS__DISK_BUDGET_BYTES", "1024")]))
+            .expect("env budget")
+            .sessions;
+        assert_eq!(budget.disk_budget(), 1024);
     }
 
     fn temp_home(label: &str) -> PathBuf {
