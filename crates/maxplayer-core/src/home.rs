@@ -2993,15 +2993,24 @@ mod tests {
         let root = temp_home("sessions-partial");
         let _ = fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
-        fs::write(home.root.join(CONFIG_FILE), "[sessions]\nlifetime_secs = 60\n").expect("write");
+        fs::write(
+            home.root.join(CONFIG_FILE),
+            "[sessions]\nlifetime_secs = 60\n",
+        )
+        .expect("write");
         save_config(&mut home, |_| {}).expect("save");
         let raw = fs::read_to_string(home.root.join(CONFIG_FILE)).expect("read config.toml");
-        let table = raw.split("[sessions]").nth(1).expect("[sessions] written back");
+        let table = raw
+            .split("[sessions]")
+            .nth(1)
+            .expect("[sessions] written back");
         let table = table.split("\n[").next().unwrap();
         assert!(table.contains("lifetime_secs = 60"), "{raw}");
         assert!(!table.contains("enabled"), "{raw}");
         assert!(!table.contains("disk_budget_bytes"), "{raw}");
-        let sessions = load_config(&home.root.join(CONFIG_FILE)).expect("reload").sessions;
+        let sessions = load_config(&home.root.join(CONFIG_FILE))
+            .expect("reload")
+            .sessions;
         assert_eq!(sessions.enabled, None);
         assert_eq!(sessions.disk_budget(), 5 * 1024 * 1024 * 1024);
         let _ = fs::remove_dir_all(&root);

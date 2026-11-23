@@ -1543,10 +1543,7 @@ mod tests {
                 params: json!({}),
             },
         );
-        assert_eq!(
-            listed["result"]["tools"],
-            with_team_tools(tools_for(true))
-        );
+        assert_eq!(listed["result"]["tools"], with_team_tools(tools_for(true)));
         let called = dispatch(
             &state,
             &McpRequest {
@@ -2010,7 +2007,10 @@ mod tests {
         assert_eq!(listed["result"]["tools"], with_team_tools(tools_for(false)));
         let tools = listed["result"]["tools"].as_array().unwrap();
         assert!(tools.iter().all(|tool| tool["name"] != "reply"));
-        let post_job = tools.iter().find(|tool| tool["name"] == "post_job").unwrap();
+        let post_job = tools
+            .iter()
+            .find(|tool| tool["name"] == "post_job")
+            .unwrap();
         assert!(
             post_job["inputSchema"]["properties"]
                 .get("max_session_sats")
