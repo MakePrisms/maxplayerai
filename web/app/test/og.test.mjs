@@ -30,6 +30,8 @@ const ROUTES = {
   "terms-20261029.html": "/terms/20261029",
   "privacy-20261029.html": "/privacy/20261029",
   "fees-20261029.html": "/fees/20261029",
+  "terms-20261123.html": "/terms/20261123",
+  "privacy-20261123.html": "/privacy/20261123",
   // The link-preview page bots get for /skill.md (vercel.json); not linked, noindex.
   "skill-preview.html": "/skill-preview",
   // The link-preview page bots get for /join/<token> (vercel.json rewrite); not linked, noindex.
@@ -106,7 +108,9 @@ test("every page has canonical, og:* and twitter:* tags with its own title and d
       assert.deepEqual(pngSize(join(dist, file.slice(1))), [size, size], `${file} is ${size}×${size}`);
     }
   }
-  assert.equal(titles.size, Object.keys(ROUTES).length, "page titles are page-specific");
+  // Dated versions of one legal document (terms-20261029, terms-20261123) share its title; every other page has its own.
+  const docs = new Set(Object.keys(ROUTES).map((page) => page.replace(/-\d{8}\.html$/, "")));
+  assert.equal(titles.size, docs.size, "page titles are page-specific");
 });
 
 test("the preview image is 1200×630, small enough for every unfurler, and rendered from a template", () => {

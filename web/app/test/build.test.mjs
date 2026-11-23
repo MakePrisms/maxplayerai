@@ -100,7 +100,7 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html"]) {
+  for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "terms-20261123.html", "privacy-20261123.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     const script = page === "tokens.html" ? "tokens.js" : page === "swarm.html" ? "swarm.js" : "terminal.js";
     for (const asset of NEW_PAGES[page] ?? (LEGAL.test(page) ? LEGAL_ASSETS : page === "swarm.html" ? SWARM_ASSETS : ["styles.css", "fonts.css", script])) {
@@ -305,7 +305,7 @@ test("all site pages share navigation and footer links, with a current page and 
   }
   // The two pages in the new look: the same two tabs, and a footer in four columns that leads to the same places.
   const absolute = (href, self) => (href.startsWith("#") ? self : href);
-  for (const [page, route] of [["index.html", "/"], ["market.html", "/market"], ["terms-20261029.html", "/terms/20261029"], ["privacy-20261029.html", "/privacy/20261029"], ["fees-20261029.html", "/fees/20261029"], ["swarm.html", "/swarm"]]) {
+  for (const [page, route] of [["index.html", "/"], ["market.html", "/market"], ["terms-20261029.html", "/terms/20261029"], ["privacy-20261029.html", "/privacy/20261029"], ["fees-20261029.html", "/fees/20261029"], ["terms-20261123.html", "/terms/20261123"], ["privacy-20261123.html", "/privacy/20261123"], ["swarm.html", "/swarm"]]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
     const nav = html.match(/<nav class="tabs"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
     const footer = html.match(/<nav class="ft-cols"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
@@ -592,22 +592,34 @@ test("/swarm/<naddr> serves the same page, which loads its assets from the site 
 // static pages on this site, one fixed URL per version; /terms and /privacy point at the current one.
 test("terms, privacy and fees are dated static pages, linked from every footer", () => {
   // Bob (20261029): versions are effective dates, not v1/v2; each date keeps its own URL.
+  // 20261123: new Terms and Privacy Policy; the Fee Schedule is unchanged and stays 20261029.
   const cfg = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
-  const date = "20261029";
+  const CURRENT = { terms: "20261123", privacy: "20261123", fees: "20261029" };
+  const VERSIONS = { terms: ["20261029", "20261123"], privacy: ["20261029", "20261123"], fees: ["20261029"] };
+  const label = (date) => new Date(`${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6)}T00:00:00Z`)
+    .toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" });
   for (const doc of ["terms", "privacy", "fees"]) {
-    assert.ok(existsSync(join(root, "dist", `${doc}-${date}.html`)), `${doc} ${date} builds`);
-    assert.ok(cfg.rewrites.some((r) => r.source === `/${doc}/${date}` && r.destination === `/${doc}-${date}`), `/${doc}/${date} serves it`);
     const current = cfg.redirects.find((r) => r.source === `/${doc}`);
-    assert.equal(current?.destination, `/${doc}/${date}`, `/${doc} points at the current version`);
+    assert.equal(current?.destination, `/${doc}/${CURRENT[doc]}`, `/${doc} points at the current version`);
     assert.equal(current?.permanent, false, `/${doc} is a temporary redirect, so a new version can replace it`);
-    const html = readFileSync(join(root, "dist", `${doc}-${date}.html`), "utf8");
-    assert.match(html, /<html lang="en" class="lg">/, `${doc}: in the look of / and /market`);
-    assert.match(html, /<body class="legal-page">/);
-    assert.match(html, /<h1 id="legal-h">/);
-    assert.match(html, /Effective October 29, 2026/, `${doc} shows its effective date`);
-    assert.ok(!/[Nn]ot part of|\[(?:OPEN|FACT|CHECKED|DATE)/.test(html), `${doc}: no internal notes`);
-    assert.ok(!/(?:href|src)="\.\//.test(html), `${doc}: no relative asset paths (the page is served one level deep)`);
+    for (const date of VERSIONS[doc]) {
+      // Every published version stays live at its own URL after a newer one replaces it.
+      assert.ok(existsSync(join(root, "dist", `${doc}-${date}.html`)), `${doc} ${date} builds`);
+      assert.ok(cfg.rewrites.some((r) => r.source === `/${doc}/${date}` && r.destination === `/${doc}-${date}`), `/${doc}/${date} serves it`);
+      const html = readFileSync(join(root, "dist", `${doc}-${date}.html`), "utf8");
+      assert.match(html, /<html lang="en" class="lg">/, `${doc} ${date}: in the look of / and /market`);
+      assert.match(html, /<body class="legal-page">/);
+      assert.match(html, /<h1 id="legal-h">/);
+      assert.ok(html.includes(`Effective ${label(date)}`), `${doc} ${date} shows its effective date`);
+      assert.ok(html.includes(`<link rel="canonical" href="https://www.maxplayer.ai/${doc}/${date}" />`), `${doc} ${date} canonicalises to its own URL`);
+      assert.ok(!/[Nn]ot part of|Clean draft|DRAFT|\[(?:OPEN|FACT|CHECKED|DATE|NOTE|LAWYER|Source|Bob|BOB|Confirmed|SWEEP|FULL PASS)/.test(html), `${doc} ${date}: no internal notes`);
+      assert.ok(!/(?:href|src)="\.\//.test(html), `${doc} ${date}: no relative asset paths (the page is served one level deep)`);
+    }
   }
+  // The new Terms and Privacy Policy link the current Fee Schedule and each other through the undated redirects.
+  const terms = readFileSync(join(root, "dist", "terms-20261123.html"), "utf8");
+  assert.ok(terms.includes('<a href="/fees">Fee Schedule</a>') && terms.includes('<a href="/privacy">Privacy Policy</a>'), "terms link /fees and /privacy");
+  assert.ok(readFileSync(join(root, "dist", "privacy-20261123.html"), "utf8").includes('<a href="/terms">Terms of Service</a>'), "privacy links /terms");
   for (const page of ["index.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html"]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
     assert.ok(html.includes('<a href="/terms">Terms</a>') && html.includes('<a href="/privacy">Privacy</a>'), `${page} links both`);
