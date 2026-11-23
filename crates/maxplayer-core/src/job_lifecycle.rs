@@ -7126,6 +7126,9 @@ mod tests {
     struct QueryControl {
         /// When set, every REQ from now on is held forever: no events, no `EOSE`, no `CLOSED`.
         stalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Set `stalled` at the first by-id OFFER REQ at or after this instant, so the stall begins
+        /// at the start of a view read rather than in the middle of one.
+        stall_from: std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
         /// When each by-id OFFER REQ (first read or recheck) reached the relay.
         offer_reads: std::sync::Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
     }
@@ -7159,11 +7162,13 @@ mod tests {
                         .as_ref()
                         .is_some_and(|k| k.contains(&offer_kind))
                 {
-                    self.control
-                        .offer_reads
-                        .lock()
-                        .unwrap()
-                        .push(tokio::time::Instant::now());
+                    let now = tokio::time::Instant::now();
+                    self.control.offer_reads.lock().unwrap().push(now);
+                    if self.control.stall_from.lock().unwrap().is_some_and(|at| now >= at) {
+                        self.control
+                            .stalled
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
                 if self
                     .control
@@ -7334,8 +7339,10 @@ mod tests {
     // relay that STOPS ANSWERING mid-wait must come back as `Ok(pending: true)` within the cap plus
     // one floored read, well inside the 15 s MCP tool deadline — never as a tool-deadline error.
     //
-    // The relay answers normally, then from 5.5 s on holds every REQ forever. The next read starts
-    // with about 4 s left on the wait. That window must bound the WHOLE view read (connect, offer,
+    // The relay answers normally, then from the first view read that starts after 5.5 s it holds
+    // every REQ forever, offer read first. That read starts with about 4 s left on the wait. (A
+    // stall that begins AFTER an answered v2 offer read fails the history read with an error
+    // instead; that fail-closed path is documented on `JobView::read_confirmed`.) That window must bound the WHOLE view read (connect, offer,
     // probe, recheck, claim/result reads), and the claim/result reads must be skipped once the
     // relay failed to answer both the offer read and the liveness probe.
     //
@@ -7350,11 +7357,7 @@ mod tests {
             let (_relay, root, home, job_id, control) =
                 slow_relay_with_an_unready_job("wait-stalled", Duration::ZERO).await;
             let started = tokio::time::Instant::now();
-            let stall = control.stalled.clone();
-            let staller = tokio::spawn(async move {
-                tokio::time::sleep(stall_at).await;
-                stall.store(true, std::sync::atomic::Ordering::SeqCst);
-            });
+            *control.stall_from.lock().unwrap() = Some(started + stall_at);
             let view = run_wait(
                 wait_loop,
                 &home,
@@ -7367,7 +7370,6 @@ mod tests {
             )
             .await;
             let elapsed = started.elapsed();
-            staller.abort();
             let stalled_reads = control
                 .offer_reads()
                 .iter()
