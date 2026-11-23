@@ -39,8 +39,7 @@ html.jn :focus-visible{outline:2px solid var(--giallo);outline-offset:3px}
 .jn-main h1{margin-top:12px;font-weight:400;font-size:clamp(40px,4.6vw,66px);line-height:1.04;letter-spacing:-.022em;text-wrap:balance}
 .jn-lede{margin-top:16px;max-width:560px;font-size:clamp(17px,1.4vw,20px);line-height:1.4;letter-spacing:-.015em;color:var(--mut)}
 .jn-lede b{font-weight:500;color:#fff}
-.jn-lbl{margin-top:34px;font-size:14px;color:var(--mut)}
-.jn-main .copy{margin-top:10px}
+.jn-main .copy{margin-top:30px}
 .jn-main .copy button.ok{background:var(--giallo)}
 .jn-row{display:flex;gap:6px}
 .jn-row .av{width:24px;height:24px}
