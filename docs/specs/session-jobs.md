@@ -148,6 +148,10 @@ plus content (git), §7.2.
 not count against the seller. Protocol §7.1 already makes the reason vocabulary extensible
 (`docs/protocol-v1.md:807 @e0262420`).
 
+`turn_too_large` (#1349) has the same shape and the same `refusal` class: a private follow-up whose
+minimal review request does not fit one NIP-59 seal (§9). Nothing ran or was charged, and the session
+stays parked.
+
 ### 2.4 Accept — binds a turn
 
 A session ACCEPT (3406) carries `["e", result_id, "", "reply"]`. Protocol §6.5 calls ACCEPT
@@ -187,7 +191,8 @@ is a new kind or a new optional tag. Protocol §2.1 lists the maxplayer-owned ki
    - `3403` allowed (`:353`): add `"reply"`, `"turn_status"`, `"context"`, `"creq"` (the existing
      16 KiB creq bound at `:440` applies).
    - `3406` (`:344`): add `"reply"`.
-   - Feedback reasons (`ppp/wire.rs:170 @e0262420`): add `"session_expired"`.
+   - Feedback reasons (`ppp/wire.rs:170 @e0262420`): add `"session_expired"` (and `"turn_too_large"`,
+     #1349).
    - `3404` allowed (`:345`): add `"reply"` — §2.3's `session_expired` FEEDBACK carries
      `["e", followup_id, "", "reply"]`, which the private allowlist would otherwise refuse.
      (Found while implementing; the list above omitted it.)
@@ -625,7 +630,8 @@ clears it. It never closes a session.
   *Found while implementing:* the encrypted (private) review lane's `Request` carried only an offer or
   a delivery. It now has an optional `followup` evidence block: the selected claim and award plus the
   buyer's signed 3412 carriers with their encrypted `FollowUp` bodies, oldest first (the last is the
-  subject), trimmed oldest-first to the 60 KiB message bound. The reviewer re-authenticates every
+  subject), trimmed oldest-first to what still fits one NIP-59 seal (#1349: measured on the sealed
+  size; the largest sealable rumor is 40,960 bytes, about 36 KB of request JSON). The reviewer re-authenticates every
   carrier and body against the signed offer/claim/award chain (buyer-authored, `bind_content`),
   admits the buyer and the selected seller as requesters, and builds the context from those bodies
   only.
@@ -637,7 +643,7 @@ clears it. It never closes a session.
   earlier than the follow-up under review, and reduces each to one line from the signed public tags only
   (`turn n: <turn_status>, commit <oid|inline>`); it never decrypts a delivery body. The context is
   rendered by the same function as the public lane (follow-ups labelled by their own turn number), so
-  both lanes give the same text for the same facts. Under the 60 KiB message bound buyer follow-ups are
+  both lanes give the same text for the same facts. Under that seal bound buyer follow-ups are
   kept first (newest first), deliveries take what is left (newest first); the current follow-up is never
   cut. Neither party authors any line: the seller only forwards signed events, and a forged, misattributed
   or misordered one fails the whole request. `deliveries` is omitted when empty, and every non-follow-up
