@@ -27,6 +27,17 @@ impl SendError {
             cause: Some(crate::error_chain::chain(error)),
         }
     }
+    /// A Git transport failure: the fixed text, then the transport's own cause
+    /// ([`crate::git_transport::operator_cause`]: no server text, credentials redacted).
+    pub(crate) fn transport(
+        kind: &'static str,
+        error: &crate::git_transport::TransportError,
+    ) -> Self {
+        Self {
+            kind: Error(kind),
+            cause: Some(crate::git_transport::operator_cause(error)),
+        }
+    }
 }
 impl From<Error> for SendError {
     fn from(kind: Error) -> Self {
@@ -117,7 +128,18 @@ impl ProvisionRequest {
     }
 
     pub async fn send(&self, authorization: &str) -> std::result::Result<(), SendError> {
-        let client = reqwest::Client::builder()
+        self.send_via(reqwest::Client::builder(), authorization)
+            .await
+    }
+
+    /// [`Self::send`] on a given client builder (tests pass one that ignores ambient proxy
+    /// variables).
+    async fn send_via(
+        &self,
+        builder: reqwest::ClientBuilder,
+        authorization: &str,
+    ) -> std::result::Result<(), SendError> {
+        let client = builder
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(20))
@@ -222,25 +244,67 @@ mod send_error_tests {
 
     // The buyer saw only "private repository provisioning unavailable" while every request failed
     // at its proxy. The fixed text must stay first and the HTTP cause must follow it.
+    fn send_to(url: String) -> SendError {
+        let request = ProvisionRequest {
+            url,
+            body: b"{}".to_vec(),
+            repo: String::new(),
+            job: String::new(),
+        };
+        // No system proxy: an ambient HTTP(S)_PROXY must not turn a refused connect into a
+        // proxy error, or route the request away from the test server.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(request.send_via(reqwest::Client::builder().no_proxy(), "Nostr x"))
+            .unwrap_err()
+    }
+
+    // A non-2xx answer names its status and never echoes the response body.
+    #[test]
+    fn refused_names_the_status_and_never_the_body() {
+        use std::io::{Read as _, Write as _};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            let body = "token=secret-in-the-body";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let error = send_to(format!("http://{addr}/api/jobs/private/{}", "a".repeat(64)));
+        thread.join().unwrap();
+        assert_eq!(error.kind, Error("private repository provisioning refused"));
+        assert_eq!(
+            error.to_string(),
+            "private repository provisioning refused: HTTP 403 Forbidden"
+        );
+    }
+
     #[test]
     fn unavailable_names_the_http_cause_after_the_fixed_text() {
         let closed = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap();
-        let request = ProvisionRequest {
-            url: format!("http://{closed}/api/jobs/private/{}", "a".repeat(64)),
-            body: b"{}".to_vec(),
-            repo: String::new(),
-            job: String::new(),
-        };
-        let error = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(request.send("Nostr x"))
-            .unwrap_err();
-        assert_eq!(error.kind, Error("private repository provisioning unavailable"));
+        let error = send_to(format!(
+            "http://{closed}/api/jobs/private/{}",
+            "a".repeat(64)
+        ));
+        assert_eq!(
+            error.kind,
+            Error("private repository provisioning unavailable")
+        );
         let text = error.to_string();
         assert!(
             text.starts_with("private repository provisioning unavailable: error sending request"),

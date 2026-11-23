@@ -1,6 +1,6 @@
 //! Private per-job Git legs. All network destinations derive from signed offer identity
 //! and trusted deployment policy; manifests bind exact objects before execution.
-use super::{Error, PreparedContent, Result, wire::HostPolicy};
+use super::{Error, PreparedContent, Result, hosting::SendError, wire::HostPolicy};
 use git2::{ObjectType, Oid, Repository};
 use std::{collections::BTreeSet, path::Path};
 
@@ -101,13 +101,13 @@ pub fn fetch_inputs(
     host: &HostPolicy,
     authorization: &str,
     destination: &Path,
-) -> Result<()> {
+) -> std::result::Result<(), SendError> {
     if !repo.is_bare() {
-        return Err(Error("private fetch requires isolated bare staging"));
+        return Err(Error("private fetch requires isolated bare staging").into());
     }
     let body = task.body();
     if body.kind != super::ContentType::Task {
-        return Err(Error("not an input task"));
+        return Err(Error("not an input task").into());
     }
     let remote = host.job_repo(buyer, &body.job_id)?;
     let manifest = input_manifest(task)?;
@@ -116,13 +116,18 @@ pub fn fetch_inputs(
         .map(|entry| entry.commit_oid.as_str())
         .collect();
     if pins.is_empty() {
-        return Err(Error("no input pins"));
+        return Err(Error("no input pins").into());
     }
     let refs: Vec<_> = pins.into_iter().collect();
     crate::git_transport::fetch_private_objects(repo, &remote, &refs, authorization)
-        .map_err(|_| Error("private input fetch unavailable"))?;
+        .map_err(|e| SendError::transport("private input fetch unavailable", &e))?;
     check_objects(repo)?;
-    super::inputs::materialize(repo, &body.job_id, &manifest, destination)
+    Ok(super::inputs::materialize(
+        repo,
+        &body.job_id,
+        &manifest,
+        destination,
+    )?)
 }
 
 /// Upload exactly the snapshot committed in the immutable encrypted task manifest.
@@ -132,7 +137,7 @@ pub fn upload_inputs(
     snapshot: &super::inputs::InputSnapshot,
     host: &HostPolicy,
     mint: crate::git_transport::AuthMinter,
-) -> Result<()> {
+) -> std::result::Result<(), SendError> {
     let body = task.body();
     if body.kind != super::ContentType::Task
         || body.attachments != snapshot.manifest
@@ -141,7 +146,7 @@ pub fn upload_inputs(
             .iter()
             .any(|entry| entry.commit_oid != snapshot.commit_oid)
     {
-        return Err(Error("input snapshot differs from task commitment"));
+        return Err(Error("input snapshot differs from task commitment").into());
     }
     let oid =
         Oid::from_str(&snapshot.commit_oid).map_err(|_| Error("invalid input snapshot pin"))?;
@@ -149,7 +154,7 @@ pub fn upload_inputs(
         .find_reference(&snapshot.reference)
         .map_err(|_| Error("input snapshot ref missing"))?;
     if reference.target() != Some(oid) {
-        return Err(Error("input snapshot ref moved"));
+        return Err(Error("input snapshot ref moved").into());
     }
     check_objects(repo)?;
     let remote = host.job_repo(&body.author, &body.job_id)?;
@@ -165,28 +170,74 @@ pub fn upload_inputs(
 }
 
 /// Name a permanent relay refusal of a private input upload in fixed words. The
-/// server's text is matched, never echoed; anything else keeps `fallback`.
+/// server's text is matched, never echoed; anything else is `fallback` followed by the
+/// transport's cause. A 407 comes from a proxy on the way, never from the relay, so it is
+/// never called a relay refusal.
 pub(super) fn upload_error(
     error: &crate::git_transport::TransportError,
     fallback: &'static str,
-) -> Error {
-    if !crate::git_transport::is_permanent_refusal(error) {
-        return Error(fallback);
-    }
+) -> SendError {
     let status = crate::git_transport::reported_http_status(error);
+    if status == Some(407) || !crate::git_transport::is_permanent_refusal(error) {
+        return SendError::transport(fallback, error);
+    }
     let excerpt = crate::git_transport::refusal_excerpt(error).unwrap_or_default();
     if status == Some(400) && excerpt.contains("cannot contain symlinks or submodules") {
-        Error("relay refused the private input: private job repositories cannot contain symlinks or submodules")
+        Error("relay refused the private input: private job repositories cannot contain symlinks or submodules").into()
     } else if status == Some(413) {
         Error("relay refused the private input: it exceeds the private job repository limits")
+            .into()
     } else {
-        Error("relay refused the private input upload (permanent HTTP refusal; not retried)")
+        Error("relay refused the private input upload (permanent HTTP refusal; not retried)").into()
     }
 }
 
 #[cfg(test)]
 mod quota_tests {
     use super::*;
+
+    // A buyer behind a proxy saw only "private input upload unavailable". The fixed text stays
+    // first and the transport cause follows, minus credentials and server-supplied text; a 407
+    // is the proxy's, never a relay refusal.
+    #[test]
+    fn upload_error_names_the_transport_cause_and_never_blames_the_relay_for_a_407() {
+        use crate::git_transport::TransportError;
+        let fallback = "private input upload unavailable";
+        for (error, cause) in [
+            (
+                TransportError::Io("http request: error sending request for url (https://u:secret@relay.example/git/o/r): client error (Connect): tunnel error: proxy authorization required".into()),
+                "io error: http request: error sending request for url (https://***@relay.example/git/o/r): client error (Connect): tunnel error: proxy authorization required",
+            ),
+            (
+                TransportError::Io("http status 407 for https://relay.example/git/o/r (refusal: secret proxy text)".into()),
+                "io error: http status 407 for https://relay.example/git/o/r",
+            ),
+            (
+                TransportError::Io("http status 503 for https://relay.example/git/o/r (refusal: secret server text)".into()),
+                "io error: http status 503 for https://relay.example/git/o/r",
+            ),
+        ] {
+            let text = upload_error(&error, fallback).to_string();
+            assert_eq!(text, format!("{fallback}: {cause}"));
+            assert!(!text.contains("secret") && !text.contains("relay refused"), "{text}");
+        }
+        // Permanent relay refusals keep their fixed words, without the server's text.
+        let refused = TransportError::Io(
+            "http status 413 for https://relay.example/git/o/r (refusal: secret)".into(),
+        );
+        assert_eq!(
+            upload_error(&refused, fallback).to_string(),
+            "relay refused the private input: it exceeds the private job repository limits"
+        );
+        assert_eq!(
+            upload_error(
+                &TransportError::Io("http status 422 for https://relay.example/git/o/r".into()),
+                fallback
+            )
+            .to_string(),
+            "relay refused the private input upload (permanent HTTP refusal; not retried)"
+        );
+    }
 
     #[test]
     fn staged_repositories_share_one_job_quota() {

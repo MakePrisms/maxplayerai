@@ -130,7 +130,10 @@ fn mcp_prints_its_version_first_on_stderr_not_on_the_json_rpc_stream() {
 /// nothing said why. The start must warn once, after the version line, and never print the token.
 #[test]
 fn a_credentialed_local_proxy_is_warned_about_once_without_its_credential() {
-    let mut daemons: Vec<(&str, &[&str], bool)> = vec![("buyer", &["buyer", "serve"], false)];
+    let mut daemons: Vec<(&str, &[&str], bool)> = vec![
+        ("buyer", &["buyer", "serve"], false),
+        ("mcp", &["mcp"], false),
+    ];
     if cfg!(feature = "acp") {
         daemons.push(("seller", &["seller", "serve"], true));
     }
@@ -145,8 +148,14 @@ fn a_credentialed_local_proxy_is_warned_about_once_without_its_credential() {
                 command.env("MAXPLAYER_HOME", &home.0);
             }
             for name in [
-                "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
-                "NO_PROXY", "no_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
             ] {
                 command.env_remove(name);
             }
@@ -154,10 +163,18 @@ fn a_credentialed_local_proxy_is_warned_about_once_without_its_credential() {
                 command.env("HTTPS_PROXY", proxy);
             }
             let out = command.output().expect("run maxplayer");
+            // stdout is `mcp`'s JSON-RPC stream: the warning never goes there.
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).contains("requires credentials"),
+                "{role}: warning on stdout"
+            );
             String::from_utf8_lossy(&out.stderr).into_owned()
         };
         let stderr = start(Some("http://openclaw:secret@127.0.0.1:1"));
-        assert!(!stderr.contains("secret"), "{role}: the credential leaked:\n{stderr}");
+        assert!(
+            !stderr.contains("secret"),
+            "{role}: the credential leaked:\n{stderr}"
+        );
         let warnings: Vec<_> = stderr
             .lines()
             .enumerate()
@@ -165,7 +182,10 @@ fn a_credentialed_local_proxy_is_warned_about_once_without_its_credential() {
             .collect();
         assert_eq!(warnings.len(), 1, "{role}: exactly one warning:\n{stderr}");
         let (at, line) = warnings[0];
-        assert!(at >= 1, "{role}: the version start line stays first:\n{stderr}");
+        assert!(
+            at >= 1,
+            "{role}: the version start line stays first:\n{stderr}"
+        );
         assert!(
             line.contains("HTTPS_PROXY")
                 && line.contains("127.0.0.1:1")
@@ -174,6 +194,9 @@ fn a_credentialed_local_proxy_is_warned_about_once_without_its_credential() {
             "{role}: {line}"
         );
         let quiet = start(None);
-        assert!(!quiet.contains("requires credentials"), "{role}: no proxy, no warning:\n{quiet}");
+        assert!(
+            !quiet.contains("requires credentials"),
+            "{role}: no proxy, no warning:\n{quiet}"
+        );
     }
 }

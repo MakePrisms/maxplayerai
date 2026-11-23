@@ -107,14 +107,18 @@ pub async fn post(
                 )
                 .map_err(|error| match error {
                     crate::git_transport::TransportError::Auth(_) if open_pool => {
-                        Error(crate::job_lifecycle::SELLER_UNREADABLE_BASE)
+                        Error(crate::job_lifecycle::SELLER_UNREADABLE_BASE).into()
                     }
                     crate::git_transport::TransportError::Auth(_) => Error(
                         "pinned contribution base requires authentication and maxplayer never \
                          sends repository credentials; for a private source use base_local_path \
                          on a targeted private job",
+                    )
+                    .into(),
+                    error => hosting::SendError::transport(
+                        "pinned contribution base unavailable",
+                        &error,
                     ),
-                    _ => Error("pinned contribution base unavailable"),
                 })?;
                 let used = repositories::check_objects_after(&base_repo, Default::default())?;
                 // Base and inputs land in one job repository: check their combined quota
@@ -132,7 +136,7 @@ pub async fn post(
                          remove it — the job was not posted",
                     )
                 })?;
-                Ok::<_, Error>((base_repo, declared))
+                Ok::<_, hosting::SendError>((base_repo, declared))
             })
             .await
             .map_err(|_| Error("base input worker unavailable"))??;
@@ -233,7 +237,7 @@ pub async fn post(
                 if let Err(e) = crate::store_seed::write(&store, base_repo.path(), &oid) {
                     crate::opline!("buyer base seed not kept ({e}); collect fetches unseeded");
                 }
-                Ok::<_, Error>(())
+                Ok::<_, hosting::SendError>(())
             })
             .await
             .map_err(|_| Error("base input worker unavailable"))??;

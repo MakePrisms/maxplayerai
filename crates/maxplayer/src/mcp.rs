@@ -142,6 +142,7 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Err(_) => "home unresolved".to_owned(),
     };
     let _ = writeln!(err, "{}", crate::build_stamp::start_line("mcp", &place));
+    crate::cli::local_proxy_warning(err);
     let state = match bootstrap_state() {
         Ok(state) => state,
         Err(error) => {

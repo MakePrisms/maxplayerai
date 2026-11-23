@@ -1465,13 +1465,18 @@ impl HttpStream {
 /// reqwest's Display stops at "error sending request for url (..)"; the cause (a proxy's 407, a
 /// refused connect, a TLS failure) is only in the source chain, so name all of it.
 fn http_request_error(error: reqwest::Error) -> io::Error {
-    let mut message = format!("http request: {error}");
-    let mut source = std::error::Error::source(&error);
-    while let Some(cause) = source {
-        message.push_str(&format!(": {cause}"));
-        source = cause.source();
-    }
-    io::Error::other(message)
+    io::Error::other(format!(
+        "http request: {}",
+        crate::error_chain::chain(&error)
+    ))
+}
+
+/// A transport error as an operator may read it: without any server-supplied refusal excerpt
+/// (server data is matched, never echoed) and with URL credentials redacted.
+#[cfg(feature = "wallet")]
+pub(crate) fn operator_cause(error: &TransportError) -> String {
+    let text = error.to_string();
+    crate::error_chain::redact_userinfo(text.split(REFUSAL_MARKER).next().unwrap_or_default())
 }
 
 /// Marker before a server-supplied refusal excerpt. Text after it is server data,
