@@ -37,7 +37,9 @@ From the design discussion of 20–23 Nov 2026:
    `seller deliver`/`seller release` command. An asynchronous agent waits inside its adapter.
 7. **Stdout is always JSON**, `{"status": ..., "answer": ...}`.
 8. **Self-reported family/model from config only**, optional. Absent ⇒ the claim carries no
-   family/model for the hook (the existing "absent stays absent" rule).
+   family/model for the hook (the existing "absent stays absent" rule). A hook named after a
+   built-in (`[agents.claude] hook = …`) is a deliberate exception: buyers who ask for that harness
+   by name reach it, so it carries that name's family (§2).
 9. **Health is the simplest thing that works:** a ping at boot and on each heartbeat tick, and job
    failures counted through the existing harness strikes. Whether a ping calls the model is the
    adapter's choice.
@@ -133,110 +135,166 @@ every check as today.
 
 ---
 
-## 3. Routing
+## 3. Routing — ONE selection per claim
 
-`LiveRoster::dispatch` and `serves` take a second argument, the offer's shape:
+A new `LiveRoster::select(offer: &OfferShape) -> Option<Selected>` replaces the name-only
+`serves` in the claim decision. `OfferShape` carries what eligibility needs:
 
 ```rust
-pub struct OfferShape { pub inline: bool, pub contribution: bool }
+pub struct OfferShape<'a> {
+    pub inline: bool,                       // offer.accepts_inline_delivery()
+    pub contribution: bool,                 // a contribution pin was resolved for this offer
+    pub request: &'a CapabilityRequest,     // requested agent / family / model / capabilities
+}
 ```
 
-- An `Acp` entry is eligible for every shape (today's behavior).
-- A `Hook` entry is eligible iff `inline && !contribution`.
-- `requested = None` ⇒ the first serving, eligible entry. `requested = Some(name)` ⇒ the serving
-  entry with that name, which must also be eligible; otherwise `None` and the seller declines.
-  Never substituted, as today.
+An entry is a **candidate** iff it is serving and:
 
-Callers:
+- its kind admits the shape: an `Acp` entry admits every shape; a `Hook` entry only
+  `inline && !contribution`;
+- a requested agent name (normalized as today, `core/seller_agents.rs:179 @4caf510`) equals its
+  name;
+- the offer's family/model/capability request is met by **that entry's own** capability (its
+  family, its model, the seat's measured tokens for an `Acp` entry, none for a `Hook` entry), using
+  the same `capability_meets_request` the claim gate calls today.
 
-- `classify_offer` builds the shape from `offer.accepts_inline_delivery()`
-  (`core/gateway.rs:490 @4caf510`) and the contribution pin the claim path already resolved
-  (`run.rs:8035 @4caf510`). A new `SkipReason::NoEligibleAgent` names the case "the requested agent
-  exists but cannot serve this offer" apart from `AgentUnavailable`.
-- The capacity re-drive (`capacity_retry_offer`, `run.rs:2516 @4caf510`) reads the contribution
-  pin back from the store (`contribution_pin`).
-- **Claim-time pin.** The entry chosen at claim is stored on the claim row (new nullable column
-  `claims.agent_label`). `execute_job` and session turns dispatch by that label when present
-  (exact name, no eligibility recheck: eligibility was decided against the same offer). A NULL
-  label (rows from before this change, or the unlabelled `--agent-argv` hatch) uses today's
-  `dispatch(requested_agent)`. Routing therefore cannot change between claim and execution.
+`select` returns the first candidate in roster order; none ⇒ the seller declines with a new
+`SkipReason::NoEligibleAgent` ("no configured agent can serve this offer's shape"), distinct from
+`AgentUnavailable` ("the named agent is not serving").
 
-### 3.1 Correction to the discussion: the delivery-budget check stays after the award
+This also fixes a latent multi-harness bug: today the claim gate judges the request against the
+whole roster (`run.rs:3019 @4caf510`) while execution runs the first entry, so a `family=codex`
+request on a `[claude, codex]` seat passes on codex's strength and runs on claude.
 
-The discussion assumed the inline review-space check could move before the claim. It cannot: it
-signs a review request over the claim and the award (`delivery_budget.rs:27 @4caf510`). It still
-runs at the same point. When it drops inline for a job routed to a hook entry, the job fails with
-`delivery_failed` (no strike: the hook never ran). The buyer's reservation is released at once by
-the existing failure feedback. It fires only for private jobs whose inline reservation cannot be
-sealed, a permanent refusal that a git-capable entry handles today by delivering through git.
+**The selection is the single source** for everything the claim says and does:
+
+- the claim's filterable tags and the private dispatch block (§4);
+- the claim pin, written in the SAME transaction as the claim row and its outbox draft
+  (`claim_and_enqueue`, `core/seller_node/store.rs:1691 @4caf510`): new nullable columns
+  `claims.agent_label`, `claims.agent_kind` (`acp` | `hook`) and `claims.agent_fingerprint`
+  (sha256 of the entry's kind + argv/hook + family + model).
+
+**Slot before projection.** Today the private claim intent is prepared (`run.rs:8628 @4caf510`)
+before the slot reservation (`run.rs:8635 @4caf510`), so a capacity skip leaves a prepared claim
+intent whose dispatch block a later re-drive could contradict. The reservation moves first and is
+released on every non-claim exit, as `release_on_no_claim` already does. A re-drive then always
+prepares the intent for the first time with its own selection.
+
+**Execution reads the pin.** `execute_job` (`run.rs:9662 @4caf510`) and session turns
+(`core/seller_node/session_run.rs:855 @4caf510`) dispatch by the pinned label and verify kind and
+fingerprint against the live roster. A missing or changed entry fails the job closed with today's
+`capability_missing` (nothing ran). A row with no pin (claimed before this change, or the
+unlabelled `--agent-argv` hatch) dispatches as today but **only over `Acp` entries**, so a hook
+added later can never pick up work that never admitted hooks.
+
+The capacity re-drive (`capacity_retry_offer`, `run.rs:2516 @4caf510`) rebuilds the shape from
+the stored offer row and the stored contribution pin (`store.rs:1597 @4caf510`).
+
+### 3.1 Correction to the discussion: the delivery-budget probe stays after the award
+
+The discussion assumed the inline review-space check could move before the claim. It cannot. It
+is a size probe (`core/review/delivery_budget.rs:8 @4caf510`) built over the claim/award selection
+(`delivery_budget.rs:27 @4caf510`), so it runs where it runs today, right after the award. For a
+job pinned to a hook entry, before the hook is spawned:
+
+- `Ok(true)` ⇒ run the hook.
+- `Ok(false)` (inline cannot be reviewed; only git could) ⇒ fail `delivery_failed`, no strike.
+- `Err(_)` (selection or probe unavailable) ⇒ fail `delivery_failed`, no strike, exactly the arm
+  that refuses today (`run.rs:9620 @4caf510`).
+
+The buyer's daemon releases its reservation when it ingests the awarded seller's error feedback
+(`core/buyer/mod.rs:3335 @4caf510`). This fires only for private jobs whose inline answer cannot be
+sealed for review, which a git-capable entry handles today by delivering through git.
 
 ---
 
 ## 4. Claim advertising
 
-- The claim's `agent` tag lists the serving names, as today. The buyer's award filter already
-  matches a requested harness against that list.
-- Families/models: a hook entry contributes its configured `family`/`model` (or the family derived
-  from a built-in name). `SeatCapability::from_roster` gets the family per entry from one helper,
-  `entry_family(entry)`, instead of `harness_family_for_preset(name)`, so the beat, the claim and
-  the private dispatch block (`run.rs:8622 @4caf510`) agree.
-- A hook entry with neither ⇒ no family/model tags for it. Buyers filtering on family/model do not
+- **The claim describes the selected entry only.** Its `agent` tag is the selected entry's name
+  (none for the unlabelled hatch), and its filterable family/model/capability tags are that
+  entry's. The kind-30340 beat stays seat-wide (every serving entry), as today. A buyer's award
+  filter reads the claim (`core/gateway.rs:830 @4caf510`), so it judges exactly what will run.
+- Family per entry comes from one helper, `entry_family(entry)`: the configured `family`, else
+  the built-in name's family (`builtin_family_for_name`), else none. `SeatCapability::from_roster`
+  and the private dispatch block (`run.rs:8622 @4caf510`) both use it.
+- A hook entry with no family ⇒ no family/model tags. Buyers filtering on family/model do not
   match it; buyers that don't filter can award it.
-- `["session","1"]`: when the entry chosen for THIS claim is a hook, the claim advertises sessions
-  iff `[sessions] enabled`. The docker/runsc conditions are about parking containers and do not
+- **Buyer-side limit, unchanged here.** The buyer refuses a `model` request without a harness
+  preset, and a family/model request whose preset has no built-in family
+  (`core/buyer/lifecycle.rs:311`, `:325 @4caf510`). So a hook named `my-hook` can be awarded by
+  name, or by `harness_family` alone; a `harness` + `model` request matches a hook only when the
+  hook is named after the built-in (`[agents.claude] hook = …`). The skill page says so.
+- `["session","1"]`: when the selected entry is a hook, the claim advertises sessions iff
+  `[sessions] enabled`. The docker/runsc conditions are about parking containers and do not
   apply. A container entry keeps today's rule.
 
 ---
 
 ## 5. The hook contract (v1)
 
-The daemon runs `hook` argv with no shell, writes ONE line of JSON to stdin, closes stdin, and
-reads stdout and stderr. Every event carries `"v": 1`. A hook must ignore unknown fields and exit
-non-zero on an unknown `event`.
+The daemon runs `hook` argv directly (no shell; `argv[0]` resolved on the daemon's `PATH`, a
+relative path refused at config load), writes ONE JSON object followed by `\n` to stdin, closes
+stdin, and reads stdout and stderr concurrently until the process exits. Every event carries
+`"v": 1`. A hook must ignore unknown fields and exit non-zero on an unknown `event`.
 
 ### 5.1 `job` — one call per turn
 
 ```json
-{"v":1,"event":"job","job_id":"<hex>","turn":1,"session":true,
+{"v":1,"event":"job","invocation":"<hex>","job_id":"<hex>","turn":1,"session":true,
  "prompt":"<the buyer's task, or the follow-up text for turn ≥ 2>",
- "output":"text/markdown","inputs_dir":"/abs/path or null","deadline_unix":1795200000}
+ "output":"text/markdown","inputs_dir":"/abs/path","deadline_unix":1795200000}
 ```
 
-- `prompt` is the buyer's own text, verbatim: the offer task for turn 1, the follow-up for turn n.
-  None of the container prompt (git remote, markers, sentinel instructions) applies.
-- `session` is true when more turns may follow (the claim advertised sessions).
-- `output` is the offer's requested output type, when stated.
-- `inputs_dir`: see §6. `null` when the job has no input files.
-- The working directory is the per-job directory (§6).
+- `invocation` identifies ONE accepted request: the job id for turn 1, the follow-up event id for
+  turn n. A retry of the same request after a daemon restart carries the same value (§7.1); a new
+  follow-up always carries a new one. Adapters that keep state key it by `invocation`, and an
+  adapter that cannot answer the same `invocation` twice exits non-zero.
+- `prompt` is the buyer's own text, verbatim. None of the container prompt (git remote, markers,
+  sentinel instructions) applies.
+- `session` is true when the claim advertised sessions (more turns may follow).
+- `output` is the offer's requested output type, or `null` when the offer stated none.
+- `inputs_dir` is an absolute path, or `null` when the job has no input files (§6).
+- cwd is the per-job directory (§6).
 
-**Answer on stdout**, exit 0:
+**Answer.** On exit 0, stdout must be exactly one JSON object (UTF-8; surrounding whitespace
+allowed; a duplicate key is a violation):
 
 ```json
 {"status":"done","answer":"..."}
 ```
 
-`status` is `done` | `needs_input` | `out_of_time`. `needs_input` is a question for the buyer on a
-session turn, delivered like an answer with `turn_status=needs_input`. On a single-turn job it is
-delivered as an ordinary answer, since there is no next turn.
+`status` is `done` | `needs_input` | `out_of_time`. The answer is delivered byte-for-byte as
+decoded; it must contain a non-whitespace character. On a session turn `needs_input` and
+`out_of_time` become the result's `turn_status` (`core/session.rs:337 @4caf510`), exactly as for a
+container turn; on a single-turn job the status is ignored and the answer delivered.
 
 **Outcomes:**
 
 | Hook result | Daemon action | Reason code | Strike |
 |---|---|---|---|
-| exit 0, valid JSON, non-empty `answer` ≤ cap | `deliver_inline` (turn 1) / inline `publish_turn_result` (turn n) | — | — |
-| exit 0, answer over `INLINE_ANSWER_MAX_BYTES` | fail, never truncated | `delivery_failed` | no |
-| exit 0, stdout not the JSON above, empty answer, unknown status | fail | `execution_failed` | yes |
-| non-zero exit, killed by signal | fail; stderr tail logged | `execution_failed` | yes |
-| still running at `deadline_unix − 30 s` | kill process group, fail | `execution_failed` | no (job clock, as `DeadlineExceeded` today) |
+| exit 0, valid object, answer ≤ cap | deliver (§7) | — | — |
+| exit 0, decoded answer over `INLINE_ANSWER_MAX_BYTES` | fail, never truncated | `delivery_failed` | no |
+| exit 0, anything else on stdout (not JSON, extra keys allowed but wrong types, empty answer, unknown status, stdout > 1 MiB) | fail | `execution_failed` | yes |
+| non-zero exit, death by signal | fail | `execution_failed` | yes |
+| still running at the cutoff | kill group, fail | `execution_failed` | no |
+| cutoff already passed when the call would start | fail without spawning | `execution_failed` | no |
 
-- The answer cap is today's inline cap (§1). No marker is involved, so the hook path checks the
-  same constant `deliver_inline` checks.
-- Stdout is read up to 1 MiB; more is a contract violation. Stderr's last 4 KiB go to the seller
-  log, never to the buyer.
-- The 30 s publish margin leaves time to sign and publish before the offer deadline.
-- The process runs in its own process group; a kill reaches every child.
-- Environment: the daemon's environment minus every `MAXPLAYER_*` variable (config overrides may
-  carry credentials), plus `MAXPLAYER_HOOK_V=1`.
+**Supervision.** One runner serves `job`, `ping` and `close`:
+
+- The child runs in its own process group. Stdin is written while stdout/stderr are drained, so a
+  hook that never reads stdin or fills a pipe cannot wedge the daemon. A broken stdin pipe
+  (hook exited early) is not itself an error; the exit status decides.
+- Stdout is capped at 1 MiB (first overflow ⇒ kill, violation). Stderr keeps only its last 4 KiB,
+  which goes to the seller log, never to the buyer.
+- Cutoff (monotonic): `job` ⇒ `deadline_unix − 30 s` (time to sign and publish); `ping`/`close`
+  ⇒ 30 s. At the cutoff, or on daemon shutdown: `SIGTERM` to the group, 2 s grace, `SIGKILL` to
+  the group, reap the child. Read ends are closed after the reap, so a descendant that kept a pipe
+  open cannot hold the runner.
+- A hook that wants a long-lived worker must start it outside its own process group (that is the
+  adapter's business, e.g. the channel adapter's `serve`, started by Claude Code, not by us).
+- Environment: the daemon's environment with every `MAXPLAYER_*` variable removed (config
+  overrides may carry credentials), plus `MAXPLAYER_HOOK_V=1`. Nothing else is added or removed;
+  the hook is the seller's own program running as the seller.
 
 ### 5.2 `ping`
 
@@ -244,8 +302,8 @@ delivered as an ordinary answer, since there is no next turn.
 {"v":1,"event":"ping"}
 ```
 
-Exit 0 within 30 s = healthy. Stdout is ignored. What a ping checks is the adapter's decision
-(a socket, a login, a tiny model call); the contract only promises pings arrive periodically.
+Exit 0 before the cutoff = healthy. Stdout is ignored. cwd is the seller home. What a ping checks
+is the adapter's decision (a socket, a login, a tiny model call).
 
 ### 5.3 `close`
 
@@ -253,84 +311,143 @@ Exit 0 within 30 s = healthy. Stdout is ignored. What a ping checks is the adapt
 {"v":1,"event":"close","job_id":"<hex>"}
 ```
 
-Sent once when a hook session ends (buyer close, expiry, eviction). Best effort: 30 s timeout,
-exit status ignored, never holds a slot or fails anything. A crash or restart can end a session
-with no `close`, so an adapter must not rely on it as its only cleanup.
+Sent once when a hook session ends (buyer close, expiry, eviction), after its directory is
+removed (cwd is the seller home). Best effort: exit status ignored, never holds a slot or fails
+anything. A crash or restart can end a session with no `close`, so an adapter must not rely on it
+as its only cleanup.
 
 ---
 
 ## 6. Inputs and the per-job directory
 
-- The pre-claim fetch, verification and pin are unchanged (§1).
-- At execution of a hook job, the daemon creates the per-job directory
-  `job_workdir(home, job_id)` (`<home>/seller-jobs/<job_id>`), mode 0700, and, when the job has
-  inputs, `materialize`s the pinned manifest into `<dir>/inputs`. `inputs::materialize` already
-  refuses traversal, links, duplicate or overlapping paths, size/sha mismatches and an existing
-  destination, and writes 0600 files with no exec bit.
-- The pinned manifest is read from the stored task content the claim path already authenticated,
-  never refetched.
-- The hook's cwd is `<dir>`; `inputs_dir` is `<dir>/inputs` or `null`.
-- The directory is deleted when the job ends: after the result is journaled or the job failed
-  (single-turn), or when the session ends (session). The input cache itself keeps today's lifetime.
+- The pre-claim fetch, verification and pin are unchanged: `preflight`
+  (`core/seller_node/privacy.rs:268 @4caf510`) stores verified objects in the bare repo at
+  `input_cache` (`privacy.rs:257 @4caf510`) and pins `refs/heads/input-baseline`.
+- At execution, the private selection is validated first (`privacy::execution`, as the container
+  path does), then the authenticated manifest is read from the stored task content and
+  `inputs::materialize` (`core/private_content/inputs.rs:138 @4caf510`) writes it from the cache
+  into a fresh sibling directory `<dir>/.inputs-<random>`, which is renamed to `<dir>/inputs` only
+  when complete. `materialize` already refuses traversal, links, duplicate or overlapping paths,
+  size/sha mismatches and an existing destination, and writes 0700 dirs / 0600 files with no exec
+  bit. A missing or corrupt cache fails the job `execution_failed` without spawning (no strike).
+- The per-job directory is `job_workdir(home, job_id)` (`<home>/seller-jobs/<job_id>`), 0700.
+  The adapter may write there; the daemon owns only `inputs/`.
+- **Every turn re-materializes** `inputs/` from the pin (the previous copy is removed first), so a
+  hook that changed its inputs on turn 1 sees the buyer's files again on turn 2.
+- The directory is removed when the job reaches a terminal state (delivered and not a session,
+  failed) or when the session ends. A restart removes the directory of any job it finds terminal.
+  The input cache keeps today's lifetime.
 
 ---
 
 ## 7. Execution (turn 1)
 
-`execute_job` resolves the entry (claim-time label, §3). For a `Hook` entry it calls a new
-`execute_hook_job` and returns, before the container branch (`run.rs:9708 @4caf510`). Steps:
+`execute_job` reads the claim pin (§3). For a `Hook` entry it calls `execute_hook_job` and
+returns before the container branch (`run.rs:9708 @4caf510`). Steps:
 
-1. `assign_agent` journals the label; `mark_executing`, as today.
-2. The delivery-budget check (§3.1).
-3. Stored creq read, as today.
-4. Per-job directory and inputs (§6).
-5. Run the hook (§5.1) on a blocking task, bounded by the deadline.
-6. Map the outcome (§5.1 table). A delivered answer uses `deliver_inline` with exec metadata from
-   `seller_exec_metadata` (`core/seller_exec.rs:2575 @4caf510`): `harness` = the entry label,
-   `usage_transport` = `hook`, `metadata_trust` = `seller-claimed`, `model` = the configured model
-   when set, wall time measured by the daemon.
-7. Session (claim advertised it, `[sessions] enabled`): after a successful delivery, record a
-   session (§8). `deliver_inline` appends `turn_status` when the status is not `done`, through the
-   same `append_result_tags` the git path uses.
-8. Single-turn: delete the per-job directory.
+1. Review gate and resume decision exactly as today (`resume_action`, `run.rs:1677 @4caf510`).
+2. `assign_agent` journals the label; `mark_executing`.
+3. The delivery-budget probe (§3.1).
+4. Stored creq read, as today.
+5. Inputs (§6).
+6. **Staged outcome check** (§7.1): if an outcome for this invocation is already journaled, skip
+   to step 8 with it.
+7. Run the hook (§5) on a blocking task; map the result (§5.1 table). A deliverable outcome is
+   journaled (§7.1) BEFORE anything is signed or bound.
+8. Deliver through `deliver_inline` (`run.rs:11027 @4caf510`) with the journaled answer. Exec
+   metadata: a hook variant of `seller_exec_metadata` (`core/seller_exec.rs:2575 @4caf510`) emits
+   `harness` = the entry label, `usage_transport` = `hook`, `metadata_trust` = `seller-claimed`,
+   `model` = the configured model when set, and the daemon-measured wall time. When the claim
+   advertised a session and the status is not `done`, `turn_status` is appended through
+   `append_result_tags` as the git path does (`run.rs:10330 @4caf510`).
+9. Session (§8.1) or single-turn cleanup (§6).
 
-Strikes: an `execution_failed` hook outcome faults the entry with `Fault::Unproven`, exactly as a
-dead harness is faulted today (`seller_roster.rs:463 @4caf510`). The deadline kill uses the
-existing `DeadlineExceeded` no-op.
+Strikes: a strike outcome faults the entry with `Fault::Unproven`
+(`core/seller_roster.rs:463 @4caf510`), as a dead harness is faulted today.
+
+### 7.1 The staged outcome — a hook answer survives a restart
+
+`deliver_inline` binds the private answer under the intent `answer:<job>` (or `answer:<fid>`)
+before signing (`core/seller_node/privacy.rs:181 @4caf510`), and the private store refuses
+different content on an existing intent. If the daemon dies after that bind and before the result
+is journaled, a re-run of a nondeterministic hook would produce a different answer that can never
+be bound: the job would deliver nothing.
+
+So the validated outcome (status, answer bytes, wall time) is written to a new table
+`hook_outcomes(invocation PRIMARY KEY, job_id, turn, status, answer, wall_time_ms,
+created_at_unix)` in the seller store as soon as the runner returns it, before step 8. A resumed
+job or re-driven turn whose invocation has a row delivers that row and never runs the hook again.
+The row is deleted when the job or session ends. Once the result is journaled, today's outbox
+dedup (`deliver_and_enqueue`, `core/seller_node/store.rs:1972 @4caf510`) already prevents a second
+publication.
 
 ---
 
 ## 8. Sessions
 
-- **Record.** A hook session is a `SessionRecord` with `container = ""`, `holder = None`,
-  `harness = <label>`, `acp_session_id = None`, and a new column `sessions.kind` = `hook`
-  (existing rows read as `container`). Lifetime, close and restart bookkeeping are unchanged.
-- **Turn n.** `run_turn` keeps the payment gate, slot wait, start margin and session lookup. For a
-  `hook` record it skips the holder gate (nothing to verify) and calls `run_hook_turn`:
-  1. The follow-up review exactly as `resume_turn` builds it today, awaited before anything runs.
-     A refusal withholds the turn (refused, unpaid), as today.
-  2. Run the hook with `turn = n`, `prompt = the follow-up text`, `inputs_dir` from turn 1.
-  3. Publish through `publish_turn_result` with `TurnDelivery::Inline` and the hook's status.
-  4. Failures refuse the turn with the §5.1 reason codes; the session stays parked.
-- **End.** `end_session` skips every docker call for a `hook` record, deletes the per-job
-  directory, and the caller sends `close` (§5.3) off the loop. The GC's disk measurement skips hook
-  records (nothing on disk is ours except the inputs). The GC's lifetime expiry ends hook sessions
-  through the same path.
-- **Restart.** `recover_sessions` has nothing to stop for a hook record; unfinished turns are
-  re-driven as today.
+### 8.1 The session exists before the result can be seen
+
+For a session claim, turn 1's delivery and the `SessionRecord` are written together: the session
+row (`kind = hook`) is inserted in the same store transaction as the delivery row and the result's
+outbox draft. A follow-up therefore can never arrive for a delivered turn 1 with no session
+(`core/seller_node/session_run.rs:213 @4caf510` would treat it as ended), and a failed delivery
+never leaves a parked session. Implementation: `deliver_and_enqueue` gains an optional session
+record argument; `put_session` (`store.rs:2144 @4caf510`) stays for the container path.
+
+A hook session record has `container = ""`, `holder = None`, `harness = <label>`,
+`acp_session_id = None`, and a new column `sessions.kind` = `hook` (existing rows read as
+`container`).
+
+### 8.2 Turn n
+
+`run_turn` (`session_run.rs:522 @4caf510`) keeps the payment gate, slot wait, start margin and
+session lookup. For a `hook` record it skips the holder gate and calls `run_hook_turn`:
+
+1. The follow-up review exactly as `resume_turn` builds it today (`session_run.rs:801 @4caf510`),
+   awaited before anything runs; a refusal (including `turn_too_large`) withholds the turn,
+   unpaid, as today.
+2. Dispatch by the session's pinned label and fingerprint (§3).
+3. Inputs re-materialized (§6), staged-outcome check (§7.1, `invocation` = follow-up id), run the
+   hook with `turn = n` and the follow-up text, journal the outcome.
+4. Publish through `publish_turn_result` (`session_run.rs:1175 @4caf510`) with
+   `TurnDelivery::Inline`, the hook's status and the hook metadata of §7 step 8. The private
+   answer binds to the follow-up id, as today.
+5. Failures refuse the turn with the §5.1 reason codes; the session stays parked.
+
+### 8.3 End, expiry, restart
+
+- `end_session` (`core/seller_node/session_gc.rs:871 @4caf510`) skips every docker call for a
+  `hook` record, removes the per-job directory and the staged outcomes, and the caller sends
+  `close` (§5.3) off the loop. Buyer close, lifetime expiry and eviction all go through it.
+- Lifetime expiry today runs only on the container sweep tick, which needs the sandbox network
+  (`run.rs:6535 @4caf510`). Hook sessions are expired by the same GC lifetime rule on the drain
+  tick, which every seat runs; the disk measurement (`session_gc.rs:955 @4caf510`) is skipped for
+  hook records.
+- `recover_sessions` (`session_run.rs:1433 @4caf510`) stops containers only for `container`
+  records; unfinished hook turns are re-driven as today and land on §7.1.
 
 ---
 
 ## 9. Health
 
-- **Boot.** The pre-advertise probe runs a `ping` for each hook entry instead of an ACP turn.
-  Failing entries are dropped through `narrow_roster_to` (`run.rs:9249 @4caf510`). A seat where
-  nothing serves refuses to boot, as today.
-- **Running.** On each heartbeat tick, every SERVING hook entry is pinged off the loop (one
-  in-flight ping per entry). A failed ping faults it (`Fault::Unproven`); the beat then advertises
-  without it, and `accepting=n` if nothing else serves.
-- **Restore.** A dropped hook entry's due probe (`run.rs:9180 @4caf510`) is a ping. A passing ping
-  restores it. Same backoff, same strike history as a harness.
+- **Boot.** `probe_configured_harnesses` (`run.rs:4471 @4caf510`) pings each hook entry instead
+  of running an ACP turn; failures are dropped through `narrow_roster_to`
+  (`run.rs:9249 @4caf510`). A seat where nothing serves refuses to boot, as today.
+- **Boot gates on a hook-only seat** (every entry is a hook): the sandbox policy, token-mode gate,
+  capability probe and nix probe (`run.rs:4667 @4caf510`) are skipped, and the doctor's sandbox
+  and nix checks (`cli/doctor.rs:3093 @4caf510`) report "not applicable: hook-only seat". The seat
+  advertises no capability tokens. A mixed seat keeps every gate, and its tokens describe its
+  `Acp` entries only (§3).
+- **Running.** On each heartbeat tick, every serving hook entry with no ping in flight is pinged
+  off the loop. A failed ping faults it (`Fault::Unproven`); the beat then advertises without it,
+  and `accepting=n` if nothing else serves.
+- **Restore.** A dropped hook entry's due probe (`run.rs:9180 @4caf510`) is a ping; a passing ping
+  restores it, with the roster's backoff and strike history.
+- **Races.** A ping result is applied only if the entry's state has not changed since the ping
+  started (the roster already counts transitions, `seller_roster.rs:320 @4caf510`); a stale
+  "healthy" never restores an entry that a later job struck, and a stale failure never strikes a
+  restored one. An awarded job pinned to a currently dropped hook still runs: the award is
+  committed, and the run itself is the best test.
 - No new timer, no new counter.
 
 ---
@@ -364,35 +481,52 @@ existing `DeadlineExceeded` no-op.
 
 A hook entry only exists when a seller configures one, so absent config every path is today's.
 
-**PR 1 — single-turn hooks.** §2, §3, §4 (without sessions), §5.1–5.2, §6, §7, §9.
+**PR 1 — single-turn hooks.** §2, §3, §3.1, §4 (without sessions), §5.1–5.2, §6, §7, §9.
 Tests (each red on revert of its piece):
-- Config: `hook` + `argv` both/neither refused; `model` without `family` refused; unknown family
-  refused; `family` on an `argv` preset refused; a bare-string hook refused.
-- Routing: a hook-only roster skips a git-only offer and a contribution offer
-  (`NoEligibleAgent`); a mixed roster `[hook, claude]` routes a git-only offer to `claude` and an
-  inline offer to the hook; a named request for the hook on a git-only offer declines.
-- Claim pin: a claim routed to the hook executes on the hook after the roster order changes; a
-  NULL-label row dispatches as today.
-- Advertising: hook family/model reach the claim's filterable tags and the beat; absent stays
-  absent.
-- Execution, against a stub hook script: done ⇒ inline result with the answer digest receipt;
-  over-cap ⇒ `delivery_failed`, nothing published; bad JSON / non-zero ⇒ `execution_failed` +
-  strike; deadline ⇒ process group killed (a grandchild too), no strike; stdin carries the task
-  verbatim; `MAXPLAYER_*` absent from the hook's environment.
-- Inputs: a private job's files appear under `inputs_dir`, 0600, cwd is the job dir; the dir is
-  gone after delivery.
-- Health: boot ping failure drops the entry; heartbeat ping failure flips `accepting=n` on a
-  hook-only seat; a passing due ping restores it.
-- Doctor: a hook-only seat passes without sandbox/nix; a mixed seat still requires them.
+- Config: `hook` + `argv` both/neither refused; `model` without a family refused; unknown family
+  refused; `family`/`model` on an `argv` preset refused; a bare-string or empty hook refused; a
+  family contradicting a built-in name refused.
+- Selection: a hook-only roster skips a git-only offer and a contribution offer
+  (`NoEligibleAgent`); `[hook, claude]` routes a git-only offer to `claude` and an inline offer to
+  the hook; a named request for the hook on a git-only offer declines; a `family=codex` request on
+  `[claude, codex]` selects `codex` (the latent bug of §3); a capability token measured for the
+  `Acp` entries never makes a hook eligible.
+- Claim = selection: the claim's `agent`/family/model tags and the private dispatch block name the
+  selected entry only; the pin row is written in the claim transaction.
+- Pin: a claim routed to the hook executes on the hook after the roster order changes; a changed
+  fingerprint fails `capability_missing` without running anything; a NULL-pin row never dispatches
+  to a hook.
+- Capacity skip: a slot-full offer prepares no private claim intent; its re-drive selects afresh.
+- Supervisor, against stub hook scripts: done ⇒ inline result whose receipt binds the answer
+  digest; exact-cap and cap+1 multibyte answers; empty/whitespace answer, bad JSON, duplicate key,
+  unknown status, stdout > 1 MiB ⇒ `execution_failed` + strike; a hook that never reads stdin and
+  writes 1 MiB to stderr does not wedge; deadline ⇒ group killed including a grandchild, no
+  strike; cutoff already past ⇒ never spawned; stdin carries the task verbatim and the
+  `invocation`; no `MAXPLAYER_*` in the hook's environment except `MAXPLAYER_HOOK_V`.
+- Budget probe `Ok(false)` / `Err` ⇒ `delivery_failed`, hook never spawned, no strike.
+- Staged outcome: a crash after the outcome row and before the result journal re-delivers the
+  same bytes and does not run the hook again.
+- Inputs: a private job's files appear under `inputs_dir`, 0600, cwd is the job dir; a partial
+  materialization leaves no `inputs/`; the dir is gone after delivery and on a restart that finds
+  the job terminal.
+- Health: boot ping failure drops the entry; a heartbeat ping failure flips `accepting=n` on a
+  hook-only seat; a passing due ping restores it; a stale healthy ping does not undo a newer strike.
+- Boot/doctor: a hook-only seat boots with no docker and no nix (with and without
+  `--skip-doctor`); a mixed seat still requires both.
 
 **PR 2 — hook sessions.** §4 session advertising, §5.3, §8.
-Tests: claim advertises sessions for a hook entry with `[sessions] enabled` on a seat with no
-docker; turn 2 runs the hook with `turn=2` and the follow-up text after the review passes; a
-refused review runs nothing; `needs_input` reaches the result tags; close/expiry send `close` and
-delete the dir with no docker call; a hanging `close` does not hold a slot.
+Tests: the claim advertises sessions for a selected hook with `[sessions] enabled` on a seat with
+no docker; turn 1's session row and result are written in one transaction (an injected session
+insert failure publishes nothing); an immediate follow-up finds the session; turn 2 runs the hook
+with `turn=2`, the follow-up text and the follow-up id as `invocation` after the review passes; a
+refused review runs nothing; `needs_input` reaches the result tags; inputs changed by turn 1 are
+restored for turn 2; close/expiry on a docker-less seat send `close`, delete the dir and make no
+docker call; a hanging `close` does not hold a slot.
 
-**PR 3 — docs, adapters, `seller hook test`.** §10. The adapters are exercised by
-`seller hook test` in CI against a fake `claude` on PATH.
+**PR 3 — docs, adapters, `seller hook test`.** §10. The channel adapter's `answer` tool carries
+the `invocation` and is matched to exactly one waiting `push`; a late or duplicate answer is
+rejected. Tested by `seller hook test` in CI against a fake `claude` on PATH, including a delayed
+turn-1 answer arriving while turn 2 waits.
 
 ---
 
@@ -426,6 +560,6 @@ delete the dir with no docker call; a hanging `close` does not hold a slot.
 ## 14. Open questions (with proposed defaults)
 
 1. **Publish margin before the deadline.** Default 30 s (§5.1).
-2. **Should a hook-only seat still advertise `nix` capability tokens?** Default: no capability
-   probe runs for a hook-only seat, so it advertises none and buyers requiring capabilities do not
-   match it.
+2. **Capability tokens for hooks.** Default: a hook entry advertises none (§3, §9), so buyers
+   requiring `node`/`python`/`rust` never match it. A `capabilities = [...]` self-report in the
+   preset can be added later without a wire change.
