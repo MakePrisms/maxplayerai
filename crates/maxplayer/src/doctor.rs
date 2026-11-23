@@ -5161,22 +5161,36 @@ mod tests {
             r#"{"runc":{"path":"runc"}}"#,
         ] {
             let mut probed = false;
-            let check =
-                check_sandbox_runsc_sessions_with(Some(runsc.clone()), SessionsConfig::default(), || {
+            let check = check_sandbox_runsc_sessions_with(
+                Some(runsc.clone()),
+                SessionsConfig::default(),
+                || {
                     probed = true;
                     Ok(json.to_owned())
-                });
+                },
+            );
             assert!(probed, "{json}: unset enabled still probes docker");
             assert_eq!(check.status, Status::Warn, "{json}: {}", check.render());
             let rendered = check.render();
             assert!(rendered.contains("single-turn jobs continue"), "{rendered}");
-            assert!(rendered.contains("[sessions] enabled = false"), "{rendered}");
-            assert!(rendered.contains("--overlay2=none"), "names the fix: {rendered}");
+            assert!(
+                rendered.contains("[sessions] enabled = false"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("--overlay2=none"),
+                "names the fix: {rendered}"
+            );
         }
         let unset_open = check_sandbox_runsc_sessions_with(
             Some(runsc.clone()),
             SessionsConfig::default(),
-            || Ok(r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=none"]}}"#.into()),
+            || {
+                Ok(
+                    r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=none"]}}"#
+                        .into(),
+                )
+            },
         );
         assert_eq!(unset_open.status, Status::Pass, "{}", unset_open.render());
         // Docker could not confirm either way: a possible hiccup, so WARN (boot continues

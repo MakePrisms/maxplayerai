@@ -1825,11 +1825,12 @@ impl SessionsConfig {
     /// Seller parked-session disk budget: an explicit `disk_budget_bytes` wins; otherwise 20 GiB
     /// when the operator set `enabled = true`, and 5 GiB when sessions are on only by default.
     pub fn disk_budget(&self) -> u64 {
-        self.disk_budget_bytes.unwrap_or(if self.explicitly_enabled() {
-            DEFAULT_SESSION_DISK_BUDGET_BYTES
-        } else {
-            DEFAULT_SESSION_DISK_BUDGET_BYTES_UNSET
-        })
+        self.disk_budget_bytes
+            .unwrap_or(if self.explicitly_enabled() {
+                DEFAULT_SESSION_DISK_BUDGET_BYTES
+            } else {
+                DEFAULT_SESSION_DISK_BUDGET_BYTES_UNSET
+            })
     }
     /// The session cap for a job priced `price_sats`: explicit > config > `10 x price`.
     pub fn cap_for(&self, explicit: Option<u64>, price_sats: u64) -> u64 {
@@ -2952,20 +2953,29 @@ mod tests {
         assert!(unset.enabled());
         assert!(!unset.explicitly_enabled());
         assert_eq!(unset.disk_budget(), DEFAULT_SESSION_DISK_BUDGET_BYTES_UNSET);
-        let table_only = parse_config_toml("[sessions]\nlifetime_secs = 60\n").unwrap().sessions;
+        let table_only = parse_config_toml("[sessions]\nlifetime_secs = 60\n")
+            .unwrap()
+            .sessions;
         assert!(table_only.enabled() && !table_only.explicitly_enabled());
 
-        let on = parse_config_toml("[sessions]\nenabled = true\n").unwrap().sessions;
+        let on = parse_config_toml("[sessions]\nenabled = true\n")
+            .unwrap()
+            .sessions;
         assert!(on.enabled() && on.explicitly_enabled());
         assert_eq!(on.disk_budget(), DEFAULT_SESSION_DISK_BUDGET_BYTES);
 
-        let off = parse_config_toml("[sessions]\nenabled = false\n").unwrap().sessions;
+        let off = parse_config_toml("[sessions]\nenabled = false\n")
+            .unwrap()
+            .sessions;
         assert!(!off.enabled() && !off.explicitly_enabled());
 
-        let sized = parse_config_toml("[sessions]\ndisk_budget_bytes = 1234\n").unwrap().sessions;
+        let sized = parse_config_toml("[sessions]\ndisk_budget_bytes = 1234\n")
+            .unwrap()
+            .sessions;
         assert_eq!(sized.disk_budget(), 1234);
-        let sized_on =
-            parse_config_toml("[sessions]\nenabled = true\ndisk_budget_bytes = 1234\n").unwrap().sessions;
+        let sized_on = parse_config_toml("[sessions]\nenabled = true\ndisk_budget_bytes = 1234\n")
+            .unwrap()
+            .sessions;
         assert_eq!(sized_on.disk_budget(), 1234);
 
         // Round trip: an explicit setting is written back as written; the default writes nothing.
