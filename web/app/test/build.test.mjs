@@ -126,6 +126,14 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
     assert.ok(joinPreview.includes(`"/${asset}?v=${stamp}"`), `${asset} is stamped in join-preview.html`);
     assert.ok(!joinPreview.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in join-preview.html`);
   }
+  // The /join/<token> page for browsers: the new look, its own stylesheet and script, served one level deep.
+  const joinInvite = readFileSync(join(root, "dist", "join-invite.html"), "utf8");
+  for (const asset of ["fonts.css", "site.css", "join.css", "join.js", "fonts/instrument-sans-normal-latin.woff2"]) {
+    assert.ok(joinInvite.includes(`"/${asset}?v=${stamp}"`), `${asset} is stamped in join-invite.html`);
+    assert.ok(!joinInvite.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in join-invite.html`);
+  }
+  assert.ok(!/(href|src)="\.\//.test(joinInvite), "join-invite.html uses absolute paths (it is served at /join/<token>)");
+  assert.ok(readFileSync(join(root, "dist", "join.css"), "utf8").includes(`/assets/`) === false, "join.css loads no pictures of its own");
   // Font preload URLs must match fonts.css URLs byte-for-byte or the browser
   // fetches every preloaded font twice.
   const fontsCss = readFileSync(join(root, "dist", "fonts.css"), "utf8");
@@ -228,7 +236,7 @@ test("the new pages and their bundles carry no inline style or script", () => {
     assert.ok(!/<style\b/.test(html), `${page}: no <style> element`);
     assert.match(html, /<noscript><link rel="stylesheet" href="\.\/nojs\.css\?v=[0-9a-f]{12}"><\/noscript>/, `${page}: its no-script rules are a stylesheet, not inline`);
   }
-  for (const bundle of ["teams.js", "market.js", "swarm.js", "legal.js", "tokens.js"]) {
+  for (const bundle of ["teams.js", "market.js", "swarm.js", "legal.js", "tokens.js", "join.js"]) {
     const js = readFileSync(join(root, "dist", bundle), "utf8");
     assert.ok(!/style=\\?["']/.test(js), `${bundle} writes no style attribute into markup`);
     assert.ok(!js.includes("cssText") && !/setAttribute\(["']style/.test(js), `${bundle} sets no style text`);
@@ -640,4 +648,14 @@ test("the Try it flow and its Vercel function are gone", () => {
   }
   assert.ok(!readFileSync(join(root, "dist", "teams.js"), "utf8").includes("fetch("), "the homepage bundle makes no request of its own");
   assert.ok(!readFileSync(join(root, "dist", "styles.css"), "utf8").includes(".try-section"), "its styles are gone");
+});
+
+// The invite page's script holds a token in its address: it sends nothing anywhere (no analytics, no request that
+// could use the invite); it only fills the line for the agent and copies it.
+test("join.js only fills in the invite line and copies it", () => {
+  const js = readFileSync(join(root, "dist", "join.js"), "utf8");
+  for (const call of ["fetch(", "sendBeacon", "XMLHttpRequest", "WebSocket", "_vercel/insights", "localStorage", "indexedDB"]) {
+    assert.ok(!js.includes(call), `join.js has no ${call}`);
+  }
+  assert.ok(js.includes("join this team for me"), "it builds the line for the agent");
 });

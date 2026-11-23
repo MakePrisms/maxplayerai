@@ -26,6 +26,7 @@
     { "source": "/fees/20261029", "destination": "/fees-20261029" },
     { "source": "/swarm/:address", "destination": "/swarm" },
     { "source": "/join/:token", "has": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }], "destination": "/join-preview" },
+    { "source": "/join/:token", "has": [{ "type": "header", "key": "user-agent", "value": { "re": "^Mozilla/5\\.0 \\(" } }], "missing": [{ "type": "header", "key": "user-agent", "value": { "re": "compatible;|[Bb]ot/|[Bb]ot\\)|ChatGPT|Claude|GPT|Perplexity|OpenAI|Anthropic|HeadlessChrome|Google-|[Ss]pider|[Cc]rawl" } }], "destination": "/join-invite" },
     { "source": "/join/:token", "destination": "/join.md" }
   ],
   "headers": [
@@ -88,12 +89,37 @@
     },
     {
       "source": "/join/:token",
+      "headers": [
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
+        }
+      ]
+    },
+    {
+      "source": "/join/:token",
+      "missing": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }, { "type": "header", "key": "user-agent", "value": { "re": "^Mozilla/5\\.0 \\(" } }],
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "text/plain; charset=utf-8"
+        }
+      ]
+    },
+    {
+      "source": "/join/:token",
+      "has": [{ "type": "header", "key": "user-agent", "value": { "re": "^Mozilla/5\\.0 \\(" } }, { "type": "header", "key": "user-agent", "value": { "re": "compatible;|[Bb]ot/|[Bb]ot\\)|ChatGPT|Claude|GPT|Perplexity|OpenAI|Anthropic|HeadlessChrome|Google-|[Ss]pider|[Cc]rawl" } }],
       "missing": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }],
       "headers": [
         {
           "key": "Content-Type",
           "value": "text/plain; charset=utf-8"
-        },
+        }
+      ]
+    },
+    {
+      "source": "/join-invite",
+      "headers": [
         {
           "key": "X-Robots-Tag",
           "value": "noindex, nofollow"

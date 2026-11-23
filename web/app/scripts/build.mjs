@@ -30,15 +30,16 @@ const watch = process.argv.includes("--watch");
 // Legal pages are served one level deep, so they load assets from "/" rather than "./".
 // Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date; older dates stay live at their URLs.
 // Stylesheets of the pages in the new look (/, /market and the legal pages). The other pages use styles.css.
-const SITE_CSS = ["site.css", "market.css", "nojs.css", "legal.css"];
-const PAGES = ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "terms-20261123.html", "privacy-20261123.html", "skill-preview.html", "join-preview.html"];
+const SITE_CSS = ["site.css", "market.css", "nojs.css", "legal.css", "join.css"];
+const PAGES = ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "terms-20261123.html", "privacy-20261123.html", "skill-preview.html", "join-preview.html", "join-invite.html"];
 
 const options = {
   // teams.js serves / and market.js serves /market (the two pages in the new look).
+  // join.js serves the team invite page a browser gets for /join/<token> (its copy line);
   // legal.js serves the legal pages (their menu); terminal.js serves the pages that keep
   // the earlier look (chat, mint); tokens.js serves /tokens only, so the token-trade reader never ships
   // in (or changes) another bundle.
-  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts"), teams: join(root, "src/teams.ts"), market: join(root, "src/market-page.ts"), legal: join(root, "src/legal.ts") },
+  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts"), teams: join(root, "src/teams.ts"), market: join(root, "src/market-page.ts"), legal: join(root, "src/legal.ts"), join: join(root, "src/join.ts") },
   bundle: true,
   define: {
     CONFIGURED_RELAY_URL: JSON.stringify(relay),
@@ -75,7 +76,7 @@ if (watch) {
   for (const rel of [...PAGES, "styles.css", "fonts.css", "swarm.css", ...SITE_CSS, ...fontNames.map((f) => join("fonts", f)), ...assetNames.map((f) => join("assets", f))]) {
     hash.update(readFileSync(join(root, "public", rel)));
   }
-  for (const bundle of ["terminal.js", "tokens.js", "swarm.js", "teams.js", "market.js", "legal.js"]) hash.update(readFileSync(join(dist, bundle)));
+  for (const bundle of ["terminal.js", "tokens.js", "swarm.js", "teams.js", "market.js", "legal.js", "join.js"]) hash.update(readFileSync(join(dist, bundle)));
   const STAMP = hash.digest("hex").slice(0, 12);
 
   // Stamp the specifiers, not the files: fonts.css's url()s and every asset
@@ -101,7 +102,7 @@ if (watch) {
     writeFileSync(
       join(dist, page),
       readFileSync(join(root, "public", page), "utf8")
-        .replace(/(href|src)="(\.?\/)(styles\.css|fonts\.css|site\.css|market\.css|nojs\.css|legal\.css|legal\.js|terminal\.js|tokens\.js|swarm\.js|teams\.js|market\.js|swarm\.css|fonts\/[^"?]+|assets\/[^"?]+)"/g, `$1="$2$3?v=${STAMP}"`),
+        .replace(/(href|src)="(\.?\/)(styles\.css|fonts\.css|site\.css|market\.css|nojs\.css|legal\.css|legal\.js|join\.css|join\.js|terminal\.js|tokens\.js|swarm\.js|teams\.js|market\.js|swarm\.css|fonts\/[^"?]+|assets\/[^"?]+)"/g, `$1="$2$3?v=${STAMP}"`),
     );
   }
 
