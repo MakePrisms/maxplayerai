@@ -931,8 +931,9 @@ async fn assert_base_readable_by_sellers(
             Err(JobLifecycleError::Input(SELLER_UNREADABLE_BASE.into()))
         }
         Err(error) => Err(JobLifecycleError::Relay(format!(
-            "could not verify that sellers can read the contribution base ({error}); the post \
-             was not published — retry it, or post a targeted private job"
+            "could not verify that sellers can read the contribution base ({}); the post \
+             was not published — retry it, or post a targeted private job",
+            crate::git_transport::operator_cause(&error)
         ))),
     }
 }

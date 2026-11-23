@@ -1481,13 +1481,54 @@ pub(crate) fn body_read_error(error: io::Error) -> io::Error {
     io::Error::new(error.kind(), crate::error_chain::chain(&error))
 }
 
-/// A transport error as an operator may read it: without any server-supplied refusal excerpt
-/// (server data is matched, never echoed) and with URL credentials redacted.
+/// A transport error as an operator may read it: server-written text is withheld, never echoed
+/// (an HTTP refusal excerpt, a push status message, libgit2's `remote error:` / `Error
+/// reported:` text), URL credentials are redacted, and what is left is printable ASCII on one
+/// line, at most [`OPERATOR_CAUSE_MAX`] characters.
 #[cfg(feature = "wallet")]
 pub(crate) fn operator_cause(error: &TransportError) -> String {
-    let text = error.to_string();
-    crate::error_chain::redact_userinfo(text.split(REFUSAL_MARKER).next().unwrap_or_default())
+    let text = match error {
+        // `require_status_report` builds `<refname>: <server message>`; keep the ref name only.
+        TransportError::Rejected(message) => match message.split_once(": ") {
+            Some((refname, _)) => {
+                format!("remote rejected ref: {refname} (server message withheld)")
+            }
+            None => error.to_string(),
+        },
+        _ => error.to_string(),
+    };
+    let mut text = text
+        .split(REFUSAL_MARKER)
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    for marker in SERVER_TEXT_MARKERS {
+        if let Some(at) = text.find(marker) {
+            text.truncate(at + marker.len());
+            text.push_str("(server text withheld)");
+        }
+    }
+    let text = crate::error_chain::redact_userinfo(&text);
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { ' ' })
+        .collect();
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(OPERATOR_CAUSE_MAX)
+        .collect()
 }
+
+/// libgit2 formats a server's `ERR` packet as `remote error: <text>` and a report-status
+/// failure as `report-status: Error reported: <text>`; the text after either is the server's.
+#[cfg(feature = "wallet")]
+const SERVER_TEXT_MARKERS: [&str; 2] = ["remote error: ", "Error reported: "];
+
+/// Longest transport cause shown to an operator.
+#[cfg(feature = "wallet")]
+const OPERATOR_CAUSE_MAX: usize = 600;
 
 /// Marker before a server-supplied refusal excerpt. Text after it is server data,
 /// not transport evidence, so error classification ignores it.
@@ -1606,6 +1647,48 @@ impl Write for HttpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Server-written text never reaches an operator line: not a push status message, not
+    /// libgit2's `remote error:` / `Error reported:` text; control characters and length are
+    /// bounded and credentials redacted.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn operator_cause_withholds_server_written_text() {
+        let rejected = operator_cause(&TransportError::Rejected(
+            "refs/heads/input/ab12: hook says EVIL\x1b[31m text".into(),
+        ));
+        assert_eq!(
+            rejected,
+            "remote rejected ref: refs/heads/input/ab12 (server message withheld)"
+        );
+        let fixed = TransportError::Rejected(
+            "private input push did not acknowledge unpack and exactly the intended ref".into(),
+        );
+        assert_eq!(operator_cause(&fixed), fixed.to_string());
+        for (message, kept) in [
+            (
+                "unexpected http status 500: remote error: EVIL server text",
+                "remote error:",
+            ),
+            (
+                "report-status: Error reported: EVIL server text",
+                "Error reported:",
+            ),
+        ] {
+            let shown = operator_cause(&TransportError::Io(message.into()));
+            assert!(!shown.contains("EVIL"), "{shown}");
+            assert!(
+                shown.contains(&format!("{kept} (server text withheld)")),
+                "{shown}"
+            );
+        }
+        let shown = operator_cause(&TransportError::Io(
+            "connect\nfailed\u{7} for http://u:secret@h/x".into(),
+        ));
+        assert_eq!(shown, "io error: connect failed for http://***@h/x");
+        let long = operator_cause(&TransportError::Io("x".repeat(5_000)));
+        assert_eq!(long.chars().count(), OPERATOR_CAUSE_MAX);
+    }
 
     // RUSTSEC-2026-0183: `git2::Remote::list()` passed a NULL pointer to `slice::from_raw_parts` when
     // the remote advertises no refs — undefined behaviour in release builds, and on git2 0.19 a
