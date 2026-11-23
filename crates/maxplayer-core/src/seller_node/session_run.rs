@@ -263,7 +263,7 @@ impl SellerNodeRunner {
                         if self
                             .turn_feedback(&job_id, &award_buyer, &fid, ReasonCode::SessionExpired)
                             .await
-                            && let Err(error) = store.mark_ended_refusal(&fid, now_secs())
+                            && let Err(error) = store.mark_ended_refusal(&fid, &job_id, now_secs())
                         {
                             opline!(
                                 "seller node follow-up id={fid}: refusal marker write failed ({error})"

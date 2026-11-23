@@ -22005,6 +22005,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// #1203 field shape — a follow-up refused while the session was live, then a second one for
+    /// the same turn after the session closed, then both replayed (and a `close`): the live-refused
+    /// one (an old refused row, as an upgraded seat holds it) is not answered again, the late one is
+    /// answered once, the close publishes nothing.
+    /// RED ON REVERT: drop the own-row check (`followup_id = ?3`) from `ended_refusal_due` and the
+    /// live-refused follow-up gets a second (session_expired) answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1203_a_live_refusal_then_a_late_follow_up_are_each_answered_once() {
+        use crate::session::{FollowUpStatus, SessionState, TurnState};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("1203-field-shape");
+        let runner = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture)).await.expect("boot"),
+        );
+        let buyer = Keys::generate();
+        let job_id = park_session_1299(&runner, &buyer);
+        let sign = |text: &str| {
+            let draft = crate::session::followup_draft(&crate::session::FollowUp {
+                offer_id: job_id.clone(),
+                seller_pubkey: runner.seller_pubkey.to_hex(),
+                status: FollowUpStatus::Turn,
+                prev_result_id: Some("c".repeat(64)),
+                turn: Some(2),
+                deadline_unix: Some(now_unix() as u64 + 3_600),
+                text: Some(text.to_owned()),
+            })
+            .expect("follow-up draft");
+            crate::gateway::nostr::event_builder(&draft)
+                .expect("builder")
+                .sign_with_keys(&buyer)
+                .expect("sign follow-up")
+        };
+        let (live, late) = (sign("#1203 refused live"), sign("#1203 sent after close"));
+        // `live` was refused (and answered) while the session was parked, by a seller from before
+        // this fix: a refused row and no `turn-refused:` marker (the shape an upgraded seat holds).
+        let store = runner.node.store();
+        let now = now_unix() as u64;
+        assert!(store
+            .record_turn(&live.id.to_hex(), &job_id, 2, now + 3_600, TurnState::Refused, now)
+            .expect("record"));
+        assert!(store
+            .set_session_state(&job_id, SessionState::Closed, now)
+            .expect("close"));
+        let close = followup_1299(&runner, &buyer, &job_id, FollowUpStatus::Close);
+        let feedback = crate::kinds::JOB_FEEDBACK_KIND as u64;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for _ in 0..3 {
+                    runner.on_followup(&live).await;
+                    runner.on_followup(&late).await;
+                    runner.on_followup(&close).await;
+                }
+            })
+            .await;
+        let refusals: Vec<_> = fixture
+            .events()
+            .await
+            .into_iter()
+            .filter(|event| event.kind == feedback)
+            .collect();
+        let replies_to = |fid: String| {
+            refusals
+                .iter()
+                .filter(|event| {
+                    event.tags.iter().any(|t| {
+                        t.iter().map(String::as_str).eq(["e", fid.as_str(), "", "reply"])
+                    })
+                })
+                .count()
+        };
+        assert_eq!(replies_to(live.id.to_hex()), 0, "the live refusal is not answered again");
+        assert_eq!(replies_to(late.id.to_hex()), 1, "the late follow-up is answered once");
+        assert_eq!(refusals.len(), 1, "a close to an ended session publishes nothing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// #1299 N4 — a turn waiting for the previous turn's payment does not hold a drain until its
     /// deadline: it returns, left `waiting_payment` for the restarted seller to re-drive.
     /// RED ON REVERT: drop the drain check in the `PaymentGate::Wait` branch and the turn task keeps
