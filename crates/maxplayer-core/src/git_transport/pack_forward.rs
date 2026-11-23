@@ -112,7 +112,7 @@ fn response(mut stream: HttpStream) -> Result<Vec<u8>, TransportError> {
         .ok_or_else(|| invalid("missing response"))?
         .take(RESPONSE_LIMIT + 1)
         .read_to_end(&mut bytes)
-        .map_err(io_error)?;
+        .map_err(|error| io_error(super::body_read_error(error)))?;
     if bytes.len() as u64 > RESPONSE_LIMIT {
         return Err(invalid("response exceeds limit"));
     }
@@ -248,6 +248,48 @@ mod tests {
         assert_eq!(
             upload_timeout(93 * 1024 * 1024),
             Duration::from_secs(60 + 93 * 8)
+        );
+    }
+    // A response body cut off mid-stream names hyper's cause, not only reqwest's top line.
+    #[test]
+    fn response_body_read_errors_name_their_source_chain() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
+                .unwrap();
+        });
+        let stream = HttpStream {
+            mint: None,
+            authority: None,
+            lifetime: None,
+            short: true,
+            read_budget: None,
+            url: format!("http://{addr}/git/o/r.git/info/refs?service=git-receive-pack"),
+            destination: String::new(),
+            service: "git-receive-pack",
+            is_post: false,
+            sent: false,
+            request_body: vec![],
+            streaming_body: None,
+            response: None,
+            timeout_override: None,
+        };
+        let error = response(stream).err().expect("truncated body");
+        server.join().unwrap();
+        let message = error.to_string();
+        assert!(
+            message.contains("request or response body error: "),
+            "{message}"
+        );
+        assert!(
+            message.contains("error reading a body from connection"),
+            "{message}"
         );
     }
     #[test]

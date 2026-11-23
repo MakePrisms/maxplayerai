@@ -998,9 +998,10 @@ fn base_validation_refusal(
             JobLifecycleError::Input(SELLER_UNREADABLE_BASE.into())
         }
         error => JobLifecycleError::Relay(format!(
-            "contribution base validation failed ({error}): every seller must be able to fetch \
+            "contribution base validation failed ({}): every seller must be able to fetch \
              base_oid {oid} from target_repo_url, and this fetch could not — the job was not \
-             posted; fix the pin (or the host) and post again"
+             posted; fix the pin (or the host) and post again",
+            crate::git_transport::operator_cause(error)
         )),
     }
 }
@@ -6685,6 +6686,23 @@ mod tests {
         assert!(io.contains("contribution base validation failed"), "{io}");
         assert!(io.contains(&oid), "{io}");
         assert!(io.contains("post again"), "{io}");
+        // Public-post text: the transport's own cause, never a server's refusal excerpt or a
+        // URL credential.
+        let refused = base_validation_refusal(
+            &TransportError::Io(
+                "http status 404 for http://u:secret@h/x (refusal: server body text)".into(),
+            ),
+            &oid,
+        )
+        .to_string();
+        assert!(
+            refused.contains("http status 404 for http://***@h/x"),
+            "{refused}"
+        );
+        assert!(
+            !refused.contains("server body text") && !refused.contains("secret"),
+            "{refused}"
+        );
 
         // Quota gate + advisory seed on a real local repository.
         let dir = std::env::temp_dir().join(format!(

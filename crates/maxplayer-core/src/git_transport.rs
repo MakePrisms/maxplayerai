@@ -1471,6 +1471,16 @@ fn http_request_error(error: reqwest::Error) -> io::Error {
     ))
 }
 
+/// A response body read that failed mid-stream: reqwest wraps its error in an `io::Error` whose
+/// Display is again only reqwest's top line, so name the whole chain. The kind is kept (read loops
+/// retry `Interrupted`); an error with no inner error (an OS error) is returned unchanged.
+pub(crate) fn body_read_error(error: io::Error) -> io::Error {
+    if error.get_ref().is_none() {
+        return error;
+    }
+    io::Error::new(error.kind(), crate::error_chain::chain(&error))
+}
+
 /// A transport error as an operator may read it: without any server-supplied refusal excerpt
 /// (server data is matched, never echoed) and with URL credentials redacted.
 #[cfg(feature = "wallet")]
@@ -1555,13 +1565,13 @@ impl Read for HttpStream {
                     budget.check()?;
                     let remaining = budget.remaining.load(std::sync::atomic::Ordering::Relaxed);
                     let len = buf.len().min(remaining);
-                    let n = response.read(&mut buf[..len])?;
+                    let n = response.read(&mut buf[..len]).map_err(body_read_error)?;
                     budget
                         .remaining
                         .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
                     Ok(n)
                 } else {
-                    response.read(buf)
+                    response.read(buf).map_err(body_read_error)
                 }
             }
             None => Ok(0),
@@ -1679,6 +1689,55 @@ mod tests {
             message.contains("proxy authorization required"),
             "{message}"
         );
+    }
+
+    // A body cut off mid-stream: reqwest's io error Display is its top line only; the read must
+    // name the cause too, with the same kind.
+    #[test]
+    fn http_body_read_errors_name_their_source_chain() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
+                .unwrap();
+        });
+        let mut stream = HttpStream {
+            mint: None,
+            authority: None,
+            lifetime: None,
+            short: true,
+            read_budget: None,
+            url: format!("http://{addr}/git/o/r.git/info/refs?service=git-upload-pack"),
+            destination: String::new(),
+            service: "git-upload-pack",
+            is_post: false,
+            sent: false,
+            request_body: vec![],
+            streaming_body: None,
+            response: None,
+            timeout_override: None,
+        };
+        let mut body = Vec::new();
+        let error = stream.read_to_end(&mut body).unwrap_err();
+        server.join().unwrap();
+        let message = error.to_string();
+        // reqwest's own Display is "request or response body error"; hyper's cause follows it.
+        assert!(
+            message.starts_with("request or response body error: "),
+            "{message}"
+        );
+        assert!(
+            message.contains("error reading a body from connection"),
+            "{message}"
+        );
+        // `pack_forward::response` maps its body read through the same helper.
+        let os = io::Error::from(io::ErrorKind::ConnectionReset);
+        assert_eq!(body_read_error(os).kind(), io::ErrorKind::ConnectionReset);
     }
 
     #[test]

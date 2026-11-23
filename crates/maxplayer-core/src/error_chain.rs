@@ -35,30 +35,53 @@ pub fn chain(error: &(dyn StdError + 'static)) -> String {
 ///   runs past the next `://`, so a second URL glued to the first (`&`, `]`, `,`) is still
 ///   redacted. `, ' ( ) ; = & [ ]` are legal in a password and do NOT end it, so a URL directly
 ///   followed by an `@`-word is over-redacted rather than leaked.
-/// - Scheme-less `user:pass@host:port` (how a proxy variable can be written) fails closed: in a
-///   whitespace-separated word with no URL, everything before the last `@` that is followed by a
-///   host becomes `***` (an e-mail address is redacted the same way).
-///
-/// A credential inside a URL's path or query is not userinfo and is not specially handled.
+/// - Scheme-less `user:pass@host:port` (how a proxy variable can be written) fails closed
+///   wherever it sits in a word: before, between or after URLs, or glued straight onto a scheme.
+///   All text outside a URL authority (a URL's path and query included) gets the bare rule: each
+///   `@` followed by a host (`[`, an ASCII letter or digit, or `::` for an unbracketed IPv6
+///   address) drops everything before it back to the previous `" ` < > { }` (JSON and quoting
+///   punctuation, never in a token) or the start of that text, keeping only leading `( [ ' / , ;`.
+///   `/ ? # , ; =` do not stop it (a base64 token may contain `/`), so `url=http://h/p,proxy=`
+///   before a credential is over-redacted rather than leaked. An e-mail address, or `pkg@1.2` in a
+///   URL path, is redacted the same way; `HEAD@{0}` and `/@org` are not.
 pub fn redact_userinfo(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for piece in text.split_inclusive(char::is_whitespace) {
         let word = piece.trim_end_matches(char::is_whitespace);
-        match word.find("://") {
-            None => redact_bare(word, &mut out),
-            Some(i) => {
-                let scheme = word[..i]
-                    .char_indices()
-                    .rev()
-                    .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-                    .map_or(0, |(j, c)| j + c.len_utf8());
-                redact_bare(&word[..scheme], &mut out);
-                redact_urls(&word[scheme..], &mut out);
+        let mut pos = 0;
+        while let Some(i) = word[pos..].find("://").map(|i| pos + i) {
+            let scheme = scheme_start(word, pos, i);
+            redact_bare(word, pos, scheme, &mut out);
+            out.push_str(&word[scheme..i + 3]);
+            let tail = &word[i + 3..];
+            // Never past the next URL's `://`: its scheme stays outside this authority.
+            let next = tail.find("://").unwrap_or(tail.len());
+            let end = tail[..next].find(ends_authority).unwrap_or(next);
+            let authority = &tail[..end];
+            match authority.rfind('@') {
+                Some(at) => {
+                    out.push_str("***@");
+                    out.push_str(&authority[at + 1..]);
+                }
+                None => out.push_str(authority),
             }
+            pos = i + 3 + end;
         }
+        redact_bare(word, pos, word.len(), &mut out);
         out.push_str(&piece[word.len()..]);
     }
     out
+}
+
+/// Start of the scheme that ends at `colon` (the `:` of `://`), never before `from`. Text before it
+/// still gets the bare rule, and a credential glued onto the scheme (`u:p@proxy.http://`) is caught
+/// there because the host after its `@` is read from the whole word.
+fn scheme_start(word: &str, from: usize, colon: usize) -> usize {
+    word[from..colon]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .map_or(from, |(j, c)| from + j + c.len_utf8())
 }
 
 /// Characters that end a URL authority: none of them is ever unencoded in userinfo.
@@ -70,45 +93,44 @@ fn ends_authority(c: char) -> bool {
         )
 }
 
-fn redact_urls(text: &str, out: &mut String) {
-    let mut rest = text;
-    while let Some(i) = rest.find("://") {
-        let (head, tail) = rest.split_at(i + 3);
-        out.push_str(head);
-        // Never past the next URL's `://`: its scheme stays outside this authority.
-        let next = tail.find("://").unwrap_or(tail.len());
-        let end = tail[..next].find(ends_authority).unwrap_or(next);
-        let authority = &tail[..end];
-        match authority.rfind('@') {
-            Some(at) => {
-                out.push_str("***@");
-                out.push_str(&authority[at + 1..]);
-            }
-            None => out.push_str(authority),
-        }
-        rest = &tail[end..];
-    }
-    out.push_str(rest);
+/// Characters that end a scheme-less credential: structural punctuation (JSON, `<..>`, quoting)
+/// that a proxy credential never carries unencoded.
+fn ends_bare(c: char) -> bool {
+    matches!(c, '"' | '`' | '<' | '>' | '{' | '}')
 }
 
-/// A word without a URL: `user:pass@host` (or `token@host`) loses everything before its last
-/// `@`, keeping only leading opening punctuation.
-fn redact_bare(word: &str, out: &mut String) {
-    let lead = word.len()
-        - word
-            .trim_start_matches(['(', '[', '<', '"', '\'', '`'])
-            .len();
-    match word.rfind('@') {
-        Some(at)
-            if at > lead
-                && word[at + 1..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '[') =>
-        {
-            out.push_str(&word[..lead]);
-            out.push_str("***");
-            out.push_str(&word[at..]);
+/// `word[start..end]`, text outside any URL authority, with every `cred@host` reduced to
+/// `***@host`. The host is read from the whole word, so an `@` at `end` followed by the next
+/// URL's scheme counts. Scanned right to left, resuming before each credential, so a later
+/// non-host `@` (`HEAD@{0}`) never hides an earlier credential.
+fn redact_bare(word: &str, start: usize, end: usize, out: &mut String) {
+    let host_start = |rest: &str| {
+        rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '[') || rest.starts_with("::")
+    };
+    let mut cuts = Vec::new();
+    let mut limit = end;
+    while let Some(at) = word[start..limit].rfind('@').map(|i| start + i) {
+        limit = at;
+        if !host_start(&word[at + 1..]) {
+            continue;
         }
-        _ => out.push_str(word),
+        // `ends_bare` characters are ASCII, so `+ 1` is the next char boundary.
+        let from = word[start..at]
+            .rfind(ends_bare)
+            .map_or(start, |i| start + i + 1);
+        let cred = word[from..at].trim_start_matches(['(', '[', '\'', '/', ',', ';']);
+        if !cred.is_empty() {
+            cuts.push(at - cred.len()..at);
+            limit = at - cred.len();
+        }
     }
+    let mut pos = start;
+    for cut in cuts.into_iter().rev() {
+        out.push_str(&word[pos..cut.start]);
+        out.push_str("***");
+        pos = cut.end;
+    }
+    out.push_str(&word[pos..end]);
 }
 
 /// The proxy variables reqwest (and so every relay, git and mint request) reads, as reqwest reads
@@ -348,6 +370,96 @@ mod tests {
         for unchanged in ["HEAD@{0}", "@mention", "no credential here", "a @ b"] {
             assert_eq!(redact_userinfo(unchanged), unchanged);
         }
+    }
+
+    // An unbracketed IPv6 host after `@`, and a later `@` that is not a host in the same word,
+    // must not let an earlier scheme-less credential through.
+    #[test]
+    fn redact_userinfo_bare_credential_before_ipv6_or_a_later_at() {
+        for (input, kept) in [
+            ("proxy u:secret@::1 refused", "proxy ***@::1 refused"),
+            (
+                "u:secret@::ffff:127.0.0.1:8080",
+                "***@::ffff:127.0.0.1:8080",
+            ),
+            (
+                "u:secret@127.0.0.1:8080/HEAD@{0}",
+                "***@127.0.0.1:8080/HEAD@{0}",
+            ),
+            (
+                "proxy=u:secret@127.0.0.1:8080,ref=HEAD@{0}",
+                "***@127.0.0.1:8080,ref=HEAD@{0}",
+            ),
+            ("u:secret@127.0.0.1:8080/@", "***@127.0.0.1:8080/@"),
+            ("a:secret1@h1,b:secret2@h2", "***@h2"),
+        ] {
+            let out = redact_userinfo(input);
+            assert!(!out.contains("secret"), "{input:?} -> {out:?}");
+            assert_eq!(out, kept, "{input:?}");
+        }
+    }
+
+    // A scheme-less credential sharing a whitespace-free word with a URL: after it, between two,
+    // or glued straight onto a scheme. Real URL credentials stay redacted as before.
+    #[test]
+    fn redact_userinfo_bare_credential_next_to_a_url() {
+        for (input, kept) in [
+            (
+                r#"{"url":"http://h1","proxy":"u:secret@127.0.0.1:8080"}"#,
+                r#"{"url":"http://h1","proxy":"***@127.0.0.1:8080"}"#,
+            ),
+            (
+                r#"{"a":"http://h1","proxy":"u:secret@127.0.0.1:8080","b":"http://h2"}"#,
+                r#"{"a":"http://h1","proxy":"***@127.0.0.1:8080","b":"http://h2"}"#,
+            ),
+            (
+                "<http://h1>,u:secret@127.0.0.1:8080",
+                "<http://h1>,***@127.0.0.1:8080",
+            ),
+            (
+                "url=http://h1/p,proxy=u:secret@127.0.0.1:8080",
+                "url=http://h1/***@127.0.0.1:8080",
+            ),
+            (
+                "u:secret@127.0.0.1http://other",
+                "***@127.0.0.1http://other",
+            ),
+            ("u:secret@proxy.http://other", "***@proxy.http://other"),
+            (
+                "u:secret@127.0.0.1http://v:secret2@other/x",
+                "***@127.0.0.1http://***@other/x",
+            ),
+            ("http://u:secret@::1", "http://***@::1"),
+            ("http://u:secret@[::1]:8080/p", "http://***@[::1]:8080/p"),
+        ] {
+            let out = redact_userinfo(input);
+            assert!(!out.contains("secret"), "{input:?} -> {out:?}");
+            assert_eq!(out, kept, "{input:?}");
+        }
+    }
+
+    // Fail-closed redaction must not mangle ordinary text: URLs without credentials, git reflog
+    // selectors, `@org` path segments, mentions. An e-mail address is redacted by design.
+    #[test]
+    fn redact_userinfo_leaves_ordinary_text_alone() {
+        for unchanged in [
+            "https://relay.example/git/o/r.git/info/refs?service=git-upload-pack",
+            "http://h1 http://h2,http://h3/p?q=1#f",
+            r#"{"url":"http://h1","b":"http://h2"}"#,
+            "HEAD@{0}",
+            "main@{upstream}",
+            "fetch https://relay.example/HEAD@{0}",
+            "https://relay.example/@org/repo",
+            "@mention",
+            "a @ b",
+            "trailing@",
+        ] {
+            assert_eq!(redact_userinfo(unchanged), unchanged);
+        }
+        assert_eq!(
+            redact_userinfo("mail alice@example.com now"),
+            "mail ***@example.com now"
+        );
     }
 
     #[test]
