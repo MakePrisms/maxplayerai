@@ -48,7 +48,7 @@ use crate::gateway::EventDraft;
 /// v15 (session jobs, docs/specs/session-jobs.md §5.4) adds the `sessions` and `session_turns`
 /// tables. Additive only: no existing table or CHECK changes, and both stay empty while
 /// `[sessions] enabled = false`.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// The platform fee as journaled so far: what is owed on paper, what has been remitted, and the
 /// figures around them. Returned by [`SellerStore::accrued_fees`]. A query and nothing more — the
@@ -936,6 +936,27 @@ impl JobState {
     }
 }
 
+/// The roster entry a claim was made for (docs/specs/hook-agents.md §3): journaled in the same
+/// transaction as the claim row, and the only thing execution dispatches by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimPin {
+    pub label: String,
+    /// `acp` | `hook`.
+    pub kind: String,
+    pub fingerprint: String,
+}
+
+/// A hook's validated outcome, staged before anything is signed or bound (spec §7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookOutcomeRow {
+    pub invocation: String,
+    pub job_id: String,
+    pub turn: u32,
+    pub status: String,
+    pub answer: String,
+    pub wall_time_ms: u64,
+}
+
 /// Outcome of parking a claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Claimed {
@@ -1436,6 +1457,28 @@ impl SellerStore {
         if !Self::column_exists(conn, "fee_remittances", "spending_quote_id")? {
             conn.execute_batch("ALTER TABLE fee_remittances ADD COLUMN spending_quote_id TEXT;")?;
         }
+        // v16 (hook agents): the claim pin. NULL on older rows, which dispatch as before but over
+        // ACP entries only. Additive + idempotent.
+        for column in ["agent_label", "agent_kind", "agent_fingerprint"] {
+            if !Self::column_exists(conn, "claims", column)? {
+                conn.execute_batch(&format!("ALTER TABLE claims ADD COLUMN {column} TEXT;"))?;
+            }
+        }
+        if !Self::column_exists(conn, "sessions", "kind")? {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN kind TEXT;")?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hook_outcomes (
+                 invocation      TEXT PRIMARY KEY,
+                 job_id          TEXT NOT NULL,
+                 turn            INTEGER NOT NULL,
+                 status          TEXT NOT NULL,
+                 answer          TEXT NOT NULL,
+                 wall_time_ms    INTEGER NOT NULL,
+                 created_at_unix INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS hook_outcomes_job ON hook_outcomes (job_id);",
+        )?;
         Ok(())
     }
 
@@ -1700,6 +1743,25 @@ impl SellerStore {
         expires_at_unix: i64,
         now_unix: i64,
     ) -> Result<Claimed, StoreError> {
+        self.claim_and_enqueue_pinned(
+            job_id, offer_id, creq, draft, created_at_unix, expires_at_unix, now_unix, None,
+        )
+    }
+
+    /// [`Self::claim_and_enqueue`] with the claim's roster pin written in the SAME transaction as
+    /// the claim row and its outbox draft, so the published claim and the pin can never disagree.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_and_enqueue_pinned(
+        &self,
+        job_id: &str,
+        offer_id: &str,
+        creq: Option<&str>,
+        draft: &EventDraft,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+        now_unix: i64,
+        pin: Option<&ClaimPin>,
+    ) -> Result<Claimed, StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if claim_state(&tx, job_id)?.is_some() {
@@ -1707,9 +1769,18 @@ impl SellerStore {
             return Ok(Claimed::Idempotent);
         }
         tx.execute(
-            "INSERT INTO claims (job_id, offer_id, state, creq, created_at_unix, updated_at_unix)
-             VALUES (?1, ?2, 'claimed', ?3, ?4, ?4)",
-            params![job_id, offer_id, creq.unwrap_or(""), now_unix],
+            "INSERT INTO claims (job_id, offer_id, state, creq, created_at_unix, updated_at_unix,
+                                 agent_label, agent_kind, agent_fingerprint)
+             VALUES (?1, ?2, 'claimed', ?3, ?4, ?4, ?5, ?6, ?7)",
+            params![
+                job_id,
+                offer_id,
+                creq.unwrap_or(""),
+                now_unix,
+                pin.map(|p| p.label.as_str()),
+                pin.map(|p| p.kind.as_str()),
+                pin.map(|p| p.fingerprint.as_str()),
+            ],
         )?;
         enqueue_event(
             &tx,
@@ -3487,6 +3558,77 @@ impl SellerStore {
         Ok(creq)
     }
 
+    /// The roster pin a claim was made for, if it was made by a pinning build.
+    pub fn claim_pin(&self, job_id: &str) -> Result<Option<ClaimPin>, StoreError> {
+        let conn = self.lock()?;
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT agent_label, agent_kind, agent_fingerprint FROM claims WHERE job_id = ?1",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(label), Some(kind), Some(fingerprint))) => {
+                Some(ClaimPin { label, kind, fingerprint })
+            }
+            _ => None,
+        })
+    }
+
+    /// Stage a validated hook outcome. Idempotent: an invocation's FIRST outcome wins, so a
+    /// re-drive can never replace the answer that may already be bound.
+    pub fn stage_hook_outcome(&self, row: &HookOutcomeRow, now_unix: i64) -> Result<HookOutcomeRow, StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO hook_outcomes
+                 (invocation, job_id, turn, status, answer, wall_time_ms, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                row.invocation,
+                row.job_id,
+                row.turn,
+                row.status,
+                row.answer,
+                i64::try_from(row.wall_time_ms).unwrap_or(i64::MAX),
+                now_unix
+            ],
+        )?;
+        drop(conn);
+        Ok(self
+            .hook_outcome(&row.invocation)?
+            .expect("a just-inserted (or existing) row reads back"))
+    }
+
+    /// The staged outcome for `invocation`, if any.
+    pub fn hook_outcome(&self, invocation: &str) -> Result<Option<HookOutcomeRow>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT invocation, job_id, turn, status, answer, wall_time_ms
+                 FROM hook_outcomes WHERE invocation = ?1",
+                [invocation],
+                |row| {
+                    Ok(HookOutcomeRow {
+                        invocation: row.get(0)?,
+                        job_id: row.get(1)?,
+                        turn: row.get(2)?,
+                        status: row.get(3)?,
+                        answer: row.get(4)?,
+                        wall_time_ms: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Drop every staged outcome of a job (job or session ended).
+    pub fn clear_hook_outcomes(&self, job_id: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM hook_outcomes WHERE job_id = ?1", [job_id])?;
+        Ok(())
+    }
+
     /// The assigned agent for a job, if any. Inspection/tests.
     pub fn job_agent(&self, job_id: &str) -> Result<Option<String>, StoreError> {
         let conn = self.lock()?;
@@ -3906,6 +4048,33 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = SellerStore::open(&path).expect("open");
         (store, path)
+    }
+
+    #[test]
+    fn the_claim_pin_lands_with_the_claim_and_hook_outcomes_stage_first_wins() {
+        let (store, _path) = fresh_store("claim-pin");
+        let draft = EventDraft::new(3402, vec![], "");
+        let pin = ClaimPin { label: "my-hook".into(), kind: "hook".into(), fingerprint: "fp".into() };
+        store
+            .claim_and_enqueue_pinned("job-p", "job-p", None, &draft, 1, 100, 1, Some(&pin))
+            .expect("claim");
+        assert_eq!(store.claim_pin("job-p").expect("read"), Some(pin));
+        store.claim_and_enqueue("job-u", "job-u", None, &draft, 1, 100, 1).expect("claim");
+        assert_eq!(store.claim_pin("job-u").expect("read"), None, "unpinned claim reads None");
+
+        let first = HookOutcomeRow {
+            invocation: "inv".into(), job_id: "job-p".into(), turn: 1,
+            status: "done".into(), answer: "first".into(), wall_time_ms: 5,
+        };
+        assert_eq!(store.stage_hook_outcome(&first, 1).expect("stage").answer, "first");
+        let second = HookOutcomeRow { answer: "second".into(), ..first.clone() };
+        assert_eq!(
+            store.stage_hook_outcome(&second, 2).expect("stage").answer,
+            "first",
+            "a re-drive can never replace a staged answer"
+        );
+        store.clear_hook_outcomes("job-p").expect("clear");
+        assert_eq!(store.hook_outcome("inv").expect("read"), None);
     }
 
     /// Put a job row in an exact state. Direct SQL on purpose: driving five states through the
@@ -6145,7 +6314,7 @@ mod tests {
             store.health().expect("health").schema_version,
             SCHEMA_VERSION
         );
-        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(SCHEMA_VERSION, 16);
         let spending = store
             .in_flight_remittance()
             .expect("row")
@@ -6417,8 +6586,8 @@ mod free_lane_tests {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 15,
-            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger; v11 its ownership and settlement provenance; v12 the spending mark; v13 the quote bound at admission; v14 queued-offer capability requirements; v15 session jobs"
+            SCHEMA_VERSION, 16,
+            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger; v11 its ownership and settlement provenance; v12 the spending mark; v13 the quote bound at admission; v14 queued-offer capability requirements; v15 session jobs; v16 hook agents (claim pin, staged hook outcomes)"
         );
 
         // The legacy rows SURVIVE and read as PAID — correct by construction, because every job
