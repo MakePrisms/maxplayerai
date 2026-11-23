@@ -553,16 +553,17 @@ impl LiveRoster {
         }
     }
 
-    /// The entry a claim pinned, by its exact registry label (never request-normalized), if it is
-    /// still serving AND still has the pinned fingerprint. `None` ⇒ fail closed.
+    /// The entry a claim pinned, by its exact registry label (never request-normalized), if it still
+    /// has the pinned fingerprint. `None` ⇒ fail closed. Serving state is deliberately NOT checked:
+    /// the award is committed, and running on the entry the claim described is the only honest
+    /// outcome (docs/specs/hook-agents.md §9) — a dropped entry's run is its own best test.
     pub fn by_pin(&self, label: &str, fingerprint: &str) -> Option<Selected<'_>> {
-        let state = self.state.lock().expect("live roster poisoned");
         self.registry
             .entries()
             .iter()
             .enumerate()
             .find(|(_, entry)| entry.name.as_deref() == Some(label))
-            .filter(|(index, entry)| Self::serving(&state, index) && entry.fingerprint() == fingerprint)
+            .filter(|(_, entry)| entry.fingerprint() == fingerprint)
             .map(|(index, agent)| Selected { index, agent })
     }
 
@@ -853,7 +854,11 @@ mod tests {
         assert_eq!(roster.dispatch_acp(None).and_then(|s| s.agent.name.clone()).as_deref(), Some("claude"));
         assert!(roster.dispatch_acp(Some("my-hook")).is_none());
         roster.fault(0, Fault::Unproven, Instant::now());
-        assert!(roster.by_pin("my-hook", &fp).is_none(), "a dropped pinned entry does not serve");
+        assert_eq!(
+            roster.by_pin("my-hook", &fp).map(|s| s.index),
+            Some(0),
+            "an awarded job still runs on its pinned entry while that entry is dropped"
+        );
     }
 
     fn named(names: &[&str]) -> LiveRoster {

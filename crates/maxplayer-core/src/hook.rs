@@ -79,6 +79,9 @@ pub enum JobOutcome {
     Answer(HookAnswer),
     /// Exit 0, a valid answer, but over the inline cap. Never truncated. `delivery_failed`, no strike.
     TooLarge { bytes: usize, cap: usize },
+    /// Exit 0, `{"status":"cannot_deliver","reason":…}`: the hook's honest refusal (spec §5.0).
+    /// `delivery_failed`, no strike. The reason is for the seller log only.
+    CannotDeliver(String),
     /// The hook broke the contract (bad stdout, non-zero exit, signal). `execution_failed` + strike.
     Broken(String),
     /// Cut at the cutoff, or the cutoff had already passed. `execution_failed`, NO strike (job clock).
@@ -121,6 +124,8 @@ pub struct RunReport {
 #[allow(clippy::too_many_arguments)]
 pub fn job_event(
     invocation: &str,
+    attempt: u32,
+    answer_max_bytes: usize,
     job_id: &str,
     turn: u32,
     session: bool,
@@ -133,12 +138,15 @@ pub fn job_event(
         "v": HOOK_CONTRACT_VERSION,
         "event": "job",
         "invocation": invocation,
+        "attempt": attempt,
         "job_id": job_id,
         "turn": turn,
         "session": session,
         "prompt": prompt,
         "output": output,
         "inputs_dir": inputs_dir.map(|p| p.to_string_lossy().into_owned()),
+        "answer_max_bytes": answer_max_bytes,
+        "files_delivered": false,
         "deadline_unix": deadline_unix,
     }))
     .expect("a JSON value always serializes");
@@ -146,10 +154,30 @@ pub fn job_event(
     line
 }
 
+/// Why a `ping` is sent (§5.2): `boot` and `restore` should prove the agent can answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PingReason {
+    Boot,
+    Interval,
+    Restore,
+}
+
+impl PingReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Boot => "boot",
+            Self::Interval => "interval",
+            Self::Restore => "restore",
+        }
+    }
+}
+
 /// The JSON line for a `ping` event (§5.2).
-pub fn ping_event() -> Vec<u8> {
-    let mut line = serde_json::to_vec(&serde_json::json!({"v": HOOK_CONTRACT_VERSION, "event": "ping"}))
-        .expect("serializes");
+pub fn ping_event(reason: PingReason) -> Vec<u8> {
+    let mut line = serde_json::to_vec(
+        &serde_json::json!({"v": HOOK_CONTRACT_VERSION, "event": "ping", "reason": reason.as_str()}),
+    )
+    .expect("serializes");
     line.push(b'\n');
     line
 }
@@ -176,7 +204,10 @@ pub fn job_cutoff(deadline_unix: u64, now_unix: u64, now: Instant) -> Instant {
 #[derive(serde::Deserialize)]
 struct WireAnswer {
     status: String,
-    answer: String,
+    #[serde(default)]
+    answer: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Interpret a finished run as a `job` outcome (§5.1). `cap` is the inline answer cap in bytes.
@@ -198,16 +229,44 @@ pub fn classify_job(report: &RunReport, cap: usize) -> JobOutcome {
         Ok(wire) => wire,
         Err(error) => return JobOutcome::Broken(format!("stdout is not the answer object: {error}")),
     };
+    if wire.status == "cannot_deliver" {
+        return JobOutcome::CannotDeliver(wire.reason.unwrap_or_default());
+    }
     let Some(status) = HookStatus::parse(&wire.status) else {
         return JobOutcome::Broken(format!("unknown status {:?}", wire.status));
     };
-    if wire.answer.trim().is_empty() {
+    let Some(answer) = wire.answer else {
+        return JobOutcome::Broken("no answer".into());
+    };
+    if answer.trim().is_empty() {
         return JobOutcome::Broken("empty answer".into());
     }
-    if wire.answer.len() > cap {
-        return JobOutcome::TooLarge { bytes: wire.answer.len(), cap };
+    if answer.len() > cap {
+        return JobOutcome::TooLarge { bytes: answer.len(), cap };
     }
-    JobOutcome::Answer(HookAnswer { status, answer: wire.answer })
+    JobOutcome::Answer(HookAnswer { status, answer })
+}
+
+/// Send one `ping` and say whether the hook is healthy. Blocking; bounded by [`CONTROL_EVENT_BUDGET`].
+pub fn ping(argv: &[String], cwd: &Path, reason: PingReason) -> Result<(), String> {
+    let report = run(argv, &ping_event(reason), cwd, Instant::now() + CONTROL_EVENT_BUDGET);
+    if ping_healthy(&report) {
+        Ok(())
+    } else {
+        Err(match &report.exit {
+            Exit::Exited { code: Some(code) } => format!("ping exit status {code}"),
+            Exit::Exited { code: None } => "ping killed by a signal".into(),
+            Exit::CutOff => format!("ping did not answer within {}s", CONTROL_EVENT_BUDGET.as_secs()),
+            Exit::SpawnFailed(error) => format!("ping could not start: {error}"),
+            Exit::StdoutOverflow => "ping stdout over the ceiling".into(),
+            Exit::NotStarted => "ping not started".into(),
+        })
+    }
+}
+
+/// Send `close` for `job_id`, best effort: exit status ignored (§5.3).
+pub fn close(argv: &[String], cwd: &Path, job_id: &str) {
+    let _ = run(argv, &close_event(job_id), cwd, Instant::now() + CONTROL_EVENT_BUDGET);
 }
 
 /// Whether a finished `ping` run means healthy: exit 0 before the cutoff. Stdout is ignored.
@@ -459,6 +518,18 @@ mod tests {
     }
 
     #[test]
+    fn cannot_deliver_is_an_honest_refusal_and_never_a_strike() {
+        let report = run_sh(
+            r#"printf '{"status":"cannot_deliver","reason":"needs files"}'"#,
+            b"",
+            Duration::from_secs(10),
+        );
+        let outcome = classify_job(&report, CAP);
+        assert_eq!(outcome, JobOutcome::CannotDeliver("needs files".into()));
+        assert!(!outcome.strikes());
+    }
+
+    #[test]
     fn a_non_zero_exit_breaks_and_keeps_only_the_stderr_tail() {
         let report = run_sh(
             r#"head -c 10000 /dev/zero | tr '\0' x >&2; echo TAILMARK >&2; exit 3"#,
@@ -563,7 +634,7 @@ mod tests {
     fn stdin_carries_the_event_and_the_env_is_scrubbed() {
         // SAFETY: test-only; no other test reads this variable.
         unsafe { std::env::set_var("MAXPLAYER_SECRETISH_TEST", "leak") };
-        let event = job_event("inv1", "job1", 2, true, "the task, verbatim \"quoted\"", None, None, 99);
+        let event = job_event("inv1", 1, 4076, "job1", 2, true, "the task, verbatim \"quoted\"", None, None, 99);
         let report = run_sh(
             r#"in=$(cat); env | grep '^MAXPLAYER_' | sort > /dev/stderr; printf '%s' "$in" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"status":"done","answer":d["prompt"]+"|"+d["invocation"]+"|"+str(d["turn"])+"|"+str(d["output"])+"|"+str(d["inputs_dir"])}))'"#,
             &event,
@@ -588,8 +659,8 @@ mod tests {
 
     #[test]
     fn ping_is_healthy_only_on_exit_zero() {
-        assert!(ping_healthy(&run_sh("cat >/dev/null; exit 0", &ping_event(), Duration::from_secs(10))));
-        assert!(!ping_healthy(&run_sh("exit 1", &ping_event(), Duration::from_secs(10))));
-        assert!(!ping_healthy(&run_sh("sleep 5", &ping_event(), Duration::from_millis(200))));
+        assert!(ping_healthy(&run_sh("cat >/dev/null; exit 0", &ping_event(PingReason::Boot), Duration::from_secs(10))));
+        assert!(!ping_healthy(&run_sh("exit 1", &ping_event(PingReason::Boot), Duration::from_secs(10))));
+        assert!(!ping_healthy(&run_sh("sleep 5", &ping_event(PingReason::Boot), Duration::from_millis(200))));
     }
 }
