@@ -7165,7 +7165,9 @@ impl SellerNodeRunner {
     /// through the signer actor and sent on the shared client; a failure is logged, never wedges the
     /// loop. Used for both the targeted under-rate refusal and an execution failure.
     ///
-    /// Returns whether the feedback reached the relay (`send_event_to` resolved `Ok`). The under-rate
+    /// Returns whether the feedback reached the relay (`send_event_to` resolved `Ok`), or, for a
+    /// private job, whether its copy is durably persisted (the private flush sends it again, so a
+    /// deduping caller must not sign a second copy). The under-rate
     /// dedup (#582) records an offer as fed ONLY on a `true`, so a transient publish failure is retried
     /// by the next backfill re-ingest rather than being permanently suppressed. Callers that do not
     /// dedup (execution/delivery failure) ignore the return.
@@ -7275,13 +7277,13 @@ impl SellerNodeRunner {
                                     ))
                                 }
                             );
-                            false
+                            private
                         }
                         Ok(Err(error)) => {
                             opline!(
                                 "seller node WARN: buyer feedback publish failed offer={offer_id} ({error})"
                             );
-                            false
+                            private
                         }
                         Err(_) => {
                             opline!(
@@ -7289,7 +7291,7 @@ impl SellerNodeRunner {
                                  offer={offer_id} (continuing)",
                                 FEEDBACK_PUBLISH_BUDGET.as_secs()
                             );
-                            false
+                            private
                         }
                     }
                     },
@@ -21893,9 +21895,11 @@ mod tests {
     }
 
     /// #1203 — two stale follow-ups for one turn of an ENDED session are answered once each, ever:
-    /// replaying both (a seat restart, a backfill) publishes no new refusal.
+    /// replaying both (on the same seller, and on a restarted one over the same home) publishes no
+    /// new refusal, while a refusal whose publish was not confirmed is retried by the next replay.
     /// RED ON REVERT: put back the `record_turn(.., Refused, ..)` dedup in the ended-session branch
-    /// and every replay of the pair publishes two more kind-3404s (each evicts the other's row).
+    /// and every replay of the pair publishes more kind-3404s (each evicts the other's row); mark
+    /// before publishing and the unconfirmed refusal of `a` is never sent again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn issue_1203_an_ended_session_refuses_each_follow_up_once_across_replays() {
         use crate::session::{FollowUpStatus, SessionState};
@@ -21934,31 +21938,70 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
+                // The relay never confirms `a`'s first refusal: it is not marked as answered.
+                fixture.withhold_ok_for(&[feedback]);
+                runner.on_followup(&a).await;
+                assert_eq!(fixture.event_kind_count(feedback).await, 1);
+                fixture.withhold_ok_for(&[]);
+                // The next replay sends it again (confirmed this time); `b` gets its one answer.
                 runner.on_followup(&a).await;
                 runner.on_followup(&b).await;
-                assert!(
-                    fixture
-                        .wait_until_published(Duration::from_secs(5), |events| {
-                            events.iter().filter(|e| e.kind == feedback).count() >= 2
-                        })
-                        .await,
-                    "harness check: each stale follow-up is answered once"
+                assert_eq!(
+                    fixture.event_kind_count(feedback).await,
+                    3,
+                    "an unconfirmed refusal is retried, a confirmed one is not"
                 );
-                // Replays, in both orders, as a restart and a backfill would deliver them.
+                // Replays, in both orders, as a backfill would deliver them.
                 for _ in 0..3 {
                     runner.on_followup(&a).await;
                     runner.on_followup(&b).await;
                     runner.on_followup(&b).await;
                     runner.on_followup(&a).await;
                 }
-                tokio::time::sleep(Duration::from_millis(300)).await;
                 assert_eq!(
                     fixture.event_kind_count(feedback).await,
-                    2,
+                    3,
                     "replays of an ended session's follow-ups must publish nothing new"
                 );
             })
             .await;
+        drop(local);
+        drop(runner);
+
+        // ---- restart: a fresh runner over the SAME home replays both again -----------------------
+        let restarted = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture))
+                .await
+                .expect("boot the restarted seller"),
+        );
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                restarted.on_followup(&b).await;
+                restarted.on_followup(&a).await;
+            })
+            .await;
+        let refusals: Vec<_> = fixture
+            .events()
+            .await
+            .into_iter()
+            .filter(|event| event.kind == feedback)
+            .collect();
+        assert_eq!(refusals.len(), 3, "a restart must publish nothing new");
+        let has = |event: &crate::seller_node::p_gate_relay_fixture::PublishedEvent, tag: &[&str]| {
+            event.tags.iter().any(|t| t.iter().map(String::as_str).eq(tag.iter().copied()))
+        };
+        for (fid, n) in [(a.id.to_hex(), 2), (b.id.to_hex(), 1)] {
+            let answers: Vec<_> = refusals
+                .iter()
+                .filter(|event| has(event, &["e", fid.as_str(), "", "reply"]))
+                .collect();
+            assert_eq!(answers.len(), n, "refusals replying to {fid}");
+            for event in answers {
+                assert!(has(event, &["status", "refusal"]), "{:?}", event.tags);
+                assert!(has(event, &["reason_code", "session_expired"]), "{:?}", event.tags);
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
