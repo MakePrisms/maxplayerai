@@ -8556,11 +8556,23 @@ impl SellerNodeRunner {
         // docs/specs/hook-agents.md §3 — ONE selection per claim: the first serving entry whose kind
         // admits this offer's shape and whose OWN capability meets the request. It drives the
         // claim's tags, the private dispatch block and the pin; nothing re-derives it later.
-        let shape = crate::seller_roster::OfferShape {
-            inline: offer.accepts_inline_delivery(),
-            contribution: contribution.is_some()
-                || self.node.store().contribution_pin(job_id).ok().flatten().is_some(),
+        // A contribution pin that cannot be read is not an absent one: a capacity re-drive of a
+        // contribution offer could otherwise be admitted to an entry that cannot take it (a hook).
+        let contribution_pinned = if contribution.is_some() {
+            true
+        } else {
+            match self.node.store().contribution_pin(job_id) {
+                Ok(pin) => pin.is_some(),
+                Err(error) => {
+                    self.log_offer_deferred(
+                        job_id,
+                        format!("seller node offer skip id={job_id}: contribution pin unreadable ({error})"),
+                    );
+                    return ClaimOutcome::Deferred;
+                }
+            }
         };
+        let shape = crate::seller_roster::OfferShape { inline: offer.accepts_inline_delivery(), contribution: contribution_pinned };
         let request = offer_capability_request(offer);
         // `selected_capability` is the snapshot the request was judged on; the claim tags and the
         // private dispatch block below carry exactly it (never a later re-read of the roster).
@@ -19074,6 +19086,38 @@ mod tests {
         let results = fetch_results(&observer, &job_id).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "the staged answer");
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex r2 #6: a partly written claim pin is neither the pinned entry nor "unpinned": the job is
+    /// deferred (left awarded for the next re-drive), not failed and not dispatched anywhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_claim_pin_defers_the_job() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-partial-pin", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "4".repeat(64);
+        let pin = hook_pin(&runner);
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&pin));
+        runner.node.store().exec_sql_for_test("UPDATE claims SET agent_kind = NULL");
+
+        runner.execute_job(&job_id, None, false).await;
+
+        assert_eq!(hook_runs(&root), 0, "nothing runs on a partial pin");
+        let store = runner.node.store();
+        assert_eq!(
+            store.job_state(&job_id).expect("state"),
+            Some(crate::seller_node::store::JobState::Awarded),
+            "deferred, not failed"
+        );
+        let observer = connect_observer(&relay_url).await;
+        assert!(fetch_results(&observer, &job_id).await.is_empty());
         observer.disconnect().await;
         runner.client.disconnect().await;
         relay.shutdown();

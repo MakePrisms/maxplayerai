@@ -3567,7 +3567,9 @@ impl SellerStore {
         Ok(creq)
     }
 
-    /// The roster pin a claim was made for, if it was made by a pinning build.
+    /// The roster pin a claim was made for. `None` only for an existing claim whose three pin columns
+    /// are ALL empty (an older build's claim, or the unlabelled hatch). A partly filled pin, or no
+    /// claim row at all, is an error: neither may fall through to legacy dispatch.
     pub fn claim_pin(&self, job_id: &str) -> Result<Option<ClaimPin>, StoreError> {
         let conn = self.lock()?;
         let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
@@ -3577,12 +3579,12 @@ impl SellerStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        Ok(match row {
-            Some((Some(label), Some(kind), Some(fingerprint))) => {
-                Some(ClaimPin { label, kind, fingerprint })
-            }
-            _ => None,
-        })
+        match row {
+            Some((Some(label), Some(kind), Some(fingerprint))) => Ok(Some(ClaimPin { label, kind, fingerprint })),
+            Some((None, None, None)) => Ok(None),
+            Some(_) => Err(StoreError(format!("claim pin of {job_id} is incomplete"))),
+            None => Err(StoreError(format!("no claim row for {job_id}"))),
+        }
     }
 
     /// Stage a validated hook outcome. Idempotent: an invocation's FIRST outcome wins, so a
@@ -3688,6 +3690,12 @@ impl SellerStore {
         let conn = self.lock()?;
         conn.execute("UPDATE hook_runs SET pgid = NULL, pgid_start = NULL WHERE invocation = ?1", [invocation])?;
         Ok(())
+    }
+
+    /// Tests elsewhere in the seller node: run one raw SQL statement (e.g. corrupt a row).
+    #[cfg(test)]
+    pub(crate) fn exec_sql_for_test(&self, sql: &str) {
+        self.lock().expect("lock").execute(sql, []).expect("test sql");
     }
 
     /// Tests elsewhere in the seller node: put a job row in an exact state (direct SQL).
@@ -4187,6 +4195,13 @@ mod tests {
         assert_eq!(store.claim_pin("job-p").expect("read"), Some(pin));
         store.claim_and_enqueue("job-u", "job-u", None, &draft, 1, 100, 1).expect("claim");
         assert_eq!(store.claim_pin("job-u").expect("read"), None, "unpinned claim reads None");
+        // codex r2 #6: a partly filled pin, or no claim at all, is an error, never "unpinned".
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute("UPDATE claims SET agent_label = 'half' WHERE job_id = 'job-u'", []).expect("partial pin");
+        }
+        assert!(store.claim_pin("job-u").is_err(), "a partial pin must not read as legacy");
+        assert!(store.claim_pin("job-none").is_err(), "no claim row must not read as legacy");
 
         let first = HookOutcomeRow {
             invocation: "inv".into(), job_id: "job-p".into(), turn: 1,
