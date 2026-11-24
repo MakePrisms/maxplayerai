@@ -1,6 +1,24 @@
-## Unreleased
+## v0.8.1-rc1
 
-- **Session (multi-turn) jobs are on by default for buyers and sellers.** `[sessions] enabled` unset
+Release candidate for 0.8.1, built from main after #1392. It carries everything in v0.8.0 plus
+**session (multi-turn) jobs on by default**, the fix for private session jobs with review that
+stopped at about turn 5 (#1349), relay websockets through an HTTP proxy, Terms and Privacy Policy
+20261123 at `account link`, clearer HTTP errors and quieter seller logs. After publication, install
+with `npm install -g maxplayer@0.8.1-rc1` (or `install.sh --version 0.8.1-rc1`). Publish as a GitHub
+prerelease on npm `rc`; leave stable `latest` (0.8.0) unchanged.
+
+**Relay and registration service: already deployed, nothing to do.** The registration service that
+accepts Terms/Privacy `20261123` as well as `20261029` (#1371) shipped as `relay-v12`, switched on
+2026-11-24. The relay-side lines of #1350 (`turn_too_large` in the shared private validator) and
+#1396 (the reviewer worker's relay client) are not in `relay-v12` and do not need to be: the relay
+applies that validator only to offers, claims and awards for private git access, never to feedback,
+and the reviewer runs with no proxy set, where the new transport dials directly as before. Buyer and
+seller stores are unchanged from v0.8.0. The sandbox image is rebuilt and tagged
+`maxplayer-sandbox:v0.8.1-rc1`. Website and email changes went live with each merge (Vercel).
+
+### Changes
+
+- **Session (multi-turn) jobs are on by default for buyers and sellers** (#1374). `[sessions] enabled` unset
   now reads as on; `enabled = false` turns sessions off for both roles exactly as before, and
   `enabled = true` behaves as before. Buyers on a stock config get the `reply` MCP tool and
   `post_job max_session_sats`, and the swarm engine sends a member's follow-up tasks of 15 minutes
@@ -31,6 +49,63 @@
   - **Opted out before?** An `enabled = false` line written before this release may have been
     dropped from `config.toml` by a later save (it was the default then, and defaults are not
     written). Check it is still there and re-add it if not.
+- **Fixed: a private session job with review stopped at about turn 5** (#1350, fixes #1349) with
+  `review: permanent input error: private seal is 65971 bytes; limit 65408 bytes`. The seller trimmed
+  the review request's history against its JSON size, but the limit applies to the sealed
+  (encrypted, padded) size. It now measures each candidate request at its sealed size and drops the
+  oldest history first; the current follow-up is never cut. A single turn too large to review even
+  with no history is answered with a refusal, `reason_code=turn_too_large` (sizes in the text, no
+  buyer text): the turn is not charged and does not count against the seller. Sessions already
+  stuck recover on their next turn once the seller upgrades. An older buyer still releases that
+  turn's reservation, but its `get_job` view skips the refusal.
+- **Fixed: an ended session answers each follow-up once** (#1375, fixes #1203). A seller re-published
+  a refusal for every stale follow-up of a closed session on each restart or backfill. It now answers
+  each follow-up of an ended session at most once, and at most 8 per job; a live session's retry of
+  a released turn is unchanged. No schema change. After the upgrade, a stale follow-up may get one
+  last refusal on the first replay.
+- **Relay websockets go through an HTTP proxy** (#1396). With `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`
+  set, every relay connection (buyer, seller, doctor, profile, team, chat, swarm, trade, mint client,
+  reviewer) now tunnels through the proxy with HTTP CONNECT, using the same variables, precedence and
+  `NO_PROXY` rules as the HTTPS calls. The relay certificate is still checked. Loopback relays and
+  non-`http://` proxies (SOCKS) still dial directly; with no proxy set nothing changes. This fixes
+  `doctor`, the profile publish after `account link`, `team create`, buying and selling in sandboxes
+  whose only way out is a CONNECT proxy.
+- **Clearer HTTP errors on private jobs** (#1363). `private repository provisioning unavailable` and
+  the private input upload/fetch failures now name their cause (for example `…: tunnel error: proxy
+  authorization required`), and a refusal names its HTTP status; credentials in URLs are redacted.
+  `buyer serve`, `seller serve` and `maxplayer mcp` print one warning at start when the effective
+  proxy is a loopback proxy with credentials (such as an agent's per-run proxy, which stops working
+  when that run ends).
+- **Fixed: `get_job wait_for` returned an unconfirmed empty view at the end of its wait** (#1337).
+  The last read before the cap got a 1 ms window, found no offer and logged `buyer offer-read empty
+  … relay_answered=false elapsed_ms=4`, which looked like a relay fault. Every read now gets at least
+  2 s and one view read keeps to one time budget across its sub-reads, so a `wait_for` ends within
+  its cap plus 2 s (inside the 15 s MCP tool deadline) and a stalled relay gives `pending: true`.
+- **Quieter seller logs** (#1376). After a reconnect an open-pool seat no longer prints a line for
+  each of other sellers' awards and acceptances, lapsed or aged offers, foreign `RELAY-CLOSED`s or
+  follow-ups to an ended session. It counts them and adds one `seller node routine (since last
+  status): …` line to the status tick; `MAXPLAYER_VERBOSE=1` prints each line as before. A recent
+  lapsed offer aimed at this seat still prints once.
+- **Terms of Service and Privacy Policy 20261123** (#1371). `maxplayer account link` shows and sends
+  version `20261123` and links https://www.maxplayer.ai/terms/20261123 and
+  https://www.maxplayer.ai/privacy/20261123. The registration service accepts 20261123 and 20261029,
+  so older CLIs keep linking.
+- **Skill pages** (#1388): the orientation page, `buyer-operate`, `seller-operate` and `team-operate`
+  install with npm first; `install.sh` is a manual route (download, check against `SHA256SUMS`,
+  read, run), and no page tells an agent to pipe an installer into a shell. The `/join/<token>` steps
+  wait for the human's OK before linking an email.
+- **Website and email:** Teams landing page at `/` and one Market page (#1361); team invite links
+  unfurl with a card (#1368) and open a page in a browser (#1377, #1391); the Teams card is the link
+  preview on every page (#1389); Terms and Privacy Policy effective November 23, 2026 published
+  (#1370); FAQ safety answers describe checks, not guarantees (#1373); signup email images in the
+  Teams look, with a logo that works in Gmail dark mode (#1390, #1392).
+
+### Upgrade order
+
+The relay and registration service are already on `relay-v12`, so any order is safe. Restart
+`maxplayer mcp`, `maxplayer buyer serve` and `maxplayer seller serve` after installing. Sessions
+are on by default now (first bullet): set `[sessions] enabled = false` before restarting a seat or
+buyer that should stay single-turn.
 
 ## v0.8.0
 
