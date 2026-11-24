@@ -129,7 +129,11 @@ model = "claude-opus-5"                  # optional, self-reported; requires fam
   argv is stored in `argv`.
 - First run with `--agent my-hook`: the first-run path today writes the resolved argv into
   `[seller] agent_command` (the unlabelled ACP fallback). For a hook it must not: it writes
-  `agents = ["my-hook"]` and leaves `agent_command` as it was.
+  `agents = ["my-hook"]` and leaves `agent_command` as it was (possibly absent). `agent_command`
+  is required only when `agents` is empty (it is the fallback for exactly that case), so a
+  hook-only seat with no ACP fallback passes the readiness check and relaunches.
+- "Is this seat hook-only" has ONE answer, `seller_agents::hook_only_seat` (every listed entry is
+  a hook preset), asked by the doctor, the boot gates, the capability probe and held-tool startup.
 - `hook = ` in config makes an older binary refuse the home (`deny_unknown_fields`); the release
   notes say so.
 
@@ -331,10 +335,16 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
   which goes to the seller log, never to the buyer.
 - Cutoff (monotonic): `job` ⇒ `deadline_unix − 30 s` (time to sign and publish); `ping`/`close`
   ⇒ 30 s. At the cutoff, or on daemon shutdown: `SIGTERM` to the group, 2 s grace, `SIGKILL` to
-  the group, reap the child. Read ends are closed after the reap, so a descendant that kept a pipe
-  open cannot hold the runner.
-- A hook that wants a long-lived worker must start it outside its own process group (that is the
-  adapter's business, e.g. the channel adapter's `serve`, started by Claude Code, not by us).
+  the group, reap the child. The child's exit is observed without reaping it (`waitid(WNOWAIT)`),
+  so the group id cannot be recycled before the group kill. An exit first observed at or after the
+  cutoff counts as the cutoff.
+- When the hook exits, the rest of its group is killed and stdout gets 2 s to reach EOF. Stdout
+  still open then (a process that left the group kept it) is incomplete: the answer is refused as a
+  violation. All three pipes are non-blocking and pumped by the one supervising thread, and every
+  read end is closed before the call returns, so nothing stays blocked on a pipe.
+- `ping` and `close` stdout is drained and discarded: never kept, never an overflow.
+- A hook that wants a long-lived worker must start it outside its own process group, with its
+  stdout pointed elsewhere (that is the adapter's business, e.g. the channel adapter's `serve`, started by Claude Code, not by us).
 - Environment: the daemon's environment with every `MAXPLAYER_*` variable removed (config
   overrides may carry credentials), plus `MAXPLAYER_HOOK_V=1`, which is added to the reserved
   env names (`core/home.rs:2438 @4caf510`) so a `maxplayer` command run by the agent does not
@@ -342,8 +352,19 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
   The hook is the seller's own program running as the seller.
 - An unknown event: exit code 64 means "unsupported" and is never a strike, so new events can be
   added without breaking old adapters.
-- On daemon shutdown every running hook group gets the same SIGTERM/grace/SIGKILL. The group id is
-  journaled while the hook runs, and a restart kills a stale group before re-running.
+- On daemon shutdown every running hook group gets the same SIGTERM/grace/SIGKILL.
+- **Crash idempotency.** A `job` call is spawned behind a gate (`/bin/sh -c 'IFS= read -r go &&
+  [ "$go" = go ] && exec "$@"'`): the gate already has its own process group but waits for one
+  `go` line on stdin. The order is: write the attempt row (`hook_runs`, attempt n+1) → spawn the
+  gate → journal its pid (= group id) and the leader's start time (`/proc/<pid>/stat` field 22) →
+  write `go` and then the event. If the daemon dies before the journal write, its end of stdin
+  closes, `read` fails and the gate exits without ever running the hook. So either the hook never
+  ran or its group is on disk. At boot, and again before an invocation is re-driven, every
+  journaled group is reaped only if verified: leader alive with the recorded start time ⇒ kill the
+  group; no process with that pid ⇒ only our group's remnants can still carry that id, so kill it;
+  pid alive with another start time ⇒ recycled, our group is gone, nothing is signalled. Without a
+  recorded start time (no `/proc`) a group is left alone and logged. The re-drive then gets
+  `attempt` n+1.
 
 ### 5.2 `ping`
 
@@ -506,11 +527,9 @@ session lookup. For a `hook` record it skips the holder gate and calls `run_hook
   already starts due probes, every heartbeat interval, independent of whether beats are published.
   Two consecutive failed interval pings fault it (`Fault::Unproven`); the beat then advertises
   without it, and `accepting=n` if nothing else serves. A passing interval ping never restores.
-- **Restore loop.** After three consecutive job strikes with no successful job between them, a
-  hook entry is no longer restored by pings; it stays dropped until the daemon restarts, with one
-  operator line saying so.
 - **Restore.** A dropped hook entry's due probe (`run.rs:9180 @4caf510`) is a ping; a passing ping
-  restores it, with the roster's backoff and strike history.
+  restores it, with the roster's backoff and strike history. There is no lockout: like an `Acp`
+  entry, a hook that keeps failing jobs keeps being re-probed on the growing backoff.
 - **Races.** A ping result is applied only if the entry's state has not changed since the ping
   started (the roster already counts transitions, `seller_roster.rs:320 @4caf510`); a stale
   "healthy" never restores an entry that a later job struck, and a stale failure never strikes a
