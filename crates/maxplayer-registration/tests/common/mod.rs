@@ -428,6 +428,44 @@ async fn resend_emails(
     Json(json!({ "id": format!("email_{}", rand_hex(8)) })).into_response()
 }
 
+/// The website's `/legal/versions.json` (the service's `legal.versions_url`). Starts out
+/// listing the two published versions; tests change the answer and count the fetches.
+pub struct FakeSite {
+    pub status: std::sync::atomic::AtomicU16,
+    pub body: Mutex<String>,
+    pub content_type: Mutex<&'static str>,
+    pub hits: AtomicUsize,
+}
+
+pub const SITE_MANIFEST: &str = r#"{"current":{"terms":"20261123","privacy":"20261123"},"terms":["20261029","20261123"],"privacy":["20261029","20261123"]}"#;
+
+impl FakeSite {
+    pub fn serve(&self, status: u16, content_type: &'static str, body: &str) {
+        self.status.store(status, Ordering::SeqCst);
+        *self.content_type.lock().unwrap() = content_type;
+        *self.body.lock().unwrap() = body.to_string();
+    }
+    pub fn manifest(&self, terms: &[&str], privacy: &[&str]) {
+        let body = json!({
+            "current": { "terms": terms.last().unwrap(), "privacy": privacy.last().unwrap() },
+            "terms": terms,
+            "privacy": privacy,
+        });
+        self.serve(200, "application/json", &body.to_string());
+    }
+    pub fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+async fn site_manifest(State(s): State<Arc<FakeSite>>) -> axum::response::Response {
+    s.hits.fetch_add(1, Ordering::SeqCst);
+    let status = StatusCode::from_u16(s.status.load(Ordering::SeqCst)).unwrap();
+    let ct = *s.content_type.lock().unwrap();
+    let body = s.body.lock().unwrap().clone();
+    (status, [("content-type", ct)], body).into_response()
+}
+
 // ------------------------------------------------------------------ the app
 
 pub struct TestApp {
@@ -436,6 +474,7 @@ pub struct TestApp {
     pub http: reqwest::Client,
     pub relay: Arc<FakeRelay>,
     pub resend: Arc<FakeResend>,
+    pub site: Arc<FakeSite>,
     pub admin: Keys,
     /// The team invite key (`teams.invite_key_file`).
     pub invite: Keys,
@@ -495,7 +534,21 @@ impl TestApp {
             .with_state(resend.clone());
         tokio::spawn(async move { axum::serve(resend_l, router).await.unwrap() });
 
+        let (site_l, site_base) = bind().await;
+        let site = Arc::new(FakeSite {
+            status: std::sync::atomic::AtomicU16::new(200),
+            body: Mutex::new(SITE_MANIFEST.to_string()),
+            content_type: Mutex::new("application/json"),
+            hits: AtomicUsize::new(0),
+        });
+        let router = axum::Router::new()
+            .route("/legal/versions.json", axum::routing::get(site_manifest))
+            .with_state(site.clone());
+        tokio::spawn(async move { axum::serve(site_l, router).await.unwrap() });
+
         let mut cfg = Config::default();
+        // Never the live site from a test.
+        cfg.legal.versions_url = format!("{site_base}/legal/versions.json");
         cfg.relay.base_url = relay_base;
         cfg.relay.relay_pubkey = Some(relay.keys.public_key().to_hex());
         cfg.email.resend_api_base = resend_base;
@@ -525,6 +578,7 @@ impl TestApp {
             http: reqwest::Client::new(),
             relay,
             resend,
+            site,
             admin,
             invite,
             db,

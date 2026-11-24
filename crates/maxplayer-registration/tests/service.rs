@@ -236,7 +236,7 @@ async fn service_runs_as_a_non_superuser_role() {
     let migrations: i64 = app
         .count("SELECT count(*) FROM _sqlx_migrations WHERE success")
         .await;
-    assert_eq!(migrations, 2);
+    assert_eq!(migrations, 3);
 }
 
 // ------------------------------------------------------------------ wrong code, expiry
@@ -641,6 +641,220 @@ async fn bad_inputs_are_refused_before_any_email() {
         .await;
     assert_eq!(r.body["error"], "invalid_entered_by");
     assert!(app.emails().is_empty());
+}
+
+// ------------------------------------------------------------------ legal versions from the site
+
+fn link_body(terms: &str, privacy: &str) -> serde_json::Value {
+    json!({ "email": EMAIL, "label": "a", "terms_version": terms, "privacy_version": privacy })
+}
+
+async fn known_versions(app: &TestApp) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT doc, version FROM legal_versions ORDER BY doc, version")
+        .fetch_all(&app.db)
+        .await
+        .unwrap()
+}
+
+/// A version the built-in lists lack links once the site's manifest lists it: no deploy. It is
+/// stored, so it keeps linking after the site goes down.
+#[tokio::test]
+async fn a_version_published_on_the_site_links_without_a_deploy() {
+    let app = TestApp::start().await;
+    app.site.manifest(
+        &["20261029", "20261123", "20270115"],
+        &["20261123", "20270115"],
+    );
+    let agent = Keys::generate();
+    let r = app
+        .post(
+            &agent,
+            api::PATH_LINK_REQUEST,
+            link_body("20270115", "20270115"),
+        )
+        .await;
+    assert_eq!(r.status, 202, "{:?}", r.body);
+    assert_eq!(
+        r.body["terms_url"],
+        "https://www.maxplayer.ai/terms/20270115"
+    );
+    assert_eq!(
+        r.body["privacy_url"],
+        "https://www.maxplayer.ai/privacy/20270115"
+    );
+    let code = app.last_code(EMAIL);
+    let r = app.confirm(&agent, &code).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    let reg = db::get_registration(&app.db, &agent.public_key().to_hex())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (reg.terms_version.as_str(), reg.privacy_version.as_str()),
+        ("20270115", "20270115")
+    );
+    // Both documents' lists were stored, and one fetch answered both checks.
+    assert_eq!(
+        known_versions(&app).await,
+        [
+            ("privacy", "20261123"),
+            ("privacy", "20270115"),
+            ("terms", "20261029"),
+            ("terms", "20261123"),
+            ("terms", "20270115"),
+        ]
+        .map(|(d, v)| (d.to_string(), v.to_string()))
+    );
+    assert_eq!(app.site.hits(), 1);
+
+    // The site goes down and the refresh window passes: the stored version still links, with
+    // no fetch at all.
+    app.site.serve(503, "text/plain", "down");
+    app.state.clock.advance(3600);
+    let r = app
+        .post(
+            &Keys::generate(),
+            api::PATH_LINK_REQUEST,
+            json!({ "email": "b@example.com", "label": "b", "terms_version": "20270115", "privacy_version": "20270115" }),
+        )
+        .await;
+    assert_eq!(r.status, 202, "{:?}", r.body);
+    assert_eq!(app.site.hits(), 1);
+}
+
+/// Only a listed, dated version is learned. A malformed one never causes a fetch, and an unlisted
+/// one is refused as before.
+#[tokio::test]
+async fn unlisted_or_malformed_versions_are_still_refused() {
+    let app = TestApp::start().await;
+    let agent = Keys::generate();
+    for (terms, privacy, code) in [
+        ("v9", "20261123", "unknown_terms_version"),
+        ("2027011", "20261123", "unknown_terms_version"),
+        ("20261123", "../../etc", "unknown_privacy_version"),
+    ] {
+        let r = app
+            .post(&agent, api::PATH_LINK_REQUEST, link_body(terms, privacy))
+            .await;
+        assert_eq!((r.status, r.body["error"].as_str()), (400, Some(code)));
+    }
+    assert_eq!(
+        app.site.hits(),
+        0,
+        "a malformed version must not reach the site"
+    );
+    let r = app
+        .post(
+            &agent,
+            api::PATH_LINK_REQUEST,
+            link_body("20270115", "20261123"),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["error"].as_str()),
+        (400, Some("unknown_terms_version"))
+    );
+    assert_eq!(app.site.hits(), 1);
+    // Listed for privacy only: still not a terms version.
+    app.site.manifest(&["20261123"], &["20261123", "20270115"]);
+    app.state.clock.advance(61);
+    let r = app
+        .post(
+            &agent,
+            api::PATH_LINK_REQUEST,
+            link_body("20270115", "20270115"),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["error"].as_str()),
+        (400, Some("unknown_terms_version"))
+    );
+    assert_eq!(app.site.hits(), 2);
+    assert!(app.emails().is_empty());
+}
+
+/// The site down, or a page in place of the file (a catch-all 200, a redirect): a new version
+/// is not accepted, the answer says to retry, and the failure is not refetched on every request.
+/// Versions the service already knows are unaffected.
+#[tokio::test]
+async fn an_unreadable_manifest_accepts_nothing_new_and_is_retried_later() {
+    let app = TestApp::start().await;
+    let agent = Keys::generate();
+    for (i, (status, ct, body)) in [
+        (503, "text/plain", "down"),
+        (200, "text/html", "<!doctype html><title>Maxplayer</title>"),
+        (
+            200,
+            "application/json",
+            r#"{"terms":["20270115"],"privacy":["20270115"]}"#,
+        ),
+        (302, "text/plain", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        app.site.serve(status, ct, body);
+        let before = app.site.hits();
+        for _ in 0..2 {
+            let r = app
+                .post(
+                    &agent,
+                    api::PATH_LINK_REQUEST,
+                    link_body("20270115", "20270115"),
+                )
+                .await;
+            assert_eq!(
+                (r.status, r.body["error"].as_str()),
+                (503, Some("legal_versions_unavailable")),
+                "{status} {body}"
+            );
+            assert_eq!(r.body["retry_after_secs"], 60);
+            assert_eq!(r.headers["retry-after"], "60");
+        }
+        assert_eq!(app.site.hits(), before + 1, "one fetch per refresh window");
+        // The built-in versions link whatever the site does.
+        let r = app
+            .post(
+                &Keys::generate(),
+                api::PATH_LINK_REQUEST,
+                json!({ "email": format!("s{i}@example.com"), "label": "a", "terms_version": "20261123", "privacy_version": "20261123" }),
+            )
+            .await;
+        assert_eq!(r.status, 202, "{:?}", r.body);
+        app.state.clock.advance(60);
+    }
+    assert!(known_versions(&app).await.is_empty());
+    // The site is back: the next window fetches again and the version links.
+    app.site
+        .manifest(&["20261123", "20270115"], &["20261123", "20270115"]);
+    let r = app
+        .post(
+            &agent,
+            api::PATH_LINK_REQUEST,
+            link_body("20270115", "20270115"),
+        )
+        .await;
+    assert_eq!(r.status, 202, "{:?}", r.body);
+}
+
+/// `legal.versions_url = ""` turns the site off: only the built-in lists count.
+#[tokio::test]
+async fn an_empty_versions_url_uses_only_the_built_in_lists() {
+    let app = TestApp::start_with(|cfg| cfg.legal.versions_url = String::new()).await;
+    app.site
+        .manifest(&["20261123", "20270115"], &["20261123", "20270115"]);
+    let r = app
+        .post(
+            &Keys::generate(),
+            api::PATH_LINK_REQUEST,
+            link_body("20270115", "20270115"),
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.body["error"].as_str()),
+        (400, Some("unknown_terms_version"))
+    );
+    assert_eq!(app.site.hits(), 0);
 }
 
 // ------------------------------------------------------------------ relay outbox, removal, reconcile

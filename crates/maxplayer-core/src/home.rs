@@ -2484,6 +2484,9 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_TEAM",
     // Test deployments only: the team invite key their registration service holds.
     "MAXPLAYER_TEAM_INVITE_PUBKEY",
+    // `maxplayer account link`: where the website's legal versions manifest is read (tests point it
+    // at a fake; empty = this build's terms and privacy versions only).
+    "MAXPLAYER_LEGAL_VERSIONS_URL",
 ];
 
 /// [`MaxplayerConfig`] fields whose env value is a comma-separated list. The env source must be told

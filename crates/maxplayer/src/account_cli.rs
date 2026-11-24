@@ -218,8 +218,8 @@ mod wallet {
     use maxplayer_core::home::{self, MaxplayerHome};
     use maxplayer_core::profile::{self, NameFill};
     use maxplayer_core::registration::{
-        self, CodeSent, EnteredBy, Linked, MARKETING_NOTICE, RegistrationClient, RegistrationError,
-        TERMS_VERSION,
+        self, CodeSent, EnteredBy, LegalVersions, Linked, MARKETING_NOTICE, RegistrationClient,
+        RegistrationError,
     };
     use nostr_sdk::prelude::{Keys, ToBech32};
 
@@ -238,6 +238,17 @@ mod wallet {
         pub home: Option<MaxplayerHome>,
         /// `[profile].name` when it is a valid label: the label prompt's default.
         pub profile_name: Option<String>,
+        /// The site's legal versions manifest (`registration::LEGAL_VERSIONS_URL`, or
+        /// `MAXPLAYER_LEGAL_VERSIONS_URL`); `None` = this build's versions only.
+        pub legal_versions_url: Option<String>,
+    }
+
+    fn legal_versions_url() -> Option<String> {
+        match std::env::var(registration::LEGAL_VERSIONS_ENV) {
+            Ok(url) if url.is_empty() => None,
+            Ok(url) => Some(url),
+            Err(_) => Some(registration::LEGAL_VERSIONS_URL.to_owned()),
+        }
     }
 
     /// `{"error": <code>, "message": <text>}` on stdout: the `--json` failure shape.
@@ -312,6 +323,7 @@ mod wallet {
                 flags,
                 home: Some(home),
                 profile_name,
+                legal_versions_url: legal_versions_url(),
             })
         }
 
@@ -344,6 +356,7 @@ mod wallet {
                 flags,
                 home: None,
                 profile_name: None,
+                legal_versions_url: legal_versions_url(),
             })
         }
 
@@ -378,13 +391,13 @@ mod wallet {
         );
     }
 
-    fn print_code_sent(out: &mut dyn Write, email: &str, sent: &CodeSent) {
+    fn print_code_sent(out: &mut dyn Write, email: &str, sent: &CodeSent, legal: &LegalVersions) {
         let minutes = sent.expires_in_secs.div_ceil(60);
         let _ = writeln!(
             out,
             "Check {email} for a 6-digit code (it expires in {minutes} minutes, {} tries).\n\
-             Entering it accepts the Maxplayer Terms of Service, effective {TERMS_VERSION}: {}",
-            sent.max_attempts, sent.terms_url
+             Entering it accepts the Maxplayer Terms of Service, effective {}: {}",
+            sent.max_attempts, legal.terms, sent.terms_url
         );
     }
 
@@ -527,8 +540,11 @@ mod wallet {
         }
 
         let _ = writeln!(out, "Linking {} ({}) to an email.", ctx.whose, ctx.npub);
+        // The site's current terms and privacy versions (this build's if it cannot be read): the
+        // notice below names that privacy page and the request accepts those versions.
+        let legal = LegalVersions::current(ctx.legal_versions_url.as_deref());
         // Spec §3 steps 1 and 6: both notices, when the email is asked for or before it is sent.
-        let _ = writeln!(out, "{}", registration::privacy_notice());
+        let _ = writeln!(out, "{}", legal.privacy_notice());
         let _ = writeln!(out, "{MARKETING_NOTICE}");
 
         let email = match &opts.email {
@@ -572,11 +588,11 @@ mod wallet {
             }
         };
 
-        let sent = match client.request_code(&email, &label) {
+        let sent = match client.request_code(&email, &label, &legal) {
             Ok(sent) => sent,
             Err(error) => return report(ctx, err, &error),
         };
-        print_code_sent(out, &email, &sent);
+        print_code_sent(out, &email, &sent, &legal);
         if !interactive {
             next_step(ctx, out);
             return SUCCESS;
@@ -773,6 +789,7 @@ mod interactive_tests {
             flags: String::new(),
             home: None,
             profile_name: None,
+            legal_versions_url: None,
         }
     }
 

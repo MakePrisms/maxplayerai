@@ -142,6 +142,14 @@ pub struct LegalConfig {
     /// `{version}` is replaced by the accepted version.
     pub terms_url: String,
     pub privacy_url: String,
+    /// The website's legal versions manifest (`web/app/public/legal/versions.json`). A link
+    /// request naming a dated (`YYYYMMDD`) terms or privacy version that the lists above lack is
+    /// accepted when this file lists it, so publishing a new version needs no deploy here.
+    /// Versions learned this way are stored and stay accepted. Empty = off (lists only).
+    pub versions_url: String,
+    /// At most one manifest fetch per this many seconds; failures are remembered as long.
+    pub versions_refresh_secs: u64,
+    pub versions_timeout_secs: u64,
 }
 
 impl Default for LegalConfig {
@@ -154,6 +162,9 @@ impl Default for LegalConfig {
             marketing_notice_versions: vec!["v1".into()],
             terms_url: "https://www.maxplayer.ai/terms/{version}".into(),
             privacy_url: "https://www.maxplayer.ai/privacy/{version}".into(),
+            versions_url: "https://www.maxplayer.ai/legal/versions.json".into(),
+            versions_refresh_secs: 60,
+            versions_timeout_secs: 5,
         }
     }
 }
@@ -357,6 +368,16 @@ impl Config {
             }
             url::Url::parse(&tpl.replace("{version}", "v1"))
                 .with_context(|| format!("{name} is not a URL"))?;
+        }
+        if !legal.versions_url.is_empty() {
+            let u =
+                url::Url::parse(&legal.versions_url).context("legal.versions_url is not a URL")?;
+            if !matches!(u.scheme(), "https" | "http") {
+                bail!("legal.versions_url must be an http(s) URL");
+            }
+        }
+        if legal.versions_refresh_secs == 0 || legal.versions_timeout_secs == 0 {
+            bail!("legal.versions_refresh_secs and legal.versions_timeout_secs must be positive");
         }
         let l = &self.limits;
         if l.code_ttl_secs <= 0

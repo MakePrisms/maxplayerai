@@ -42,8 +42,15 @@ fn maxplayer() -> Command {
 
 fn base_command(home: &Path, registration_url: &str) -> Command {
     let mut cmd = maxplayer();
+    // The legal versions manifest from the same fake server (404 unless a test sets one), never
+    // the live site.
+    let legal = format!(
+        "{}/legal/versions.json",
+        registration_url.trim_end_matches("/account")
+    );
     cmd.env("MAXPLAYER_HOME", home)
         .env("MAXPLAYER_REGISTRATION_URL", registration_url)
+        .env("MAXPLAYER_LEGAL_VERSIONS_URL", legal)
         .stdin(Stdio::null());
     cmd
 }
@@ -98,6 +105,110 @@ fn request_code(fake: &FakeRegistration, home: &Home) {
         &["link", "--email", "You@Example.com", "--label", "my-laptop"],
     );
     assert_eq!(code, 0, "{out}\n{err}");
+}
+
+fn manifest(terms: &[&str], privacy: &[&str]) -> Value {
+    serde_json::json!({
+        "current": { "terms": terms.last().unwrap(), "privacy": privacy.last().unwrap() },
+        "terms": terms,
+        "privacy": privacy,
+    })
+}
+
+fn sent_versions(fake: &FakeRegistration) -> (String, String) {
+    let requests = fake.requests();
+    let request = requests
+        .iter()
+        .rfind(|r| r.path == "/account/link/request")
+        .expect("a link request");
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    (
+        body["terms_version"].as_str().unwrap().to_owned(),
+        body["privacy_version"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// A version published on the site after this build is what `account link` shows and accepts:
+/// no release needed. `--code` sends no version and reads nothing from the site.
+#[test]
+fn link_offers_the_sites_current_legal_versions() {
+    let fake = FakeRegistration::start();
+    fake.set_legal_manifest(manifest(
+        &["20261029", "20261123", "20270115"],
+        &["20261123", "20270201"],
+    ));
+    let home = new_home();
+    fake.set_next_code("482913");
+    let (code, out, err) = run(
+        &home,
+        &fake.base_url(),
+        &["link", "--email", "you@example.com", "--label", "my-laptop"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("Privacy Policy: https://www.maxplayer.ai/privacy/20270201"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "Entering it accepts the Maxplayer Terms of Service, effective 20270115: \
+             https://www.maxplayer.ai/terms/20270115"
+        ),
+        "{out}"
+    );
+    assert_eq!(
+        sent_versions(&fake),
+        ("20270115".to_owned(), "20270201".to_owned())
+    );
+    assert_eq!(fake.legal_fetches(), 1);
+    let (code, out, err) = run(&home, &fake.base_url(), &["link", "--code", "482913"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let reg = fake.registration(&home.pubkey).unwrap();
+    assert_eq!(
+        (reg.terms_version.as_str(), reg.privacy_version.as_str()),
+        ("20270115", "20270201")
+    );
+    assert_eq!(
+        fake.legal_fetches(),
+        1,
+        "--code reads nothing from the site"
+    );
+}
+
+/// The site unreachable, an older manifest (a stale cache, a rollback) or a malformed one: this
+/// build's versions, so linking never depends on the site.
+#[test]
+fn link_keeps_this_builds_versions_unless_the_site_has_newer_ones() {
+    for (label, manifest) in [
+        ("missing", None),
+        ("older", Some(manifest(&["20261029"], &["20261029"]))),
+        (
+            "current not listed",
+            Some(serde_json::json!({
+                "current": { "terms": "20270115", "privacy": "20270115" },
+                "terms": ["20261123"],
+                "privacy": ["20261123"],
+            })),
+        ),
+        (
+            "undated entry",
+            Some(manifest(&["20261123", "v2"], &["20261123", "v2"])),
+        ),
+        ("not a manifest", Some(serde_json::json!({ "ok": true }))),
+    ] {
+        let fake = FakeRegistration::start();
+        if let Some(m) = manifest {
+            fake.set_legal_manifest(m);
+        }
+        let home = new_home();
+        request_code(&fake, &home);
+        assert_eq!(
+            sent_versions(&fake),
+            ("20261123".to_owned(), "20261123".to_owned()),
+            "{label}"
+        );
+        assert_eq!(fake.legal_fetches(), 1, "{label}");
+    }
 }
 
 #[test]

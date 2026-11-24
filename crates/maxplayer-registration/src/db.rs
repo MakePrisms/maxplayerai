@@ -22,6 +22,37 @@ pub async fn mark_nip98_seen(db: &PgPool, event_id: &str, now: DateTime<Utc>) ->
     Ok(r.rows_affected() == 1)
 }
 
+// ---------------------------------------------------------------- legal versions
+
+/// Whether `version` of `doc` (`terms`/`privacy`) was learned from the website's manifest.
+pub async fn legal_version_known(db: &PgPool, doc: &str, version: &str) -> Result<bool> {
+    let row = sqlx::query("SELECT 1 AS one FROM legal_versions WHERE doc = $1 AND version = $2")
+        .bind(doc)
+        .bind(version)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Store versions listed by the manifest; ones already stored keep their first-seen time.
+pub async fn record_legal_versions(
+    db: &PgPool,
+    doc: &str,
+    versions: &[String],
+    now: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO legal_versions (doc, version, first_seen_at) \
+         SELECT $1, v, $3 FROM unnest($2::text[]) AS v ON CONFLICT DO NOTHING",
+    )
+    .bind(doc)
+    .bind(versions)
+    .bind(now)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 pub async fn count_rate(
     db: &PgPool,
     bucket: &str,

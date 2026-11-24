@@ -29,6 +29,11 @@ privacy_versions = ["20261029", "20261123"]
 marketing_notice_versions = ["v1"]
 terms_url = "https://www.maxplayer.ai/terms/{version}"
 privacy_url = "https://www.maxplayer.ai/privacy/{version}"
+# Dated versions missing above are accepted when the site's manifest lists them (stored once
+# seen). "" = the lists above only.
+versions_url = "https://www.maxplayer.ai/legal/versions.json"
+versions_refresh_secs = 60
+versions_timeout_secs = 5
 
 [limits]                                           # defaults shown
 code_ttl_secs = 600
