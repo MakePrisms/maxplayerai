@@ -127,14 +127,14 @@ test("the preview image is 1200×630, small enough for every unfurler, and rende
 });
 
 test("the invite card is 1200×630, small enough for WhatsApp, and rendered from its template", () => {
-  const card = join(dist, "og", "invite-card.png");
+  const card = join(dist, "og", "invite-card-2.png");
   assert.deepEqual(pngSize(card), [1200, 630]);
   assert.ok(statSync(card).size < 300 * 1024, `invite card is ${statSync(card).size} bytes`);
   const template = readFileSync(join(root, "og", "invite-card.html"), "utf8");
   assert.match(template, /width: 1200px; height: 630px/, "the template renders at 1200×630");
   assert.match(template, /You’re invited<br \/>to a Maxplayer<br \/>team/, "the card says it (Bob, 2026-11-22)");
   const render = readFileSync(join(root, "scripts", "render-og.mjs"), "utf8");
-  assert.match(render, /"og\/invite-card\.html", "public\/og\/invite-card\.png", 1200, 630/, "npm run og writes the invite card");
+  assert.match(render, /"og\/invite-card\.html", "public\/og\/invite-card-2\.png", 1200, 630/, "npm run og writes the invite card");
 });
 
 // bob (2026-11-10): https://www.maxplayer.ai/skill.md must unfurl too. It is markdown, which no
@@ -263,13 +263,13 @@ test("/join/<token>: preview bots get the card, browsers the invite page, agents
   assert.match(preview, /<meta name="robots" content="noindex, nofollow" \/>/, "the preview page is noindex");
   assert.doesNotMatch(preview, /<script|<form|fetch\(/i, "the preview runs nothing");
   assert.equal(one(preview, "property", "og:title", "join-preview.html"), "Give this link to your agent to join", "Bob, 2026-11-22");
-  assert.equal(one(preview, "property", "og:image", "join-preview.html"), `${ORIGIN}/og/invite-card.png`);
+  assert.equal(one(preview, "property", "og:image", "join-preview.html"), `${ORIGIN}/og/invite-card-2.png`);
   assert.equal(one(preview, "property", "og:url", "join-preview.html"), `${ORIGIN}/join-preview`, "og:url needs no token");
 
   const page = readFileSync(join(dist, "join-invite.html"), "utf8");
   assert.match(page, /<meta name="robots" content="noindex, nofollow" \/>/, "the invite page is noindex");
   assert.match(page, /<meta name="referrer" content="no-referrer" \/>/);
-  assert.equal(one(page, "property", "og:image", "join-invite.html"), `${ORIGIN}/og/invite-card.png`, "the same card if it is ever shared");
+  assert.equal(one(page, "property", "og:image", "join-invite.html"), `${ORIGIN}/og/invite-card-2.png`, "the same card if it is ever shared");
   assert.equal(one(page, "property", "og:url", "join-invite.html"), `${ORIGIN}/join-invite`, "og:url needs no token");
   for (const route of ["/join-preview", "/join-invite"]) {
     for (const f of readdirSync(dist).filter((f) => f.endsWith(".html") && f !== `${route.slice(1)}.html`)) {

@@ -386,17 +386,23 @@ function paintFloats() {
   // The cell is set from script, not written as style="" in the markup: the site's CSP (style-src 'self') drops
   // inline style attributes, and every mark would show cell 0.
   for (const el of $('#floats').querySelectorAll('.fl-soft')) { el.style.setProperty('--cx', el.dataset.cx); el.style.setProperty('--cy', el.dataset.cy); }
-  // phone-size screens show the eight agents once, in a row under the hero buttons (site.css .hero-marks)
-  $('#hero-marks').innerHTML = ['grok', 'inst', 'codex', 'claude', 'openclaw', 'hermes', 'dots', 'duet'].map(k => {
-    const kk = k === me ? 'muse' : k;
-    return `<span class="hm" data-k="${kk}">${mark(kk)}</span>`;
-  }).join('');
+  // phone-size screens show the agents once, in a row under the hero buttons, Muse first (site.css .hero-marks).
+  // All of them are fully lit; each glows for a moment as it joins the hero chat's team (rowGlow, floatFlash).
+  $('#hero-marks').innerHTML = ['muse', 'grok', 'inst', 'codex', 'claude', 'openclaw', 'hermes', 'dots', 'duet']
+    .map(k => `<span class="hm" data-k="${k}">${mark(k)}</span>`).join('');
 }
 let floatT = [];
 function floatClear() { floatT.forEach(clearTimeout); floatT = []; $$('#floats .fl, #hero-marks .hm').forEach(f => f.classList.remove('lit')); }
 // The two marks the chat has just added light for a moment, one after the other, and sink back (Bob: flash briefly,
 // do not stay lit). The CSS comes up fast and goes down slowly.
 const FLASH_HOLD = 700;
+// the phone-size row only: the agent that creates the team glows as the team goes live (desktop shows it on the phone)
+function rowGlow(k) {
+  const f = $(`#hero-marks [data-k="${k}"]`);
+  if (!f) return;
+  f.classList.add('lit');
+  floatT.push(setTimeout(() => f.classList.remove('lit'), FLASH_HOLD));
+}
 function floatFlash() {
   floatT.forEach(clearTimeout); floatT = [];
   [friend(), mate()].forEach((k, i) => {
@@ -410,7 +416,7 @@ async function heroTeaser(t) {
     clearChat(); floatClear();
     await wait(900, t);
     await userSays('Create a team for our product launch', t);
-    await agentSays('Done. Team <b>launch</b> is live.', t);
+    await agentSays('Done. Team <b>launch</b> is live.', t, undefined, () => rowGlow(me));
     await cardSays(teamCard(1), t, 900);
     await userSays(`Invite ${nm(friend())} and ${nm(mate())}`, t);
     await agentSays('Invited. Both are in.', t, 1100, floatFlash);
