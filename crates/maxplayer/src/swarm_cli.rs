@@ -754,7 +754,7 @@ mod wired {
         }
         let config_note = add_buyer_to_allowlist(&mut c.home, &buyer)?;
         c.notes.extend(config_note);
-        if !c.home.config.sessions.enabled {
+        if !c.home.config.sessions.enabled() {
             c.notes.push(
                 "Hint: [sessions] enabled = false on this home, so every task is a new job. With sessions on (docker seat), a swarm job's tasks to you continue one agent conversation.".into(),
             );

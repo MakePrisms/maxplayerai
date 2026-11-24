@@ -504,7 +504,7 @@ fn tools() -> Value {
     ])
 }
 
-/// Session jobs (docs/specs/session-jobs.md §10): with `[sessions] enabled = true` the surface gains
+/// Session jobs (docs/specs/session-jobs.md §10): with sessions on (the default) the surface gains
 /// `reply`, `collect.turn`, and `get_job` documents its `session` object. `reply close: true` is the
 /// one advertised way to close; the daemon still accepts `collect close_session` as a deprecated
 /// alias for one release, but the schema no longer lists it.
@@ -556,7 +556,7 @@ fn tools_for(sessions: bool) -> Value {
 /// swarm tools with `[swarm] enabled`, then the team tools on every `wallet` build.
 fn listed_tools(state: &McpState) -> Value {
     with_team_tools(with_swarm_tools(
-        tools_for(state.home.config.sessions.enabled),
+        tools_for(state.home.config.sessions.enabled()),
         state.home.config.swarm.enabled,
     ))
 }
@@ -678,7 +678,7 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
         "get_job" => route_tool(state, "get_job", "get_job", arguments).await?,
         "collect" => route_tool(state, "collect", "collect", arguments).await?,
         "award_claim" => route_tool(state, "award_claim", "award", arguments).await?,
-        "reply" if state.home.config.sessions.enabled => {
+        "reply" if state.home.config.sessions.enabled() => {
             route_tool(state, "reply", "reply", arguments).await?
         }
         swarm if state.home.config.swarm.enabled && SWARM_TOOLS.contains(&swarm) => {
@@ -1543,10 +1543,7 @@ mod tests {
                 params: json!({}),
             },
         );
-        assert_eq!(
-            listed["result"]["tools"],
-            with_team_tools(tools_for(state.home.config.sessions.enabled))
-        );
+        assert_eq!(listed["result"]["tools"], with_team_tools(tools_for(true)));
         let called = dispatch(
             &state,
             &McpRequest {
@@ -1574,10 +1571,10 @@ mod tests {
                 params: json!({}),
             },
         );
-        assert_eq!(
-            names(listed["result"]["tools"].clone())[4..4 + SWARM_TOOLS.len()],
-            *SWARM_TOOLS
-        );
+        // Sessions are on by default (`[sessions]` unset), so `reply` sits before the swarm tools.
+        let listed = names(listed["result"]["tools"].clone());
+        assert_eq!(listed[4], "reply");
+        assert_eq!(listed[5..5 + SWARM_TOOLS.len()], *SWARM_TOOLS);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1622,7 +1619,7 @@ mod tests {
     // END swarm tests
 
     // BEGIN team tests
-    /// The team tools are listed on every `wallet` build, after the trade loop and any swarm
+    /// The team tools are listed on every `wallet` build, after the trade loop, `reply` and any swarm
     /// tools, each with a closed object schema and the untrusted-text warning.
     #[cfg(feature = "wallet")]
     #[test]
@@ -1647,6 +1644,7 @@ mod tests {
                 "get_job",
                 "collect",
                 "award_claim",
+                "reply",
                 "team_whoami",
                 "team_create",
                 "team_invite",
@@ -1658,8 +1656,9 @@ mod tests {
                 "team_delete"
             ]
         );
-        assert_eq!(&names[4..], team::TEAM_TOOLS);
-        for tool in &tools[4..] {
+        // `reply` is listed because sessions are on by default (`[sessions]` unset).
+        assert_eq!(&names[5..], team::TEAM_TOOLS);
+        for tool in &tools[5..] {
             assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
             assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{tool}");
             let description = tool["description"].as_str().unwrap();
@@ -1987,6 +1986,42 @@ mod tests {
             .unwrap()
             .remove("max_session_sats");
         assert_eq!(on_post, post(&off));
+    }
+
+    /// `[sessions] enabled = false` in config.toml, through the real dispatch: `tools/list` has no
+    /// `reply` and `post_job` no `max_session_sats`, and a `reply` call is an unknown tool.
+    #[test]
+    fn sessions_off_in_config_hides_and_refuses_reply() {
+        let root = temp_home("sessions-off");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.toml"), "[sessions]\nenabled = false\n").unwrap();
+        let state = state_at(&root);
+        assert!(!state.home.config.sessions.enabled());
+        let request = |id: u64, method: &str, params: Value| McpRequest {
+            id: Some(json!(id)),
+            method: method.into(),
+            params,
+        };
+        let listed = dispatch(&state, &request(1, "tools/list", json!({})));
+        assert_eq!(listed["result"]["tools"], with_team_tools(tools_for(false)));
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().all(|tool| tool["name"] != "reply"));
+        let post_job = tools
+            .iter()
+            .find(|tool| tool["name"] == "post_job")
+            .unwrap();
+        assert!(
+            post_job["inputSchema"]["properties"]
+                .get("max_session_sats")
+                .is_none()
+        );
+        let reply = json!({"name": "reply", "arguments": {"job_id": "00"}});
+        let called = dispatch(&state, &request(2, "tools/call", reply));
+        assert_eq!(called["result"]["isError"], true);
+        let text = called["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("unknown tool: reply"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

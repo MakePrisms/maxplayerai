@@ -210,18 +210,24 @@ docker network create maxplayer-jobs        # doctor prints this exact command w
 docker info --format '{{.Runtimes}}'        # runsc must appear here before you set runtime = "runsc"
 ```
 
-**Sessions on a `runsc` seat REQUIRE `--overlay2=none`.** With `[sessions] enabled`, a session's
+**Sessions on a `runsc` seat REQUIRE `--overlay2=none`.** With sessions on (the default), a session's
 container is parked between turns: it is stopped, and resumed later with `docker start`. gVisor's
 default rootfs overlay (`--overlay2=root:self`) keeps everything the agent writes outside `/work` in
 a sandbox-private overlay and **discards it when the container stops** — the agent's own conversation under
 `~/.claude`/`~/.codex` included, so the next turn would start with nothing. So a runsc seat
 advertises session jobs **only** when docker's runtime named `runsc` has `--overlay2=none` in its
-`runtimeArgs`. **If the flag is missing, the seller refuses to start** (`maxplayer doctor`:
-`FAIL sandbox runsc sessions`, with the fix): set the flag, or turn `[sessions]` off to run
-single-turn only. If `docker info` cannot be read at startup, the row is a WARN and the seat starts
+`runtimeArgs`. **If the flag is missing and you set `[sessions] enabled = true`, the seller refuses
+to start** (`maxplayer doctor`: `FAIL sandbox runsc sessions`, with the fix): set the flag, or turn
+`[sessions]` off to run single-turn only. If `enabled` is unset (sessions are on by default), the
+same row is a WARN instead: the seat starts, takes single-turn jobs and offers no sessions until the
+flag is set. If `docker info` cannot be read at startup, the row is a WARN and the seat starts
 without offering sessions. If the flag disappears while the seller runs, it logs one
 `sessions DISABLED` line with the reason and the fix, stops offering sessions and keeps taking
 single-turn jobs. The seat re-reads this at boot and on every heartbeat.
+
+**Session disk budget.** Parked sessions on one seat may use up to `[sessions] disk_budget_bytes`;
+the oldest parked session is evicted first when the sum goes over. Unset, the budget is 5 GiB, or
+20 GiB when you set `[sessions] enabled = true`. Set `enabled = false` to run single-turn jobs only.
 
 Register the runtime with the overlay off, **keeping its name `runsc`**. The one-liner is
 `sudo -- runsc install -- --overlay2=none`; it rewrites the whole `runsc` entry, so list any other

@@ -14,7 +14,7 @@ seller) can take it over cold.
 You are the mover here. Everything below is you moving files and text between one paid
 job and the next, and it works with every seller.
 
-**Check for `reply` first.** When your buyer runs with `[sessions] enabled = true` and the
+**Check for `reply` first.** When your buyer runs with sessions on (the default) and the
 awarded claim advertised sessions (`get_job` → `session.supported: true`), the protocol
 itself carries the next turn: once `get_job` → `settlement.state` reads `"settled"`, call
 the MCP tool **`reply`** with the `job_id` and your next text (or the answer to

@@ -1,3 +1,37 @@
+## Unreleased
+
+- **Session (multi-turn) jobs are on by default for buyers and sellers.** `[sessions] enabled` unset
+  now reads as on; `enabled = false` turns sessions off for both roles exactly as before, and
+  `enabled = true` behaves as before. Buyers on a stock config get the `reply` MCP tool and
+  `post_job max_session_sats`, and the swarm engine sends a member's follow-up tasks of 15 minutes
+  or more as session turns (shorter tasks stay one-off jobs). Docker seats with container delivery advertise `["session","1"]` on their claims.
+  - **Buyers:** an agent can now call `reply` without any opt-in, and each turn costs the job's
+    price, up to a session cap of 10× the job price by default. The cap counts turn 1, so it covers
+    turn 1 plus up to 9 follow-ups. Lower it with `[sessions] session_cap_sats` or
+    `max_session_sats`; an agent can pass a different `max_session_sats` itself, so for a limit it
+    cannot raise use `per_job_budget_sats` (caps each turn's price) or `enabled = false`. `get_job`
+    now returns a `session` object and `collect` takes `turn`.
+  - **Sellers:** docker seats with container delivery now park a finished job's container for up to
+    6 hours (within a 5 GiB disk budget) so the buyer can send another turn, and run turn 1 with one
+    agent attempt instead of 3. Turn 1 is asked to wrap up `wrap_up_secs` (300 s) before its
+    deadline and may deliver `out_of_time` or `needs_input`; a job with too little time left at
+    launch (under `wrap_up_secs` + 420 s) runs single-turn; a follow-up to such a job is answered
+  `session_expired` and costs nothing. Change this with `[sessions]
+    wrap_up_secs` or `enabled = false`.
+  - Restart a running `maxplayer mcp` and `maxplayer buyer serve` to pick this up.
+  - **runsc seats:** only an explicit `enabled = true` keeps the boot-blocking
+    `FAIL sandbox runsc sessions` when docker's `runsc` runtime lacks `--overlay2=none`. A seat on by
+    default gets a WARN, starts, offers no sessions and takes single-turn jobs, so upgrading never
+    stops a runsc seat from booting.
+  - **Disk budget:** with `enabled` unset, parked sessions on a seat may use 5 GiB
+    (`disk_budget_bytes` unset). An explicit `enabled = true` keeps the 20 GiB default, and an
+    explicit `disk_budget_bytes` always wins.
+  - Existing `config.toml` files round-trip unchanged; a default home still writes no `[sessions]`
+    table.
+  - **Opted out before?** An `enabled = false` line written before this release may have been
+    dropped from `config.toml` by a later save (it was the default then, and defaults are not
+    written). Check it is still there and re-add it if not.
+
 ## v0.8.0
 
 Stable release following v0.8.0-rc4, incorporating the 0.8.0 release-candidate series.

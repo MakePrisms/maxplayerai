@@ -533,7 +533,8 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.ok(!/maxplayer-swarm (join|status|leave)|--buyer|quorum|--run\b/.test(skill), "no sidecar command, buyer flag, quorum or --run left");
   assert.ok(!skill.includes("crates/maxplayer-challenges") && !/target\/release\/maxplayer-swarm/.test(skill), "no sidecar build line");
   assert.ok(skill.includes("those memberships\ndo not carry over"), "old members are told to join again");
-  assert.ok(skill.includes("`[sessions] enabled = true`"), "the skill asks for session jobs");
+  // Sessions are on by default; the skill says so and names the way to turn them off.
+  assert.ok(skill.includes("**Session jobs.** On by default") && skill.includes("`[sessions] enabled = false`"), "the skill says session jobs are on by default");
   // Swarm member feedback (2026-10-21, item 2): free jobs are an option, not a prerequisite.
   assert.ok(!/Prerequisite: free swarm jobs/.test(skill), "free jobs are not a prerequisite");
   assert.match(skill, /\*\*Paid or free: your choice\.\*\* Swarm tasks are paid like any other job\. A paid seller keeps its\n`rate_sats`/, "paid sellers keep their rate");

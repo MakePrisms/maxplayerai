@@ -215,7 +215,7 @@ impl Fx {
             swarm: swarm.into(),
             seller: self.seller(i),
             since: T0 - 500,
-            minutes: 60,
+            minutes: 120,
             status: "joined".into(),
             note: String::new(),
         };
@@ -256,7 +256,7 @@ impl Fx {
     fn queue(&self, e: &Engine, job: &str, text: &str, fresh: bool) -> i64 {
         let t = NewTask {
             text: text.into(),
-            duration_secs: 600,
+            duration_secs: MIN_SESSION_TURN_SECS,
             max_sats: 100,
             fresh,
             ..NewTask::default()
@@ -438,10 +438,10 @@ async fn expired_task_frees_its_seller() {
         (task(&e, a).state.as_str(), task(&e, b).state.as_str()),
         ("posted", "queued")
     );
-    fx.at(T0 + 600 + EXPIRED_GRACE_SECS);
+    fx.at(T0 + MIN_SESSION_TURN_SECS + EXPIRED_GRACE_SECS);
     e.tick(&fx.stub).await.unwrap();
     assert_eq!(task(&e, a).state, "posted", "not before deadline + grace");
-    fx.at(T0 + 600 + EXPIRED_GRACE_SECS + 1);
+    fx.at(T0 + MIN_SESSION_TURN_SECS + EXPIRED_GRACE_SECS + 1);
     e.tick(&fx.stub).await.unwrap();
     let ta = task(&e, a);
     assert_eq!(ta.state, "failed");
@@ -806,6 +806,56 @@ async fn fresh_non_session_and_dead_session_each_post_a_one_off_job() {
     assert_eq!((tb.state.as_str(), tb.turn), ("posted", None));
 }
 
+/// §7.6: a task shorter than [`MIN_SESSION_TURN_SECS`] to a member with a live session goes out as a
+/// one-off job (the seller could not start it as a turn); a 3600 s task is still a session turn.
+#[tokio::test]
+async fn a_short_task_skips_the_live_session_and_a_long_one_uses_it() {
+    let fx = Fx::math(1, 10, 10_000, "public");
+    fx.stub.session_claims.store(true, Ordering::SeqCst);
+    let e = fx.engine(true);
+    session_open(&fx, &e).await;
+    let short = NewTask {
+        text: "short".into(),
+        duration_secs: 600,
+        max_sats: 100,
+        ..NewTask::default()
+    };
+    let b = e
+        .store
+        .queue_swarm_task("math-1", &short, "agent", T0 as i64)
+        .unwrap();
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(
+        (fx.stub.posts().len(), fx.stub.replies.lock().unwrap().len()),
+        (2, 0)
+    );
+    assert_eq!(
+        (task(&e, b).state.as_str(), task(&e, b).turn),
+        ("posted", None)
+    );
+    fx.stub.deliver(task(&e, b).job_id.as_deref().unwrap());
+    fx.at(T0 + 240);
+    let long = NewTask {
+        text: "long".into(),
+        duration_secs: 3_600,
+        ..short
+    };
+    let c = e
+        .store
+        .queue_swarm_task("math-1", &long, "agent", T0 as i64)
+        .unwrap();
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(task(&e, b).state, "collected");
+    assert_eq!(
+        (fx.stub.posts().len(), fx.stub.replies.lock().unwrap().len()),
+        (2, 1)
+    );
+    assert_eq!(
+        (task(&e, c).state.as_str(), task(&e, c).turn),
+        ("posted", Some(2))
+    );
+}
+
 /// §12, §7.6, §8: closing the swarm job stops posting, lets the in-flight turn settle, then closes
 /// its sessions.
 #[tokio::test]
@@ -918,6 +968,10 @@ async fn default_off_daemon_starts_no_engine_and_knows_no_swarm_method() {
         assert!(!home.config.swarm.enabled, "default off");
         home.config.swarm.enabled = enabled;
         let (_lock, context, _socket) = bootstrap(home).await.unwrap();
+        assert!(
+            engine_for(&context, String::new()).sessions,
+            "default [sessions]: the engine sends session turns"
+        );
         assert_eq!(
             spawn(context.clone()),
             enabled,

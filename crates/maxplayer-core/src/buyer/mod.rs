@@ -667,7 +667,7 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
     };
     let max_session_sats = match post_job_session_cap(
         params.max_session_sats,
-        context.home.config.sessions.enabled,
+        context.home.config.sessions.enabled(),
     ) {
         Ok(cap) => cap,
         Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
@@ -1593,7 +1593,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     if params.close_session {
         crate::opline!("{}", close_session_deprecation_line(&params.job_id));
     }
-    let sessions = context.home.config.sessions.enabled;
+    let sessions = context.home.config.sessions.enabled();
     if !sessions && (params.turn.is_some_and(|t| t > 1) || params.close_session) {
         return Response::err(id, CODE_REFUSED, session_reply::disabled());
     }
@@ -6886,7 +6886,8 @@ mod tests {
         drop(relay);
     }
 
-    // Shared fixture for the close/read-back handler tests: a buyer with `[sessions] enabled`, the
+    // Shared fixture for the close/read-back handler tests: a buyer on the DEFAULT `[sessions]`
+    // (sessions on, `enabled` unset), the
     // buyer-signed offer on a local relay, a recorded award, and a FREE INLINE accept-bind, so the
     // real `collect` handler settles end to end (no wallet, no mint) and `send_close` really publishes.
     async fn free_session_job(
@@ -6906,7 +6907,6 @@ mod tests {
         let relay = LocalRelay::new(RelayBuilder::default());
         relay.run().await.expect("relay run");
         home.config.relay_url = relay.url().await.to_string();
-        home.config.sessions.enabled = true;
         let (lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let keys = buyer_keys(&context.home).expect("buyer keys");
         let offer = EventBuilder::new(Kind::Custom(crate::kinds::JOB_OFFER_KIND), "")

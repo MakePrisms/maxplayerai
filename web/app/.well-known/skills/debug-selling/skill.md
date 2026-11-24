@@ -394,14 +394,16 @@ backlog full (cap 32)` line and a count of `claimed` rows past their deadline
 
 ## Symptom: sessions DISABLED on a runsc seat
 
-Only a seat with `[sandbox] mode = "docker"`, `runtime = "runsc"` and `[sessions] enabled` can see
+Only a seat with `[sandbox] mode = "docker"`, `runtime = "runsc"` and sessions on (the default) can see
 this. Any other seat (no runtime set, runc, any other runtime name, launcher mode) never runs this
 check and never logs this line.
 
-**At startup, a missing flag stops the seller.** When docker shows the runtime named `runsc` without
-`--overlay2=none` (or no `runsc` at all), `maxplayer doctor` reports `FAIL sandbox runsc sessions`,
-and the seller refuses to start with that row and the fix below. Either set the flag (below) or turn
-`[sessions]` off to run single-turn only. If docker cannot be read at startup (timeout, bad output),
+**At startup, a missing flag stops the seller if you set `[sessions] enabled = true`.** When docker
+shows the runtime named `runsc` without `--overlay2=none` (or no `runsc` at all), `maxplayer doctor`
+reports `FAIL sandbox runsc sessions`, and the seller refuses to start with that row and the fix
+below. Either set the flag (below) or turn `[sessions]` off to run single-turn only. With `enabled`
+unset (sessions on by default) the same row is a WARN: the seller starts, logs the line below and
+takes single-turn jobs. If docker cannot be read at startup (timeout, bad output),
 the row is a WARN instead: the seller starts without offering sessions and re-checks on each
 heartbeat. While running, the seller logs this line when the verdict changes (for example if the flag
 disappears after a docker reconfigure); it then stops offering sessions but keeps running:
@@ -410,8 +412,8 @@ disappears after a docker reconfigure); it then stops offering sessions but keep
 seller node sessions DISABLED on this runsc seat (single-turn jobs continue): the docker runtime "runsc" runs without --overlay2=none (runtimeArgs []); ...
 ```
 
-`maxplayer doctor` reports the same verdict as `sandbox runsc sessions` (FAIL for a missing flag,
-WARN when docker could not be read), with the same fix.
+`maxplayer doctor` reports the same verdict as `sandbox runsc sessions` (FAIL for a missing flag
+with `enabled = true`, WARN with `enabled` unset or when docker could not be read), with the same fix.
 
 **Read it:** a session job's container is stopped between turns and started again for the next one.
 gVisor's default (`--overlay2=root:self`) keeps every file the agent writes outside the job's work
@@ -419,7 +421,8 @@ folder in a sandbox-private layer that is thrown away when the container stops. 
 agent's own conversation under `~/.claude` or `~/.codex`, so turn 2 would start with nothing. The
 seat therefore offers session jobs only when docker's runtime named `runsc` has `--overlay2=none`.
 A seller that is already running when this happens keeps taking single-turn jobs; a seller that
-starts with sessions on and no flag refuses to start until the flag is set or `[sessions]` is off.
+starts with `[sessions] enabled = true` and no flag refuses to start until the flag is set or
+`[sessions]` is off; one with `enabled` unset starts single-turn.
 
 **Fix:**
 

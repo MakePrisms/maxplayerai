@@ -23,7 +23,13 @@ fn turn2() -> FollowUp {
 }
 fn on() -> SessionsConfig {
     SessionsConfig {
-        enabled: true,
+        enabled: Some(true),
+        ..SessionsConfig::default()
+    }
+}
+fn off() -> SessionsConfig {
+    SessionsConfig {
+        enabled: Some(false),
         ..SessionsConfig::default()
     }
 }
@@ -133,8 +139,8 @@ fn followup_from_wrong_author_seat_or_turn_is_ignored() {
 /// today's. `advertise_on_claim` is the only path a `session` tag enters a claim.
 #[test]
 fn disabled_sessions_leave_claim_bytes_identical() {
-    let off = SessionsConfig::default();
-    assert!(!off.enabled);
+    let off = off();
+    assert!(!off.enabled());
     for payment in [ClaimPayment::Sat("creqAtest"), ClaimPayment::None] {
         let before = gateway::claim_draft(
             OFFER,
@@ -160,6 +166,15 @@ fn disabled_sessions_leave_claim_bytes_identical() {
         advertise_on_claim(&mut adv, &on(), true, &RunscOverlayGate::Open);
         advertise_on_claim(&mut adv, &on(), true, &RunscOverlayGate::Open);
         assert!(claim_supports_sessions(&adv.tags));
+        // Unset `enabled` (sessions on by default) advertises exactly as `enabled = true`.
+        let mut unset = before.clone();
+        advertise_on_claim(
+            &mut unset,
+            &SessionsConfig::default(),
+            true,
+            &RunscOverlayGate::Open,
+        );
+        assert_eq!(unset, adv);
         let mut stripped = adv.clone();
         stripped.tags.retain(|t| t.first() != Some(SESSION_TAG));
         assert_eq!(stripped, before);
@@ -1039,7 +1054,8 @@ fn runsc_gate_tells_a_missing_flag_from_an_unconfirmed_one() {
     );
 }
 
-/// The gate is scoped: a seat that is not docker + runsc + sessions is never gated, whatever docker
+/// The gate is scoped: a seat that is not docker (container delivery) + runsc + sessions is never
+/// gated, whatever docker
 /// would say — including a probe that would close it.
 #[test]
 fn runsc_gate_leaves_other_seats_alone() {
@@ -1048,13 +1064,17 @@ fn runsc_gate_leaves_other_seats_alone() {
         runtime: Some("runsc".into()),
         ..Default::default()
     };
-    assert!(runsc_overlay_gate_applies(Some(&runsc), &on()));
+    assert!(runsc_overlay_gate_applies(Some(&runsc), &on(), 1000));
+    assert!(
+        runsc_overlay_gate_applies(Some(&runsc), &SessionsConfig::default(), 1000),
+        "sessions on by default gate like enabled = true"
+    );
     let padded = SandboxConfig {
         runtime: Some(" runsc ".into()),
         ..runsc.clone()
     };
     assert!(
-        runsc_overlay_gate_applies(Some(&padded), &on()),
+        runsc_overlay_gate_applies(Some(&padded), &on(), 1000),
         "trimmed like the seat resolves it"
     );
     let runc = SandboxConfig {
@@ -1069,14 +1089,20 @@ fn runsc_gate_leaves_other_seats_alone() {
         mode: SandboxMode::Launcher,
         ..runsc.clone()
     };
+    // Host delivery: the seat never advertises sessions (§2.2), so there is nothing to gate.
+    let host = SandboxConfig {
+        container_delivery: Some(false),
+        ..runsc.clone()
+    };
     for (label, sandbox, sessions) in [
         ("default runtime", Some(&runc), on()),
         ("non-runsc runtime", Some(&other), on()),
         ("launcher mode", Some(&launcher), on()),
         ("no sandbox", None, on()),
-        ("sessions off", Some(&runsc), SessionsConfig::default()),
+        ("host delivery", Some(&host), on()),
+        ("sessions off", Some(&runsc), off()),
     ] {
-        let applies = runsc_overlay_gate_applies(sandbox, &sessions);
+        let applies = runsc_overlay_gate_applies(sandbox, &sessions, 1000);
         assert!(!applies, "{label}");
         let gate = runsc_overlay_gate(applies, Err("would close"));
         assert_eq!(gate, RunscOverlayGate::NotApplicable, "{label}");
@@ -1130,11 +1156,25 @@ fn closed_runsc_gate_runs_an_advertised_job_single_turn() {
         !runs_as_session(&on(), &RunscOverlayGate::Open, false),
         "not advertised"
     );
-    assert!(!runs_as_session(
-        &SessionsConfig::default(),
-        &RunscOverlayGate::Open,
-        true
-    ));
+    assert!(!runs_as_session(&off(), &RunscOverlayGate::Open, true));
+    assert!(
+        runs_as_session(&SessionsConfig::default(), &RunscOverlayGate::Open, true),
+        "unset enabled is on"
+    );
+}
+
+/// Turn 1 on a default config: a 120 s deadline leaves no time for the wrap-up, so the job runs
+/// single-turn; a 3600 s deadline still runs as a session.
+#[test]
+fn a_short_deadline_runs_turn_one_single_turn() {
+    let cfg = SessionsConfig::default();
+    let open = RunscOverlayGate::Open;
+    assert!(!runs_turn_one_as_session(&cfg, &open, true, 1_000, 1_120));
+    assert!(runs_turn_one_as_session(&cfg, &open, true, 1_000, 4_600));
+    assert!(!runs_turn_one_as_session(&off(), &open, true, 1_000, 4_600));
+    // Boundary: wrap_up_secs (300) + 420 s = 720 s left starts a session; 719 s does not.
+    assert!(runs_turn_one_as_session(&cfg, &open, true, 1_000, 1_720));
+    assert!(!runs_turn_one_as_session(&cfg, &open, true, 1_000, 1_719));
 }
 
 // ───────────── Non-runsc seats are unchanged (Petar, 15:33): no probe, no log, main's claims ─────────────
@@ -1223,7 +1263,7 @@ async fn non_runsc_seats_never_probe_and_advertise_as_on_main() {
     assert!(claim_supports_sessions(&on_main.tags));
     for (label, sandbox) in seats {
         assert!(!seat_runs_runsc(sandbox.as_ref()), "{label}");
-        let gate = resolve_runsc_gate(sandbox.as_ref(), &on(), || async {
+        let gate = resolve_runsc_gate(sandbox.as_ref(), &on(), 1000, || async {
             panic!("{label}: a non-runsc seat must never call docker info")
         })
         .await;
@@ -1249,7 +1289,7 @@ async fn runsc_seat_probes_once_only_with_sessions_on() {
         ..Default::default()
     };
     let calls = std::cell::Cell::new(0);
-    let gate = resolve_runsc_gate(Some(&runsc), &on(), || async {
+    let gate = resolve_runsc_gate(Some(&runsc), &on(), 1000, || async {
         calls.set(calls.get() + 1);
         Ok(r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=none"]}}"#.to_owned())
     })
@@ -1257,7 +1297,13 @@ async fn runsc_seat_probes_once_only_with_sessions_on() {
     assert_eq!(calls.get(), 1);
     assert_eq!(gate, RunscOverlayGate::Open);
     assert!(runsc_gate_log_line(&gate).is_some());
-    let off = resolve_runsc_gate(Some(&runsc), &SessionsConfig::default(), || async {
+    // Unset `enabled` (on by default) probes too.
+    let unset = resolve_runsc_gate(Some(&runsc), &SessionsConfig::default(), 1000, || async {
+        Ok(r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=none"]}}"#.to_owned())
+    })
+    .await;
+    assert_eq!(unset, RunscOverlayGate::Open);
+    let off = resolve_runsc_gate(Some(&runsc), &off(), 1000, || async {
         panic!("sessions off: no probe")
     })
     .await;

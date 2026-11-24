@@ -126,7 +126,8 @@ A reader MUST ignore a follow-up whose author is not the buyer that authored the
 
 `["session", "1"]` on CLAIM (3402), 0..1, **absent ⇒ no session support**. Absent is the fail-closed
 direction: every claim on the wire today reads as single-turn. A seat emits it only when
-`[sessions] enabled = true` **and** it is a docker seat on the container-delivery path (§5.1). Protocol
+`[sessions] enabled` is on (unset reads as on since sessions became the default; `false` turns it
+off) **and** it is a docker seat on the container-delivery path (§5.1). Protocol
 §6.2 says a claim carries the three filterable tags "and no others" (`docs/protocol-v1.md:607
 @e0262420`); that sentence gains `session`. It is **not** an award filter: every job stays awardable to
 every seller (input 1); it only decides whether `reply` works after turn 1.
@@ -229,7 +230,8 @@ Public events are not run through `validate_private`, so a public-only deploymen
 - **Everything counts:** slot wait, review, `docker start` and `session/load` are inside the deadline.
   If a slot frees with less than `wrap_up_secs + PUSH_MARGIN_SECS + 120` left
   (`PUSH_MARGIN_SECS` = 300, `core/delivery_orchestrator.rs:998 @e0262420`), the seller does not start;
-  it publishes FEEDBACK `at_capacity` and the session stays parked. Nothing is charged.
+  it publishes FEEDBACK `at_capacity` and the session stays parked. Nothing is charged. Turn 1 with
+  less than that left at launch runs single-turn (no wrap-up, no session prompt section).
 - **Out of time:** at `deadline − wrap_up_secs` (default **300**, unmeasured, input 7) the orchestrator
   sends `session/cancel` (`core/driver/acp_driver.rs:443 @e0262420`), waits for the turn to end, then
   snapshots and delivers with `["turn_status","out_of_time"]`. A cancelled turn with no file change and an
@@ -320,7 +322,8 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
   (`run_expiry_sweep`, `core/seller_node/run.rs:5051 @e0262420`): a parked session past
   `last_turn_at + lifetime_secs` is expired — `docker rm --force` the container and the holder, remove
   the workdir and the resolver file, `state = expired`.
-- `[sessions] disk_budget_bytes` (default §0 item 12). After each park, measure the session
+- `[sessions] disk_budget_bytes` (default §0 item 12: 20 GiB with `enabled = true`; 5 GiB when
+  `enabled` is unset and sessions are on only by default). After each park, measure the session
   (`docker container inspect --size` → `SizeRw`, plus `du` of the workdir) into `disk_bytes`; while the
   sum over parked sessions exceeds the budget, expire the oldest `last_turn_at` first. A running session
   is never evicted.
@@ -349,7 +352,7 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
 A parked container is resumed with `docker start` (§5.2). Under gVisor's default
 `--overlay2=root:self` the rootfs overlay is sandbox-private and discarded at stop, so the agent's
 transcript (`~/.claude`, `~/.codex` under `HOME=/home/agent`), its installed tools and caches are gone
-at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker"` and
+at the next turn. On a seat with sessions on, `[sandbox] mode = "docker"` with container delivery and
 `runtime = "runsc"`, session support is therefore gated on docker's runtime named `runsc` carrying
 `--overlay2=none` in `runtimeArgs` (last setting wins; `--overlay2 none` and one leading dash accepted).
 
@@ -375,8 +378,11 @@ at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker
 - **Doctor** reports the same verdict as `sandbox runsc sessions`: PASS when open; **FAIL** with the fix
   when docker answered and shows the seat cannot keep a session (`runsc` without the flag, another
   overlay value, or no `runsc` registered: `Closed { misconfigured: true }`); WARN when docker could not
-  confirm (unreadable, timed out, unparseable: `misconfigured: false`). FAIL is part of the seller boot
-  gate, so a runsc seat with `[sessions] enabled` and no flag **does not start** until the operator sets
+  confirm (unreadable, timed out, unparseable: `misconfigured: false`). The FAIL applies only when the
+  operator wrote `[sessions] enabled = true`; a seat on by default (`enabled` unset) gets a WARN for the
+  same verdict and runs single-turn, so the default-on upgrade never stops a runsc seat from booting.
+  FAIL is part of the seller boot
+  gate, so a runsc seat with `[sessions] enabled = true` and no flag **does not start** until the operator sets
   the flag (and restarts docker) or turns `[sessions]` off — operator intent the seat cannot honour is
   surfaced, not silently degraded (Petar, 2026-11-07). WARN keeps a daemon hiccup at boot from blocking
   the seat; it starts single-turn and the heartbeat re-probes. A gate that closes at runtime (heartbeat)
@@ -678,9 +684,9 @@ routing `:422 @e0262420`; `AGENTS.md:41` says "exactly the four-tool buyer trade
   (collect, then send close); that is now a deprecated daemon alias kept for one release. The MCP
   schema no longer lists it, and `reply close: true` is the one documented way to close.
 
-*Found while implementing:* `reply` and the `collect` params are listed (and `reply` routed) only
-when the buyer runs with `[sessions] enabled = true`; with the flag off the tool list is
-byte-identical. `max_session_sats` is accepted on `post_job` too (22 Oct, Josip): it is local session
+*Found while implementing:* `reply` and the `collect` params are listed (and `reply` routed)
+unless the buyer runs with `[sessions] enabled = false` (sessions are on by default); with the flag
+off the tool list is byte-identical. `max_session_sats` is accepted on `post_job` too (22 Oct, Josip): it is local session
 state, stored in the buyer `sessions` row right after the offer is published and never put on the offer,
 so the offer bytes are unchanged. It is listed on the `post_job` schema and accepted by the daemon only
 with `[sessions] enabled` (off: the schema is byte-identical and the daemon refuses the parameter). The
@@ -694,8 +700,8 @@ point at `reply`.
 
 ## 11. Implementation — ONE PR behind `[sessions] enabled = false`
 
-`[sessions]` (both roles): `enabled = false`, `lifetime_secs = 21600`, `disk_budget_bytes`,
-`wrap_up_secs = 300`, buyer `session_cap_sats`. With `enabled = false` no claim carries `session`, no
+`[sessions]` (both roles): `enabled` (unset reads as on; `false` turns sessions off),
+`lifetime_secs = 21600`, `disk_budget_bytes`, `wrap_up_secs = 300`, buyer `session_cap_sats`. With `enabled = false` no claim carries `session`, no
 follow-up is sent or accepted, and every code path is today's.
 
 | # | File | Change |

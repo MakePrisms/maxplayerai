@@ -30,7 +30,6 @@ impl Daemon {
         let root = tempfile::tempdir().expect("tempdir");
         let mut home = bootstrap_home(root.path()).expect("bootstrap home");
         home.config.relay_url = relay_url.clone();
-        home.config.sessions.enabled = true;
         home.config.review.buyer_delivery = buyer_review;
         let (lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         // Counterparty events come from a client that is NOT the daemon's (one nostr-sdk client
@@ -858,6 +857,32 @@ async fn reply_to(context: &Arc<BuyerContext>, job_id: &str) -> Result<Value, St
         (Some(result), None) => Ok(result),
         (_, Some(error)) => Err(error.message),
         (None, None) => Err("empty response".into()),
+    }
+}
+
+/// `[sessions] enabled = false` on the daemon: `reply` and `collect turn=2` are refused with the
+/// disabled text.
+#[tokio::test]
+async fn sessions_off_refuses_reply_and_turn_two_collect() {
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.expect("relay run");
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut home = bootstrap_home(root.path()).expect("bootstrap home");
+    home.config.relay_url = relay.url().await.to_string();
+    home.config.sessions.enabled = Some(false);
+    let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+    let job = hex(0x0ff);
+    for (method, params) in [
+        ("reply", json!({ "job_id": job, "text": "more" })),
+        ("collect", json!({ "job_id": job, "turn": 2 })),
+    ] {
+        let request = protocol::Request {
+            method: method.into(),
+            params,
+            id: json!(1),
+        };
+        let error = dispatch(&context, request).await.error.expect(method);
+        assert_eq!(error.message, session_reply::disabled(), "{method}");
     }
 }
 

@@ -905,6 +905,21 @@ pub struct SessionGc {
 }
 
 impl SessionGc {
+    /// The GC for this `[sessions]` config: `None` with sessions off, otherwise its lifetime and
+    /// [`crate::home::SessionsConfig::disk_budget`].
+    pub fn for_config(
+        config: &crate::home::SessionsConfig,
+        store: SellerStore,
+        home_root: PathBuf,
+    ) -> Option<Self> {
+        config.enabled().then(|| Self {
+            store,
+            home_root,
+            lifetime_secs: config.lifetime_secs,
+            disk_budget_bytes: config.disk_budget(),
+        })
+    }
+
     /// One pass (§5.5): expire parked sessions past their lifetime, then evict the oldest parked
     /// sessions while the measured total exceeds the disk budget. Never touches a running one.
     pub fn pass<D: DockerCli>(&self, cli: &mut D, now_unix: u64) -> Result<GcReport, StoreError> {
@@ -1040,6 +1055,30 @@ mod tests {
             },
             root,
         )
+    }
+
+    /// The run loop's GC budget: 5 GiB with `enabled` unset, 20 GiB with `enabled = true`, an
+    /// explicit `disk_budget_bytes` either way, and no GC with sessions off.
+    #[test]
+    fn gc_budget_follows_the_sessions_config() {
+        use crate::home::SessionsConfig;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (gc, root) = gc("budget");
+        let budget = |enabled: Option<bool>, disk_budget_bytes: Option<u64>| {
+            let config = SessionsConfig {
+                enabled,
+                disk_budget_bytes,
+                ..SessionsConfig::default()
+            };
+            SessionGc::for_config(&config, gc.store.clone(), root.clone())
+                .map(|gc| gc.disk_budget_bytes)
+        };
+        assert_eq!(budget(None, None), Some(5 * GIB));
+        assert_eq!(budget(Some(true), None), Some(20 * GIB));
+        assert_eq!(budget(None, Some(1234)), Some(1234));
+        assert_eq!(budget(Some(true), Some(1234)), Some(1234));
+        assert_eq!(budget(Some(false), None), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// §5.5 lifetime + failure test 12 (disk): past its lifetime a parked session is expired

@@ -7,7 +7,7 @@ differ only in what you do after it. Then read your role's page.
 ## Buyers
 
 1. [`BUYER-QUICKSTART.md`](BUYER-QUICKSTART.md) — zero to a paid delivery over the four-tool MCP loop: `post_job`,
-   `get_job`, `award_claim`, `collect` (plus `reply` with `[sessions] enabled`, and the `swarm_*`
+   `get_job`, `award_claim`, `collect` (plus `reply` unless `[sessions] enabled = false`, and the `swarm_*`
    tools with `[swarm] enabled`).
 
 2. [`PRIVATE-JOBS.md`](PRIVATE-JOBS.md) — what private jobs keep private, the `post_job` fields,

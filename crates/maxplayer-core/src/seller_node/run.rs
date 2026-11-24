@@ -1399,13 +1399,14 @@ fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter 
 /// Bound on the §5.6 `docker info` read. A daemon that does not answer in time closes the gate.
 const RUNSC_GATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The §5.6 runsc overlay gate for this config. A seat it does not apply to (not docker + runsc +
-/// `[sessions] enabled`) runs NO docker command ([`crate::session::resolve_runsc_gate`] awaits the
+/// The §5.6 runsc overlay gate for this config. A seat it does not apply to (not a docker
+/// container-delivery seat on runsc with sessions on) runs NO docker command ([`crate::session::resolve_runsc_gate`] awaits the
 /// read only when it applies); otherwise one bounded `docker info --format '{{json .Runtimes}}'`.
 async fn probe_runsc_gate(
     config: &crate::home::MaxplayerConfig,
 ) -> crate::session::RunscOverlayGate {
-    crate::session::resolve_runsc_gate(config.sandbox.as_ref(), &config.sessions, || {
+    let uid = crate::seller_exec::job_identity().0;
+    crate::session::resolve_runsc_gate(config.sandbox.as_ref(), &config.sessions, uid, || {
         bounded_runtimes_read(RUNSC_GATE_PROBE_TIMEOUT, || {
             use crate::seller_exec::DockerCli as _;
             crate::seller_exec::RealDockerCli
@@ -5566,13 +5567,11 @@ impl SellerNodeRunner {
     }
 
     fn session_gc(&self) -> Option<super::session_gc::SessionGc> {
-        let config = &self.node.home().config.sessions;
-        config.enabled.then(|| super::session_gc::SessionGc {
-            store: self.node.store().clone(),
-            home_root: self.node.home().root.clone(),
-            lifetime_secs: config.lifetime_secs,
-            disk_budget_bytes: config.disk_budget_bytes,
-        })
+        super::session_gc::SessionGc::for_config(
+            &self.node.home().config.sessions,
+            self.node.store().clone(),
+            self.node.home().root.clone(),
+        )
     }
 
     pub fn seller_pubkey(&self) -> String {
@@ -6117,7 +6116,7 @@ impl SellerNodeRunner {
             AWARD_SUB_ID => award_filter_with(
                 self.seller_pubkey,
                 self.claim_open_pool(),
-                self.node.home().config.sessions.enabled,
+                self.node.home().config.sessions.enabled(),
             ),
             WRAP_SUB_ID => Filter::new()
                 .kind(Kind::GiftWrap)
@@ -10526,14 +10525,17 @@ impl SellerNodeRunner {
         // seat's claim carried `["session","1"]`. Otherwise `None`, and the inputs file is today's.
         let sessions_config = &self.node.home().config.sessions;
         // §5.6: a gate that closed after the claim (the daemon lost `--overlay2=none`) runs the
-        // job single-turn rather than parking a container whose rootfs would not survive.
-        let session_job = crate::session::runs_as_session(
+        // job single-turn rather than parking a container whose rootfs would not survive. §4: so
+        // does a job with too little time left for the wrap-up (its cancel would fire at once).
+        let session_job = crate::session::runs_turn_one_as_session(
             sessions_config,
             &self.runsc_gate(),
             self.node
                 .store()
                 .claim_advertised_session(job_id)
                 .unwrap_or(false),
+            now_unix().max(0) as u64,
+            deadline,
         );
         let prompt = if session_job {
             format!("{prompt}\n\n{}", crate::session::prompt_session_section())
@@ -12900,11 +12902,13 @@ mod tests {
         );
         assert_eq!(
             production
-                .matches("crate::session::runs_as_session(")
+                .matches("crate::session::runs_turn_one_as_session(")
                 .count(),
             1
         );
-        let execute = production.find("crate::session::runs_as_session(").unwrap();
+        let execute = production
+            .find("crate::session::runs_turn_one_as_session(")
+            .unwrap();
         assert!(
             production[execute..]
                 .chars()
@@ -17370,7 +17374,7 @@ mod tests {
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
         home.config.relay_url = relay_url;
         home.config.review.seller_offer = false;
-        home.config.sessions.enabled = true;
+        home.config.sessions.enabled = Some(true);
         let mut seller = seller_cfg(1, true);
         seller.claim_award_timeout_secs = Some(3_600);
         home.config.seller = Some(seller);
@@ -21602,12 +21606,41 @@ mod tests {
         assert!(outcome.is_ok(), "{outcome:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
-    /// #1299 follow-up: a seller home with sessions on, for the session drain tests.
+    /// #1299 follow-up: a seller home for the session drain tests, on the default `[sessions]`
+    /// (sessions on because `enabled` is unset).
     fn drain_session_home(root: &std::path::Path, fixture: &PGateRelay) -> crate::home::MaxplayerHome {
         let mut home = lane_home(root, fixture);
         home.config.seller_heartbeat.interval_secs = 3600;
-        home.config.sessions.enabled = true;
         home
+    }
+
+    /// A default home (`[sessions] enabled` unset) puts kind-3412 follow-ups on the award REQ it
+    /// actually sends. RED ON REVERT: read `explicitly_enabled()` for the award filter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_home_award_subscription_carries_followups() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("default-award-3412");
+        let home = drain_session_home(&root, &fixture);
+        assert_eq!(home.config.sessions.enabled, None, "default [sessions]");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot");
+        runner
+            .subscribe_one(AWARD_SUB_ID, None)
+            .await
+            .expect("award REQ");
+        let filters = runner
+            .client
+            .subscription(&nostr_sdk::SubscriptionId::new(AWARD_SUB_ID))
+            .await;
+        let followup = Kind::Custom(crate::kinds::SESSION_FOLLOWUP_KIND);
+        assert!(
+            filters
+                .values()
+                .flatten()
+                .any(|f| f.kinds.as_ref().is_some_and(|k| k.contains(&followup))),
+            "{filters:?}"
+        );
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// #1299 follow-up: a priced session job parked after turn 1 (turn 1 unpaid): offer row, our

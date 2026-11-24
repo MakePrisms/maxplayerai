@@ -2,7 +2,7 @@
 //!
 //! This module holds the wire shapes (§2) and every pure decision rule the spec names (§4–§10),
 //! so each money-path and security invariant is a function with its own failure test. Nothing
-//! here performs I/O. Everything is inert unless `[sessions] enabled = true`: [`advertise_on_claim`]
+//! here performs I/O. Everything is inert with `[sessions] enabled = false` (unset reads as on): [`advertise_on_claim`]
 //! is the only place a `session` tag can enter a claim, and it is a no-op when disabled, which is
 //! what keeps every claim/offer/result/accept byte identical to today's (failure test 13).
 use crate::gateway::{EventDraft, TagSpec};
@@ -268,7 +268,7 @@ pub fn advertise_on_claim(
     runsc_gate: &RunscOverlayGate,
 ) {
     if draft.kind != JOB_CLAIM_KIND
-        || !cfg.enabled
+        || !cfg.enabled()
         || !docker_container_seat
         || !runsc_gate.allows_sessions()
     {
@@ -1039,17 +1039,35 @@ pub fn runs_as_session(
     runsc_gate: &RunscOverlayGate,
     claim_advertised: bool,
 ) -> bool {
-    cfg.enabled && runsc_gate.allows_sessions() && claim_advertised
+    cfg.enabled() && runsc_gate.allows_sessions() && claim_advertised
 }
 
-/// Whether the gate applies: `[sessions] enabled`, `mode = "docker"` and `runtime = "runsc"`
-/// (trimmed, as the seat resolves it). Every other seat is [`RunscOverlayGate::NotApplicable`] and
-/// never asks docker anything.
+/// Turn 1 of an awarded job: [`runs_as_session`], and only with the time a follow-up needs to start
+/// ([`turn_can_start`], §4). With less left the wrap-up cancel would fire at once, so the job runs
+/// single-turn (no wrap-up, no session prompt section, the normal agent attempts).
+pub fn runs_turn_one_as_session(
+    cfg: &SessionsConfig,
+    runsc_gate: &RunscOverlayGate,
+    claim_advertised: bool,
+    now_unix: u64,
+    deadline_unix: u64,
+) -> bool {
+    runs_as_session(cfg, runsc_gate, claim_advertised)
+        && turn_can_start(now_unix, deadline_unix, cfg.wrap_up_secs)
+}
+
+/// Whether the gate applies: sessions on, `mode = "docker"` with container delivery for
+/// `container_uid` (the only seats that advertise sessions, §2.2) and `runtime = "runsc"` (trimmed,
+/// as the seat resolves it). Every other seat is [`RunscOverlayGate::NotApplicable`] and never asks
+/// docker anything.
 pub fn runsc_overlay_gate_applies(
     sandbox: Option<&SandboxConfig>,
     sessions: &SessionsConfig,
+    container_uid: u32,
 ) -> bool {
-    sessions.enabled && seat_runs_runsc(sandbox)
+    sessions.enabled()
+        && seat_runs_runsc(sandbox)
+        && sandbox.is_some_and(|sandbox| sandbox.container_delivery_enabled(container_uid))
 }
 
 /// Whether this seat's jobs run under gVisor: `[sandbox] mode = "docker"` and `runtime` trims to
@@ -1070,13 +1088,14 @@ pub fn seat_runs_runsc(sandbox: Option<&SandboxConfig>) -> bool {
 pub async fn resolve_runsc_gate<F, Fut>(
     sandbox: Option<&SandboxConfig>,
     sessions: &SessionsConfig,
+    container_uid: u32,
     read_runtimes: F,
 ) -> RunscOverlayGate
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
-    if !runsc_overlay_gate_applies(sandbox, sessions) {
+    if !runsc_overlay_gate_applies(sandbox, sessions, container_uid) {
         return RunscOverlayGate::NotApplicable;
     }
     let probed = read_runtimes().await;
