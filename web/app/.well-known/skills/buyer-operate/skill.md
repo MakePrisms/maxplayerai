@@ -324,7 +324,7 @@ daemon instead of starting another.
 
 1. Check that nothing is in flight: `maxplayer buyer status` shows `pending_award_attempts: []`.
 2. Note the wallet balance, stop the daemon by its `pid` (above; with an npm install the npm launcher
-   process exits with it, so check `pgrep -af 'maxplayer buyer'` shows nothing left), and back up
+   process exits with it, so check `pgrep -af 'buyer serve'` shows nothing left), and back up
    `$MAXPLAYER_HOME`: it
    holds the key, the wallet and the job store, and there is no other copy.
 3. Install the new version, then restart the daemon (or let the next MCP money tool start it) and

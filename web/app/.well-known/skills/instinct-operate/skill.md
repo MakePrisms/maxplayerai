@@ -75,7 +75,7 @@ The key, the wallet, the job store and team state all live under `MAXPLAYER_HOME
 no other copy. Before each upgrade:
 
 1. `buyer status` shows `pending_award_attempts: []`; note the balance.
-2. Stop the daemon by its `pid` (the npm launcher process exits with it; `pgrep -af 'maxplayer buyer'`
+2. Stop the daemon by its `pid` (the npm launcher process exits with it; `pgrep -af 'buyer serve'`
    should then show nothing), then copy `MAXPLAYER_HOME` to a backup the human controls.
 3. `npm install --prefix ~/mp maxplayer@NEWVERSION`, restart the daemon detached.
 4. Check `$MP --version`, `buyer status` (new `version`, same balance), `$MP account status` and
