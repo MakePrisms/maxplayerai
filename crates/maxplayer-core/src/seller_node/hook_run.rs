@@ -38,7 +38,17 @@ impl SellerNodeRunner {
 
         let invocation = job_id.to_owned();
         let workdir = job_workdir(self.node.home(), job_id);
-        let staged = self.node.store().hook_outcome(&invocation).ok().flatten();
+        // `execute_job` re-delivers a staged answer before dispatch; this re-check covers the window
+        // since. An unreadable row is not an absent one: defer rather than run the hook again.
+        let staged = match self.node.store().hook_outcome(&invocation) {
+            Ok(staged) => staged,
+            Err(error) => {
+                opline!(
+                    "seller node execute defer job_id={job_id}: staged hook outcome unreadable ({error}); retried on the next re-drive"
+                );
+                return;
+            }
+        };
         let (status, answer, wall_ms) = match staged {
             // §7.1: a staged outcome is re-delivered, never re-run — its answer may already be bound.
             Some(row) => {
@@ -194,12 +204,52 @@ impl SellerNodeRunner {
             }
         };
         debug_assert_eq!(status, "done");
-        let metadata = hook_exec_metadata(label, kind, wall_ms);
+        let model = match kind {
+            crate::seller_agents::AgentKind::Hook { model, .. } => model.as_deref(),
+            _ => None,
+        };
+        let metadata = hook_exec_metadata(label, model, wall_ms);
         let seller_pubkey = self.seller_pubkey.to_hex();
         self.deliver_inline(job_id, offer, &seller_pubkey, stored_creq, &answer, &metadata)
             .await;
         // Delivered, or failed by `deliver_inline`: terminal, so the staged answer goes. A failure arm
         // that leaves the job live (it can still be re-delivered) keeps it (§7.1).
+        self.finish_hook_job(job_id, &workdir);
+    }
+
+    /// Re-deliver a staged hook answer (§7.1) without consulting the live roster: the claim's pin
+    /// names the entry that produced it. Its model is stated only while that exact entry is still
+    /// configured. Called by `execute_job` before dispatch, after the review and delivery gates.
+    pub(super) async fn redeliver_staged_hook_outcome(
+        &self,
+        job_id: &str,
+        offer: &crate::seller_node::store::Offer,
+        stored_creq: &str,
+        row: crate::seller_node::store::HookOutcomeRow,
+    ) {
+        let buyer = offer.buyer_pubkey.clone();
+        let workdir = job_workdir(self.node.home(), job_id);
+        if !offer.accepts_delivery.iter().any(|m| m == gateway::DELIVERY_MODE_INLINE) {
+            opline!(
+                "seller node hook job_id={job_id}: offer does not (or no longer) accept inline delivery; the staged answer cannot be delivered"
+            );
+            self.hook_refused(job_id, &buyer, &workdir).await;
+            return;
+        }
+        let pin = self.node.store().claim_pin(job_id).ok().flatten();
+        let label = pin.as_ref().map_or_else(|| "<hook>".to_owned(), |pin| pin.label.clone());
+        let model = pin
+            .as_ref()
+            .and_then(|pin| self.agents.for_execution(Some((&pin.label, &pin.kind, &pin.fingerprint)), None, true))
+            .and_then(|selected| match &selected.agent.kind {
+                crate::seller_agents::AgentKind::Hook { model, .. } => model.clone(),
+                _ => None,
+            });
+        opline!("seller node hook job_id={job_id}: re-delivering the staged outcome (hook not re-run)");
+        let metadata = hook_exec_metadata(&label, model.as_deref(), row.wall_time_ms);
+        let seller_pubkey = self.seller_pubkey.to_hex();
+        self.deliver_inline(job_id, offer, &seller_pubkey, stored_creq, &row.answer, &metadata)
+            .await;
         self.finish_hook_job(job_id, &workdir);
     }
 
@@ -431,11 +481,7 @@ impl SellerNodeRunner {
 
 /// The result's exec metadata for a hook: the entry label as harness, `usage_transport=hook`, the
 /// configured (self-reported) model when set, and the daemon-measured wall time.
-pub(super) fn hook_exec_metadata(
-    label: &str,
-    kind: &crate::seller_agents::AgentKind,
-    wall_ms: u64,
-) -> Vec<gateway::TagSpec> {
+pub(super) fn hook_exec_metadata(label: &str, model: Option<&str>, wall_ms: u64) -> Vec<gateway::TagSpec> {
     let wall = wall_ms.to_string();
     let mut tags = vec![
         gateway::TagSpec::new(["harness", label]),
@@ -443,8 +489,8 @@ pub(super) fn hook_exec_metadata(
         gateway::TagSpec::new(["metadata_trust", "seller-claimed"]),
         gateway::TagSpec::new(["wall_time", wall.as_str(), "ms"]),
     ];
-    if let crate::seller_agents::AgentKind::Hook { model: Some(model), .. } = kind {
-        tags.push(gateway::TagSpec::new(["model", model.as_str()]));
+    if let Some(model) = model {
+        tags.push(gateway::TagSpec::new(["model", model]));
     }
     tags
 }
@@ -680,8 +726,7 @@ mod tests {
 
     #[test]
     fn hook_metadata_names_the_entry_and_its_configured_model() {
-        let kind = crate::seller_agents::AgentKind::Hook { family: Some("claude-code".into()), model: Some("m1".into()) };
-        let tags = hook_exec_metadata("my-hook", &kind, 42);
+        let tags = hook_exec_metadata("my-hook", Some("m1"), 42);
         let flat: Vec<Vec<String>> = tags.iter().map(|t| t.0.clone()).collect();
         assert!(flat.contains(&vec!["harness".into(), "my-hook".into()]));
         assert!(flat.contains(&vec!["usage_transport".into(), "hook".into()]));

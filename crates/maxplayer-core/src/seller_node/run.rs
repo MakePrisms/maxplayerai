@@ -9763,6 +9763,23 @@ impl SellerNodeRunner {
         // ⛔ This is a LABEL, not a guard. It changes nothing about whether the job is paid: under
         // award-is-payment the sats were committed at award, upstream of this arm. Never read this
         // code as protecting money (see `ReasonCode::CapabilityMissing`).
+        // hook-agents §7.1: a staged hook answer is re-delivered, never re-run, and BEFORE the current
+        // roster is consulted: the answer may already be bound, and a hook removed or edited since
+        // the claim must not strand it. Only a NEW execution faces the pin check below. A staged row
+        // that cannot be read is not an absent one: defer rather than run the hook again.
+        match self.node.store().hook_outcome(job_id) {
+            Ok(Some(row)) => {
+                self.redeliver_staged_hook_outcome(job_id, &offer, &stored_creq, row).await;
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                opline!(
+                    "seller node execute defer job_id={job_id}: staged hook outcome unreadable ({error}); retried on the next re-drive"
+                );
+                return;
+            }
+        }
         let requested_agent = offer.requested_agent.clone();
         // hook-agents §3: a pinned claim runs on exactly the entry it described (label + fingerprint);
         // an unpinned one (an older build's claim, or the unlabelled hatch) dispatches as before but
@@ -19057,6 +19074,54 @@ mod tests {
         let results = fetch_results(&observer, &job_id).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "the staged answer");
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex r2 #3: the hook was edited after the claim (its fingerprint no longer matches the pin)
+    /// while a staged answer waited for delivery. The staged answer is still delivered, naming the
+    /// pinned entry, and the edited hook is not run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_hook_answer_is_delivered_even_after_the_hook_changed() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-staged-changed", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "5".repeat(64);
+        let then = crate::seller_node::store::ClaimPin { fingerprint: "the-entry-at-claim-time".into(), ..hook_pin(&runner) };
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&then));
+        runner
+            .node
+            .store()
+            .stage_hook_outcome(
+                &crate::seller_node::store::HookOutcomeRow {
+                    invocation: job_id.clone(),
+                    job_id: job_id.clone(),
+                    turn: 1,
+                    status: "done".into(),
+                    answer: "staged before the edit".into(),
+                    wall_time_ms: 5,
+                },
+                now_unix(),
+            )
+            .expect("stage");
+
+        runner.execute_job(&job_id, None, true).await;
+
+        assert_eq!(hook_runs(&root), 0, "the edited hook is never run for it");
+        let store = runner.node.store();
+        assert!(store.has_delivery(&job_id).expect("has_delivery"));
+        assert!(store.hook_job_ids().expect("ids").is_empty(), "delivered: hook state cleared");
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "staged before the edit");
+        assert_eq!(tag_value(&results[0], "harness", 1).as_deref(), Some("my-hook"), "names the pinned entry");
+        assert_eq!(tag_value(&results[0], "model", 1), None, "the edited entry's model is not claimed for it");
         observer.disconnect().await;
         runner.client.disconnect().await;
         relay.shutdown();
