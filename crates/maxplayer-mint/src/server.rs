@@ -51,7 +51,7 @@ impl Server {
         relays: &[String],
         rate_limit: u32,
     ) -> Result<Self> {
-        let client = Client::new(keys.clone());
+        let client = maxplayer_core::relay_transport::client(keys.clone());
         client.automatic_authentication(true);
         for relay in relays {
             client

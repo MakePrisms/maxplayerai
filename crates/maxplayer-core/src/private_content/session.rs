@@ -145,7 +145,7 @@ fn sign_in_not_completed(
 
 impl AuthenticatedContentRelay {
     pub async fn connect(keys: &Keys, url: &str) -> std::result::Result<Self, ConnectError> {
-        let client = Client::new(keys.clone());
+        let client = crate::relay_transport::client(keys.clone());
         client.automatic_authentication(true);
         client
             .add_relay(url)

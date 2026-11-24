@@ -31,7 +31,7 @@ pub(crate) struct WireHistory(Arc<Mutex<BTreeMap<(String, String), Page>>>);
 impl WireHistory {
     pub(crate) fn client(keys: &Keys) -> (Client, Self) {
         let wire = Self::default();
-        let client = Client::builder()
+        let client = crate::relay_transport::builder()
             .signer(keys.clone())
             .websocket_transport(wire.clone())
             .build();
@@ -137,7 +137,8 @@ impl WebSocketTransport for WireHistory {
     ) -> BoxedFuture<'a, std::result::Result<(WebSocketSink, WebSocketStream), TransportError>>
     {
         Box::pin(async move {
-            let (sink, stream) = DefaultWebsocketTransport
+            // Same route as every other relay client: through the HTTP proxy when one is set.
+            let (sink, stream) = crate::relay_transport::RelayTransport::from_env()
                 .connect(url, mode, timeout)
                 .await?;
             let wire = self.clone();

@@ -612,7 +612,7 @@ impl Home {
     // ---- relay ---------------------------------------------------------------------------
 
     async fn connect(&self) -> Result<Client> {
-        let client = Client::builder()
+        let client = maxplayer_core::relay_transport::builder()
             .signer(self.keys.clone())
             .opts(ClientOptions::new().automatic_authentication(true))
             .build();

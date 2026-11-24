@@ -17,7 +17,7 @@ acp = ["tokio/sync", "tokio/time"]
 # `tokio/time` is declared here because the gateway's relay-auth window uses `tokio::time::timeout`.
 # On native it also arrives transitively through nostr-sdk, but that supplier's tokio feature
 # selection is target-conditional and does not provide it on wasm32 (issue #214).
-gateway = ["dep:nostr-sdk", "dep:base64", "tokio/time"]
+gateway = ["dep:nostr-sdk", "dep:base64", "dep:async-wsocket", "dep:tokio-tungstenite", "tokio/time", "tokio/net", "tokio/io-util"]
 # All git legs (seller push/fetch, buyer verify-fetch, ref-advertisement probes) run in-process
 # via libgit2 — NO system `git` on any product path (issue #55). Needs nostr-sdk (NIP-98 signing)
 # so it composes gateway; git2 (rustls-backed) + reqwest + base64 carry the smart-HTTP transport.
@@ -54,8 +54,12 @@ test-support = []
 [dependencies]
 # Collision key for delivered paths on APFS/HFS+ (collect.rs, #1290).
 unicode-normalization = "0.1"
-# Same transport crate as the pinned SDK; observe raw row counts before SDK filtering.
+# Same transport crate as the pinned SDK; observe raw row counts before SDK filtering, and open relay
+# websockets through an HTTP proxy (relay_transport.rs).
 async-wsocket = { version = "0.13.2", optional = true }
+# The SDK transport's own websocket crate and TLS roots (same version as async-wsocket's), for the
+# handshake inside an HTTP CONNECT tunnel (relay_transport.rs). Already in the lock; no new resolution.
+tokio-tungstenite = { version = "0.26", optional = true, default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tempfile = { version = "3", optional = true }
 # Pure schemas and shared quotas are also used by the feature-independent review contract.
 maxplayer-private-protocol = { path = "../buzz/crates/maxplayer-private-protocol" }

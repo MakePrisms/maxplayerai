@@ -653,7 +653,7 @@ impl NostrMintConnector {
         let client = match &pooled {
             Some(pooled) => pooled.client.clone(),
             None => {
-                let client = Client::new(keys.clone());
+                let client = crate::relay_transport::client(keys.clone());
                 client.automatic_authentication(true);
                 for relay in &self.relays {
                     let _ = client.add_relay(relay.as_str()).await;
@@ -1039,7 +1039,7 @@ impl NostrMintConnector {
     }
 
     async fn open_pooled(&self, identity: &Keys, runtime: tokio::runtime::Handle) -> Arc<Pooled> {
-        let client = Client::new(identity.clone());
+        let client = crate::relay_transport::client(identity.clone());
         client.automatic_authentication(true);
         for relay in &self.relays {
             let _ = client.add_relay(relay.as_str()).await;
