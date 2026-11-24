@@ -3015,16 +3015,7 @@ fn build_environment_checks() -> Vec<Box<dyn FnOnce() -> Check>> {
 /// then not applicable (an exception to #745 keyed on the resolved roster, not a bypass).
 #[cfg(feature = "wallet")]
 fn hook_only_seat(home: &maxplayer_core::home::MaxplayerHome) -> bool {
-    let Some(seller) = home.config.seller.as_ref() else {
-        return false;
-    };
-    !seller.agents.is_empty()
-        && seller.agents.iter().all(|name| {
-            home.config
-                .agents
-                .get(name.trim())
-                .is_some_and(maxplayer_core::home::AgentPresetConfig::is_hook)
-        })
+    maxplayer_core::seller_agents::hook_only_home(home)
 }
 
 #[cfg(feature = "wallet")]

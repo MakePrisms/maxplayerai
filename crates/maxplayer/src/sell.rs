@@ -444,7 +444,8 @@ fn ensure_seller_config(
     let interactive = !options.non_interactive && !steady_state && atty_stderr();
     if options.non_interactive || steady_state {
         let mut missing = Vec::new();
-        if agent_command.is_empty() {
+        // A resolved label (a preset, possibly a hook with no ACP fallback) is an agent too.
+        if agent_command.is_empty() && agent_label.is_none() {
             missing.push("agent (--agent claude|cursor|codex, or --agent-argv)");
         }
         if rate_sats.is_none() {
@@ -466,7 +467,7 @@ fn ensure_seller_config(
             return Err(USAGE_ERROR);
         }
     } else if interactive {
-        if agent_command.is_empty() {
+        if agent_command.is_empty() && agent_label.is_none() {
             let available = agent_presets::detect_available_agents(&custom_agents);
             let suggestion = available.first().map(String::as_str).unwrap_or("claude");
             let detected = if available.is_empty() {
@@ -485,9 +486,14 @@ fn ensure_seller_config(
                     let _ = writeln!(err, "{message}");
                     USAGE_ERROR
                 })?;
-            agent_command = argv;
+            report_agent_preset(err, &label, &argv[0], &custom_agents);
+            agent_command = maxplayer_core::seller_agents::fallback_command_for(
+                &label,
+                argv,
+                &custom_agents,
+                existing.as_ref().map(|seller| seller.agent_command.as_slice()),
+            );
             agent_label = Some(label.clone());
-            report_agent_preset(err, &label, &agent_command[0], &custom_agents);
         }
         if rate_sats.is_none() {
             rate_sats = Some(prompt_u64(
@@ -497,7 +503,7 @@ fn ensure_seller_config(
                 DEFAULT_RATE_SATS,
             )?);
         }
-    } else if agent_command.is_empty() || rate_sats.is_none() {
+    } else if (agent_command.is_empty() && agent_label.is_none()) || rate_sats.is_none() {
         // Non-TTY first run without flags.
         let _ = writeln!(
             err,
@@ -638,7 +644,14 @@ fn resolve_agent(
                 USAGE_ERROR
             })?;
         report_agent_preset(err, &label, &argv[0], custom_agents);
-        return Ok((Some(label), argv));
+        // A hook preset's argv never becomes the ACP fallback: the previous fallback (if any) stays.
+        let command = maxplayer_core::seller_agents::fallback_command_for(
+            &label,
+            argv,
+            custom_agents,
+            existing.map(|seller| seller.agent_command.as_slice()),
+        );
+        return Ok((Some(label), command));
     }
     if let Some(seller) = existing {
         return Ok((seller.agents.first().cloned(), seller.agent_command.clone()));
@@ -1186,6 +1199,50 @@ mod tests {
     // boot, before the seller node read it. The assertion is on the PERSISTED (reloaded-from-disk)
     // config because that disk value is exactly what the next boot reads for capacity
     // (`maxplayer_core::seller_node::run` derives it from `config.seller.slots` with no ceiling clamp).
+    /// codex r1 #9: `--agent <hook>` on a first run must not store the hook's argv as the ACP
+    /// `agent_command` fallback, and the seat it writes must pass the readiness check and relaunch.
+    #[test]
+    fn a_hook_first_run_stores_no_acp_fallback_and_relaunches() {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-hook-first-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap temp home");
+        home::save_config(&mut home, |config| {
+            config.agents.insert(
+                "my-hook".to_owned(),
+                home::AgentPresetConfig::hook(vec!["/bin/sh".to_owned(), "-c".to_owned(), "true".to_owned()]),
+            );
+        })
+        .expect("seed hook preset");
+        let options = SellOptions {
+            non_interactive: true,
+            agent: Some("my-hook".to_owned()),
+            agents: vec!["my-hook".to_owned()],
+            rate_sats: Some(100),
+            ..SellOptions::default()
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        ensure_seller_config(&mut home, &options, &mut out, &mut err).unwrap_or_else(|code| {
+            panic!("first run failed code={code} err={}", String::from_utf8_lossy(&err))
+        });
+        let mut home = home::bootstrap(&root).expect("reload persisted config");
+        let seller = home.config.seller.clone().expect("[seller] written");
+        assert_eq!(seller.agents, vec!["my-hook".to_owned()]);
+        assert!(seller.agent_command.is_empty(), "hook argv must not be the ACP fallback: {:?}", seller.agent_command);
+        maxplayer_core::seller::require_seller_config(&home).expect("a named roster satisfies readiness");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        ensure_seller_config(&mut home, &SellOptions::default(), &mut out, &mut err).unwrap_or_else(|code| {
+            panic!("bare relaunch failed code={code} err={}", String::from_utf8_lossy(&err))
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn sell_writeback_preserves_operator_multi_harness_agents() {
         // #369-class (seller-orch comment 5173135097): a bare relaunch must carry a multi-harness

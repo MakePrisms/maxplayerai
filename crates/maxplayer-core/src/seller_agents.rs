@@ -238,6 +238,46 @@ impl AgentRegistry {
     }
 }
 
+/// docs/specs/hook-agents.md §9: whether every configured `[seller] agents` entry is a `hook` preset,
+/// so nothing of ours runs a job on this box (no sandbox, no job environment, no held tools).
+///
+/// THE one answer to "is this seat hook-only": the doctor, the boot gates, the capability probe and
+/// held-tool startup all ask it, so they cannot disagree. Read from config, not a resolved registry,
+/// so the doctor can ask before anything resolves. An empty list (the unlabelled `agent_command`
+/// fallback) is never hook-only.
+pub fn hook_only_seat(seller: &SellerConfig, presets: &BTreeMap<String, AgentPresetConfig>) -> bool {
+    !seller.agents.is_empty()
+        && seller
+            .agents
+            .iter()
+            .all(|name| presets.get(name.trim()).is_some_and(AgentPresetConfig::is_hook))
+}
+
+/// [`hook_only_seat`] for a home: `false` without a `[seller]` section.
+pub fn hook_only_home(home: &crate::home::MaxplayerHome) -> bool {
+    home.config
+        .seller
+        .as_ref()
+        .is_some_and(|seller| hook_only_seat(seller, &home.config.agents))
+}
+
+/// The `agent_command` a first run or relaunch should store when `label` resolved to `argv`.
+/// `agent_command` is only the UNLABELLED fallback (used when `agents` is empty), so a hook preset's
+/// argv must never land there: it would run as an ACP agent if the list were ever emptied. A hook
+/// keeps whatever fallback was there before (possibly none).
+pub fn fallback_command_for(
+    label: &str,
+    argv: Vec<String>,
+    presets: &BTreeMap<String, AgentPresetConfig>,
+    previous: Option<&[String]>,
+) -> Vec<String> {
+    if presets.get(label.trim()).is_some_and(AgentPresetConfig::is_hook) {
+        previous.map(<[String]>::to_vec).unwrap_or_default()
+    } else {
+        argv
+    }
+}
+
 /// Canonicalise a requested harness: trims, lowercases, and maps both absence and [`AGENT_ANY`]
 /// (and an empty value) to "no preference", so `None`, `""`, `"any"` and `" ANY "` are one case.
 pub fn normalize_request(requested: Option<&str>) -> Option<String> {
@@ -402,6 +442,31 @@ fn fallback_registry(seller: &SellerConfig) -> Result<ResolvedRegistry, Registry
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_only_is_every_listed_entry_a_hook_and_never_the_unlabelled_fallback() {
+        let mut presets = BTreeMap::new();
+        presets.insert("h1".to_owned(), AgentPresetConfig::hook(vec!["/bin/h1".into()]));
+        presets.insert("h2".to_owned(), AgentPresetConfig::hook(vec!["/bin/h2".into()]));
+        assert!(hook_only_seat(&seller_with(vec!["h1".into(), "h2".into()]), &presets));
+        assert!(!hook_only_seat(&seller_with(vec!["h1".into(), "claude".into()]), &presets), "mixed");
+        assert!(!hook_only_seat(&seller_with(Vec::new()), &presets), "agent_command fallback");
+        assert!(!hook_only_seat(&seller_with(vec!["unknown".into()]), &presets));
+    }
+
+    #[test]
+    fn a_hook_preset_never_becomes_the_acp_fallback() {
+        let mut presets = BTreeMap::new();
+        presets.insert("h".to_owned(), AgentPresetConfig::hook(vec!["/bin/h".into()]));
+        let previous = vec!["claude-acp".to_owned()];
+        assert_eq!(fallback_command_for("h", vec!["/bin/h".into()], &presets, Some(&previous)), previous);
+        assert!(fallback_command_for("h", vec!["/bin/h".into()], &presets, None).is_empty());
+        assert_eq!(
+            fallback_command_for("claude", vec!["claude-acp".into()], &presets, None),
+            vec!["claude-acp".to_owned()],
+            "an ACP preset still stores its argv, as before"
+        );
+    }
 
     fn seller_with(agents: Vec<String>) -> SellerConfig {
         SellerConfig {

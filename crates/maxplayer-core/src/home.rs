@@ -195,11 +195,18 @@ pub const DEFAULT_RELAY_GIT_REPO: &str = "maxplayer-seller";
 /// Seller daemon config (`[seller]` in config.toml). Key never lives here.
 ///
 /// `agent_command` MUST be an argv array — a TOML string/shell value is refused at parse
-/// (no-shell by construction).
+/// (no-shell by construction). It is the UNLABELLED fallback harness, used only when `agents` is
+/// empty, so it may be absent when `agents` names the harnesses (a hook-only seat has no ACP
+/// fallback to name); `require_seller_config` refuses a config with neither. Present-but-empty is
+/// still refused at parse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SellerConfig {
-    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_agent_command_argv"
+    )]
     pub agent_command: Vec<String>,
     pub rate_sats: u64,
     /// This seat TAKES NO PAYMENT (§2.1, §4.1). Default **false**. Opting in does two things and

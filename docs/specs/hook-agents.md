@@ -129,7 +129,11 @@ model = "claude-opus-5"                  # optional, self-reported; requires fam
   argv is stored in `argv`.
 - First run with `--agent my-hook`: the first-run path today writes the resolved argv into
   `[seller] agent_command` (the unlabelled ACP fallback). For a hook it must not: it writes
-  `agents = ["my-hook"]` and leaves `agent_command` as it was.
+  `agents = ["my-hook"]` and leaves `agent_command` as it was (possibly absent). `agent_command`
+  is required only when `agents` is empty (it is the fallback for exactly that case), so a
+  hook-only seat with no ACP fallback passes the readiness check and relaunches.
+- "Is this seat hook-only" has ONE answer, `seller_agents::hook_only_seat` (every listed entry is
+  a hook preset), asked by the doctor, the boot gates, the capability probe and held-tool startup.
 - `hook = ` in config makes an older binary refuse the home (`deny_unknown_fields`); the release
   notes say so.
 

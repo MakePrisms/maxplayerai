@@ -4478,6 +4478,17 @@ pub async fn probe_configured_harnesses(
     home: &MaxplayerHome,
 ) -> Result<Vec<HarnessProbeVerdict>, NodeError> {
     let registry = boot_agent_registry(home)?;
+    // hook-agents §9: a hook-only seat runs nothing of ours, so NONE of the sandbox-side gates below
+    // apply (sandbox policy, token-mode gate, forward_env/mcp lines, holder reap) — any of them could
+    // refuse a host with no docker at all. Decided by the one shared predicate the doctor also uses.
+    if crate::seller_agents::hook_only_home(home) {
+        opline!("seller node: hook-only seat — no sandbox, token-mode gate or containment holders apply; each hook proves itself with a boot ping");
+        let mut verdicts = Vec::with_capacity(registry.entries().len());
+        for (index, entry) in registry.entries().iter().enumerate() {
+            verdicts.push(hook_boot_verdict(index, entry, home).await);
+        }
+        return Ok(verdicts);
+    }
     // A `[sandbox]` that does not resolve into an executor refuses the boot gate outright: probing
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
@@ -4563,15 +4574,7 @@ pub async fn probe_configured_harnesses(
         // hook-agents §9: a hook entry proves itself with a `boot` ping, run on the host as the
         // seller's own program — no sandbox, no sentinel turn. Its model is self-reported config.
         if entry.kind.is_hook() {
-            let (argv, cwd) = (entry.argv.clone(), home.root.clone());
-            let result = tokio::task::spawn_blocking(move || {
-                crate::hook::ping(&argv, &cwd, crate::hook::PingReason::Boot)
-            })
-            .await
-            .unwrap_or_else(|error| Err(format!("ping task failed: {error}")))
-            .map(|()| None)
-            .map_err(|reason| (reason, Fault::Unproven));
-            verdicts.push(HarnessProbeVerdict { index, name: entry.name.clone(), result });
+            verdicts.push(hook_boot_verdict(index, entry, home).await);
             continue;
         }
         let result = probe_one_harness(index, &entry.argv, &label, &sandbox, &identity, home).await;
@@ -4582,6 +4585,23 @@ pub async fn probe_configured_harnesses(
         });
     }
     Ok(verdicts)
+}
+
+/// A hook entry's boot verdict: one `boot` ping on the host, as the seller's own program (§9).
+async fn hook_boot_verdict(
+    index: usize,
+    entry: &crate::seller_agents::RegisteredAgent,
+    home: &MaxplayerHome,
+) -> HarnessProbeVerdict {
+    let (argv, cwd) = (entry.argv.clone(), home.root.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        crate::hook::ping(&argv, &cwd, crate::hook::PingReason::Boot)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("ping task failed: {error}")))
+    .map(|()| None)
+    .map_err(|reason| (reason, Fault::Unproven));
+    HarnessProbeVerdict { index, name: entry.name.clone(), result }
 }
 
 /// The pure decision the pre-advertise gate turns on: the registry indices that PROVED they can
@@ -4686,9 +4706,7 @@ pub async fn boot_advertising_only_proven(
     // into the roster below, before the first heartbeat or claim can read it.
     // hook-agents §9: a hook-only seat runs nothing of ours, so there is no job environment to
     // measure: it advertises no capability tokens and skips the probe (and its sandbox gate).
-    let hook_only = boot_agent_registry(&home)
-        .map(|registry| !registry.entries().is_empty() && registry.entries().iter().all(|e| e.kind.is_hook()))
-        .unwrap_or(false);
+    let hook_only = crate::seller_agents::hook_only_home(&home);
     let (capabilities, job_nix) = if hook_only {
         opline!("seller node: hook-only seat — no job environment of ours to probe; advertising no capability tokens");
         (Vec::new(), false)
@@ -5233,11 +5251,15 @@ impl SellerNodeRunner {
         // it — the posture a vendor outage would give. Several tools start concurrently: each start
         // waits on its own vendor's enrolment.
         let held_tools = {
+            // A hook-only seat runs no container, so it starts no holder (a REQUIRED one that cannot
+            // start would otherwise refuse a seat that never uses it). Same predicate as the doctor.
+            let hook_only = crate::seller_agents::hook_only_home(node.home());
             let cfgs: Vec<&crate::home::HeldToolConfig> = node
                 .home()
                 .config
                 .sandbox
                 .as_ref()
+                .filter(|_| !hook_only)
                 .map(|sandbox| sandbox.held_tools.iter().collect())
                 .unwrap_or_default();
             let (uid, gid) = job_identity();
@@ -23774,6 +23796,50 @@ mod tests {
     // the wire BY KIND (kind-0 identity, kind-30340 seat announcement). Safe: the bogus case fails
     // at spawn with ENOENT (no process created), and the healthy case injects a passing verdict so
     // no agent is ever spawned.
+
+    /// hook-agents §9 / codex r1 #9: a hook-only seat must not reach ANY sandbox-side boot gate. The
+    /// `[sandbox]` here cannot even resolve into an executor; before the fix the probe refused the
+    /// boot on it (`NodeError::Sandbox`) although no job of this seat ever runs in a sandbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_only_seat_boots_past_an_unresolvable_sandbox_on_its_ping() {
+        use crate::home::SandboxConfig;
+        let root = throwaway_root("hookonly-boot");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        // Harness session settings are docker-only: on a launcher they refuse to resolve.
+        let mut sandbox: SandboxConfig = crate::home::parse_config_toml(
+            "[sandbox]\nmode='docker'\n[sandbox.harnesses.codex]\nmodel='gpt-5.6-sol'\nreasoning_effort='high'\n",
+        )
+        .expect("parse")
+        .sandbox
+        .expect("sandbox");
+        sandbox.mode = crate::home::SandboxMode::Launcher;
+        assert!(
+            crate::seller_exec::SandboxPolicy::from_config(Some(&sandbox)).is_err(),
+            "precondition: this [sandbox] refuses to resolve"
+        );
+        crate::home::save_config(&mut home, |config| {
+            let mut seller = seller_cfg(1, false);
+            seller.agents = vec!["my-hook".to_owned()];
+            config.seller = Some(seller);
+            config.agents.insert(
+                "my-hook".to_owned(),
+                crate::home::AgentPresetConfig::hook(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "cat >/dev/null; exit 0".to_owned(),
+                ]),
+            );
+            config.sandbox = Some(sandbox);
+        })
+        .expect("persist config");
+        assert!(crate::seller_agents::hook_only_home(&home));
+        let verdicts = probe_configured_harnesses(&home)
+            .await
+            .expect("a hook-only seat never reaches the sandbox gate");
+        assert_eq!(verdicts.len(), 1);
+        assert!(verdicts[0].result.is_ok(), "{:?}", verdicts[0].result);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A seat whose every configured harness FAILS its pre-advertise probe must publish nothing: no
     /// kind-0 identity and no kind-30340 announcement. The `[sandbox]` launcher is unresolvable, so
