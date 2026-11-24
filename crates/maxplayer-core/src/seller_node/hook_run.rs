@@ -48,9 +48,22 @@ impl SellerNodeRunner {
             None => {
                 // §5.1: a group a crashed daemon left running for THIS invocation dies before the
                 // re-drive touches its directory; then the new call gets the next attempt number.
-                reap_journaled_groups(self.node.store(), Some(&invocation));
+                // An earlier call that cannot be shown stopped keeps its journal entry and defers this
+                // one: running the invocation again could overlap it in the same directory.
+                if !reap_journaled_groups(self.node.store(), Some(&invocation)) {
+                    opline!(
+                        "seller node execute defer job_id={job_id}: an earlier hook call is not resolved; not re-run (retried on the next re-drive)"
+                    );
+                    return;
+                }
                 let attempt = match self.node.store().begin_hook_attempt(&invocation, job_id, now_unix()) {
-                    Ok(attempt) => attempt,
+                    Ok(Some(attempt)) => attempt,
+                    Ok(None) => {
+                        opline!(
+                            "seller node execute defer job_id={job_id}: an earlier hook call is still journaled; not re-run (retried on the next re-drive)"
+                        );
+                        return;
+                    }
                     Err(error) => {
                         opline!("seller node hook job_id={job_id}: attempt journal failed ({error})");
                         self.fail_job_with_feedback(job_id, &buyer, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None)
@@ -240,16 +253,19 @@ impl SellerNodeRunner {
 }
 
 /// Stop hook groups a previous daemon journaled and may have left running (§5.1): every one at boot
-/// (`only = None`), or just `only`'s before it is re-driven. Each is verified against its recorded
-/// start time before any signal ([`hook::reap_stale_group`]); its journal entry is then cleared.
-pub(super) fn reap_journaled_groups(store: &crate::seller_node::store::SellerStore, only: Option<&str>) {
+/// (`only = None`), or just `only`'s before it is re-driven. Each is verified before any signal
+/// ([`hook::reap_stale_group`]). A group shown stopped or gone has its journal entry cleared; an
+/// unresolved one KEEPS it, so its invocation is not run again and its directory is kept.
+/// Returns whether every group in scope was resolved (false also when the journal is unreadable).
+pub(super) fn reap_journaled_groups(store: &crate::seller_node::store::SellerStore, only: Option<&str>) -> bool {
     let groups = match store.journaled_hook_groups() {
         Ok(groups) => groups,
         Err(error) => {
             opline!("seller node hook: could not read journaled hook groups ({error})");
-            return;
+            return false;
         }
     };
+    let mut resolved = true;
     for (invocation, pgid, start) in groups {
         if only.is_some_and(|only| only != invocation) {
             continue;
@@ -259,12 +275,20 @@ pub(super) fn reap_journaled_groups(store: &crate::seller_node::store::SellerSto
                 opline!("seller node hook: stopped the hook group {pgid} an earlier run left for {invocation}")
             }
             hook::StaleReap::Gone => {}
-            hook::StaleReap::Unverifiable => opline!(
-                "seller node hook: hook group {pgid} for {invocation} cannot be verified on this host (no /proc); left alone"
-            ),
+            hook::StaleReap::Unresolved(why) => {
+                opline!(
+                    "seller node hook: hook group {pgid} for {invocation} is not resolved ({why}); it is not re-run and its directory is kept until it is (check `ps -g {pgid}`)"
+                );
+                resolved = false;
+                continue;
+            }
         }
-        let _ = store.clear_hook_group(&invocation);
+        if let Err(error) = store.clear_hook_group(&invocation) {
+            opline!("seller node hook: could not clear the journal of {invocation} ({error})");
+            resolved = false;
+        }
     }
+    resolved
 }
 
 /// Drop a job's hook state (staged answer, run record, per-job directory) if the job is terminal.
@@ -275,6 +299,11 @@ pub(super) fn clear_terminal_hook_state(
     job_id: &str,
 ) -> bool {
     use crate::seller_node::store::JobState;
+    // A group that is still journaled may still run in the directory: keep everything until it is
+    // resolved (§5.1).
+    if !matches!(store.hook_group_journaled(job_id), Ok(false)) {
+        return false;
+    }
     match store.job_state(job_id) {
         Ok(Some(JobState::Delivered | JobState::Paid | JobState::Failed)) => {
             let _ = store.clear_hook_outcomes(job_id);
@@ -527,8 +556,8 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn");
-        store.begin_hook_attempt("job-x", "job-x", 1).expect("begin");
-        let start = crate::hook::process_start(orphan.id());
+        assert_eq!(store.begin_hook_attempt("job-x", "job-x", 1).expect("begin"), Some(1));
+        let start = crate::hook::process_identity(orphan.id());
         store.record_hook_group("job-x", orphan.id(), start.as_deref(), 2).expect("record");
         // Another invocation's group is not touched by a targeted reap.
         reap_journaled_groups(&store, Some("job-other"));
@@ -537,7 +566,51 @@ mod tests {
         let status = orphan.wait().expect("wait");
         assert!(status.code().is_none(), "the orphan was killed: {status:?}");
         assert!(store.journaled_hook_groups().expect("list").is_empty(), "its journal entry is cleared");
-        assert_eq!(store.begin_hook_attempt("job-x", "job-x", 3).expect("begin"), 2, "the re-drive is attempt 2");
+        assert_eq!(store.begin_hook_attempt("job-x", "job-x", 3).expect("begin"), Some(2), "the re-drive is attempt 2");
+    }
+
+    /// codex r2 #2: a journaled group whose stop cannot be established (here: its leader is gone but
+    /// a process is left in the group, which can no longer be proven ours) keeps its journal entry,
+    /// blocks the next attempt and keeps the job's hook state, even once the job is terminal. When
+    /// the group is empty it resolves and the re-drive proceeds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unresolved_stale_group_blocks_the_re_drive_and_keeps_its_state() {
+        use crate::seller_node::store::JobState;
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = crate::home::bootstrap(dir.path()).expect("home");
+        let store = crate::seller_node::store::SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
+        let mut leader = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & exit 0"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        let pgid = leader.id();
+        assert_eq!(store.begin_hook_attempt("job-u", "job-u", 1).expect("begin"), Some(1));
+        let identity = crate::hook::process_identity(pgid);
+        store.record_hook_group("job-u", pgid, identity.as_deref(), 2).expect("record");
+        let _ = leader.wait();
+        let workdir = job_workdir(&home, "job-u");
+        std::fs::create_dir_all(&workdir).expect("dir");
+
+        assert!(!reap_journaled_groups(&store, Some("job-u")), "unresolved");
+        assert_eq!(store.journaled_hook_groups().expect("list").len(), 1, "the journal entry is kept");
+        assert_eq!(store.begin_hook_attempt("job-u", "job-u", 3).expect("begin"), None, "no new attempt while it is journaled");
+        store.insert_job_for_test("job-u", JobState::Failed);
+        assert!(!clear_terminal_hook_state(&store, &home, "job-u"), "terminal, but the group may still run there");
+        assert!(workdir.exists());
+
+        // SAFETY: test cleanup of the group this test created.
+        unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) };
+        let by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !reap_journaled_groups(&store, Some("job-u")) && std::time::Instant::now() < by {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(store.journaled_hook_groups().expect("list").is_empty(), "resolved once the group is empty");
+        assert_eq!(store.begin_hook_attempt("job-u", "job-u", 4).expect("begin"), Some(2));
+        assert!(clear_terminal_hook_state(&store, &home, "job-u"));
+        assert!(!workdir.exists());
     }
 
     /// codex r1 #12: hook state goes once the job is terminal (delivered, paid or failed, including

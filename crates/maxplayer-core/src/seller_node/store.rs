@@ -3640,19 +3640,33 @@ impl SellerStore {
     }
 
     /// Start a new call of `invocation` (§5.1): its attempt number, 1 for the first call and one more
-    /// for every re-drive. Any previously journaled group is forgotten — the caller reaped it first.
-    pub fn begin_hook_attempt(&self, invocation: &str, job_id: &str, now_unix: i64) -> Result<u32, StoreError> {
+    /// for every re-drive. `None` while an earlier call's group is still journaled: that group was not
+    /// resolved (reaped and cleared), so nothing may run the invocation again yet.
+    pub fn begin_hook_attempt(&self, invocation: &str, job_id: &str, now_unix: i64) -> Result<Option<u32>, StoreError> {
         let conn = self.lock()?;
-        conn.execute(
+        let changed = conn.execute(
             "INSERT INTO hook_runs (invocation, job_id, attempt, pgid, pgid_start, updated_at_unix)
              VALUES (?1, ?2, 1, NULL, NULL, ?3)
              ON CONFLICT(invocation) DO UPDATE SET
-                 attempt = attempt + 1, pgid = NULL, pgid_start = NULL, updated_at_unix = ?3",
+                 attempt = attempt + 1, updated_at_unix = ?3
+             WHERE hook_runs.pgid IS NULL",
             params![invocation, job_id, now_unix],
         )?;
+        if changed == 0 {
+            return Ok(None);
+        }
         let attempt: i64 =
             conn.query_row("SELECT attempt FROM hook_runs WHERE invocation = ?1", [invocation], |row| row.get(0))?;
-        Ok(u32::try_from(attempt).unwrap_or(u32::MAX))
+        Ok(Some(u32::try_from(attempt).unwrap_or(u32::MAX)))
+    }
+
+    /// Whether any invocation of `job_id` still has a journaled group (one not yet resolved).
+    pub fn hook_group_journaled(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let found: Option<i64> = conn
+            .query_row("SELECT 1 FROM hook_runs WHERE job_id = ?1 AND pgid IS NOT NULL LIMIT 1", [job_id], |row| row.get(0))
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Journal the running group of `invocation`, BEFORE the hook is released from its gate.
@@ -4142,17 +4156,24 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let store = SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
         assert!(store.record_hook_group("inv", 42, Some("7"), 1).is_err(), "no attempt row yet");
-        assert_eq!(store.begin_hook_attempt("inv", "job-h", 1).expect("begin"), 1);
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 1).expect("begin"), Some(1));
         store.record_hook_group("inv", 42, Some("7"), 2).expect("record");
         assert_eq!(store.journaled_hook_groups().expect("list"), vec![("inv".to_owned(), 42, Some("7".to_owned()))]);
-        // A re-drive is the next attempt and forgets the previous group (the caller reaped it).
-        assert_eq!(store.begin_hook_attempt("inv", "job-h", 3).expect("begin"), 2);
+        assert!(store.hook_group_journaled("job-h").expect("read"));
+        // codex r2 #2: no next attempt while the previous group is journaled (not yet resolved), and
+        // its identity is not overwritten.
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 3).expect("begin"), None);
+        assert_eq!(store.journaled_hook_groups().expect("list"), vec![("inv".to_owned(), 42, Some("7".to_owned()))]);
+        // Once the caller resolved and cleared it, a re-drive is the next attempt.
+        store.clear_hook_group("inv").expect("clear");
+        assert!(!store.hook_group_journaled("job-h").expect("read"));
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 3).expect("begin"), Some(2));
         assert!(store.journaled_hook_groups().expect("list").is_empty());
         store.record_hook_group("inv", 43, None, 4).expect("record");
         store.clear_hook_group("inv").expect("clear");
         assert!(store.journaled_hook_groups().expect("list").is_empty());
         store.clear_hook_outcomes("job-h").expect("clear job");
-        assert_eq!(store.begin_hook_attempt("inv", "job-h", 5).expect("begin"), 1, "job end drops the run record");
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 5).expect("begin"), Some(1), "job end drops the run record");
     }
 
     #[test]

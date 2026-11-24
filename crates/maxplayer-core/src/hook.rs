@@ -350,8 +350,8 @@ pub fn run(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunRep
 pub struct Started {
     /// The process-group id (= the leader's pid).
     pub pgid: u32,
-    /// The leader's start time as the kernel reports it (Linux: `/proc/<pid>/stat` field 22), so a
-    /// later boot can tell our leader from a recycled pid. `None` where it cannot be read.
+    /// The leader's identity, `<boot id>/<start time>` ([`process_identity`]), so a later daemon can
+    /// tell our leader from a recycled pid or a previous boot. `None` where it cannot be read.
     pub start: Option<String>,
 }
 
@@ -463,7 +463,7 @@ fn supervise(
     active_groups().insert(pgid);
     if let Some(journal) = journal {
         // Nothing has been written to stdin yet, so a gated hook is still parked in the gate.
-        let started = Started { pgid, start: process_start(pgid) };
+        let started = Started { pgid, start: process_identity(pgid) };
         if let Err(error) = journal(&started) {
             terminate_group(pgid, &mut child);
             return report(Exit::SpawnFailed(format!("journal: {error}")), Vec::new(), false, String::new());
@@ -733,48 +733,260 @@ pub fn terminate_all() {
     }
 }
 
-/// A process's start time, for telling it from a later process that reused its pid. Linux reads
-/// `/proc/<pid>/stat` field 22; elsewhere (and for a pid that does not exist) `None`.
-pub fn process_start(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // `comm` (field 2) is parenthesised and may contain spaces: count from the LAST ')'.
-    let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace().nth(19).map(str::to_owned)
+/// What `/proc` says about a pid right now (Linux).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProcState {
+    /// A process has this pid: its start time (`stat` field 22), its process group, and whether it
+    /// is a zombie (exited, not yet reaped: it still holds its pid and keeps its group id reserved).
+    Present { start: String, pgrp: u32, zombie: bool },
+    /// No process has this pid.
+    Absent,
+    /// It could not be read or parsed: neither of the above may be assumed.
+    Unreadable(String),
 }
 
-/// What [`reap_stale_group`] did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StaleReap {
-    /// Our old group was found and killed (SIGTERM, grace, SIGKILL).
-    Killed,
-    /// The id now belongs to an unrelated process: our group is long gone. Nothing signalled.
-    Gone,
-    /// No start time was recorded (no `/proc`): the group cannot be verified, so it is left alone.
-    Unverifiable,
-}
-
-/// Stop a hook group a previous daemon journaled (§5.1), verified so a recycled id is never hit:
-/// - the leader pid is alive with the recorded start time ⇒ it is ours: kill the group;
-/// - no process has that pid ⇒ only remnants of OUR group can still carry that pgid (the kernel
-///   does not hand out a pid that is still some group's id), so signalling it is safe (ESRCH if
-///   none are left);
-/// - the pid is alive with another start time ⇒ it was recycled, so our group is gone entirely.
-pub fn reap_stale_group(pgid: u32, recorded_start: Option<&str>) -> StaleReap {
-    let Some(recorded) = recorded_start else {
-        return StaleReap::Unverifiable;
+fn proc_state(pid: u32) -> ProcState {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => return ProcState::Absent,
+        Err(error) => return ProcState::Unreadable(error.to_string()),
     };
-    match process_start(pgid) {
-        Some(now) if now != recorded => StaleReap::Gone,
-        _ => {
-            signal_group(pgid, SIGTERM);
-            let grace_until = Instant::now() + KILL_GRACE;
-            while Instant::now() < grace_until && process_start(pgid).as_deref() == Some(recorded) {
-                std::thread::sleep(POLL);
-            }
-            signal_group(pgid, SIGKILL);
-            StaleReap::Killed
+    // `comm` (field 2) is parenthesised and may contain spaces: count from the LAST ')'.
+    let Some(close) = stat.rfind(')') else {
+        return ProcState::Unreadable("malformed stat".into());
+    };
+    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    // After `comm`: [0] state (field 3), [2] pgrp (field 5), [19] starttime (field 22).
+    match (fields.first(), fields.get(2).and_then(|pgrp| pgrp.parse::<u32>().ok()), fields.get(19)) {
+        (Some(state), Some(pgrp), Some(start)) => ProcState::Present {
+            start: (*start).to_owned(),
+            pgrp,
+            zombie: matches!(*state, "Z" | "X" | "x"),
+        },
+        _ => ProcState::Unreadable("malformed stat".into()),
+    }
+}
+
+/// This boot's id (Linux): start times count from boot, so they identify a process only within one.
+fn boot_id() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+/// A process's identity as a later daemon can check it: `<boot id>/<start time>`, so neither a
+/// recycled pid (another start time) nor a reboot (another boot id) can pass for it. Linux only;
+/// `None` elsewhere, or when it cannot be read.
+pub fn process_identity(pid: u32) -> Option<String> {
+    let boot = boot_id()?;
+    match proc_state(pid) {
+        ProcState::Present { start, .. } => Some(format!("{boot}/{start}")),
+        _ => None,
+    }
+}
+
+/// What [`reap_stale_group`] established.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StaleReap {
+    /// Our old group was found and every live process in it was stopped (seen gone afterwards).
+    Killed,
+    /// Nothing of our old group is left: the host rebooted since, the leader's pid now names another
+    /// process, or neither the leader nor any process of its group exists.
+    Gone,
+    /// It could not be established that the group is ours, or that it stopped. Nothing unverified
+    /// was signalled. The caller keeps the journal entry and must neither re-run the invocation nor
+    /// reuse its directory until a later attempt resolves it.
+    Unresolved(String),
+}
+
+/// How long SIGKILLed members of a stale group get to disappear before the reap gives up.
+const STALE_KILL_SETTLE: Duration = Duration::from_secs(2);
+
+/// Stop a hook group a previous daemon journaled (§5.1), never signalling a process that is not
+/// provably ours:
+/// - another boot id ⇒ the reboot ended it: [`StaleReap::Gone`];
+/// - the leader pid names a process with another start time ⇒ the pid was recycled, which the
+///   kernel does only once no process of our group is left: [`StaleReap::Gone`];
+/// - no leader and no process in its group ⇒ [`StaleReap::Gone`]; no leader but processes left in
+///   the group ⇒ they can no longer be proven ours: [`StaleReap::Unresolved`], nothing signalled;
+/// - the leader is ours ⇒ every live member is signalled ONE BY ONE through a pidfd that pins it
+///   (no numeric group signal), SIGTERM, the grace, then SIGKILL until none is left.
+///
+/// Membership is accepted only while a process already proven ours still exists after the listing
+/// (it keeps the group id from being reused), so a member listed in between belongs to OUR group.
+/// Unreadable state, a host without `/proc`, or members that outlive SIGKILL are `Unresolved`.
+pub fn reap_stale_group(pgid: u32, recorded: Option<&str>) -> StaleReap {
+    use StaleReap::Unresolved;
+    if !cfg!(target_os = "linux") {
+        return Unresolved("this host has no /proc to verify a process group with".into());
+    }
+    let Some(recorded) = recorded else {
+        return Unresolved("no process identity was recorded for it".into());
+    };
+    let Some((boot, start)) = recorded.split_once('/') else {
+        return Unresolved(format!("unrecognised identity record {recorded:?}"));
+    };
+    let Some(boot_now) = boot_id() else {
+        return Unresolved("the boot id is unreadable".into());
+    };
+    if boot_now != boot {
+        return StaleReap::Gone;
+    }
+    match proc_state(pgid) {
+        ProcState::Present { start: now, .. } if now != start => return StaleReap::Gone,
+        ProcState::Present { .. } => {}
+        ProcState::Unreadable(error) => return Unresolved(format!("its leader is unreadable: {error}")),
+        ProcState::Absent => {
+            return match live_group_members(pgid) {
+                Ok(members) if members.is_empty() => StaleReap::Gone,
+                Ok(members) => Unresolved(format!(
+                    "its leader has exited but {} process(es) remain in group {pgid}; they cannot be proven to be ours, so none was signalled",
+                    members.len()
+                )),
+                Err(error) => Unresolved(error),
+            };
         }
     }
+    let mut anchors = vec![(pgid, start.to_owned())];
+    let term_until = Instant::now() + KILL_GRACE;
+    let kill_until = term_until + STALE_KILL_SETTLE;
+    let mut termed = false;
+    loop {
+        let killing = Instant::now() >= term_until;
+        let signal = if killing {
+            Some(SIGKILL)
+        } else if termed {
+            None
+        } else {
+            Some(SIGTERM)
+        };
+        termed = true;
+        match sweep_verified_group(pgid, &mut anchors, signal) {
+            Ok(Sweep::Empty) => return StaleReap::Killed,
+            Ok(Sweep::Live) => {}
+            Ok(Sweep::Unanchored(left)) => {
+                return Unresolved(format!(
+                    "{left} process(es) remain in group {pgid} but none of ours is left to prove they are ours"
+                ));
+            }
+            Err(error) => return Unresolved(error),
+        }
+        if killing && Instant::now() >= kill_until {
+            return Unresolved(format!("processes of group {pgid} survived SIGKILL"));
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// One pass of [`reap_stale_group`].
+enum Sweep {
+    /// No live process is left in the group.
+    Empty,
+    /// Live members remain; all were proven ours (and signalled, if asked).
+    Live,
+    /// Live members remain but no process already proven ours still exists: nothing signalled.
+    Unanchored(usize),
+}
+
+/// List the live members of `pgid`, then accept them only if one of `anchors` (processes already
+/// proven ours, the leader first) still exists in the group afterwards. Accepted members become
+/// anchors and, with `signal`, are each signalled through a pinned pidfd.
+fn sweep_verified_group(pgid: u32, anchors: &mut Vec<(u32, String)>, signal: Option<i32>) -> Result<Sweep, String> {
+    let members = live_group_members(pgid)?;
+    let mut still = Vec::with_capacity(anchors.len());
+    for (pid, start) in anchors.drain(..) {
+        match proc_state(pid) {
+            ProcState::Present { start: now, pgrp, .. } if now == start && (pgrp == pgid || pid == pgid) => {
+                still.push((pid, start));
+            }
+            ProcState::Unreadable(error) => return Err(format!("process {pid}: {error}")),
+            _ => {}
+        }
+    }
+    *anchors = still;
+    if members.is_empty() {
+        return Ok(Sweep::Empty);
+    }
+    if anchors.is_empty() {
+        return Ok(Sweep::Unanchored(members.len()));
+    }
+    for (pid, start) in &members {
+        if !anchors.iter().any(|(p, s)| p == pid && s == start) {
+            anchors.push((*pid, start.clone()));
+        }
+        if let Some(sig) = signal {
+            signal_pinned(*pid, start, pgid, sig)?;
+        }
+    }
+    Ok(Sweep::Live)
+}
+
+/// The live (non-zombie) processes in group `pgid`, as `(pid, start)`. An unreadable process of
+/// this user might be a member, so it is an error; other users' processes are skipped.
+fn live_group_members(pgid: u32) -> Result<Vec<(u32, String)>, String> {
+    let mut members = Vec::new();
+    let entries = std::fs::read_dir("/proc").map_err(|e| format!("/proc: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("/proc: {e}"))?;
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        match proc_state(pid) {
+            ProcState::Present { start, pgrp, zombie } => {
+                if pgrp == pgid && !zombie {
+                    members.push((pid, start));
+                }
+            }
+            ProcState::Absent => {}
+            ProcState::Unreadable(error) => {
+                use std::os::unix::fs::MetadataExt;
+                // SAFETY: geteuid has no preconditions and cannot fail.
+                let me = unsafe { libc::geteuid() };
+                if entry.metadata().map(|m| m.uid() == me).unwrap_or(true) {
+                    return Err(format!("process {pid}: {error}"));
+                }
+            }
+        }
+    }
+    Ok(members)
+}
+
+/// Send `sig` to `pid` only while it is still the process `(pid, start)` in group `pgid`: the pid
+/// is pinned with a pidfd FIRST and checked after, so the signal cannot reach a process that took
+/// the pid over in between. `Ok(false)`: it was no longer there.
+#[cfg(target_os = "linux")]
+fn signal_pinned(pid: u32, start: &str, pgid: u32, sig: i32) -> Result<bool, String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+        return Ok(false);
+    };
+    // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, raw_pid, 0) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) { Ok(false) } else { Err(format!("pidfd_open: {error}")) };
+    }
+    // SAFETY: the descriptor was just returned to us; OwnedFd closes it exactly once.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) };
+    match proc_state(pid) {
+        ProcState::Present { start: now, pgrp, .. } if now == start && pgrp == pgid => {}
+        ProcState::Unreadable(error) => return Err(format!("process {pid}: {error}")),
+        _ => return Ok(false),
+    }
+    // SAFETY: a valid pidfd, a signal number, no siginfo, no flags.
+    let rc = unsafe {
+        libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0)
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) { Ok(false) } else { Err(format!("pidfd_send_signal: {error}")) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_pinned(_pid: u32, _start: &str, _pgid: u32, _sig: i32) -> Result<bool, String> {
+    Err("no pidfd on this host".into())
 }
 
 /// `kill(-pgid, sig)`, refusing the widening ids 0 and 1. Errors (ESRCH: the group is gone) are
@@ -1104,26 +1316,64 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn spawn_group(script: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        Command::new("sh").args(["-c", script]).process_group(0).spawn().expect("spawn")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn group_alive(pgid: u32) -> bool {
+        !live_group_members(pgid).expect("scan").is_empty()
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_stale_group_is_killed_only_when_its_leader_is_verified() {
-        use std::os::unix::process::CommandExt;
-        let spawn = || {
-            Command::new("sh").args(["-c", "sleep 30"]).process_group(0).spawn().expect("spawn")
-        };
-        // A recycled pid (start time differs): never signalled.
-        let mut other = spawn();
-        assert_eq!(reap_stale_group(other.id(), Some("1")), StaleReap::Gone);
+        let boot = boot_id().expect("boot id");
+        // A recycled pid (same boot, another start time): never signalled.
+        let mut other = spawn_group("sleep 30");
+        assert_eq!(reap_stale_group(other.id(), Some(&format!("{boot}/1"))), StaleReap::Gone);
         assert!(other.try_wait().expect("try_wait").is_none(), "an unverified group must be left alone");
+        // Another boot: whatever runs under that pid now is not ours.
+        let start = process_identity(other.id()).expect("identity");
+        let (_, ticks) = start.split_once('/').expect("boot/start");
+        assert_eq!(reap_stale_group(other.id(), Some(&format!("not-this-boot/{ticks}"))), StaleReap::Gone);
+        assert!(other.try_wait().expect("try_wait").is_none(), "a previous boot's record must not reach this boot's process");
         let _ = other.kill();
         let _ = other.wait();
-        // No recorded start time: unverifiable, left alone.
-        assert_eq!(reap_stale_group(1, None), StaleReap::Unverifiable);
-        // Our leader (start time matches): the whole group dies.
-        let mut ours = spawn();
-        let start = process_start(ours.id()).expect("start time");
-        assert_eq!(reap_stale_group(ours.id(), Some(&start)), StaleReap::Killed);
+        // No recorded identity: unresolved, left alone.
+        assert!(matches!(reap_stale_group(1, None), StaleReap::Unresolved(_)));
+        // Our leader (identity matches): the whole group dies, a member that ignores SIGTERM included.
+        let mut ours = spawn_group("(trap '' TERM; sleep 30) & sleep 30");
+        let pgid = ours.id();
+        let identity = process_identity(pgid).expect("identity");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(reap_stale_group(pgid, Some(&identity)), StaleReap::Killed);
         let status = ours.wait().expect("wait");
         assert!(status.code().is_none(), "killed by a signal: {status:?}");
+        assert!(!group_alive(pgid), "Killed means nothing live is left in the group");
+    }
+
+    /// codex r2 #1: once the leader is gone, a process still carrying the group id can no longer be
+    /// proven ours (the id could have been reused), so nothing is signalled and the reap is
+    /// unresolved; once the group is empty it is gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stale_group_without_its_leader_is_never_signalled() {
+        let mut leader = spawn_group("sleep 30 & exit 0");
+        let pgid = leader.id();
+        let identity = process_identity(pgid).expect("identity");
+        let _ = leader.wait(); // the leader exits and is reaped; its sleep stays in the group
+        assert!(group_alive(pgid), "the member is still running");
+        assert!(matches!(reap_stale_group(pgid, Some(&identity)), StaleReap::Unresolved(_)));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(group_alive(pgid), "an unprovable member must not be signalled");
+        signal_group(pgid, SIGKILL);
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while group_alive(pgid) && Instant::now() < gone_by {
+            std::thread::sleep(POLL);
+        }
+        assert_eq!(reap_stale_group(pgid, Some(&identity)), StaleReap::Gone);
     }
 
     #[test]
