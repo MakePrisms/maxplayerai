@@ -239,8 +239,11 @@ impl SellerNodeRunner {
             .unwrap_or_else(|error| Err(format!("ping task failed: {error}")));
             match result {
                 Ok(()) => {
-                    roster.restore(harness);
-                    opline!("seller node hook RESTORED {label}: restore ping passed");
+                    if roster.restore_if_probing(harness) {
+                        opline!("seller node hook RESTORED {label}: restore ping passed");
+                    } else {
+                        opline!("seller node hook {label}: restore ping passed but a newer strike landed meanwhile; staying dropped");
+                    }
                 }
                 Err(reason) => {
                     let state = roster.fault(harness, Fault::Unproven, std::time::Instant::now());

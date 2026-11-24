@@ -557,14 +557,32 @@ impl LiveRoster {
     /// has the pinned fingerprint. `None` ⇒ fail closed. Serving state is deliberately NOT checked:
     /// the award is committed, and running on the entry the claim described is the only honest
     /// outcome (docs/specs/hook-agents.md §9) — a dropped entry's run is its own best test.
-    pub fn by_pin(&self, label: &str, fingerprint: &str) -> Option<Selected<'_>> {
+    pub fn by_pin(&self, label: &str, kind: &str, fingerprint: &str) -> Option<Selected<'_>> {
         self.registry
             .entries()
             .iter()
             .enumerate()
             .find(|(_, entry)| entry.name.as_deref() == Some(label))
-            .filter(|(_, entry)| entry.fingerprint() == fingerprint)
+            .filter(|(_, entry)| entry.kind.as_str() == kind && entry.fingerprint() == fingerprint)
             .map(|(index, agent)| Selected { index, agent })
+    }
+
+    /// The ONE executable-dispatch resolver (turn 1 and session follow-ups alike): a pinned claim runs
+    /// on exactly its pinned entry (label, kind, fingerprint); an unpinned one (an older build's
+    /// claim, or the unlabelled hatch) dispatches as before over ACP entries only. `allow_hook` is
+    /// false for a session follow-up: hook sessions are a later stage, so a follow-up never reaches a
+    /// hook, pinned or not. `None` ⇒ fail closed, never substitute.
+    pub fn for_execution(
+        &self,
+        pin: Option<(&str, &str, &str)>,
+        requested: Option<&str>,
+        allow_hook: bool,
+    ) -> Option<Selected<'_>> {
+        let selected = match pin {
+            Some((label, kind, fingerprint)) => self.by_pin(label, kind, fingerprint),
+            None => self.dispatch_acp(requested),
+        }?;
+        (allow_hook || !selected.agent.kind.is_hook()).then_some(selected)
     }
 
     /// Today's unpinned dispatch restricted to ACP entries: a job claimed before pins existed (or by
@@ -642,6 +660,25 @@ impl LiveRoster {
     /// award the test and a buyer would pay for our diagnostic.
     ///
     /// Strike history survives, so a harness that flaps escalates instead of resetting to 1m.
+    /// [`Self::restore`] for a probe whose verdict may be STALE (a hook restore ping runs off the
+    /// loop for up to 30 s): restores only while this entry's probe is still in flight. Any newer
+    /// verdict — a job strike, which [`Self::fault`] records by clearing `probing` — wins, so a ping
+    /// that passed before the strike can never put the just-struck entry back (hook-agents §9 races).
+    /// Returns whether it restored.
+    pub fn restore_if_probing(&self, index: usize) -> bool {
+        let restored = match self.state.lock().expect("live roster poisoned").get_mut(&index) {
+            Some(entry) if entry.probing => {
+                entry.probing = false;
+                entry.unavailable.take().is_some()
+            }
+            _ => false,
+        };
+        if restored {
+            self.bump_generation();
+        }
+        restored
+    }
+
     pub fn restore(&self, index: usize) {
         let restored = match self
             .state
@@ -848,17 +885,58 @@ mod tests {
     fn the_pin_resolves_by_exact_label_and_fingerprint_and_unpinned_work_never_reaches_a_hook() {
         let roster = mixed();
         let fp = roster.entry(0).unwrap().fingerprint();
-        assert_eq!(roster.by_pin("my-hook", &fp).map(|s| s.index), Some(0));
-        assert!(roster.by_pin("my-hook", "different").is_none(), "changed entry fails closed");
-        assert!(roster.by_pin("MY-HOOK", &fp).is_none(), "exact label only");
+        assert_eq!(roster.by_pin("my-hook", "hook", &fp).map(|s| s.index), Some(0));
+        assert!(roster.by_pin("my-hook", "hook", "different").is_none(), "changed entry fails closed");
+        assert!(roster.by_pin("MY-HOOK", "hook", &fp).is_none(), "exact label only");
+        assert!(roster.by_pin("my-hook", "acp", &fp).is_none(), "the pinned kind must match");
         assert_eq!(roster.dispatch_acp(None).and_then(|s| s.agent.name.clone()).as_deref(), Some("claude"));
         assert!(roster.dispatch_acp(Some("my-hook")).is_none());
         roster.fault(0, Fault::Unproven, Instant::now());
         assert_eq!(
-            roster.by_pin("my-hook", &fp).map(|s| s.index),
+            roster.by_pin("my-hook", "hook", &fp).map(|s| s.index),
             Some(0),
             "an awarded job still runs on its pinned entry while that entry is dropped"
         );
+    }
+
+    /// Review r1 #1/#4: one resolver for turn 1 AND session follow-ups. A pinned follow-up runs on
+    /// its pinned ACP entry (not the preferred one); an unpinned follow-up never reaches a hook
+    /// added in front; a follow-up never runs a hook even when pinned to one.
+    #[test]
+    fn followups_resolve_through_the_pin_and_never_reach_a_hook() {
+        let roster = mixed();
+        let codex_fp = roster.entry(2).unwrap().fingerprint();
+        let hook_fp = roster.entry(0).unwrap().fingerprint();
+        assert_eq!(
+            roster.for_execution(Some(("codex", "acp", &codex_fp)), None, false).map(|s| s.index),
+            Some(2),
+            "an unnamed session pinned to codex stays on codex for turn n"
+        );
+        assert_eq!(
+            roster.for_execution(None, None, false).map(|s| s.index),
+            Some(1),
+            "an unpinned follow-up skips the hook in front"
+        );
+        assert!(roster.for_execution(Some(("my-hook", "hook", &hook_fp)), None, false).is_none());
+        assert_eq!(roster.for_execution(Some(("my-hook", "hook", &hook_fp)), None, true).map(|s| s.index), Some(0));
+        assert!(roster.for_execution(Some(("codex", "hook", &codex_fp)), None, true).is_none());
+    }
+
+    /// Review r1 #7: a restore ping that passed is stale once a job struck the entry meanwhile.
+    #[test]
+    fn a_stale_restore_ping_cannot_restore_an_entry_struck_after_it_started() {
+        let roster = mixed();
+        let t0 = Instant::now();
+        roster.fault(0, Fault::Unproven, t0);
+        assert_eq!(roster.claim_due_probes(t0 + Duration::from_secs(3600)), vec![0]);
+        // An already-awarded job strikes the hook while its restore ping is in flight.
+        roster.fault(0, Fault::Unproven, t0 + Duration::from_secs(3601));
+        assert!(!roster.restore_if_probing(0), "the stale pass loses to the newer strike");
+        assert!(roster.unavailable(0).is_some());
+        // Without an intervening strike the pass restores.
+        assert_eq!(roster.claim_due_probes(t0 + Duration::from_secs(100_000)), vec![0]);
+        assert!(roster.restore_if_probing(0));
+        assert!(roster.unavailable(0).is_none());
     }
 
     fn named(names: &[&str]) -> LiveRoster {

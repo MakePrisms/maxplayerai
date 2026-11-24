@@ -9736,11 +9736,19 @@ impl SellerNodeRunner {
         // hook-agents §3: a pinned claim runs on exactly the entry it described (label + fingerprint);
         // an unpinned one (an older build's claim, or the unlabelled hatch) dispatches as before but
         // over ACP entries only, so a hook added later never picks up work that never admitted hooks.
-        let pin = self.node.store().claim_pin(job_id).ok().flatten();
-        let selected = match &pin {
-            Some(pin) => self.agents.by_pin(&pin.label, &pin.fingerprint),
-            None => self.agents.dispatch_acp(requested_agent.as_deref()),
+        // A pin READ error is not an unpinned claim: retrying beats running unrelated ACP work.
+        let pin = match self.node.store().claim_pin(job_id) {
+            Ok(pin) => pin,
+            Err(error) => {
+                opline!("seller node execute defer job_id={job_id}: claim pin unreadable ({error}); retried on the next re-drive");
+                return;
+            }
         };
+        let selected = self.agents.for_execution(
+            pin.as_ref().map(|p| (p.label.as_str(), p.kind.as_str(), p.fingerprint.as_str())),
+            requested_agent.as_deref(),
+            true,
+        );
         let Some(selected) = selected else {
             opline!(
                 "seller node execute fail job_id={job_id}: {} (never substituted)",
