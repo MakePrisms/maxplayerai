@@ -192,12 +192,15 @@ prepares the intent for the first time with its own selection.
 **Execution reads the pin.** `execute_job` (`run.rs:9662 @4caf510`) and session turns
 (`core/seller_node/session_run.rs:855 @4caf510`) dispatch by the pinned label and verify kind and
 fingerprint against the live roster. A missing or changed entry fails the job closed with today's
-`capability_missing` (nothing ran). A row with no pin (claimed before this change, or the
-unlabelled `--agent-argv` hatch) dispatches as today but **only over `Acp` entries**, so a hook
-added later can never pick up work that never admitted hooks.
+`capability_missing` (nothing ran). A row with no pin (all three pin columns empty: claimed before
+this change, or the unlabelled `--agent-argv` hatch) dispatches as today but **only over `Acp`
+entries**, so a hook added later can never pick up work that never admitted hooks. A partly written
+pin, a missing claim row or an unreadable one is not "no pin": the job is deferred to the next
+re-drive, never dispatched on the legacy rule.
 
 The capacity re-drive (`capacity_retry_offer`, `run.rs:2516 @4caf510`) rebuilds the shape from
-the stored offer row and the stored contribution pin (`store.rs:1597 @4caf510`).
+the stored offer row and the stored contribution pin (`store.rs:1597 @4caf510`). A contribution pin
+that cannot be read defers the offer; it is never taken as "no contribution".
 
 ### 3.1 Correction to the discussion: the delivery-budget probe stays after the award
 
@@ -335,9 +338,12 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
   which goes to the seller log, never to the buyer.
 - Cutoff (monotonic): `job` ⇒ `deadline_unix − 30 s` (time to sign and publish); `ping`/`close`
   ⇒ 30 s. At the cutoff, or on daemon shutdown: `SIGTERM` to the group, 2 s grace, `SIGKILL` to
-  the group, reap the child. The child's exit is observed without reaping it (`waitid(WNOWAIT)`),
-  so the group id cannot be recycled before the group kill. An exit first observed at or after the
-  cutoff counts as the cutoff.
+  the group, reap the child. The grace is the group's: it ends early only once the leader has
+  exited and (on Linux, where members can be listed) no other live process is left in the group.
+  The child's exit is observed without reaping it (`waitid(WNOWAIT)`), so the group id cannot be
+  recycled before the group kill. An exit, or a stdout overflow, first observed at or after the
+  cutoff counts as the cutoff; an overflow seen while draining after the exit changes only an
+  ordinary exit status, never a resolved cutoff or shutdown.
 - When the hook exits, the rest of its group is killed and stdout gets 2 s to reach EOF. Stdout
   still open then (a process that left the group kept it) is incomplete: the answer is refused as a
   violation. All three pipes are non-blocking and pumped by the one supervising thread, and every
@@ -352,19 +358,39 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
   The hook is the seller's own program running as the seller.
 - An unknown event: exit code 64 means "unsupported" and is never a strike, so new events can be
   added without breaking old adapters.
-- On daemon shutdown every running hook group gets the same SIGTERM/grace/SIGKILL.
+- On daemon shutdown a latch is set under the one lock that also registers groups and releases
+  gates: after it nothing is registered or released (a launch in progress kills its gated group,
+  the hook never ran). Every registered group gets the same SIGTERM/grace/SIGKILL, and shutdown
+  waits (bounded) for the supervisors to reap. A hook stopped by shutdown is **interrupted**: no
+  verdict, no strike, the job is not failed, and the next start re-drives it (attempt n+1). An
+  answer completed with exit 0 before the stop still counts.
 - **Crash idempotency.** A `job` call is spawned behind a gate (`/bin/sh -c 'IFS= read -r go &&
   [ "$go" = go ] && exec "$@"'`): the gate already has its own process group but waits for one
   `go` line on stdin. The order is: write the attempt row (`hook_runs`, attempt n+1) → spawn the
-  gate → journal its pid (= group id) and the leader's start time (`/proc/<pid>/stat` field 22) →
-  write `go` and then the event. If the daemon dies before the journal write, its end of stdin
-  closes, `read` fails and the gate exits without ever running the hook. So either the hook never
-  ran or its group is on disk. At boot, and again before an invocation is re-driven, every
-  journaled group is reaped only if verified: leader alive with the recorded start time ⇒ kill the
-  group; no process with that pid ⇒ only our group's remnants can still carry that id, so kill it;
-  pid alive with another start time ⇒ recycled, our group is gone, nothing is signalled. Without a
-  recorded start time (no `/proc`) a group is left alone and logged. The re-drive then gets
-  `attempt` n+1.
+  gate → journal its pid (= group id) and the leader's identity (`<boot id>/<start time>`: the
+  boot id from `/proc/sys/kernel/random/boot_id`, the start time from `/proc/<pid>/stat` field 22)
+  → write `go` (under the shutdown lock, only before the cutoff: a journal write that ends at or
+  after it kills the gated group, out of time, no strike) and then the event. If the daemon dies
+  before the journal write, its end of stdin closes, `read` fails and the gate exits without ever
+  running the hook. So either the hook never ran or its group is on disk.
+- **Reaping a journaled group.** At boot, and again before an invocation is re-driven, a journaled
+  group is signalled only where it is provably ours, and never by a numeric group signal:
+  - another boot id ⇒ the reboot ended it: gone;
+  - the leader pid names a process with another start time ⇒ the pid was recycled, which the
+    kernel does only once no process of the group is left: gone, nothing signalled;
+  - the leader is alive with the recorded identity ⇒ the group's live members are listed and
+    accepted only while a process already proven ours (the leader first) still holds the group
+    id after the listing; each accepted member is signalled through a pidfd that pins it
+    (SIGTERM, 2 s, then SIGKILL until none is left);
+  - no leader ⇒ gone if no process is left in the group; otherwise **unresolved** (the members can
+    no longer be proven ours; nothing is signalled).
+
+  Unresolved also covers unreadable `/proc` state, a host without `/proc` (non-Linux), a row with
+  no recorded identity, and members that outlive SIGKILL. An unresolved group keeps its journal
+  entry: the invocation is not run again, its directory and hook rows are kept (even once the job
+  is terminal), and the job stays awarded for the next re-drive, lapsing at its deadline like any
+  stale award. `hook_runs` refuses a new attempt while a group is journaled. A resolved group's
+  entry is cleared and the re-drive gets `attempt` n+1.
 
 ### 5.2 `ping`
 
@@ -412,7 +438,9 @@ as its only cleanup.
   the seller and can read the home anyway; the skill page says to run the agent as another user
   if that matters.
 - The directory is removed when the job reaches a terminal state (delivered and not a session,
-  failed) or when the session ends. A restart removes the directory of any job it finds terminal.
+  failed, on whichever path failed it) or when the session ends. A restart removes the directory of
+  any job it finds terminal. The directory goes first and the job's hook rows only once it is gone:
+  the rows are how a restart finds a directory that a crash or a failed removal left behind.
   The input cache keeps today's lifetime.
 
 ---
@@ -428,7 +456,11 @@ returns before the container branch (`run.rs:9708 @4caf510`). Steps:
 4. Stored creq read, as today.
 5. Inputs (§6).
 6. **Staged outcome check** (§7.1): if an outcome for this invocation is already journaled, skip
-   to step 8 with it.
+   to step 8 with it. This happens after the review, resume and delivery gates and BEFORE the pin
+   is resolved against the live roster: a staged answer is delivered even if the hook was edited or
+   removed since the claim (its metadata names the pinned label, and states a model only while that
+   exact entry is still configured). Only a new execution faces the pin check. A staged row that
+   cannot be read defers the job; it is never taken as absent.
 7. Run the hook (§5) on a blocking task; map the result (§5.1 table). A deliverable outcome is
    journaled (§7.1) BEFORE anything is signed or bound.
 8. Deliver through `deliver_inline` (`run.rs:11027 @4caf510`) with the journaled answer.
@@ -531,11 +563,14 @@ session lookup. For a `hook` record it skips the holder gate and calls `run_hook
   restores it, with the roster's backoff and strike history. There is no lockout: like an `Acp`
   entry, a hook that keeps failing jobs keeps being re-probed on the growing backoff.
 - **Races.** A ping result is applied only if the entry's state has not changed since the ping
-  started (the roster already counts transitions, `seller_roster.rs:320 @4caf510`); a stale
-  "healthy" never restores an entry that a later job struck, and a stale failure never strikes a
-  restored one. An awarded job pinned to a currently dropped hook still runs: the award is
-  committed, and the run itself is the best test.
-- No new timer, no new counter.
+  started: each roster entry carries a revision bumped by every drop and restore, and an interval
+  failure is counted and applied (in the same locked step as the check) only at the revision the
+  ping started at, so a stale failure never strikes a restored entry and an interval streak never
+  crosses a drop or restore. A stale "healthy" never restores an entry that a later job struck.
+  (A failed `restore` ping faults the entry as a failed `Acp` re-probe does.) An awarded job
+  pinned to a currently dropped hook still runs: the award is committed, and the run itself is
+  the best test.
+- No new timer.
 
 ---
 
