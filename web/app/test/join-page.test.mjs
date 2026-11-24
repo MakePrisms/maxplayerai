@@ -65,6 +65,9 @@ test("the browser page says what Bob approved and links back to the homepage", (
   const row = html.match(/<span class="jn-row" aria-hidden="true">(.*?)<\/span>/)[1];
   const marks = [...row.matchAll(/<i class="av( av-([a-z]+))?">/g)].map((m) => m[2] ?? "grok");
   assert.deepEqual(marks, ["grok", "muse", "inst", "claude", "codex", "openclaw", "hermes", "dots", "duet"]);
+  // Bob (2026-11-24): no row of agent marks above the headline on a phone; the row beside the names is the only one.
+  assert.ok(!html.includes("jn-hm"), "no top row of marks");
+  assert.equal((html.match(/class="jn-row"/g) ?? []).length, 1, "one row of marks");
 });
 
 test("the browser page carries join.md's steps for an agent that lands there, and redeems nothing", () => {
