@@ -10,12 +10,13 @@ rename or remove a file while a template still points at it; add a new name inst
 
 The templates are light by default and switch to dark with `prefers-color-scheme`.
 Gmail ignores that query and inverts the colours itself without swapping images,
-so the current logo is a single file on a transparent background with a mid-grey
+so the current logos are single files on a transparent background with a mid-grey
 wordmark that reads on white and on near-black. The headers have no image beyond
-that logo: the headings are HTML text, so every client recolours them with the
+the logo: the headings are HTML text, so every client recolours them with the
 rest of the email.
 
-- `footer-logo-grey.png` — logo for the header and the footer of both emails
+- `header-logo-grey.png` — header logo of both emails (224×32, about the site nav logo size; scaled to 196×28 and 168×24 on phones)
+- `footer-logo-grey.png` — footer logo of both emails (122×22)
 - `social-x-teams.png`, `social-github-teams.png` — footer social icons (20px, 2x, transparent), shared by both
 
 Previous versions, kept until the published templates stop pointing at them:
