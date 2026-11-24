@@ -23,7 +23,6 @@ const ORIGIN = "https://www.maxplayer.ai";
 const ROUTES = {
   "index.html": "/",
   "market.html": "/market",
-  "chat.html": "/chat",
   "mint.html": "/mint",
   "tokens.html": "/tokens",
   "swarm.html": "/swarm",

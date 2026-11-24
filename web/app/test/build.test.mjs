@@ -100,7 +100,7 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "terms-20261123.html", "privacy-20261123.html"]) {
+  for (const page of ["index.html", "market.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "terms-20261123.html", "privacy-20261123.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     const script = page === "tokens.html" ? "tokens.js" : page === "swarm.html" ? "swarm.js" : "terminal.js";
     for (const asset of NEW_PAGES[page] ?? (LEGAL.test(page) ? LEGAL_ASSETS : page === "swarm.html" ? SWARM_ASSETS : ["styles.css", "fonts.css", script])) {
@@ -278,7 +278,7 @@ test("all site pages share navigation and footer links, with a current page and 
   };
   // bob (2026-11-20): the top nav is Teams and Market, on every page. Buy and Sell are sections of Market.
   // The pages that keep the earlier look.
-  const pages = ["chat.html", "mint.html", "tokens.html"];
+  const pages = ["mint.html", "tokens.html"];
   let expectedNav;
   let expectedFooter;
   for (const page of pages) {
@@ -355,9 +355,13 @@ test("/swarm is no longer a Lab page: no Lab mark or experimental note over the 
   assert.match(html, /<h1 id="top-h">Level up with swarms<\/h1>\s*<p class="lede">Agents working together to solve the hardest problems\.<\/p>/);
 });
 
-test("/chat carries the /tokens experimental notice under the nav", () => {
-  const chat = readFileSync(join(root, "dist", "chat.html"), "utf8");
-  assert.match(chat, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/, "experimental strip under the nav, like /tokens");
+// bob (2026-11-24): Teams replaced peer chat. /chat is gone and its old address lands on the Teams homepage.
+test("/chat is gone and its address redirects to the Teams homepage", () => {
+  assert.ok(!existsSync(join(root, "public", "chat.html")) && !existsSync(join(root, "dist", "chat.html")), "no chat page ships");
+  const { redirects = [] } = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
+  for (const source of ["/chat", "/chat.html"]) {
+    assert.ok(redirects.some((r) => r.source === source && r.destination === "/"), `${source} redirects to /`);
+  }
 });
 
 test("/tokens ships its own read-only bundle and is linked from the footer", () => {
@@ -384,7 +388,7 @@ test("/tokens ships its own read-only bundle and is linked from the footer", () 
   assert.ok(tokens.indexOf('id="trade-detail"') > tokens.indexOf("</footer>"), "the popup lives outside the page flow");
   // bob: linked from the footer (asserted with the shared chrome); the page
   // carries the experimental notice right under the nav, like /chat and /mint.
-  assert.match(tokens, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/);
+  assert.match(tokens, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Early preview<\/span>/);
   // Agent-facing docs stay about the jobs market.
   for (const page of ["llms.txt", "skill.md"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
@@ -427,7 +431,7 @@ test("/mint explains the seller mint with the shared page layout", () => {
   for (const cmd of ["maxplayer-mint init", "maxplayer-mint serve", "maxplayer-mint issue 1000", "maxplayer wallet mints add nostr://"]) {
     assert.ok(mint.includes(cmd), `shows ${cmd}`);
   }
-  assert.match(mint, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/, "experimental strip under the nav, like /tokens");
+  assert.match(mint, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Early preview<\/span>/, "early-preview strip under the nav, like /tokens");
   assert.match(mint, /Are my tokens bitcoin\?<\/summary><p>No\./, "seller tokens are distinguished from bitcoin");
   assert.doesNotMatch(mint, /stopped backups|separate trading home/i, "backups are automatic; trading uses the same home");
   const skill = readFileSync(join(root, "dist", ".well-known", "skills", "mint-and-trade", "skill.md"), "utf8");
@@ -476,7 +480,7 @@ test("FAQ sections pin their heading so opening an answer never moves it", () =>
   const js = readFileSync(join(root, "dist", "terminal.js"), "utf8");
   assert.ok(js.includes("faq-pinned") && js.includes("--faq-lift"), "the shared bundle pins FAQs");
   // The pages in the earlier look that have an FAQ. (/ and /market have their own, in a grid that cannot move the heading.)
-  for (const page of ["chat.html", "mint.html"]) {
+  for (const page of ["mint.html"]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
     assert.match(html, /class="h-section h-faq[" ]/, `${page} has an FAQ`);
     assert.match(html, /src="\.\/terminal\.js/, `${page} loads the bundle that pins it`);
@@ -491,7 +495,7 @@ test("swarm page stays noindexed, linked from the nav and footer, and isolated f
   assert.ok(!html.includes("terminal.js"));
   // bob (2026-11-21): Swarm is in every top nav and footer; those two links are the only places the other pages name
   // the route.
-  for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html"]) {
+  for (const page of ["index.html", "market.html", "mint.html", "tokens.html"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
     assert.equal([...text.matchAll(/\/swarm\b/g)].length, 2, `${page} names /swarm twice: nav and footer`);
     assert.ok(!text.includes("/challenges"), `${page} no longer links the old /challenges route`);
@@ -511,7 +515,7 @@ test("the community page builds at /swarm, every page links it there, and /chall
   for (const old of ["challenges.html", "challenges.js", "challenges.css"]) {
     assert.ok(!existsSync(join(root, "dist", old)), `dist/${old} is gone`);
   }
-  for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html"]) {
+  for (const page of ["index.html", "market.html", "mint.html", "tokens.html", "swarm.html"]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
     // bob (2026-11-21): Swarm is in the top nav and the footer (on /swarm itself the nav tab is the current page).
     const swarmLinks = [...html.matchAll(/<a href="([^"]*)"[^>]*>Swarm<\/a>/g)].map((m) => m[1]);
@@ -629,7 +633,7 @@ test("terms, privacy and fees are dated static pages, linked from every footer",
   const terms = readFileSync(join(root, "dist", "terms-20261123.html"), "utf8");
   assert.ok(terms.includes('<a href="/fees">Fee Schedule</a>') && terms.includes('<a href="/privacy">Privacy Policy</a>'), "terms link /fees and /privacy");
   assert.ok(readFileSync(join(root, "dist", "privacy-20261123.html"), "utf8").includes('<a href="/terms">Terms of Service</a>'), "privacy links /terms");
-  for (const page of ["index.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html"]) {
+  for (const page of ["index.html", "mint.html", "market.html", "tokens.html", "swarm.html"]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
     assert.ok(html.includes('<a href="/terms">Terms</a>') && html.includes('<a href="/privacy">Privacy</a>'), `${page} links both`);
   }

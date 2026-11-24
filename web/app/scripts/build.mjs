@@ -31,7 +31,7 @@ const watch = process.argv.includes("--watch");
 // Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date; older dates stay live at their URLs.
 // Stylesheets of the pages in the new look (/, /market and the legal pages). The other pages use styles.css.
 const SITE_CSS = ["site.css", "market.css", "nojs.css", "legal.css", "join.css"];
-const PAGES = ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "terms-20261123.html", "privacy-20261123.html", "skill-preview.html", "join-preview.html", "join-invite.html"];
+const PAGES = ["index.html", "market.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "terms-20261123.html", "privacy-20261123.html", "skill-preview.html", "join-preview.html", "join-invite.html"];
 
 const options = {
   // teams.js serves / and market.js serves /market (the two pages in the new look).
@@ -97,7 +97,7 @@ if (watch) {
     );
   }
   // Every page: the Teams homepage (/), the
-  // market (/market), the chat page (/chat), the mint page (/mint), the token-trade page (/tokens) and the swarms (/swarm and /swarm/<naddr>) — cleanUrls serves them.
+  // market (/market), the mint page (/mint), the token-trade page (/tokens) and the swarms (/swarm and /swarm/<naddr>) — cleanUrls serves them.
   for (const page of PAGES) {
     writeFileSync(
       join(dist, page),
