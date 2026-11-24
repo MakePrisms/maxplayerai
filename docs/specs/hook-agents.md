@@ -353,9 +353,10 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
 - A hook that wants a long-lived worker must start it outside its own process group, with its
   stdout pointed elsewhere (that is the adapter's business, e.g. the channel adapter's `serve`, started by Claude Code, not by us).
 - Environment: the daemon's environment with every `MAXPLAYER_*` variable removed (config
-  overrides may carry credentials), plus `MAXPLAYER_HOOK_V=1`, which is added to the reserved
-  env names (`core/home.rs:2438 @4caf510`) so a `maxplayer` command run by the agent does not
-  refuse it. `MAXPLAYER_HOME` is removed too: an agent that runs `maxplayer` uses its own home.
+  overrides may carry credentials), plus `MAXPLAYER_HOOK_V=1` and, on a `job` call,
+  `MAXPLAYER_HOOK_RUN=<invocation>/<attempt>` (the crash-recovery tag below). Both are reserved
+  env names (`RESERVED_ENV_VARS` in `core/home.rs`) so a `maxplayer` command run by the agent
+  does not refuse them. `MAXPLAYER_HOME` is removed too: an agent that runs `maxplayer` uses its own home.
   The hook is the seller's own program running as the seller.
 - An unknown event: exit code 64 means "unsupported" and is never a strike, so new events can be
   added without breaking old adapters.
@@ -368,9 +369,11 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
 - **Crash idempotency.** A `job` call is spawned behind a gate (`/bin/sh -c 'IFS= read -r go &&
   [ "$go" = go ] && exec "$@"'`): the gate already has its own process group but waits for one
   `go` line on stdin. The order is: write the attempt row (`hook_runs`, attempt n+1) → spawn the
-  gate → journal its pid (= group id) and the leader's identity (`<boot id>/<start time>`: the
-  boot id from `/proc/sys/kernel/random/boot_id`, the start time from `/proc/<pid>/stat` field 22)
-  → write `go` (under the shutdown lock, only before the cutoff: a journal write that ends at or
+  gate (its environment carries `MAXPLAYER_HOOK_RUN=<invocation>/<attempt>`, which every process
+  the hook starts inherits) → journal its pid (= group id) and the leader's identity
+  (`<boot id>/<start time>`: on Linux the boot id from `/proc/sys/kernel/random/boot_id` and the
+  start time from `/proc/<pid>/stat` field 22; on macOS `kern.bootsessionuuid` and the
+  `proc_pidinfo` start time) → write `go` (under the shutdown lock, only before the cutoff: a journal write that ends at or
   after it kills the gated group, out of time, no strike) and then the event. If the daemon dies
   before the journal write, its end of stdin closes, `read` fails and the gate exits without ever
   running the hook. So either the hook never ran or its group is on disk.
@@ -382,12 +385,16 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
   - the leader is alive with the recorded identity ⇒ the group's live members are listed and
     accepted only while a process already proven ours (the leader first) still holds the group
     id after the listing; each accepted member is signalled through a pidfd that pins it
-    (SIGTERM, 2 s, then SIGKILL until none is left);
-  - no leader ⇒ gone if no process is left in the group; otherwise **unresolved** (the members can
-    no longer be proven ours; nothing is signalled).
+    (SIGTERM, 2 s, then SIGKILL until none is left). macOS has no pidfd: each member's identity
+    is checked immediately before `kill`;
+  - no leader (or no recorded identity) ⇒ gone if no process is left in the group; otherwise a
+    member whose environment carries this call's `MAXPLAYER_HOOK_RUN` (read after the listing,
+    and still the same process afterwards) proves the group ours, and the group is stopped as
+    above. With no such member (a hook that cleared its environment, another attempt's tag, or a
+    group from before the tag) it is **unresolved**: nothing is signalled and the job waits.
 
-  Unresolved also covers unreadable `/proc` state, a host without `/proc` (non-Linux), a row with
-  no recorded identity, and members that outlive SIGKILL. An unresolved group keeps its journal
+  Unresolved also covers unreadable process state, a host other than Linux or macOS, a row with
+  neither a recorded identity nor a tagged member, and members that outlive SIGKILL. An unresolved group keeps its journal
   entry: the invocation is not run again, its directory and hook rows are kept (even once the job
   is terminal), and the job stays awarded for the next re-drive, lapsing at its deadline like any
   stale award. `hook_runs` refuses a new attempt while a group is journaled. A resolved group's
@@ -627,7 +634,8 @@ Tests (each red on revert of its piece):
   unknown status, stdout > 1 MiB ⇒ `execution_failed` + strike; a hook that never reads stdin and
   writes 1 MiB to stderr does not wedge; deadline ⇒ group killed including a grandchild, no
   strike; cutoff already past ⇒ never spawned; stdin carries the task verbatim and the
-  `invocation`; no `MAXPLAYER_*` in the hook's environment except `MAXPLAYER_HOOK_V`.
+  `invocation`; no `MAXPLAYER_*` in the hook's environment except `MAXPLAYER_HOOK_V` and the
+  `job` call's `MAXPLAYER_HOOK_RUN`.
 - Budget probe `Ok(false)` / `Err` ⇒ `delivery_failed`, hook never spawned, no strike.
 - Staged outcome: a crash after the outcome row and before the result journal re-delivers the
   same bytes and does not run the hook again.

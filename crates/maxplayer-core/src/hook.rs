@@ -23,8 +23,20 @@ use std::time::{Duration, Instant};
 
 /// The contract version written as `"v"` on every event and as `MAXPLAYER_HOOK_V` in the env.
 pub const HOOK_CONTRACT_VERSION: u32 = 1;
-/// The one `MAXPLAYER_*` variable a hook sees.
+/// The `MAXPLAYER_*` variable every hook call sees.
 pub const HOOK_VERSION_ENV: &str = "MAXPLAYER_HOOK_V";
+/// The tag a `job` call carries in its environment: `<invocation>/<attempt>` ([`run_tag`]). Every
+/// process the hook starts inherits it, so a later daemon can recognise the call's leftover
+/// processes after a crash, even once the leader is gone (§5.1).
+pub const HOOK_RUN_ENV: &str = "MAXPLAYER_HOOK_RUN";
+
+/// The [`HOOK_RUN_ENV`] value of one `job` call.
+pub fn run_tag(invocation: &str, attempt: u32) -> String {
+    format!("{invocation}/{attempt}")
+}
+
+/// Whether this host can inspect processes well enough to verify a stale hook group (§5.1).
+const STALE_REAP_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 /// Stdout ceiling: more than this is a contract violation, and the hook is killed on the overflow.
 pub const STDOUT_MAX_BYTES: usize = 1024 * 1024;
 /// Stderr is kept only as its last this-many bytes, for the seller log.
@@ -350,7 +362,7 @@ enum StdoutMode {
 /// child gets the daemon's environment minus every `MAXPLAYER_*` variable, plus
 /// [`HOOK_VERSION_ENV`].
 pub fn run(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunReport {
-    supervise(&SUPERVISION, argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, None)
+    supervise(&SUPERVISION, argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, None, None)
 }
 
 /// A started hook group's identity, journaled BEFORE the hook is allowed to run (§5.1).
@@ -373,14 +385,16 @@ const GATE_GO: &[u8] = b"go\n";
 /// behind a gate, `journal` records its group identity, and only after `journal` returns `Ok` is
 /// the gate released. So either the hook never ran, or its group is on disk for the next boot to
 /// reap. A `journal` error kills the gated group (the hook never ran) and reports `SpawnFailed`.
+/// `tag` ([`run_tag`]) is set as [`HOOK_RUN_ENV`] in the hook's environment.
 pub fn run_gated(
     argv: &[String],
     stdin: &[u8],
     cwd: &Path,
     cutoff: Instant,
+    tag: &str,
     journal: &mut dyn FnMut(&Started) -> Result<(), String>,
 ) -> RunReport {
-    run_gated_in(&SUPERVISION, argv, stdin, cwd, cutoff, journal)
+    run_gated_in(&SUPERVISION, argv, stdin, cwd, cutoff, tag, journal)
 }
 
 fn run_gated_in(
@@ -389,21 +403,22 @@ fn run_gated_in(
     stdin: &[u8],
     cwd: &Path,
     cutoff: Instant,
+    tag: &str,
     journal: &mut dyn FnMut(&Started) -> Result<(), String>,
 ) -> RunReport {
     if argv.is_empty() {
-        return supervise(supervision, argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, None);
+        return supervise(supervision, argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, Some(tag), None);
     }
     let mut gated: Vec<String> =
         vec!["/bin/sh".into(), "-c".into(), GATE_SCRIPT.into(), "maxplayer-hook-gate".into()];
     gated.extend(argv.iter().cloned());
     // `go` is written by the supervisor itself, under the shutdown lock, once the group is journaled.
-    supervise(supervision, &gated, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, Some(journal))
+    supervise(supervision, &gated, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, Some(tag), Some(journal))
 }
 
 /// [`run`] for a control event: the same supervision, with stdout discarded (§5.2: ignored).
 pub fn run_control(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunReport {
-    supervise(&SUPERVISION, argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Discard, None)
+    supervise(&SUPERVISION, argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Discard, None, None)
 }
 
 /// [`run`] with the parent environment passed in, so the scrub is testable without mutating the
@@ -415,7 +430,7 @@ pub fn run_with_env(
     cutoff: Instant,
     parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> RunReport {
-    supervise(&SUPERVISION, argv, stdin, cwd, cutoff, parent_env, StdoutMode::Keep, None)
+    supervise(&SUPERVISION, argv, stdin, cwd, cutoff, parent_env, StdoutMode::Keep, None, None)
 }
 
 /// The one supervisor. Single-threaded on purpose: all three pipes are non-blocking and pumped
@@ -449,6 +464,7 @@ fn supervise(
     cutoff: Instant,
     parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     mode: StdoutMode,
+    tag: Option<&str>,
     journal: Option<&mut dyn FnMut(&Started) -> Result<(), String>>,
 ) -> RunReport {
     let started = Instant::now();
@@ -479,6 +495,9 @@ fn supervise(
         }
     }
     command.env(HOOK_VERSION_ENV, HOOK_CONTRACT_VERSION.to_string());
+    if let Some(tag) = tag {
+        command.env(HOOK_RUN_ENV, tag);
+    }
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
@@ -773,9 +792,9 @@ fn terminate_group(supervision: &Supervision, pgid: u32, child: &mut std::proces
     let _ = child.wait();
 }
 
-/// Whether a live (non-zombie) process is still in `pgid`. Linux only; elsewhere `false`.
+/// Whether a live (non-zombie) process is still in `pgid`. Linux and macOS; elsewhere `false`.
 fn group_has_live_members(pgid: u32) -> bool {
-    cfg!(target_os = "linux") && live_group_members(pgid).map(|members| !members.is_empty()).unwrap_or(false)
+    STALE_REAP_SUPPORTED && live_group_members(pgid).map(|members| !members.is_empty()).unwrap_or(false)
 }
 
 /// The hook groups this process supervises, and whether daemon shutdown has latched (§5.1). One
@@ -842,11 +861,12 @@ fn terminate_all_in(supervision: &Supervision) {
     settled(Instant::now() + SHUTDOWN_SETTLE);
 }
 
-/// What `/proc` says about a pid right now (Linux).
+/// What the OS says about a pid right now (Linux: `/proc`; macOS: `proc_pidinfo`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProcState {
-    /// A process has this pid: its start time (`stat` field 22), its process group, and whether it
-    /// is a zombie (exited, not yet reaped: it still holds its pid and keeps its group id reserved).
+    /// A process has this pid: its start time (Linux: `stat` field 22; macOS: `sec.usec`), its
+    /// process group, and whether it is a zombie (exited, not yet reaped: it still holds its pid and
+    /// keeps its group id reserved).
     Present { start: String, pgrp: u32, zombie: bool },
     /// No process has this pid.
     Absent,
@@ -854,38 +874,9 @@ enum ProcState {
     Unreadable(String),
 }
 
-fn proc_state(pid: u32) -> ProcState {
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => return ProcState::Absent,
-        Err(error) => return ProcState::Unreadable(error.to_string()),
-    };
-    // `comm` (field 2) is parenthesised and may contain spaces: count from the LAST ')'.
-    let Some(close) = stat.rfind(')') else {
-        return ProcState::Unreadable("malformed stat".into());
-    };
-    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-    // After `comm`: [0] state (field 3), [2] pgrp (field 5), [19] starttime (field 22).
-    match (fields.first(), fields.get(2).and_then(|pgrp| pgrp.parse::<u32>().ok()), fields.get(19)) {
-        (Some(state), Some(pgrp), Some(start)) => ProcState::Present {
-            start: (*start).to_owned(),
-            pgrp,
-            zombie: matches!(*state, "Z" | "X" | "x"),
-        },
-        _ => ProcState::Unreadable("malformed stat".into()),
-    }
-}
-
-/// This boot's id (Linux): start times count from boot, so they identify a process only within one.
-fn boot_id() -> Option<String> {
-    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-    let id = id.trim();
-    (!id.is_empty()).then(|| id.to_owned())
-}
-
 /// A process's identity as a later daemon can check it: `<boot id>/<start time>`, so neither a
-/// recycled pid (another start time) nor a reboot (another boot id) can pass for it. Linux only;
-/// `None` elsewhere, or when it cannot be read.
+/// recycled pid (another start time) nor a reboot (another boot id) can pass for it. Linux and
+/// macOS; `None` elsewhere, or when it cannot be read.
 pub fn process_identity(pid: u32) -> Option<String> {
     let boot = boot_id()?;
     match proc_state(pid) {
@@ -912,54 +903,53 @@ pub enum StaleReap {
 const STALE_KILL_SETTLE: Duration = Duration::from_secs(2);
 
 /// Stop a hook group a previous daemon journaled (§5.1), never signalling a process that is not
-/// provably ours:
+/// provably ours. `recorded` is the leader's [`process_identity`]; `tag` the call's [`run_tag`].
 /// - another boot id ⇒ the reboot ended it: [`StaleReap::Gone`];
 /// - the leader pid names a process with another start time ⇒ the pid was recycled, which the
 ///   kernel does only once no process of our group is left: [`StaleReap::Gone`];
-/// - no leader and no process in its group ⇒ [`StaleReap::Gone`]; no leader but processes left in
-///   the group ⇒ they can no longer be proven ours: [`StaleReap::Unresolved`], nothing signalled;
-/// - the leader is ours ⇒ every live member is signalled ONE BY ONE through a pidfd that pins it
-///   (no numeric group signal), SIGTERM, the grace, then SIGKILL until none is left.
+/// - the leader is ours (start time matches) ⇒ the group is ours;
+/// - otherwise (leader gone, or no identity recorded) a process in the group that carries `tag`
+///   in its environment ([`HOOK_RUN_ENV`]) proves the group ours; with no process left in the
+///   group it is [`StaleReap::Gone`], and with processes left but none tagged (a hook that cleared
+///   its environment, or a run from before the tag) it is [`StaleReap::Unresolved`]: nothing is
+///   signalled and the job waits.
 ///
-/// Membership is accepted only while a process already proven ours still exists after the listing
-/// (it keeps the group id from being reused), so a member listed in between belongs to OUR group.
-/// Unreadable state, a host without `/proc`, or members that outlive SIGKILL are `Unresolved`.
-pub fn reap_stale_group(pgid: u32, recorded: Option<&str>) -> StaleReap {
+/// A group proven ours has every live member signalled one by one (pinned by a pidfd on Linux; no
+/// numeric group signal): SIGTERM, the grace, then SIGKILL until none is left. Membership is
+/// accepted only while a process already proven ours still exists after the listing (it keeps the
+/// group id from being reused), so a member listed in between belongs to OUR group. Unreadable
+/// state, an unsupported host, or members that outlive SIGKILL are `Unresolved`.
+pub fn reap_stale_group(pgid: u32, recorded: Option<&str>, tag: Option<&str>) -> StaleReap {
     use StaleReap::Unresolved;
-    if !cfg!(target_os = "linux") {
-        return Unresolved("this host has no /proc to verify a process group with".into());
+    if !STALE_REAP_SUPPORTED {
+        return Unresolved("this host has no process table to verify a process group with".into());
     }
-    let Some(recorded) = recorded else {
-        return Unresolved("no process identity was recorded for it".into());
-    };
-    let Some((boot, start)) = recorded.split_once('/') else {
-        return Unresolved(format!("unrecognised identity record {recorded:?}"));
-    };
-    let Some(boot_now) = boot_id() else {
-        return Unresolved("the boot id is unreadable".into());
-    };
-    if boot_now != boot {
-        return StaleReap::Gone;
-    }
-    match proc_state(pgid) {
-        ProcState::Present { start: now, .. } if now != start => return StaleReap::Gone,
-        ProcState::Present { .. } => {}
-        ProcState::Unreadable(error) => return Unresolved(format!("its leader is unreadable: {error}")),
-        ProcState::Absent => {
-            return match live_group_members(pgid) {
-                Ok(members) if members.is_empty() => StaleReap::Gone,
-                Ok(members) => Unresolved(format!(
-                    "its leader has exited but {} process(es) remain in group {pgid}; they cannot be proven to be ours, so none was signalled",
-                    members.len()
-                )),
-                Err(error) => Unresolved(error),
+    let mut anchors = Vec::new();
+    match recorded {
+        Some(recorded) => {
+            let Some((boot, start)) = recorded.split_once('/') else {
+                return Unresolved(format!("unrecognised identity record {recorded:?}"));
             };
+            let Some(boot_now) = boot_id() else {
+                return Unresolved("the boot id is unreadable".into());
+            };
+            if boot_now != boot {
+                return StaleReap::Gone;
+            }
+            match proc_state(pgid) {
+                ProcState::Present { start: now, .. } if now != start => return StaleReap::Gone,
+                ProcState::Present { .. } => anchors.push((pgid, start.to_owned())),
+                ProcState::Unreadable(error) => return Unresolved(format!("its leader is unreadable: {error}")),
+                ProcState::Absent => {}
+            }
         }
+        None if tag.is_none() => return Unresolved("no process identity was recorded for it".into()),
+        None => {}
     }
-    let mut anchors = vec![(pgid, start.to_owned())];
     let term_until = Instant::now() + KILL_GRACE;
     let kill_until = term_until + STALE_KILL_SETTLE;
     let mut termed = false;
+    let mut signalled = false;
     loop {
         let killing = Instant::now() >= term_until;
         let signal = if killing {
@@ -969,13 +959,20 @@ pub fn reap_stale_group(pgid: u32, recorded: Option<&str>) -> StaleReap {
         } else {
             Some(SIGTERM)
         };
-        termed = true;
-        match sweep_verified_group(pgid, &mut anchors, signal) {
-            Ok(Sweep::Empty) => return StaleReap::Killed,
-            Ok(Sweep::Live) => {}
-            Ok(Sweep::Unanchored(left)) => {
+        match sweep_verified_group(pgid, &mut anchors, tag, signal) {
+            Ok(Sweep::Empty) => return if signalled { StaleReap::Killed } else { StaleReap::Gone },
+            Ok(Sweep::Live) => {
+                termed = true;
+                signalled |= signal.is_some();
+            }
+            Ok(Sweep::Unanchored(left)) if signalled => {
                 return Unresolved(format!(
                     "{left} process(es) remain in group {pgid} but none of ours is left to prove they are ours"
+                ));
+            }
+            Ok(Sweep::Unanchored(left)) => {
+                return Unresolved(format!(
+                    "{left} process(es) remain in group {pgid} but its leader is gone and none carries this run's {HOOK_RUN_ENV} tag, so none can be proven ours or was signalled"
                 ));
             }
             Err(error) => return Unresolved(error),
@@ -993,14 +990,20 @@ enum Sweep {
     Empty,
     /// Live members remain; all were proven ours (and signalled, if asked).
     Live,
-    /// Live members remain but no process already proven ours still exists: nothing signalled.
+    /// Live members remain but no process proven ours still exists: nothing signalled.
     Unanchored(usize),
 }
 
 /// List the live members of `pgid`, then accept them only if one of `anchors` (processes already
-/// proven ours, the leader first) still exists in the group afterwards. Accepted members become
-/// anchors and, with `signal`, are each signalled through a pinned pidfd.
-fn sweep_verified_group(pgid: u32, anchors: &mut Vec<(u32, String)>, signal: Option<i32>) -> Result<Sweep, String> {
+/// proven ours, the leader first) still exists in the group afterwards. With no anchor left, a
+/// member that carries `tag` (read AFTER the listing, and still the same process afterwards)
+/// becomes one. Accepted members become anchors and, with `signal`, are each signalled.
+fn sweep_verified_group(
+    pgid: u32,
+    anchors: &mut Vec<(u32, String)>,
+    tag: Option<&str>,
+    signal: Option<i32>,
+) -> Result<Sweep, String> {
     let members = live_group_members(pgid)?;
     let mut still = Vec::with_capacity(anchors.len());
     for (pid, start) in anchors.drain(..) {
@@ -1017,7 +1020,25 @@ fn sweep_verified_group(pgid: u32, anchors: &mut Vec<(u32, String)>, signal: Opt
         return Ok(Sweep::Empty);
     }
     if anchors.is_empty() {
-        return Ok(Sweep::Unanchored(members.len()));
+        if let Some(tag) = tag {
+            for (pid, start) in &members {
+                if process_tag(*pid).as_deref() != Some(tag) {
+                    continue;
+                }
+                // Still the process that was listed (same start time, same group) after its tag
+                // was read: the tag is its own, and the group id was not reused in between.
+                match proc_state(*pid) {
+                    ProcState::Present { start: now, pgrp, .. } if now == *start && pgrp == pgid => {
+                        anchors.push((*pid, start.clone()));
+                    }
+                    ProcState::Unreadable(error) => return Err(format!("process {pid}: {error}")),
+                    _ => {}
+                }
+            }
+        }
+        if anchors.is_empty() {
+            return Ok(Sweep::Unanchored(members.len()));
+        }
     }
     for (pid, start) in &members {
         if !anchors.iter().any(|(p, s)| p == pid && s == start) {
@@ -1030,8 +1051,58 @@ fn sweep_verified_group(pgid: u32, anchors: &mut Vec<(u32, String)>, signal: Opt
     Ok(Sweep::Live)
 }
 
+/// The [`HOOK_RUN_ENV`] value among `entries` (an environment block's `NAME=value` entries).
+fn tag_in_environ<'a>(entries: impl IntoIterator<Item = &'a [u8]>) -> Option<String> {
+    let prefix = format!("{HOOK_RUN_ENV}=");
+    entries
+        .into_iter()
+        .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .map(str::to_owned)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_state(pid: u32) -> ProcState {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => return ProcState::Absent,
+        Err(error) => return ProcState::Unreadable(error.to_string()),
+    };
+    // `comm` (field 2) is parenthesised and may contain spaces: count from the LAST ')'.
+    let Some(close) = stat.rfind(')') else {
+        return ProcState::Unreadable("malformed stat".into());
+    };
+    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    // After `comm`: [0] state (field 3), [2] pgrp (field 5), [19] starttime (field 22).
+    match (fields.first(), fields.get(2).and_then(|pgrp| pgrp.parse::<u32>().ok()), fields.get(19)) {
+        (Some(state), Some(pgrp), Some(start)) => ProcState::Present {
+            start: (*start).to_owned(),
+            pgrp,
+            zombie: matches!(*state, "Z" | "X" | "x"),
+        },
+        _ => ProcState::Unreadable("malformed stat".into()),
+    }
+}
+
+/// This boot's id (Linux): start times count from boot, so they identify a process only within one.
+#[cfg(target_os = "linux")]
+fn boot_id() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+/// `pid`'s [`HOOK_RUN_ENV`], from `/proc/<pid>/environ`. `None` when it has none, or when its
+/// environment cannot be read (it then proves nothing).
+#[cfg(target_os = "linux")]
+fn process_tag(pid: u32) -> Option<String> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    tag_in_environ(environ.split(|byte| *byte == 0))
+}
+
 /// The live (non-zombie) processes in group `pgid`, as `(pid, start)`. An unreadable process of
 /// this user might be a member, so it is an error; other users' processes are skipped.
+#[cfg(target_os = "linux")]
 fn live_group_members(pgid: u32) -> Result<Vec<(u32, String)>, String> {
     let mut members = Vec::new();
     let entries = std::fs::read_dir("/proc").map_err(|e| format!("/proc: {e}"))?;
@@ -1093,9 +1164,167 @@ fn signal_pinned(pid: u32, start: &str, pgid: u32, sig: i32) -> Result<bool, Str
     if error.raw_os_error() == Some(libc::ESRCH) { Ok(false) } else { Err(format!("pidfd_send_signal: {error}")) }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS `pbi_status` of a zombie (`SZOMB`, <sys/proc.h>).
+#[cfg(target_os = "macos")]
+const MACOS_SZOMB: u32 = 5;
+
+#[cfg(target_os = "macos")]
+fn proc_state(pid: u32) -> ProcState {
+    let Ok(raw_pid) = libc::c_int::try_from(pid) else {
+        return ProcState::Absent;
+    };
+    // SAFETY: proc_bsdinfo is plain old data; all-zero is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a proc_bsdinfo of exactly `size` bytes, owned by this frame.
+    let read = unsafe {
+        libc::proc_pidinfo(raw_pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
+    };
+    if read == size {
+        return ProcState::Present {
+            start: format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+            pgrp: info.pbi_pgid,
+            zombie: info.pbi_status == MACOS_SZOMB,
+        };
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        // proc_pidinfo does not report exited pids (zombies included): nothing live is there.
+        Some(libc::ESRCH) => ProcState::Absent,
+        _ if read > 0 => ProcState::Unreadable(format!("proc_pidinfo: short read ({read} of {size} bytes)")),
+        _ => ProcState::Unreadable(format!("proc_pidinfo: {error}")),
+    }
+}
+
+/// This boot's id (macOS `kern.bootsessionuuid`): start times identify a process only within one.
+#[cfg(target_os = "macos")]
+fn boot_id() -> Option<String> {
+    let mut buf = [0u8; 128];
+    let mut len = buf.len();
+    // SAFETY: a NUL-terminated name, a writable buffer and its length; no new value.
+    let rc = unsafe {
+        libc::sysctlbyname(c"kern.bootsessionuuid".as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc != 0 {
+        return None;
+    }
+    let id = std::str::from_utf8(buf.get(..len)?).ok()?.trim_end_matches('\0').trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+/// `pid`'s [`HOOK_RUN_ENV`], from `KERN_PROCARGS2`. `None` when it has none, or when its
+/// environment cannot be read (it then proves nothing).
+#[cfg(target_os = "macos")]
+fn process_tag(pid: u32) -> Option<String> {
+    let raw_pid = libc::c_int::try_from(pid).ok()?;
+    let mut argmax: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: a NUL-terminated name and a c_int-sized output buffer; no new value.
+    let rc = unsafe {
+        libc::sysctlbyname(c"kern.argmax".as_ptr(), (&mut argmax as *mut libc::c_int).cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc != 0 || argmax <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; usize::try_from(argmax).ok()?];
+    let mut size = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, raw_pid];
+    // SAFETY: a three-element MIB, a writable buffer of `size` bytes; no new value.
+    let rc = unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(size);
+    tag_in_environ(procargs2_environ(&buf)?)
+}
+
+/// The environment entries of a `KERN_PROCARGS2` buffer: `argc` (i32), the exec path, NUL padding,
+/// `argc` argument strings, then the environment strings up to an empty one.
+#[cfg(any(target_os = "macos", test))]
+fn procargs2_environ(buf: &[u8]) -> Option<Vec<&[u8]>> {
+    let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
+    let rest = buf.get(4..)?;
+    let path_end = rest.iter().position(|byte| *byte == 0)?;
+    let rest = &rest[path_end..];
+    let strings_start = rest.iter().position(|byte| *byte != 0)?;
+    let mut strings = rest[strings_start..].split(|byte| *byte == 0);
+    for _ in 0..argc {
+        strings.next()?;
+    }
+    Some(strings.take_while(|entry| !entry.is_empty()).collect())
+}
+
+/// The live (non-zombie) processes in group `pgid`, as `(pid, start)`.
+#[cfg(target_os = "macos")]
+fn live_group_members(pgid: u32) -> Result<Vec<(u32, String)>, String> {
+    let raw_pgid = libc::pid_t::try_from(pgid).map_err(|_| format!("group id {pgid} out of range"))?;
+    // Room for more than the group holds right now; a zero-filled slot is no pid (0 is never in a
+    // user group), so whether the count is in pids or bytes does not matter.
+    // SAFETY: a null buffer asks only for the size.
+    let estimate = unsafe { libc::proc_listpgrppids(raw_pgid, std::ptr::null_mut(), 0) };
+    let slots = usize::try_from(estimate).unwrap_or(0).max(64) * 2;
+    let mut pids = vec![0 as libc::pid_t; slots];
+    let bytes = libc::c_int::try_from(slots * std::mem::size_of::<libc::pid_t>()).map_err(|_| "too many pids".to_owned())?;
+    // SAFETY: the buffer holds exactly `bytes` bytes of pid_t slots, owned by this frame.
+    let rc = unsafe { libc::proc_listpgrppids(raw_pgid, pids.as_mut_ptr().cast(), bytes) };
+    if rc < 0 {
+        return Err(format!("proc_listpgrppids: {}", std::io::Error::last_os_error()));
+    }
+    let mut members = Vec::new();
+    for pid in pids.into_iter().filter_map(|pid| u32::try_from(pid).ok()).filter(|pid| *pid != 0) {
+        match proc_state(pid) {
+            ProcState::Present { start, pgrp, zombie } if pgrp == pgid && !zombie => members.push((pid, start)),
+            ProcState::Present { .. } | ProcState::Absent => {}
+            ProcState::Unreadable(error) => return Err(format!("process {pid}: {error}")),
+        }
+    }
+    Ok(members)
+}
+
+/// Send `sig` to `pid` only while it is still the process `(pid, start)` in group `pgid`. macOS has
+/// no pidfd: the identity is checked immediately before `kill`, leaving only the instant between
+/// the two for the pid to be recycled. `Ok(false)`: it was no longer there.
+#[cfg(target_os = "macos")]
+fn signal_pinned(pid: u32, start: &str, pgid: u32, sig: i32) -> Result<bool, String> {
+    let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+        return Ok(false);
+    };
+    match proc_state(pid) {
+        ProcState::Present { start: now, pgrp, .. } if now == start && pgrp == pgid => {}
+        ProcState::Unreadable(error) => return Err(format!("process {pid}: {error}")),
+        _ => return Ok(false),
+    }
+    // SAFETY: kill(2) takes two ints and touches no memory of ours.
+    if unsafe { libc::kill(raw_pid, sig) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) { Ok(false) } else { Err(format!("kill: {error}")) }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn proc_state(_pid: u32) -> ProcState {
+    ProcState::Unreadable("no process table on this host".into())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn boot_id() -> Option<String> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_tag(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn live_group_members(_pgid: u32) -> Result<Vec<(u32, String)>, String> {
+    Err("no process table on this host".into())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn signal_pinned(_pid: u32, _start: &str, _pgid: u32, _sig: i32) -> Result<bool, String> {
-    Err("no pidfd on this host".into())
+    Err("no way to signal a verified process on this host".into())
 }
 
 /// `kill(-pgid, sig)`, refusing the widening ids 0 and 1. Errors (ESRCH: the group is gone) are
@@ -1375,6 +1604,7 @@ mod tests {
             b"EVENT",
             dir.path(),
             Instant::now() + Duration::from_secs(10),
+            "t/1",
             &mut |started| {
                 journaled.push(started.clone());
                 Ok(())
@@ -1401,6 +1631,7 @@ mod tests {
             b"{}",
             dir.path(),
             Instant::now() + Duration::from_secs(10),
+            "t/1",
             &mut |_| Err("disk full".into()),
         );
         assert!(matches!(&report.exit, Exit::SpawnFailed(why) if why.contains("journal")), "{:?}", report.exit);
@@ -1441,40 +1672,50 @@ mod tests {
         let boot = boot_id().expect("boot id");
         // A recycled pid (same boot, another start time): never signalled.
         let mut other = spawn_group("sleep 30");
-        assert_eq!(reap_stale_group(other.id(), Some(&format!("{boot}/1"))), StaleReap::Gone);
+        assert_eq!(reap_stale_group(other.id(), Some(&format!("{boot}/1")), None), StaleReap::Gone);
         assert!(other.try_wait().expect("try_wait").is_none(), "an unverified group must be left alone");
         // Another boot: whatever runs under that pid now is not ours.
         let start = process_identity(other.id()).expect("identity");
         let (_, ticks) = start.split_once('/').expect("boot/start");
-        assert_eq!(reap_stale_group(other.id(), Some(&format!("not-this-boot/{ticks}"))), StaleReap::Gone);
+        assert_eq!(reap_stale_group(other.id(), Some(&format!("not-this-boot/{ticks}")), None), StaleReap::Gone);
         assert!(other.try_wait().expect("try_wait").is_none(), "a previous boot's record must not reach this boot's process");
         let _ = other.kill();
         let _ = other.wait();
         // No recorded identity: unresolved, left alone.
-        assert!(matches!(reap_stale_group(1, None), StaleReap::Unresolved(_)));
+        assert!(matches!(reap_stale_group(1, None, None), StaleReap::Unresolved(_)));
         // Our leader (identity matches): the whole group dies, a member that ignores SIGTERM included.
         let mut ours = spawn_group("(trap '' TERM; sleep 30) & sleep 30");
         let pgid = ours.id();
         let identity = process_identity(pgid).expect("identity");
         std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(reap_stale_group(pgid, Some(&identity)), StaleReap::Killed);
+        assert_eq!(reap_stale_group(pgid, Some(&identity), None), StaleReap::Killed);
         let status = ours.wait().expect("wait");
         assert!(status.code().is_none(), "killed by a signal: {status:?}");
         assert!(!group_alive(pgid), "Killed means nothing live is left in the group");
     }
 
-    /// codex r2 #1: once the leader is gone, a process still carrying the group id can no longer be
-    /// proven ours (the id could have been reused), so nothing is signalled and the reap is
-    /// unresolved; once the group is empty it is gone.
+    #[cfg(target_os = "linux")]
+    fn spawn_tagged_group(script: &str, tag: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        Command::new("sh").args(["-c", script]).env(HOOK_RUN_ENV, tag).process_group(0).spawn().expect("spawn")
+    }
+
+    /// codex r2 #1: once the leader is gone, a process still carrying the group id is proven ours
+    /// only by this run's tag. Without it (cleared, or another run's) nothing is signalled and the
+    /// reap is unresolved: the job waits; once the group is empty it is gone.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_stale_group_without_its_leader_is_never_signalled() {
+    fn a_stale_group_without_its_leader_or_its_tag_is_never_signalled() {
         let mut leader = spawn_group("sleep 30 & exit 0");
         let pgid = leader.id();
         let identity = process_identity(pgid).expect("identity");
         let _ = leader.wait(); // the leader exits and is reaped; its sleep stays in the group
         assert!(group_alive(pgid), "the member is still running");
-        assert!(matches!(reap_stale_group(pgid, Some(&identity)), StaleReap::Unresolved(_)));
+        assert!(matches!(reap_stale_group(pgid, Some(&identity), None), StaleReap::Unresolved(_)));
+        assert!(
+            matches!(reap_stale_group(pgid, Some(&identity), Some("job-t/1")), StaleReap::Unresolved(_)),
+            "a member with no tag is not proven ours"
+        );
         std::thread::sleep(Duration::from_millis(100));
         assert!(group_alive(pgid), "an unprovable member must not be signalled");
         signal_group(pgid, SIGKILL);
@@ -1482,7 +1723,79 @@ mod tests {
         while group_alive(pgid) && Instant::now() < gone_by {
             std::thread::sleep(POLL);
         }
-        assert_eq!(reap_stale_group(pgid, Some(&identity)), StaleReap::Gone);
+        assert_eq!(reap_stale_group(pgid, Some(&identity), None), StaleReap::Gone);
+
+        // Another run's tag (the previous attempt) proves nothing about this one.
+        let mut leader = spawn_tagged_group("sleep 30 & exit 0", "job-t/2");
+        let pgid = leader.id();
+        let identity = process_identity(pgid).expect("identity");
+        let _ = leader.wait();
+        assert!(matches!(reap_stale_group(pgid, Some(&identity), Some("job-t/1")), StaleReap::Unresolved(_)));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(group_alive(pgid), "another run's member must not be signalled");
+        signal_group(pgid, SIGKILL);
+    }
+
+    /// The leader is gone but a member carries this run's `MAXPLAYER_HOOK_RUN`: the tag proves the
+    /// group ours, so every member (one that ignores SIGTERM included) is stopped and the job can be
+    /// re-run instead of waiting for its deadline.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stale_group_without_its_leader_is_reaped_by_its_run_tag() {
+        let mut leader = spawn_tagged_group("(trap '' TERM; sleep 30) & sleep 30 & exit 0", "job-t/1");
+        let pgid = leader.id();
+        let identity = process_identity(pgid).expect("identity");
+        let _ = leader.wait();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(group_alive(pgid), "the members are still running");
+        assert_eq!(reap_stale_group(pgid, Some(&identity), Some("job-t/1")), StaleReap::Killed);
+        assert!(!group_alive(pgid), "Killed means nothing live is left in the group");
+        assert_eq!(reap_stale_group(pgid, Some(&identity), Some("job-t/1")), StaleReap::Gone);
+    }
+
+    /// No identity could be recorded for the leader: the tag alone proves the group ours.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stale_group_with_no_recorded_identity_is_reaped_by_its_run_tag() {
+        let mut ours = spawn_tagged_group("sleep 30", "job-n/1");
+        let pgid = ours.id();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(matches!(reap_stale_group(pgid, None, Some("job-n/9")), StaleReap::Unresolved(_)));
+        assert!(ours.try_wait().expect("try_wait").is_none(), "a wrong tag signals nothing");
+        assert_eq!(reap_stale_group(pgid, None, Some("job-n/1")), StaleReap::Killed);
+        let status = ours.wait().expect("wait");
+        assert!(status.code().is_none(), "killed by a signal: {status:?}");
+    }
+
+    #[test]
+    fn a_gated_job_sees_its_run_tag_and_no_other_maxplayer_variable() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let report = run_gated(
+            &sh(r#"cat >/dev/null; env | grep '^MAXPLAYER_' | sort | tr '\n' ' ' > env.txt; printf '{"status":"done","answer":"x"}'"#),
+            b"{}
+",
+            dir.path(),
+            Instant::now() + Duration::from_secs(10),
+            &run_tag("job-e", 3),
+            &mut |_| Ok(()),
+        );
+        assert!(matches!(classify_job(&report, CAP), JobOutcome::Answer(_)), "{report:?}");
+        let env = std::fs::read_to_string(dir.path().join("env.txt")).expect("env");
+        assert_eq!(env, "MAXPLAYER_HOOK_RUN=job-e/3 MAXPLAYER_HOOK_V=1 ");
+    }
+
+    #[test]
+    fn the_run_tag_is_found_in_a_procargs2_environment() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/sh\0\0\0\0sh\0-c\0A=1\0MAXPLAYER_HOOK_RUN=job-m/2\0B=2\0\0junk=MAXPLAYER_HOOK_RUN=x\0");
+        let environ = procargs2_environ(&buf).expect("parsed");
+        assert_eq!(environ, vec![&b"A=1"[..], b"MAXPLAYER_HOOK_RUN=job-m/2", b"B=2"]);
+        assert_eq!(tag_in_environ(environ).as_deref(), Some("job-m/2"));
+        // An argument that looks like the variable is not the environment.
+        let mut args = 1i32.to_ne_bytes().to_vec();
+        args.extend_from_slice(b"/bin/x\0MAXPLAYER_HOOK_RUN=fake\0A=1\0\0");
+        assert_eq!(tag_in_environ(procargs2_environ(&args).expect("parsed")), None);
+        assert_eq!(procargs2_environ(b"\x01\0"), None, "truncated");
     }
 
     /// codex r2 #4: a journal write that outlasts the cutoff must not release the hook: it would
@@ -1492,7 +1805,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let marker = dir.path().join("ran");
         let argv = sh(&format!("touch '{}'; cat >/dev/null; sleep 30", marker.display()));
-        let report = run_gated(&argv, b"{}\n", dir.path(), Instant::now() + Duration::from_millis(300), &mut |_| {
+        let report = run_gated(&argv, b"{}\n", dir.path(), Instant::now() + Duration::from_millis(300), "t/1", &mut |_| {
             std::thread::sleep(Duration::from_millis(600));
             Ok(())
         });
@@ -1541,7 +1854,7 @@ mod tests {
         let marker = dir.path().join("ran");
         let argv = sh(&format!("touch '{}'", marker.display()));
         let report =
-            run_gated_in(&supervision, &argv, b"{}\n", dir.path(), Instant::now() + Duration::from_secs(10), &mut |_| Ok(()));
+            run_gated_in(&supervision, &argv, b"{}\n", dir.path(), Instant::now() + Duration::from_secs(10), "t/1", &mut |_| Ok(()));
         assert_eq!(report.exit, Exit::Shutdown);
         assert_eq!(classify_job(&report, CAP), JobOutcome::Interrupted);
         std::thread::sleep(Duration::from_millis(200));
@@ -1558,7 +1871,7 @@ mod tests {
         let marker = dir.path().join("ran");
         let argv = sh(&format!("touch '{}'", marker.display()));
         std::thread::scope(|scope| {
-            let report = run_gated_in(&supervision, &argv, b"{}\n", dir.path(), Instant::now() + Duration::from_secs(10), &mut |_| {
+            let report = run_gated_in(&supervision, &argv, b"{}\n", dir.path(), Instant::now() + Duration::from_secs(10), "t/1", &mut |_| {
                 scope.spawn(|| terminate_all_in(&supervision));
                 std::thread::sleep(Duration::from_millis(200));
                 Ok(())
@@ -1586,6 +1899,7 @@ mod tests {
                 b"{}\n",
                 dir.path(),
                 Instant::now() + Duration::from_secs(20),
+                "t/1",
                 &mut |_| Ok(()),
             );
             assert_eq!(report.exit, Exit::Shutdown);

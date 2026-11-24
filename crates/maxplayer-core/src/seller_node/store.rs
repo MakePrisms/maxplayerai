@@ -952,6 +952,17 @@ pub struct ClaimPin {
     pub fingerprint: String,
 }
 
+/// A hook call's group as journaled before its hook was released (spec §5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournaledHookGroup {
+    pub invocation: String,
+    /// The call's attempt number: with `invocation`, the call's `MAXPLAYER_HOOK_RUN` tag.
+    pub attempt: u32,
+    pub pgid: u32,
+    /// The leader's `<boot id>/<start time>`, when it could be read.
+    pub start: Option<String>,
+}
+
 /// A hook's validated outcome, staged before anything is signed or bound (spec §7.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookOutcomeRow {
@@ -3911,19 +3922,20 @@ impl SellerStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Every journaled group a previous daemon may have left running: `(invocation, pgid, start)`.
-    pub fn journaled_hook_groups(&self) -> Result<Vec<(String, u32, Option<String>)>, StoreError> {
+    /// Every journaled group a previous daemon may have left running.
+    pub fn journaled_hook_groups(&self) -> Result<Vec<JournaledHookGroup>, StoreError> {
         let conn = self.lock()?;
-        let mut statement =
-            conn.prepare("SELECT invocation, pgid, pgid_start FROM hook_runs WHERE pgid IS NOT NULL ORDER BY invocation")?;
+        let mut statement = conn.prepare(
+            "SELECT invocation, attempt, pgid, pgid_start FROM hook_runs WHERE pgid IS NOT NULL ORDER BY invocation",
+        )?;
         let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<String>>(3)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (invocation, pgid, start) = row?;
-            if let Ok(pgid) = u32::try_from(pgid) {
-                out.push((invocation, pgid, start));
+            let (invocation, attempt, pgid, start) = row?;
+            if let (Ok(attempt), Ok(pgid)) = (u32::try_from(attempt), u32::try_from(pgid)) {
+                out.push(JournaledHookGroup { invocation, attempt, pgid, start });
             }
         }
         Ok(out)
@@ -4592,18 +4604,25 @@ mod tests {
         assert!(store.record_hook_group("inv", 42, Some("7"), 1).is_err(), "no attempt row yet");
         assert_eq!(store.begin_hook_attempt("inv", "job-h", 1).expect("begin"), Some(1));
         store.record_hook_group("inv", 42, Some("7"), 2).expect("record");
-        assert_eq!(store.journaled_hook_groups().expect("list"), vec![("inv".to_owned(), 42, Some("7".to_owned()))]);
+        let journaled =
+            vec![JournaledHookGroup { invocation: "inv".to_owned(), attempt: 1, pgid: 42, start: Some("7".to_owned()) }];
+        assert_eq!(store.journaled_hook_groups().expect("list"), journaled);
         assert!(store.hook_group_journaled("job-h").expect("read"));
         // codex r2 #2: no next attempt while the previous group is journaled (not yet resolved), and
         // its identity is not overwritten.
         assert_eq!(store.begin_hook_attempt("inv", "job-h", 3).expect("begin"), None);
-        assert_eq!(store.journaled_hook_groups().expect("list"), vec![("inv".to_owned(), 42, Some("7".to_owned()))]);
+        assert_eq!(store.journaled_hook_groups().expect("list"), journaled);
         // Once the caller resolved and cleared it, a re-drive is the next attempt.
         store.clear_hook_group("inv").expect("clear");
         assert!(!store.hook_group_journaled("job-h").expect("read"));
         assert_eq!(store.begin_hook_attempt("inv", "job-h", 3).expect("begin"), Some(2));
         assert!(store.journaled_hook_groups().expect("list").is_empty());
         store.record_hook_group("inv", 43, None, 4).expect("record");
+        assert_eq!(
+            store.journaled_hook_groups().expect("list"),
+            vec![JournaledHookGroup { invocation: "inv".to_owned(), attempt: 2, pgid: 43, start: None }],
+            "the group carries the attempt that started it"
+        );
         store.clear_hook_group("inv").expect("clear");
         assert!(store.journaled_hook_groups().expect("list").is_empty());
         store.clear_hook_outcomes("job-h").expect("clear job");

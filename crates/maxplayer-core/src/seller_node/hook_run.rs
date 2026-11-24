@@ -109,7 +109,7 @@ impl SellerNodeRunner {
                 let cutoff = hook::job_cutoff(deadline, now, std::time::Instant::now());
                 opline!("seller node hook job_id={job_id}: running {label} (attempt {attempt})");
                 let report = match self
-                    .run_hook_call(job_id, argv, event, &workdir, cutoff, &invocation)
+                    .run_hook_call(job_id, argv, event, &workdir, cutoff, &invocation, attempt)
                     .await
                 {
                     Ok(report) => report,
@@ -335,8 +335,9 @@ impl SellerNodeRunner {
         self.finish_hook_job(job_id, &workdir);
     }
 
-    /// One gated `job` call of a hook on a blocking task (§5.1): the group is journaled before the
-    /// gate releases the hook, and forgotten once the runner has killed and reaped it. The stderr tail
+    /// One gated `job` call of a hook on a blocking task (§5.1), tagged `<invocation>/<attempt>`: the
+    /// group is journaled before the gate releases the hook, and forgotten once the runner has killed
+    /// and reaped it. The stderr tail
     /// goes to the seller log.
     pub(super) async fn run_hook_call(
         &self,
@@ -346,11 +347,14 @@ impl SellerNodeRunner {
         workdir: &std::path::Path,
         cutoff: std::time::Instant,
         invocation: &str,
+        attempt: u32,
     ) -> Result<hook::RunReport, String> {
         let (argv_owned, dir) = (argv.to_vec(), workdir.to_path_buf());
         let (store, inv) = (self.node.store().clone(), invocation.to_owned());
+        // The call's MAXPLAYER_HOOK_RUN tag: what proves a stale group ours once its leader is gone.
+        let tag = hook::run_tag(invocation, attempt);
         let report = tokio::task::spawn_blocking(move || {
-            let report = hook::run_gated(&argv_owned, &event, &dir, cutoff, &mut |started| {
+            let report = hook::run_gated(&argv_owned, &event, &dir, cutoff, &tag, &mut |started| {
                 store
                     .record_hook_group(&inv, started.pgid, started.start.as_deref(), now_unix())
                     .map_err(|e| e.to_string())
@@ -432,11 +436,12 @@ pub(super) fn reap_journaled_groups(store: &crate::seller_node::store::SellerSto
         }
     };
     let mut resolved = true;
-    for (invocation, pgid, start) in groups {
+    for crate::seller_node::store::JournaledHookGroup { invocation, attempt, pgid, start } in groups {
         if only.is_some_and(|only| only != invocation) {
             continue;
         }
-        match hook::reap_stale_group(pgid, start.as_deref()) {
+        let tag = hook::run_tag(&invocation, attempt);
+        match hook::reap_stale_group(pgid, start.as_deref(), Some(&tag)) {
             hook::StaleReap::Killed => {
                 opline!("seller node hook: stopped the hook group {pgid} an earlier run left for {invocation}")
             }
@@ -787,6 +792,39 @@ mod tests {
         assert_eq!(store.begin_hook_attempt("job-x", "job-x", 3).expect("begin"), Some(2), "the re-drive is attempt 2");
     }
 
+    /// The daemon died, then the hook's leader exited, but a worker it started is still running in
+    /// the group. The worker inherited the call's `MAXPLAYER_HOOK_RUN` (the journaled invocation and
+    /// attempt), so the re-drive proves it ours, stops it and runs the next attempt instead of
+    /// waiting for the deadline.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_worker_left_by_a_dead_daemon_and_an_exited_leader_is_reaped_by_its_run_tag() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = crate::seller_node::store::SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
+        assert_eq!(store.begin_hook_attempt("job-y", "job-y", 1).expect("begin"), Some(1));
+        let worker_pid = dir.path().join("worker.pid");
+        let mut leader = std::process::Command::new("sh")
+            .args(["-c", &format!("sleep 30 & echo $! > '{}'; exit 0", worker_pid.display())])
+            .env(crate::hook::HOOK_RUN_ENV, crate::hook::run_tag("job-y", 1))
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        let pgid = leader.id();
+        let identity = crate::hook::process_identity(pgid);
+        store.record_hook_group("job-y", pgid, identity.as_deref(), 2).expect("record");
+        let _ = leader.wait();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        assert!(reap_journaled_groups(&store, Some("job-y")), "resolved by the tag");
+        assert!(store.journaled_hook_groups().expect("list").is_empty(), "its journal entry is cleared");
+        let worker = std::fs::read_to_string(&worker_pid).expect("pid");
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", worker.trim())).unwrap_or_default();
+        let state = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start().chars().next());
+        assert!(stat.is_empty() || state == Some(Some('Z')), "the tagged worker was stopped: {stat}");
+        assert_eq!(store.begin_hook_attempt("job-y", "job-y", 3).expect("begin"), Some(2), "the re-drive is attempt 2");
+    }
+
     /// codex r2 #8: a directory that cannot be removed keeps the job's hook rows (the only way a
     /// later boot finds it); once it can be removed, boot reconciliation clears both.
     #[cfg(unix)]
@@ -833,8 +871,8 @@ mod tests {
         assert!(workdir.exists());
     }
 
-    /// codex r2 #2: a journaled group whose stop cannot be established (here: its leader is gone but
-    /// a process is left in the group, which can no longer be proven ours) keeps its journal entry,
+    /// codex r2 #2: a journaled group whose stop cannot be established (here: its leader is gone and
+    /// the process left in the group carries no run tag, so it cannot be proven ours) keeps its journal entry,
     /// blocks the next attempt and keeps the job's hook state, even once the job is terminal. When
     /// the group is empty it resolves and the re-drive proceeds.
     #[cfg(target_os = "linux")]

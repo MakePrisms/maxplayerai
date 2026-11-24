@@ -1800,7 +1800,7 @@ impl SellerNodeRunner {
             "seller node session job_id={job_id}: turn {n} running {label} (attempt {attempt})"
         );
         let report = self
-            .run_hook_call(job_id, argv, event, &workdir, cutoff, fid)
+            .run_hook_call(job_id, argv, event, &workdir, cutoff, fid, attempt)
             .await
             .map_err(|error| {
                 HookTurnEnd::Refused(
