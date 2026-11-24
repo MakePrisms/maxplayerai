@@ -68,13 +68,10 @@ html.jn :focus-visible{outline:2px solid var(--giallo);outline-offset:3px}
 .jn-steps a{color:#fff;text-decoration:underline;text-decoration-color:rgba(255,255,255,.35);text-underline-offset:3px}
 .jn-steps code{font-family:var(--mono);font-size:13px;color:#fff;background:rgba(255,255,255,.07);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}
 
-.jn-hm{display:none}
 @media (max-width:899px){
   .jn-field,.jn-glow,.jn-navl span{display:none}
   .jn-wrap::before{content:"";position:absolute;left:-20%;right:-20%;top:-60px;height:520px;filter:blur(80px);opacity:.33;pointer-events:none;
     background:radial-gradient(220px 200px at 30% 40%,#ff2800 0,transparent 70%),radial-gradient(240px 220px at 75% 55%,#ff8a1c 0,transparent 70%),radial-gradient(260px 240px at 45% 90%,#ffdf00 0,transparent 70%)}
   .jn-main{padding-top:40px}
-  .jn-hm{display:flex;margin-bottom:26px}
-  .jn-hm .av{width:30px;height:30px}
 }
 .copysrc{position:fixed;left:0;top:0;opacity:0;pointer-events:none;white-space:pre;-webkit-user-select:text;user-select:text}   /* ui/clipboard.ts */
