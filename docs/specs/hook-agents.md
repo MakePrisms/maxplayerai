@@ -506,11 +506,9 @@ session lookup. For a `hook` record it skips the holder gate and calls `run_hook
   already starts due probes, every heartbeat interval, independent of whether beats are published.
   Two consecutive failed interval pings fault it (`Fault::Unproven`); the beat then advertises
   without it, and `accepting=n` if nothing else serves. A passing interval ping never restores.
-- **Restore loop.** After three consecutive job strikes with no successful job between them, a
-  hook entry is no longer restored by pings; it stays dropped until the daemon restarts, with one
-  operator line saying so.
 - **Restore.** A dropped hook entry's due probe (`run.rs:9180 @4caf510`) is a ping; a passing ping
-  restores it, with the roster's backoff and strike history.
+  restores it, with the roster's backoff and strike history. There is no lockout: like an `Acp`
+  entry, a hook that keeps failing jobs keeps being re-probed on the growing backoff.
 - **Races.** A ping result is applied only if the entry's state has not changed since the ping
   started (the roster already counts transitions, `seller_roster.rs:320 @4caf510`); a stale
   "healthy" never restores an entry that a later job struck, and a stale failure never strikes a
