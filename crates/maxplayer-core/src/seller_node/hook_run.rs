@@ -385,10 +385,33 @@ pub(super) struct PingTrack {
     pub last_started: Option<std::time::Instant>,
     pub in_flight: bool,
     pub consecutive_failures: u32,
+    /// The roster revision the streak was counted at: a streak never crosses a drop or restore.
+    pub revision: u64,
 }
 
 /// Two consecutive failed interval pings fault a hook (a single blip does not).
 pub(super) const INTERVAL_PING_FAILURES_TO_FAULT: u32 = 2;
+
+/// Fold one finished interval ping into its entry's streak. A ping that started before the entry
+/// was dropped or restored, or that ends while it is dropped (`stale`), neither counts nor resets;
+/// a streak from an earlier revision of the entry never carries over. Returns whether the streak
+/// now faults the entry.
+pub(super) fn record_interval_ping(track: &mut PingTrack, revision: u64, stale: bool, passed: bool) -> bool {
+    track.in_flight = false;
+    if stale {
+        return false;
+    }
+    if track.revision != revision {
+        track.revision = revision;
+        track.consecutive_failures = 0;
+    }
+    if passed {
+        track.consecutive_failures = 0;
+        return false;
+    }
+    track.consecutive_failures += 1;
+    track.consecutive_failures >= INTERVAL_PING_FAILURES_TO_FAULT
+}
 
 impl SellerNodeRunner {
     /// A dropped hook entry's due re-probe is a `restore` ping, off the loop. A pass restores it
@@ -447,6 +470,7 @@ impl SellerNodeRunner {
                 track.in_flight = true;
                 track.last_started = Some(now);
             }
+            let revision = self.agents.revision(index);
             let (roster, pings, cwd) = (Arc::clone(&self.agents), Arc::clone(&self.hook_pings), self.node.home().root.clone());
             let argv = entry.argv.clone();
             let label = entry.name.clone().unwrap_or_else(|| "<hook>".to_owned());
@@ -456,26 +480,24 @@ impl SellerNodeRunner {
                 })
                 .await
                 .unwrap_or_else(|error| Err(format!("ping task failed: {error}")));
+                // A verdict from before a drop or restore of this entry (or for an entry dropped now)
+                // is stale: it neither counts nor faults (§9 races).
+                let stale = roster.revision(index) != revision || roster.unavailable(index).is_some();
                 let fault_now = {
                     let mut pings = pings.lock().expect("hook pings");
-                    let track = pings.entry(index).or_default();
-                    track.in_flight = false;
-                    match &result {
-                        Ok(()) => {
-                            track.consecutive_failures = 0;
-                            false
-                        }
-                        Err(_) => {
-                            track.consecutive_failures += 1;
-                            track.consecutive_failures >= INTERVAL_PING_FAILURES_TO_FAULT
-                        }
-                    }
+                    record_interval_ping(pings.entry(index).or_default(), revision, stale, result.is_ok())
                 };
                 if let Err(reason) = result {
-                    if fault_now && roster.unavailable(index).is_none() {
-                        let state = roster.fault(index, Fault::Unproven, std::time::Instant::now());
+                    let applied = if fault_now {
+                        roster.fault_if_unchanged(index, revision, Fault::Unproven, std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    if let Some(state) = applied {
                         pings.lock().expect("hook pings").entry(index).or_default().consecutive_failures = 0;
                         opline!("seller node hook {label} DROPPED after failed interval pings: {reason} — {}", state.reason());
+                    } else if stale || fault_now {
+                        opline!("seller node hook {label} interval ping failed ({reason}); the entry changed meanwhile, so it does not count");
                     } else {
                         opline!("seller node hook {label} interval ping failed ({reason})");
                     }
@@ -728,6 +750,23 @@ mod tests {
         let (cache, oid) = baseline(&[("link", b"/etc/passwd", 0o120000)]);
         let out = tempfile::tempdir().expect("tmp");
         assert!(materialize_baseline(cache.path(), &oid, &out.path().join("inputs")).is_err());
+    }
+
+    /// codex r2 #7: a failure from an earlier revision of the entry never seeds the next streak, and
+    /// a stale verdict changes nothing.
+    #[test]
+    fn interval_ping_streaks_do_not_cross_a_drop_or_restore() {
+        let mut track = PingTrack::default();
+        assert!(!record_interval_ping(&mut track, 0, false, false));
+        assert_eq!(track.consecutive_failures, 1);
+        // Dropped and restored (revision 2) before the next ping: a fresh streak.
+        assert!(!record_interval_ping(&mut track, 2, false, false), "one failure at the new revision does not fault");
+        assert!(record_interval_ping(&mut track, 2, false, false), "two at the same revision do");
+        // A stale verdict neither counts nor resets.
+        let mut track = PingTrack { consecutive_failures: 1, revision: 4, ..Default::default() };
+        assert!(!record_interval_ping(&mut track, 4, true, false));
+        assert_eq!(track.consecutive_failures, 1);
+        assert!(!track.in_flight);
     }
 
     #[test]

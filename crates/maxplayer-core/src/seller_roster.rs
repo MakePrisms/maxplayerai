@@ -216,6 +216,9 @@ struct HarnessState {
     /// without this the tick would launch a new probe on every tick and the harness would be running
     /// a dozen concurrent turns of our own tokens.
     probing: bool,
+    /// Bumped by every drop and every restore of this entry, so a verdict that started before one
+    /// can tell it is stale ([`LiveRoster::fault_if_unchanged`]).
+    revision: u64,
 }
 
 /// The harnesses a booted node is serving with right now: its resolved registry plus live
@@ -448,6 +451,7 @@ impl LiveRoster {
                 strikes: 0,
                 probing: false,
                 model: None,
+                revision: 0,
             })
             .model = model;
     }
@@ -634,14 +638,31 @@ impl LiveRoster {
     /// [`Fault::Incapable`] does not schedule a probe at all.
     pub fn fault(&self, index: usize, fault: Fault, now: Instant) -> Unavailable {
         let mut state = self.state.lock().expect("live roster poisoned");
+        let (unavailable, was_serving) = Self::record_fault(&mut state, index, fault, now);
+        drop(state);
+        if was_serving {
+            self.bump_generation();
+        }
+        unavailable
+    }
+
+    /// The body of [`Self::fault`], on the locked state. Returns the state and whether it was serving.
+    fn record_fault(
+        state: &mut BTreeMap<usize, HarnessState>,
+        index: usize,
+        fault: Fault,
+        now: Instant,
+    ) -> (Unavailable, bool) {
         let entry = state.entry(index).or_insert(HarnessState {
             unavailable: None,
             strikes: 0,
             probing: false,
             model: None,
+            revision: 0,
         });
         // Whatever a probe was testing, its answer arrived: this fault IS the answer.
         entry.probing = false;
+        entry.revision = entry.revision.wrapping_add(1);
         let was_serving = entry.unavailable.is_none();
         let unavailable = match fault {
             Fault::Incapable(capability) => Unavailable::Incapable(capability),
@@ -654,11 +675,30 @@ impl LiveRoster {
             }
         };
         entry.unavailable = Some(unavailable.clone());
+        (unavailable, was_serving)
+    }
+
+    /// This entry's revision: bumped by every drop ([`Self::fault`]) and every restore.
+    pub fn revision(&self, index: usize) -> u64 {
+        self.state.lock().expect("live roster poisoned").get(&index).map_or(0, |entry| entry.revision)
+    }
+
+    /// [`Self::fault`] for a verdict that may be STALE (a hook interval ping runs off the loop for up
+    /// to 30 s): recorded, in the same locked step as the check, only while the entry still serves at
+    /// `revision` (what [`Self::revision`] gave when the ping started). A drop and restore in
+    /// between, or a drop still in force, makes it stale: `None`, nothing recorded.
+    pub fn fault_if_unchanged(&self, index: usize, revision: u64, fault: Fault, now: Instant) -> Option<Unavailable> {
+        let mut state = self.state.lock().expect("live roster poisoned");
+        let current = state.get(&index);
+        if current.map_or(0, |entry| entry.revision) != revision || current.is_some_and(|entry| entry.unavailable.is_some()) {
+            return None;
+        }
+        let (unavailable, was_serving) = Self::record_fault(&mut state, index, fault, now);
         drop(state);
         if was_serving {
             self.bump_generation();
         }
-        unavailable
+        Some(unavailable)
     }
 
     /// Put a harness back in service. The ONLY restoration path, and it is meant to be called after
@@ -675,7 +715,11 @@ impl LiveRoster {
         let restored = match self.state.lock().expect("live roster poisoned").get_mut(&index) {
             Some(entry) if entry.probing => {
                 entry.probing = false;
-                entry.unavailable.take().is_some()
+                let restored = entry.unavailable.take().is_some();
+                if restored {
+                    entry.revision = entry.revision.wrapping_add(1);
+                }
+                restored
             }
             _ => false,
         };
@@ -694,7 +738,11 @@ impl LiveRoster {
         {
             Some(entry) => {
                 entry.probing = false;
-                entry.unavailable.take().is_some()
+                let restored = entry.unavailable.take().is_some();
+                if restored {
+                    entry.revision = entry.revision.wrapping_add(1);
+                }
+                restored
             }
             None => false,
         };
@@ -957,6 +1005,26 @@ mod tests {
         assert!(roster.for_execution(Some(("my-hook", "hook", &hook_fp)), None, false).is_none());
         assert_eq!(roster.for_execution(Some(("my-hook", "hook", &hook_fp)), None, true).map(|s| s.index), Some(0));
         assert!(roster.for_execution(Some(("codex", "hook", &codex_fp)), None, true).is_none());
+    }
+
+    /// codex r2 #7: an interval-ping failure that started before a drop and restore of the entry is
+    /// stale and faults nothing; one at the current revision does; none applies while dropped.
+    #[test]
+    fn a_stale_interval_verdict_cannot_fault_an_entry_that_changed_since() {
+        let roster = mixed();
+        let t0 = Instant::now();
+        let before = roster.revision(0);
+        roster.fault(0, Fault::Unproven, t0);
+        roster.restore(0);
+        assert!(roster.unavailable(0).is_none());
+        assert!(roster.fault_if_unchanged(0, before, Fault::Unproven, t0).is_none(), "started before the drop and restore");
+        assert!(roster.unavailable(0).is_none(), "the restored entry keeps serving");
+        let current = roster.revision(0);
+        assert_ne!(current, before);
+        assert!(roster.fault_if_unchanged(0, current, Fault::Unproven, t0).is_some());
+        assert!(roster.unavailable(0).is_some());
+        let dropped = roster.revision(0);
+        assert!(roster.fault_if_unchanged(0, dropped, Fault::Unproven, t0).is_none(), "already dropped: nothing more");
     }
 
     /// Review r1 #7: a restore ping that passed is stale once a job struck the entry meanwhile.
