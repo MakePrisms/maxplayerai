@@ -64,7 +64,7 @@ impl SellerNodeRunner {
                         opline!("seller node hook job_id={job_id}: inputs unavailable ({error})");
                         self.fail_job_with_feedback(job_id, &buyer, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None)
                             .await;
-                        let _ = std::fs::remove_dir_all(&workdir);
+                        self.finish_hook_job(job_id, &workdir);
                         return;
                     }
                 };
@@ -104,7 +104,7 @@ impl SellerNodeRunner {
                         opline!("seller node hook job_id={job_id}: runner task failed ({error})");
                         self.fail_job_with_feedback(job_id, &buyer, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None)
                             .await;
-                        let _ = std::fs::remove_dir_all(&workdir);
+                        self.finish_hook_job(job_id, &workdir);
                         return;
                     }
                 };
@@ -131,7 +131,7 @@ impl SellerNodeRunner {
                                 opline!("seller node hook job_id={job_id}: outcome stage failed ({error})");
                                 self.fail_job_with_feedback(job_id, &buyer, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None)
                                     .await;
-                                let _ = std::fs::remove_dir_all(&workdir);
+                                self.finish_hook_job(job_id, &workdir);
                                 return;
                             }
                         }
@@ -166,7 +166,7 @@ impl SellerNodeRunner {
                         self.drop_harness(harness, Some(ExecutionFailure::DeadlineExceeded));
                         self.fail_job_with_feedback(job_id, &buyer, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None)
                             .await;
-                        let _ = std::fs::remove_dir_all(&workdir);
+                        self.finish_hook_job(job_id, &workdir);
                         return;
                     }
                     JobOutcome::Broken(why) => {
@@ -174,7 +174,7 @@ impl SellerNodeRunner {
                         self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
                         self.fail_job_with_feedback(job_id, &buyer, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None)
                             .await;
-                        let _ = std::fs::remove_dir_all(&workdir);
+                        self.finish_hook_job(job_id, &workdir);
                         return;
                     }
                 }
@@ -185,18 +185,23 @@ impl SellerNodeRunner {
         let seller_pubkey = self.seller_pubkey.to_hex();
         self.deliver_inline(job_id, offer, &seller_pubkey, stored_creq, &answer, &metadata)
             .await;
-        // The job is terminal either way now (journaled delivery, or `deliver_inline` failed it).
-        if self.node.store().has_delivery(job_id).unwrap_or(false) {
-            let _ = self.node.store().clear_hook_outcomes(job_id);
-        }
-        let _ = std::fs::remove_dir_all(&workdir);
+        // Delivered, or failed by `deliver_inline`: terminal, so the staged answer goes. A failure arm
+        // that leaves the job live (it can still be re-delivered) keeps it (§7.1).
+        self.finish_hook_job(job_id, &workdir);
     }
 
     /// `delivery_failed`, no strike: the hook answered honestly but nothing deliverable came of it.
     async fn hook_refused(&self, job_id: &str, buyer: &str, workdir: &std::path::Path) {
         self.fail_job_with_feedback(job_id, buyer, ReasonCode::DeliveryFailed, HOOK_DELIVERY_REFUSED_FEEDBACK, None)
             .await;
+        self.finish_hook_job(job_id, workdir);
+    }
+
+    /// The end of one hook call: its per-job directory goes; its staged answer and run record go too
+    /// once the job is terminal (§6, §7.1).
+    fn finish_hook_job(&self, job_id: &str, workdir: &std::path::Path) {
         let _ = std::fs::remove_dir_all(workdir);
+        clear_terminal_hook_state(self.node.store(), self.node.home(), job_id);
     }
 
     /// Create the per-job directory (0700) and, for a private job with input files, re-materialize
@@ -259,6 +264,33 @@ pub(super) fn reap_journaled_groups(store: &crate::seller_node::store::SellerSto
             ),
         }
         let _ = store.clear_hook_group(&invocation);
+    }
+}
+
+/// Drop a job's hook state (staged answer, run record, per-job directory) if the job is terminal.
+/// A live job keeps its staged answer: it may still be re-delivered (§7.1). Returns whether cleared.
+pub(super) fn clear_terminal_hook_state(
+    store: &crate::seller_node::store::SellerStore,
+    home: &MaxplayerHome,
+    job_id: &str,
+) -> bool {
+    use crate::seller_node::store::JobState;
+    match store.job_state(job_id) {
+        Ok(Some(JobState::Delivered | JobState::Paid | JobState::Failed)) => {
+            let _ = store.clear_hook_outcomes(job_id);
+            let _ = std::fs::remove_dir_all(job_workdir(home, job_id));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Boot reconciliation: hook state a crash left behind for jobs that have since become terminal.
+pub(super) fn reconcile_terminal_hook_state(store: &crate::seller_node::store::SellerStore, home: &MaxplayerHome) {
+    let Ok(jobs) = store.hook_job_ids() else { return };
+    let cleared = jobs.iter().filter(|job| clear_terminal_hook_state(store, home, job)).count();
+    if cleared > 0 {
+        opline!("seller node hook: cleared leftover hook state of {cleared} finished job(s)");
     }
 }
 
@@ -506,6 +538,49 @@ mod tests {
         assert!(status.code().is_none(), "the orphan was killed: {status:?}");
         assert!(store.journaled_hook_groups().expect("list").is_empty(), "its journal entry is cleared");
         assert_eq!(store.begin_hook_attempt("job-x", "job-x", 3).expect("begin"), 2, "the re-drive is attempt 2");
+    }
+
+    /// codex r1 #12: hook state goes once the job is terminal (delivered, paid or failed, including
+    /// a refusal), and is kept while the job is live and could still re-deliver its staged answer.
+    /// Boot reconciliation clears what a crash left behind.
+    #[test]
+    fn hook_state_is_cleared_for_terminal_jobs_only_and_on_boot() {
+        use crate::seller_node::store::{HookOutcomeRow, JobState};
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = crate::home::bootstrap(dir.path()).expect("home");
+        let store = crate::seller_node::store::SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
+        let stage = |job: &str| {
+            store.begin_hook_attempt(job, job, 1).expect("begin");
+            store
+                .stage_hook_outcome(
+                    &HookOutcomeRow {
+                        invocation: job.to_owned(),
+                        job_id: job.to_owned(),
+                        turn: 1,
+                        status: "done".into(),
+                        answer: "a".into(),
+                        wall_time_ms: 1,
+                    },
+                    1,
+                )
+                .expect("stage");
+            std::fs::create_dir_all(job_workdir(&home, job)).expect("workdir");
+        };
+        for (job, state) in [
+            ("job-live", JobState::Executing),
+            ("job-failed", JobState::Failed),
+            ("job-delivered", JobState::Delivered),
+        ] {
+            store.insert_job_for_test(job, state);
+            stage(job);
+        }
+        assert!(!clear_terminal_hook_state(&store, &home, "job-live"), "a live job keeps its staged answer");
+        assert!(store.hook_outcome("job-live").expect("read").is_some());
+        reconcile_terminal_hook_state(&store, &home);
+        assert_eq!(store.hook_job_ids().expect("ids"), vec!["job-live".to_owned()]);
+        assert!(!job_workdir(&home, "job-failed").exists());
+        assert!(!job_workdir(&home, "job-delivered").exists());
+        assert!(job_workdir(&home, "job-live").exists());
     }
 
     #[test]

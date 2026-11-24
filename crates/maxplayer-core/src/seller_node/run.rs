@@ -5248,6 +5248,7 @@ impl SellerNodeRunner {
         // hook-agents §5.1: a hook group a killed daemon left running is stopped before anything
         // can re-drive its job (each verified against its journaled start time).
         hook_run::reap_journaled_groups(node.store(), None);
+        hook_run::reconcile_terminal_hook_state(node.store(), node.home());
 
         // The Holder route: start the seat's holder containers BEFORE anything goes on the wire, so
         // a REQUIRED tool that cannot start refuses the boot rather than a seat that advertises and

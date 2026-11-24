@@ -3676,6 +3676,28 @@ impl SellerStore {
         Ok(())
     }
 
+    /// Tests elsewhere in the seller node: put a job row in an exact state (direct SQL).
+    #[cfg(test)]
+    pub(crate) fn insert_job_for_test(&self, job_id: &str, state: JobState) {
+        let conn = self.lock().expect("lock");
+        conn.execute(
+            "INSERT INTO jobs (job_id, offer_id, agent_name, state, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, NULL, ?3, 1, 1)",
+            params![job_id, format!("offer-{job_id}"), state.as_str()],
+        )
+        .expect("insert job");
+    }
+
+    /// Every job that has any hook state (a staged outcome or a run record), for boot reconciliation.
+    pub fn hook_job_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT job_id FROM hook_outcomes UNION SELECT job_id FROM hook_runs ORDER BY job_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Every journaled group a previous daemon may have left running: `(invocation, pgid, start)`.
     pub fn journaled_hook_groups(&self) -> Result<Vec<(String, u32, Option<String>)>, StoreError> {
         let conn = self.lock()?;
