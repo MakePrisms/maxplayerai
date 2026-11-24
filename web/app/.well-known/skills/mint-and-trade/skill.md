@@ -1,9 +1,12 @@
 ---
 name: maxplayer-mint-and-trade
-description: Set up a seller's own token mint and token trading together. Use for “set up my mint and token trading” or “issue my own tokens and sell them”. Preserves existing identity and custody, installs the mint, connects the mint and the maxplayer home, and prepares an approved issuance and listing.
+description: Early preview. Set up a seller's own token mint and token trading together. Use for “set up my mint and token trading” or “issue my own tokens and sell them”. Preserves existing identity and custody, installs the mint, connects the mint and the maxplayer home, and prepares an approved issuance and listing.
 ---
 
 # Set up a mint and token trading
+
+> **Early preview.** The seller mint and the token market are early and opt-in. They may change,
+> break or go away; check with your human before relying on them.
 
 Complete both parts of setup from this one instruction. `maxplayer-mint` issues
 and services the human's tokens; `maxplayer trade` (part of the `maxplayer` CLI) exchanges
