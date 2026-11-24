@@ -36,7 +36,8 @@ Errors are `{"error": <stable code>, "message": <text>}` and never contain an em
 The codes are: `missing_auth`, `malformed_auth`, `wrong_kind`, `bad_signature`, `stale_auth`,
 `url_mismatch`, `method_mismatch`, `payload_missing`, `payload_mismatch`, `replayed_auth`,
 `invalid_body`, `invalid_email`, `invalid_label`, `unknown_terms_version`,
-`unknown_privacy_version`, `unknown_notice_version`, `invalid_entered_by`, `resend_cooldown`,
+`unknown_privacy_version`, `unknown_notice_version`, `legal_versions_unavailable` (503, with
+`Retry-After`), `invalid_entered_by`, `resend_cooldown`,
 `rate_limited` (both with `Retry-After`), `email_send_failed`, `no_pending_code`, `wrong_code`
 (with `attempts_left`), `code_expired`, `too_many_attempts`, `key_linked_to_other_email`,
 `not_registered`, `bad_webhook_signature`, `webhook_not_configured`; team invite links add
@@ -75,6 +76,14 @@ key loaded'` shows that pubkey. A test deployment with its own invite key sets
 - Re-linking the same key to the same email is idempotent. The label, versions and
   `accepted_at` are updated and `created_at` is kept. A 9030 is sent again (the relay treats it
   as a no-op), and no second welcome email goes out.
+- Terms and privacy versions: the `[legal]` lists always count. A dated version (`YYYYMMDD`)
+  missing from them is accepted when the website's manifest (`legal.versions_url`, default
+  `https://www.maxplayer.ai/legal/versions.json`, from `web/app/public/legal/versions.json`)
+  lists it, so publishing a new version is a website change with no deploy here. Learned
+  versions are stored in `legal_versions` and stay accepted. The manifest is fetched at most once
+  per `versions_refresh_secs` (60 s); if it cannot be read (site down, an HTML page in its place,
+  a malformed entry), an unknown version gets `503 legal_versions_unavailable` and known ones
+  are unaffected. `versions_url = ""` turns this off.
 - On the first link, a `marketing_consents` row is created (`signup_default`, automatic
   opt-in, spec §8.1) unless that email already has one, so an earlier opt-out survives.
 

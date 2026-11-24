@@ -9,6 +9,7 @@ pub mod api;
 pub mod config;
 pub mod db;
 pub mod email;
+pub mod legal;
 pub mod nip98;
 pub mod relay;
 pub mod secrets;
@@ -34,6 +35,8 @@ pub struct AppState {
     pub db: PgPool,
     pub relay: relay::RelayClient,
     pub email: email::EmailClient,
+    /// The website's legal versions manifest (`legal.versions_url`).
+    pub legal_versions: legal::ManifestSource,
     pub pepper: [u8; 32],
     pub webhook_secret: Option<Vec<u8>>,
     pub clock: Arc<Clock>,
@@ -90,11 +93,13 @@ impl AppState {
         let pepper = secrets::code_pepper(&admin);
         let relay = relay::RelayClient::new(&cfg.relay, admin)?;
         let email = email::EmailClient::new(&cfg.email, resend_api_key)?;
+        let legal_versions = legal::ManifestSource::new(&cfg.legal)?;
         Ok(Self {
             cfg,
             db,
             relay,
             email,
+            legal_versions,
             pepper,
             webhook_secret,
             clock: Arc::new(Clock::default()),

@@ -33,6 +33,7 @@ use tracing::{info, warn};
 use crate::AppState;
 use crate::db::{self, ConfirmOutcome, LinkState};
 use crate::email::{CodeEmail, WelcomeEmail};
+use crate::legal::{self, Check, Doc};
 use crate::nip98;
 use crate::relay::KIND_PUT_USER;
 use crate::sync;
@@ -275,17 +276,42 @@ async fn link_request(
         )
     })?;
     let legal = &state.cfg.legal;
-    if !legal.terms_versions.contains(&req.terms_version) {
-        return Err(ApiError::bad(
+    for (doc, version, code, message) in [
+        (
+            Doc::Terms,
+            &req.terms_version,
             "unknown_terms_version",
             "terms version is not offered",
-        ));
-    }
-    if !legal.privacy_versions.contains(&req.privacy_version) {
-        return Err(ApiError::bad(
+        ),
+        (
+            Doc::Privacy,
+            &req.privacy_version,
             "unknown_privacy_version",
             "privacy version is not offered",
-        ));
+        ),
+    ] {
+        match legal::check(
+            legal,
+            &state.legal_versions,
+            &state.db,
+            doc,
+            version,
+            state.now(),
+        )
+        .await?
+        {
+            Check::Offered => {}
+            Check::NotOffered => return Err(ApiError::bad(code, message)),
+            Check::Unavailable => {
+                let mut e = ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "legal_versions_unavailable",
+                    "could not check this terms or privacy version, try again later",
+                );
+                e.retry_after = Some(legal.versions_refresh_secs.min(3600) as i64);
+                return Err(e);
+            }
+        }
     }
     let notice_version = match req.notice_version {
         Some(v) if legal.marketing_notice_versions.contains(&v) => v,
