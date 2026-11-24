@@ -1,3 +1,68 @@
+## v0.8.1
+
+Stable release following v0.8.1-rc2, incorporating the 0.8.1 release-candidate series. The
+binaries are built from the same code as v0.8.1-rc2; since then only the website, version strings,
+skill-page version lines and these notes changed. After publication, install with
+`npm install -g maxplayer@0.8.1` (or `install.sh --version 0.8.1`). The stable tag publishes npm
+`latest`; the `rc` dist-tag remains on its existing release candidate.
+
+This is a **patch** release, but it changes two defaults: session (multi-turn) jobs are on for
+buyers and sellers unless `[sessions] enabled = false`, and the seller store moves to schema 16.
+Read "Upgrade and release scope" before restarting a seat that should stay single-turn.
+
+### Highlights since stable v0.8.0
+
+- **Session (multi-turn) jobs are on by default.** Buyers get the `reply` MCP tool without an
+  opt-in; each turn costs the job's price, up to a session cap of 10× the job price by default
+  (`[sessions] session_cap_sats`, `max_session_sats`, or `per_job_budget_sats` for a limit the
+  agent cannot raise). Docker seats with container delivery park a finished job's container for up
+  to 6 hours within a 5 GiB disk budget so the buyer can send another turn. runsc seats that cannot
+  run sessions warn and take single-turn jobs instead of failing to boot.
+- **Hook agents (stage 1):** a seller can serve single-turn inline jobs with an agent of its own by
+  listing `[agents.<name>] hook = ["<command>", ...]`. The daemon runs the command once per job
+  (one JSON line in, `{"status","answer"}` out), journals each run so a restart never runs a hook
+  twice, health-checks hooks with `ping`, and a hook-only seat needs no sandbox. Session
+  follow-ups on a hook, example adapters and `seller hook test` are not in this release; see
+  `docs/specs/hook-agents.md`.
+- **Fixed: private session jobs with review stopped at about turn 5** (`private seal is … bytes`).
+  The review request is now sized at its sealed size and drops the oldest history first; a turn too
+  large to review is refused (`turn_too_large`) without charge.
+- **Relay websockets go through an HTTP proxy.** With `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` set,
+  every relay connection tunnels with HTTP CONNECT under the same `NO_PROXY` rules as HTTPS calls,
+  so `doctor`, `account link`, teams, buying and selling work in sandboxes whose only way out is a
+  CONNECT proxy.
+- **Terms of Service and Privacy Policy 20261123**, and `account link` reads the current version
+  from https://www.maxplayer.ai/legal/versions.json (falling back to this build's versions).
+- An ended session answers each stale follow-up once; `get_job wait_for` no longer ends on an
+  unconfirmed empty view; private-job HTTP errors name their cause; quieter seller logs after a
+  reconnect (`MAXPLAYER_VERBOSE=1` restores every line).
+- Skill pages install with npm first; `install.sh` is a manual, checksum-verified route.
+
+The RC sections below keep the detailed changes and rollout notes for each stage; they are not new
+release announcements.
+
+### Upgrade and release scope
+
+- **Relay, reviewer and registration service: nothing to deploy.** `relay-v12`, live since
+  2026-11-24, accepts Terms/Privacy `20261123` and `20261029`, the only versions the website
+  manifest lists. The registration side of the legal-versions manifest (accepting a version only
+  the manifest lists) is in `relay-v13`; this release does not need it, but deploy a relay carrying
+  it before publishing a newer legal version on the site. The relay-side validator and reviewer
+  client changes in the series need no redeploy (see v0.8.1-rc1). No wire change: hook agents use
+  the existing claim, delivery and feedback events.
+- **Sessions are on by default:** set `[sessions] enabled = false` before restarting a buyer or
+  seat that should stay single-turn. An `enabled = false` line written before 0.8.1 may have been
+  dropped from `config.toml` by a later save; check it is still there.
+- **Seller store schema 15 → 16** on first start (claim pins, staged hook answers and hook run
+  records; additive). Buyer store unchanged (schema 10).
+- Restart `maxplayer mcp`, `maxplayer buyer serve` and `maxplayer seller serve` after upgrading,
+  keeping their homes, keys, wallets and state. Sellers not adding a hook change nothing in
+  `config.toml`. Match Docker sandbox image overrides to
+  `ghcr.io/makeprisms/maxplayer-sandbox:v0.8.1`; host-mode seats keep their own adapters.
+- The release workflow packages the `maxplayer` client, the `maxplayer-mint` tarballs and the
+  sandbox image. The relay, reviewer, registration service, website and chat sidecar are deployed
+  or built separately; website and email changes went live with each merge.
+
 ## v0.8.1-rc2
 
 Release candidate for 0.8.1, built from main after #1387. It carries everything in v0.8.1-rc1 plus
