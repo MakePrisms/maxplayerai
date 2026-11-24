@@ -1346,7 +1346,7 @@ fn publish_receipt_event(
     keys: &Keys,
     event: &nostr_sdk::Event,
 ) -> Result<(Vec<String>, Option<String>), EffectError> {
-    use nostr_sdk::prelude::{Client, RelayUrl};
+    use nostr_sdk::prelude::RelayUrl;
     use std::time::Duration;
     std::thread::scope(|scope| {
         scope
@@ -1356,7 +1356,7 @@ fn publish_receipt_event(
                     .build()
                     .map_err(|error| EffectError::new(format!("receipt runtime: {error}")))?;
                 runtime.block_on(async {
-                    let client = Client::new(keys.clone());
+                    let client = crate::relay_transport::client(keys.clone());
                     // Enable the auto-AUTH responder explicitly (default true; set to mirror
                     // the seller and guard against option drift) so the client answers the
                     // relay's NIP-42 challenge — otherwise the write is rejected auth-required.

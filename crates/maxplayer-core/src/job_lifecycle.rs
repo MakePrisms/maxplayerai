@@ -1602,7 +1602,7 @@ pub async fn send_signed_award_async(
     expected_event_id: &str,
     event_json: &str,
 ) -> SendOutcome {
-    use nostr_sdk::prelude::{Client, Event, JsonUtil};
+    use nostr_sdk::prelude::{Event, JsonUtil};
 
     let event = match Event::from_json(event_json) {
         Ok(event) => event,
@@ -1626,7 +1626,7 @@ pub async fn send_signed_award_async(
             detail: format!("pinned award event fails verification ({error}); probe will resolve"),
         };
     }
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     // Explicit, not a default we hope for: the NIP-42 resend after auth fails SILENTLY when
     // auto-auth is off — the drift guard buyer/relay.rs pins for its own client.
     client.automatic_authentication(true);
@@ -2970,8 +2970,7 @@ async fn publish_draft_async(
     publish_signed_event_async(home, keys, &event).await
 }
 async fn publish_signed_event_async(home: &MaxplayerHome, keys: &nostr_sdk::Keys, event: &nostr_sdk::Event) -> Result<String, JobLifecycleError> {
-    use nostr_sdk::Client;
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     client
         .add_relay(&home.config.relay_url)
         .await
@@ -3175,11 +3174,11 @@ pub(crate) async fn award_presence_async(
     job_id: &str,
     timeout: Duration,
 ) -> Result<PresenceRead<AwardPresence>, JobLifecycleError> {
-    use nostr_sdk::prelude::{Client, EventId, Filter, Kind};
+    use nostr_sdk::prelude::{EventId, Filter, Kind};
 
     let offer_id = EventId::from_hex(job_id)
         .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     // Same discipline as the send path: auto-auth on (NIP-42-gated reads re-issue silently only
     // when it is), and WAIT for the socket — `connect()` only spawns, and a fetch racing the
     // handshake burns its whole window and reads as empty.
@@ -3356,9 +3355,8 @@ async fn presence_of_filter(
     timeout: Duration,
 ) -> Result<PresenceRead<()>, JobLifecycleError> {
     use nostr_sdk::pool::relay::ReqExitPolicy;
-    use nostr_sdk::prelude::Client;
 
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     client.automatic_authentication(true);
     client
         .add_relay(relay_url)

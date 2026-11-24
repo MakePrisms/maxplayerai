@@ -174,7 +174,7 @@ pub async fn connect_authenticated(
     keys: &nostr_sdk::Keys,
     url: &str,
 ) -> Result<nostr_sdk::Client, RelayAuthError> {
-    let client = nostr_sdk::Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     client.automatic_authentication(true);
     client
         .add_relay(url)

@@ -28,10 +28,10 @@ pub async fn probe_relay(
     timeout: Duration,
 ) -> Result<RelayProbe, String> {
     use nostr_sdk::pool::RelayNotification;
-    use nostr_sdk::prelude::{Client, Keys, RelayUrl};
+    use nostr_sdk::prelude::{Keys, RelayUrl};
 
     let keys = Keys::parse(secret_key_hex).map_err(|error| format!("key parse: {error}"))?;
-    let client = Client::new(keys);
+    let client = crate::relay_transport::client(keys);
     // Seller receive depends on this; match the daemon so the probe exercises the same path.
     client.automatic_authentication(true);
     client

@@ -1184,7 +1184,7 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         "reviewer: worker start (maxplayer-core {})",
         env!("CARGO_PKG_VERSION")
     );
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     client.automatic_authentication(true);
     client
         .add_relay(&config.relay)

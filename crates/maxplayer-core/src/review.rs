@@ -712,7 +712,7 @@ pub async fn check_buyer_detailed(
     {
         return Err("review: configure reviewer key or explicitly skip delivery review".into());
     }
-    let client = nostr_sdk::Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     client.automatic_authentication(true);
     client
         .add_relay(&home.config.relay_url)

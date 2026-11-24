@@ -38,7 +38,7 @@ impl SwarmRelay {
 
     pub async fn connect_url(home: &MaxplayerHome, url: &str) -> Result<Self, String> {
         let keys = home_keys(home)?;
-        let client = Client::new(keys.clone());
+        let client = crate::relay_transport::client(keys.clone());
         client.automatic_authentication(true);
         client
             .add_relay(url)

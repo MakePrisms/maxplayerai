@@ -5381,7 +5381,7 @@ impl SellerNodeRunner {
         }
 
         let seller_pubkey = keys.public_key();
-        let client = Client::new(keys);
+        let client = crate::relay_transport::client(keys);
         // Seller receive depends on NIP-42; keep auto-auth ON so a relay that challenges on the REQ
         // (not just connect) still authenticates.
         client.automatic_authentication(true);

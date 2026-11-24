@@ -116,6 +116,9 @@ pub mod reviewer;
 /// receipt-publish both use it).
 #[cfg(feature = "gateway")]
 pub mod relay_auth;
+/// Relay websockets through the HTTP proxy variables (HTTP CONNECT), for every relay client.
+#[cfg(feature = "gateway")]
+pub mod relay_transport;
 /// The relay's advertised scoped-token policy (NIP-11), and the boot verdict for `[sandbox]
 /// container_delivery_token = "long-lived"`.
 ///

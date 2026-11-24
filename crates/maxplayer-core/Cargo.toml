@@ -17,7 +17,10 @@ acp = ["tokio/sync", "tokio/time"]
 # `tokio/time` is declared here because the gateway's relay-auth window uses `tokio::time::timeout`.
 # On native it also arrives transitively through nostr-sdk, but that supplier's tokio feature
 # selection is target-conditional and does not provide it on wasm32 (issue #214).
-gateway = ["dep:nostr-sdk", "dep:base64", "tokio/time"]
+# The relay websocket transport (relay_transport.rs) adds the CONNECT tunnel's pieces: the SDK's
+# websocket crates, hyper-util's proxy matcher (the one reqwest uses) and an HTTP/1 response parser.
+# Those, and tokio's sockets, are native-only target dependencies below, so wasm32 keeps none of them.
+gateway = ["dep:nostr-sdk", "dep:base64", "dep:async-wsocket", "dep:tokio-tungstenite", "dep:hyper-util", "dep:http", "dep:httparse", "tokio/time"]
 # All git legs (seller push/fetch, buyer verify-fetch, ref-advertisement probes) run in-process
 # via libgit2 — NO system `git` on any product path (issue #55). Needs nostr-sdk (NIP-98 signing)
 # so it composes gateway; git2 (rustls-backed) + reqwest + base64 carry the smart-HTTP transport.
@@ -41,7 +44,7 @@ git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64", "dep:libc"]
 # calls, and a reqwest async client (with `stream`, for SSE responses) forwarding to the real upstream.
 # It lives under `wallet` because `seller_exec` — the only caller — already does, so reqwest and
 # `tokio/net` are guaranteed present here.
-wallet = ["dep:async-wsocket", "dep:tempfile", "dep:ciborium", "git-delivery", "gateway", "dep:async-trait", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:bitcoin", "dep:uuid", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "dep:bytes", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util", "tokio/signal"]
+wallet = ["dep:async-wsocket", "dep:tempfile", "dep:ciborium", "git-delivery", "gateway", "dep:async-trait", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:bitcoin", "dep:uuid", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "dep:bytes", "dep:hyper", "dep:hyper-util", "hyper-util/tokio", "hyper-util/server-auto", "dep:http-body-util", "dep:futures-util", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util", "tokio/signal"]
 # TESTS ONLY, opt-in, OFF by default (issue #720). The job_lifecycle pre-publish
 # fee-floor test resolves the home's shipped minibits default over the internet.
 # The two payment_wallet worker-send tests now use cached keysets and an in-process
@@ -54,7 +57,8 @@ test-support = []
 [dependencies]
 # Collision key for delivered paths on APFS/HFS+ (collect.rs, #1290).
 unicode-normalization = "0.1"
-# Same transport crate as the pinned SDK; observe raw row counts before SDK filtering.
+# Same transport crate as the pinned SDK; observe raw row counts before SDK filtering, and open relay
+# websockets through an HTTP proxy (relay_transport.rs).
 async-wsocket = { version = "0.13.2", optional = true }
 tempfile = { version = "3", optional = true }
 # Pure schemas and shared quotas are also used by the feature-independent review contract.
@@ -79,7 +83,6 @@ reqwest = { workspace = true, optional = true, features = ["stream"] }
 # whose agent endpoint sent 3372 bytes opening with that preface.
 bytes = { version = "1", optional = true }
 hyper = { version = "1", optional = true, features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", optional = true, features = ["tokio", "server-auto"] }
 http-body-util = { version = "0.1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false }
 cdk = { version = "=0.17.2", default-features = false, features = ["wallet"], optional = true }
@@ -170,6 +173,22 @@ required-features = ["git-delivery"]
 name = "reap_isolated_linux"
 required-features = ["wallet"]
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# relay_transport.rs's HTTP CONNECT tunnel, native only (the browser's websocket has no socket of ours
+# to tunnel). All already in the lock; no new resolution.
+# The SDK transport's own websocket crate and TLS roots (same version as async-wsocket's), for the
+# handshake inside the tunnel.
+tokio-tungstenite = { version = "0.26", optional = true, default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# hyper-util: `client-proxy` is the proxy matcher the locked reqwest runs to pick a proxy
+# (`Matcher::from_system`), so a relay websocket takes the route an HTTPS call to the same host takes.
+# `wallet` adds the server half (`tokio`, `server-auto`) for the credential-containment proxy (#647).
+hyper-util = { version = "0.1.20", optional = true, features = ["client-proxy"] }
+# `http::Uri` is the matcher's vocabulary; httparse reads the proxy's CONNECT answer.
+http = { version = "1", optional = true }
+httparse = { version = "1", optional = true }
+# The tunnel's own sockets: the proxy dial and the CONNECT exchange.
+tokio = { version = "1.52.0", default-features = false, features = ["net", "io-util"] }
+
 [dev-dependencies]
 tempfile = "3"
 async-trait = "0.1.89"
@@ -203,6 +222,11 @@ nostr-relay-builder = "0.44"
 # because a delivery-push child is given `SSL_CERT_FILE` and never the bypass. The `pem` crate is
 # already in the lock (3.0.6); this adds a feature edge, not a resolution.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# relay_transport's bypass guard parses the product sources (with real line numbers) instead of
+# matching lines. Both already in the lock through the proc-macro stack; `span-locations` is a new
+# feature edge for the test build only.
+syn = { version = "2", default-features = false, features = ["full", "visit", "parsing", "printing"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "1.52.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "time", "test-util"] }
 # The p-gate relay fixture speaks raw NIP-01 over a websocket, because it has to answer a p-gated REQ
