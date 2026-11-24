@@ -18869,6 +18869,231 @@ mod tests {
             .expect("award");
     }
 
+    // ── hook agents (docs/specs/hook-agents.md), codex r1 #11: claim pin → award → hook → result ──
+    //
+    // These drive the REAL execute_job against a local relay with a hook entry whose program is a
+    // shell script. What they pin: the hook runs once; the result carries exactly its decoded answer;
+    // the seller's co-signature verifies over the receipt preimage built from that answer's digest; a
+    // staged answer is re-delivered without re-running; a delivered job never re-runs; a claim whose
+    // pin does not match (or carries none) never reaches a hook.
+
+    const HOOK_ANSWER: &str = "héllo\nbuyer — exact bytes";
+
+    /// Boot a 1-slot hook-only seller. The hook appends a line to <root>/runs per call and answers
+    /// [HOOK_ANSWER].
+    async fn boot_hook_seller(label: &str, relay_url: &str) -> (SellerNodeRunner, Keys, std::path::PathBuf) {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay_url.to_string();
+        let mut seller = seller_cfg(1, false);
+        seller.claim_award_timeout_secs = Some(0);
+        seller.offer_backfill_secs = 0;
+        seller.agents = vec!["my-hook".to_owned()];
+        home.config.seller = Some(seller);
+        // No reviewer on the fixture relay: the seller's own offer review is switched off.
+        home.config.review.seller_offer = false;
+        let runs = root.join("runs");
+        let script = format!(
+            r#"cat >/dev/null; echo run >> '{}'; printf '%s' '{{"status":"done","answer":"héllo\nbuyer — exact bytes"}}'"#,
+            runs.display()
+        );
+        let mut preset = crate::home::AgentPresetConfig::hook(vec!["sh".into(), "-c".into(), script]);
+        preset.family = Some("claude-code".into());
+        preset.model = Some("my-model".into());
+        home.config.agents.insert("my-hook".to_owned(), preset);
+        let secret = crate::home::read_secret_key_hex(&home).expect("read seller secret");
+        let keys = Keys::parse(&secret).expect("parse seller keys");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot the hook seller");
+        (runner, keys, root)
+    }
+
+    fn hook_runs(root: &std::path::Path) -> usize {
+        std::fs::read_to_string(root.join("runs")).map(|s| s.lines().count()).unwrap_or(0)
+    }
+
+    /// An awarded inline job, claimed with `pin`.
+    fn seed_awarded_inline_job(runner: &SellerNodeRunner, job_id: &str, buyer_hex: &str, pin: Option<&crate::seller_node::store::ClaimPin>) {
+        let now = now_unix();
+        let store = runner.node.store();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    accepts_delivery: vec![gateway::DELIVERY_MODE_INLINE.to_owned()],
+                    payment_mode: crate::gateway::PaymentMode::Sat,
+                    offer_id: job_id.to_owned(),
+                    buyer_pubkey: buyer_hex.to_owned(),
+                    amount_sats: 100,
+                    unit: "sat".to_owned(),
+                    task: "answer me".to_owned(),
+                    deadline_unix: now + 3_600,
+                    targeted: true,
+                    capability_request: Some(Default::default()),
+                    requested_agent: None,
+                    output: Some("text/plain".to_owned()),
+                },
+                now,
+            )
+            .expect("record offer");
+        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), crate::gateway::ClaimPayment::Sat("creq"), &[], &Default::default());
+        store
+            .claim_and_enqueue_pinned(job_id, job_id, Some("creq"), &draft, now, now + 3_600, now, pin)
+            .expect("claim");
+        // A distinct award event per job (award ids are unique).
+        store.record_award(&Keys::generate().public_key().to_hex(), job_id, buyer_hex, now).expect("award");
+    }
+
+    fn hook_pin(runner: &SellerNodeRunner) -> crate::seller_node::store::ClaimPin {
+        let entry = runner.agents.entry(0).expect("hook entry");
+        crate::seller_node::store::ClaimPin { label: "my-hook".into(), kind: "hook".into(), fingerprint: entry.fingerprint() }
+    }
+
+    async fn fetch_results(observer: &Client, job_id: &str) -> Vec<nostr_sdk::Event> {
+        observer
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(crate::kinds::JOB_RESULT_KIND))
+                    .event(nostr_sdk::EventId::from_hex(job_id).expect("job id")),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fetch results")
+            .into_iter()
+            .collect()
+    }
+
+    fn tag_value(event: &nostr_sdk::Event, name: &str, index: usize) -> Option<String> {
+        event.tags.iter().map(|t| t.as_slice()).find(|t| t.first().map(String::as_str) == Some(name)).and_then(|t| t.get(index).cloned())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_job_runs_once_and_its_exact_answer_is_the_signed_result() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, seller_keys, root) = boot_hook_seller("hook-e2e", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "7".repeat(64);
+        let pin = hook_pin(&runner);
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&pin));
+
+        runner.execute_job(&job_id, None, false).await;
+
+        let store = runner.node.store();
+        assert_eq!(hook_runs(&root), 1, "the hook runs exactly once");
+        assert!(store.has_delivery(&job_id).expect("has_delivery"), "the answer was journaled as the delivery");
+        assert!(store.hook_job_ids().expect("ids").is_empty(), "terminal: staged answer and run record cleared");
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        assert_eq!(results.len(), 1, "one result");
+        let result = &results[0];
+        assert_eq!(result.content, HOOK_ANSWER, "the result carries the hook's decoded answer byte-for-byte");
+        assert_eq!(tag_value(result, "harness", 1).as_deref(), Some("my-hook"), "names the pinned entry");
+        assert_eq!(tag_value(result, "usage_transport", 1).as_deref(), Some("hook"));
+        assert_eq!(tag_value(result, "model", 1).as_deref(), Some("my-model"));
+        // The co-signature binds THIS answer: rebuild the preimage from its digest and verify.
+        let preimage = delivery_receipt_preimage(
+            &job_id,
+            "answer me",
+            100,
+            &buyer_hex,
+            &seller_keys.public_key().to_hex(),
+            &crate::receipt::result_content_hash_hex(HOOK_ANSWER),
+            crate::receipt::DeliveryKind::Inline.as_str(),
+            Some("creq"),
+        );
+        let sig_hex = tag_value(result, "sig", 2).expect("sig seller tag");
+        let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&hex::decode(&sig_hex).expect("sig hex"))
+            .expect("sig bytes");
+        let message = nostr_sdk::secp256k1::Message::from_digest(preimage.digest_bytes());
+        nostr_sdk::secp256k1::Secp256k1::verification_only()
+            .verify_schnorr(&sig, &message, &seller_keys.public_key().xonly().expect("xonly"))
+            .expect("the seller co-signed the receipt preimage of exactly this answer");
+
+        // A redundant re-drive of the delivered job never runs the hook again nor emits a second result.
+        runner.execute_job(&job_id, None, true).await;
+        assert_eq!(hook_runs(&root), 1);
+        assert_eq!(fetch_results(&observer, &job_id).await.len(), 1);
+
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_hook_answer_is_redelivered_without_rerunning_the_hook() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-staged", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "8".repeat(64);
+        let pin = hook_pin(&runner);
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&pin));
+        // The crash: the hook ran and its answer was staged, but the daemon died before delivery.
+        runner
+            .node
+            .store()
+            .stage_hook_outcome(
+                &crate::seller_node::store::HookOutcomeRow {
+                    invocation: job_id.clone(),
+                    job_id: job_id.clone(),
+                    turn: 1,
+                    status: "done".into(),
+                    answer: "the staged answer".into(),
+                    wall_time_ms: 5,
+                },
+                now_unix(),
+            )
+            .expect("stage");
+
+        runner.execute_job(&job_id, None, true).await;
+
+        assert_eq!(hook_runs(&root), 0, "a staged answer is re-delivered, never re-run");
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "the staged answer");
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_whose_pin_does_not_match_or_is_absent_never_reaches_the_hook() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-pin", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let changed = crate::seller_node::store::ClaimPin { fingerprint: "not-the-configured-entry".into(), ..hook_pin(&runner) };
+        let (mismatch, unpinned) = ("9".repeat(64), "6".repeat(64));
+        seed_awarded_inline_job(&runner, &mismatch, &buyer_hex, Some(&changed));
+        seed_awarded_inline_job(&runner, &unpinned, &buyer_hex, None);
+
+        runner.execute_job(&mismatch, None, false).await;
+        runner.execute_job(&unpinned, None, false).await;
+
+        assert_eq!(hook_runs(&root), 0, "neither claim may run the hook");
+        let store = runner.node.store();
+        for job in [&mismatch, &unpinned] {
+            assert_eq!(store.job_state(job).expect("state"), Some(crate::seller_node::store::JobState::Failed), "{job}");
+            assert!(!store.has_delivery(job).expect("has_delivery"));
+        }
+        let observer = connect_observer(&relay_url).await;
+        assert!(fetch_results(&observer, &mismatch).await.is_empty());
+        assert!(fetch_results(&observer, &unpinned).await.is_empty());
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Compose the resume decision exactly as `execute_job` does on resume: read every durable marker
     /// (incl. the #563 settled-elsewhere marker) and feed them to `resume_action`.
     fn compose_resume_action(runner: &SellerNodeRunner, job_id: &str, now: i64) -> ResumeAction {
