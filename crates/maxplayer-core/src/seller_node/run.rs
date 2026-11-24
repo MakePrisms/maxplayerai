@@ -12043,6 +12043,9 @@ impl SellerNodeRunner {
                 opline!("seller node job_id={job_id}: fail_job write error (continuing): {error}")
             }
         }
+        // hook-agents §6/§7.1: a failed hook job's state (staged answer, run record, directory) goes
+        // with it, whichever path failed it. A job with no hook state is not touched.
+        hook_run::clear_terminal_hook_state(self.node.store(), self.node.home(), job_id);
     }
 
     /// The job row's state, for a LOG that must name why a write moved nothing. Never fails the
@@ -19087,6 +19090,34 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "the staged answer");
         observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex r2 #8: a job failed on a path outside the hook runner (here: the hook was edited since
+    /// the claim) still loses the hook state an earlier attempt left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_job_failed_before_dispatch_still_loses_its_hook_state() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-fail-cleanup", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "3".repeat(64);
+        let changed = crate::seller_node::store::ClaimPin { fingerprint: "the-entry-at-claim-time".into(), ..hook_pin(&runner) };
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&changed));
+        let store = runner.node.store();
+        assert_eq!(store.begin_hook_attempt(&job_id, &job_id, now_unix()).expect("begin"), Some(1));
+        let workdir = job_workdir(runner.node.home(), &job_id);
+        std::fs::create_dir_all(&workdir).expect("dir");
+
+        runner.execute_job(&job_id, None, true).await;
+
+        assert_eq!(store.job_state(&job_id).expect("state"), Some(crate::seller_node::store::JobState::Failed));
+        assert!(store.hook_job_ids().expect("ids").is_empty(), "the run record went with the failure");
+        assert!(!workdir.exists(), "and so did the directory");
         runner.client.disconnect().await;
         relay.shutdown();
         let _ = std::fs::remove_dir_all(&root);

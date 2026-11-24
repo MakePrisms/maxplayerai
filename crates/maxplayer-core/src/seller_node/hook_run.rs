@@ -348,26 +348,36 @@ pub(super) fn reap_journaled_groups(store: &crate::seller_node::store::SellerSto
 }
 
 /// Drop a job's hook state (staged answer, run record, per-job directory) if the job is terminal.
-/// A live job keeps its staged answer: it may still be re-delivered (§7.1). Returns whether cleared.
+/// A live job keeps its staged answer: it may still be re-delivered (§7.1). The directory goes
+/// FIRST and the rows only once it is gone: the rows are how a later boot finds a directory that a
+/// crash or a failed removal left behind. A job with no hook state is not touched (another seat
+/// kind's directory is not ours to remove). Returns whether cleared.
 pub(super) fn clear_terminal_hook_state(
     store: &crate::seller_node::store::SellerStore,
     home: &MaxplayerHome,
     job_id: &str,
 ) -> bool {
     use crate::seller_node::store::JobState;
+    if !matches!(store.has_hook_state(job_id), Ok(true)) {
+        return false;
+    }
     // A group that is still journaled may still run in the directory: keep everything until it is
     // resolved (§5.1).
     if !matches!(store.hook_group_journaled(job_id), Ok(false)) {
         return false;
     }
-    match store.job_state(job_id) {
-        Ok(Some(JobState::Delivered | JobState::Paid | JobState::Failed)) => {
-            let _ = store.clear_hook_outcomes(job_id);
-            let _ = std::fs::remove_dir_all(job_workdir(home, job_id));
-            true
-        }
-        _ => false,
+    if !matches!(store.job_state(job_id), Ok(Some(JobState::Delivered | JobState::Paid | JobState::Failed))) {
+        return false;
     }
+    match std::fs::remove_dir_all(job_workdir(home, job_id)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            opline!("seller node hook job_id={job_id}: job directory not removed ({error}); its hook state is kept and retried at the next start");
+            return false;
+        }
+    }
+    store.clear_hook_outcomes(job_id).is_ok()
 }
 
 /// Boot reconciliation: hook state a crash left behind for jobs that have since become terminal.
@@ -641,6 +651,52 @@ mod tests {
         assert!(status.code().is_none(), "the orphan was killed: {status:?}");
         assert!(store.journaled_hook_groups().expect("list").is_empty(), "its journal entry is cleared");
         assert_eq!(store.begin_hook_attempt("job-x", "job-x", 3).expect("begin"), Some(2), "the re-drive is attempt 2");
+    }
+
+    /// codex r2 #8: a directory that cannot be removed keeps the job's hook rows (the only way a
+    /// later boot finds it); once it can be removed, boot reconciliation clears both.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_directory_that_cannot_be_removed_keeps_its_hook_rows() {
+        use crate::seller_node::store::JobState;
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root removes it regardless of the mode
+        }
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = crate::home::bootstrap(dir.path()).expect("home");
+        let store = crate::seller_node::store::SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
+        assert_eq!(store.begin_hook_attempt("job-d", "job-d", 1).expect("begin"), Some(1));
+        store.insert_job_for_test("job-d", JobState::Failed);
+        let workdir = job_workdir(&home, "job-d");
+        let locked = workdir.join("inputs");
+        std::fs::create_dir_all(&locked).expect("dir");
+        std::fs::write(locked.join("f"), b"x").expect("file");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+
+        assert!(!clear_terminal_hook_state(&store, &home, "job-d"), "the directory could not go");
+        assert_eq!(store.hook_job_ids().expect("ids"), vec!["job-d".to_owned()], "its rows stay so a boot finds it");
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        reconcile_terminal_hook_state(&store, &home);
+        assert!(store.hook_job_ids().expect("ids").is_empty());
+        assert!(!workdir.exists());
+    }
+
+    /// codex r2 #8: a job without hook state is never touched (its directory belongs to another
+    /// seat kind).
+    #[test]
+    fn a_job_without_hook_state_keeps_its_directory() {
+        use crate::seller_node::store::JobState;
+        let dir = tempfile::tempdir().expect("tmp");
+        let home = crate::home::bootstrap(dir.path()).expect("home");
+        let store = crate::seller_node::store::SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
+        store.insert_job_for_test("job-acp", JobState::Failed);
+        let workdir = job_workdir(&home, "job-acp");
+        std::fs::create_dir_all(&workdir).expect("dir");
+        assert!(!clear_terminal_hook_state(&store, &home, "job-acp"));
+        assert!(workdir.exists());
     }
 
     /// codex r2 #2: a journaled group whose stop cannot be established (here: its leader is gone but

@@ -3662,6 +3662,19 @@ impl SellerStore {
         Ok(Some(u32::try_from(attempt).unwrap_or(u32::MAX)))
     }
 
+    /// Whether `job_id` has any hook state (a staged outcome or a run record).
+    pub fn has_hook_state(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM hook_outcomes WHERE job_id = ?1 UNION ALL SELECT 1 FROM hook_runs WHERE job_id = ?1 LIMIT 1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Whether any invocation of `job_id` still has a journaled group (one not yet resolved).
     pub fn hook_group_journaled(&self, job_id: &str) -> Result<bool, StoreError> {
         let conn = self.lock()?;
