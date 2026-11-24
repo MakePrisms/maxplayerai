@@ -24,8 +24,9 @@ you look, and the settled `settlement` carries `results_path` and the file list,
 seller resumes the same agent conversation and working tree; each turn is priced like the
 job, and the daemon settles turns 2 and later on its own too, strictly in turn order,
 into `results/<job_id>-t<n>` (`get_job` → `settlement`, `turn: <n>`, goes `settling` →
-`settled`). `collect` is only the explicit retry of a `failed` settle, and it is your call,
-not the human's. `reply close: true` ends the
+`settled`). Every turn costs the job's price again, up to `max_session_sats` in total (default 10×
+`amount_sats`, turn 1 included; buyer-operate §5 has the limits). `collect` is only the explicit
+retry of a `failed` settle, and it is your call, not the human's. `reply close: true` ends the
 session; that is optional, since a parked session expires at `session.expires_hint`. Keep the
 `QUESTIONS.md` convention below inside a session too — it is still how open questions
 travel. Use the rest of this skill when `reply` is unavailable (flag off, or a seller
