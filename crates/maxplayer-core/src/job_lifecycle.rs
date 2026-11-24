@@ -3174,11 +3174,11 @@ pub(crate) async fn award_presence_async(
     job_id: &str,
     timeout: Duration,
 ) -> Result<PresenceRead<AwardPresence>, JobLifecycleError> {
-    use nostr_sdk::prelude::{Client, EventId, Filter, Kind};
+    use nostr_sdk::prelude::{EventId, Filter, Kind};
 
     let offer_id = EventId::from_hex(job_id)
         .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     // Same discipline as the send path: auto-auth on (NIP-42-gated reads re-issue silently only
     // when it is), and WAIT for the socket — `connect()` only spawns, and a fetch racing the
     // handshake burns its whole window and reads as empty.
@@ -3355,9 +3355,8 @@ async fn presence_of_filter(
     timeout: Duration,
 ) -> Result<PresenceRead<()>, JobLifecycleError> {
     use nostr_sdk::pool::relay::ReqExitPolicy;
-    use nostr_sdk::prelude::Client;
 
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     client.automatic_authentication(true);
     client
         .add_relay(relay_url)
