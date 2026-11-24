@@ -331,10 +331,16 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
   which goes to the seller log, never to the buyer.
 - Cutoff (monotonic): `job` ⇒ `deadline_unix − 30 s` (time to sign and publish); `ping`/`close`
   ⇒ 30 s. At the cutoff, or on daemon shutdown: `SIGTERM` to the group, 2 s grace, `SIGKILL` to
-  the group, reap the child. Read ends are closed after the reap, so a descendant that kept a pipe
-  open cannot hold the runner.
-- A hook that wants a long-lived worker must start it outside its own process group (that is the
-  adapter's business, e.g. the channel adapter's `serve`, started by Claude Code, not by us).
+  the group, reap the child. The child's exit is observed without reaping it (`waitid(WNOWAIT)`),
+  so the group id cannot be recycled before the group kill. An exit first observed at or after the
+  cutoff counts as the cutoff.
+- When the hook exits, the rest of its group is killed and stdout gets 2 s to reach EOF. Stdout
+  still open then (a process that left the group kept it) is incomplete: the answer is refused as a
+  violation. All three pipes are non-blocking and pumped by the one supervising thread, and every
+  read end is closed before the call returns, so nothing stays blocked on a pipe.
+- `ping` and `close` stdout is drained and discarded: never kept, never an overflow.
+- A hook that wants a long-lived worker must start it outside its own process group, with its
+  stdout pointed elsewhere (that is the adapter's business, e.g. the channel adapter's `serve`, started by Claude Code, not by us).
 - Environment: the daemon's environment with every `MAXPLAYER_*` variable removed (config
   overrides may carry credentials), plus `MAXPLAYER_HOOK_V=1`, which is added to the reserved
   env names (`core/home.rs:2438 @4caf510`) so a `maxplayer` command run by the agent does not

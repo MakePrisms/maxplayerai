@@ -1,7 +1,7 @@
 //! The hook runner: a seller's OWN agent behind a command (docs/specs/hook-agents.md §5).
 //!
 //! The daemon runs the hook argv directly (no shell), writes one JSON object + `\n` to its stdin,
-//! closes stdin, and drains stdout/stderr concurrently until the process exits or the cutoff.
+//! closes stdin, and drains stdout/stderr until the process exits or the cutoff.
 //! Everything here is blocking and synchronous on purpose: the caller runs it on a blocking task,
 //! and the run loop never waits on a hook.
 //!
@@ -12,13 +12,13 @@
 //! - stdout is capped (first overflow ⇒ kill, contract violation); stderr keeps only its tail;
 //! - at the cutoff: SIGTERM to the group, a grace period, SIGKILL to the group, reap;
 //! - after the child exits, the group is SIGKILLed anyway (a hook that wants a long-lived worker
-//!   starts it outside its own group), and reader threads get a bounded wait, so a descendant that
-//!   escaped the group and kept a pipe open cannot hold the runner.
+//!   starts it outside its own group, with its stdout pointed elsewhere), and stdout gets a bounded
+//!   wait for EOF: a pipe still held open then means stdout is incomplete and the answer is refused.
+//!   All pipes are non-blocking and pumped by one thread, so nothing is left blocked afterwards.
 
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The contract version written as `"v"` on every event and as `MAXPLAYER_HOOK_V` in the env.
@@ -35,7 +35,7 @@ pub const KILL_GRACE: Duration = Duration::from_secs(2);
 pub const CONTROL_EVENT_BUDGET: Duration = Duration::from_secs(30);
 /// Seconds before the job deadline at which a `job` call is cut, leaving time to sign + publish.
 pub const PUBLISH_MARGIN_SECS: u64 = 30;
-/// How long reader threads get after the reap before their buffers are read as-is.
+/// How long stdout/stderr get to reach EOF after the hook exits. Stdout still open then is incomplete.
 const READER_JOIN_BUDGET: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
 
@@ -115,6 +115,10 @@ pub enum Exit {
 pub struct RunReport {
     pub exit: Exit,
     pub stdout: Vec<u8>,
+    /// Whether stdout reached EOF without a read error or overflow. A `job` answer is accepted only
+    /// from complete stdout: a pipe still open after the exit (held by a process that left the
+    /// group) may be a prefix.
+    pub stdout_complete: bool,
     /// The last [`STDERR_TAIL_BYTES`] of stderr, lossily decoded. Seller log only, never the buyer.
     pub stderr_tail: String,
     pub wall: Duration,
@@ -223,6 +227,12 @@ pub fn classify_job(report: &RunReport, cap: usize) -> JobOutcome {
         Exit::Exited { code: Some(code) } => return JobOutcome::Broken(format!("exit status {code}")),
         Exit::Exited { code: None } => return JobOutcome::Broken("killed by a signal".into()),
     }
+    if !report.stdout_complete {
+        return JobOutcome::Broken(format!(
+            "stdout not complete: still open {}s after the hook exited (a process outside its group kept it), or unreadable",
+            READER_JOIN_BUDGET.as_secs()
+        ));
+    }
     // serde_json refuses invalid UTF-8, trailing non-whitespace and (for a derived struct) a
     // duplicate field; unknown extra fields are tolerated.
     let wire: WireAnswer = match serde_json::from_slice(&report.stdout) {
@@ -249,7 +259,7 @@ pub fn classify_job(report: &RunReport, cap: usize) -> JobOutcome {
 
 /// Send one `ping` and say whether the hook is healthy. Blocking; bounded by [`CONTROL_EVENT_BUDGET`].
 pub fn ping(argv: &[String], cwd: &Path, reason: PingReason) -> Result<(), String> {
-    let report = run(argv, &ping_event(reason), cwd, Instant::now() + CONTROL_EVENT_BUDGET);
+    let report = run_control(argv, &ping_event(reason), cwd, Instant::now() + CONTROL_EVENT_BUDGET);
     if ping_healthy(&report) {
         Ok(())
     } else {
@@ -266,7 +276,7 @@ pub fn ping(argv: &[String], cwd: &Path, reason: PingReason) -> Result<(), Strin
 
 /// Send `close` for `job_id`, best effort: exit status ignored (§5.3).
 pub fn close(argv: &[String], cwd: &Path, job_id: &str) {
-    let _ = run(argv, &close_event(job_id), cwd, Instant::now() + CONTROL_EVENT_BUDGET);
+    let _ = run_control(argv, &close_event(job_id), cwd, Instant::now() + CONTROL_EVENT_BUDGET);
 }
 
 /// Whether a finished `ping` run means healthy: exit 0 before the cutoff. Stdout is ignored.
@@ -274,11 +284,25 @@ pub fn ping_healthy(report: &RunReport) -> bool {
     matches!(report.exit, Exit::Exited { code: Some(0) })
 }
 
+/// What a call does with the hook's stdout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StdoutMode {
+    /// A `job`: stdout is the answer, kept up to [`STDOUT_MAX_BYTES`] (overflow ⇒ kill).
+    Keep,
+    /// A control event (`ping`, `close`): stdout is drained and discarded, never a violation.
+    Discard,
+}
+
 /// Run `argv` once under the supervision rules, feeding `stdin`, in `cwd`, until `cutoff`. The
 /// child gets the daemon's environment minus every `MAXPLAYER_*` variable, plus
 /// [`HOOK_VERSION_ENV`].
 pub fn run(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunReport {
-    run_with_env(argv, stdin, cwd, cutoff, std::env::vars_os())
+    supervise(argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep)
+}
+
+/// [`run`] for a control event: the same supervision, with stdout discarded (§5.2: ignored).
+pub fn run_control(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunReport {
+    supervise(argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Discard)
 }
 
 /// [`run`] with the parent environment passed in, so the scrub is testable without mutating the
@@ -290,18 +314,44 @@ pub fn run_with_env(
     cutoff: Instant,
     parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> RunReport {
+    supervise(argv, stdin, cwd, cutoff, parent_env, StdoutMode::Keep)
+}
+
+/// The one supervisor. Single-threaded on purpose: all three pipes are non-blocking and pumped
+/// from this loop, so nothing can be left blocked on a pipe after it returns — every pipe is
+/// closed (dropped) before the report is built.
+///
+/// Order of resolution, decided once:
+/// 1. stdout overflow (Keep mode) ⇒ kill the group, [`Exit::StdoutOverflow`];
+/// 2. the leader has exited ⇒ if that is first observed at or after the cutoff, [`Exit::CutOff`]
+///    (the deadline wins over a late exit); else its status;
+/// 3. the cutoff ⇒ SIGTERM, grace, SIGKILL, [`Exit::CutOff`].
+///
+/// Exit is detected WITHOUT reaping (`waitid(WNOWAIT)`): the zombie leader keeps its pid — the group id —
+/// reserved while the rest of the group is SIGKILLed, so the signal cannot reach a recycled group.
+/// Only then is the leader reaped. After the exit, stdout gets [`READER_JOIN_BUDGET`] to reach EOF; a
+/// pipe still open then (a process outside the group kept it) means stdout is NOT complete.
+fn supervise(
+    argv: &[String],
+    stdin: &[u8],
+    cwd: &Path,
+    cutoff: Instant,
+    parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    mode: StdoutMode,
+) -> RunReport {
     let started = Instant::now();
-    let report = |exit, stdout, stderr_tail| RunReport {
+    let report = |exit, stdout, stdout_complete, stderr_tail| RunReport {
         exit,
         stdout,
+        stdout_complete,
         stderr_tail,
         wall: started.elapsed(),
     };
     if Instant::now() >= cutoff {
-        return report(Exit::NotStarted, Vec::new(), String::new());
+        return report(Exit::NotStarted, Vec::new(), false, String::new());
     }
     let Some((program, args)) = argv.split_first() else {
-        return report(Exit::SpawnFailed("empty argv".into()), Vec::new(), String::new());
+        return report(Exit::SpawnFailed("empty argv".into()), Vec::new(), false, String::new());
     };
     let mut command = Command::new(program);
     command
@@ -317,85 +367,53 @@ pub fn run_with_env(
         }
     }
     command.env(HOOK_VERSION_ENV, HOOK_CONTRACT_VERSION.to_string());
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return report(Exit::SpawnFailed(error.to_string()), Vec::new(), String::new()),
+        Err(error) => return report(Exit::SpawnFailed(error.to_string()), Vec::new(), false, String::new()),
     };
     let pgid = child.id();
-
-    // Stdin on its own thread: a hook that never reads it must not block the runner. EPIPE (the
-    // hook exited or closed stdin early) is not an error; the exit status decides.
-    if let Some(mut pipe) = child.stdin.take() {
-        let payload = stdin.to_vec();
-        std::thread::spawn(move || {
-            let _ = pipe.write_all(&payload);
-            // Dropping the pipe closes stdin.
-        });
+    let mut stdin_pipe = child.stdin.take();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    {
+        use std::os::fd::AsRawFd;
+        let fds = [
+            stdin_pipe.as_ref().map(|p| p.as_raw_fd()),
+            stdout_pipe.as_ref().map(|p| p.as_raw_fd()),
+            stderr_pipe.as_ref().map(|p| p.as_raw_fd()),
+        ];
+        if let Some(error) = fds.into_iter().flatten().find_map(|fd| set_nonblocking(fd).err()) {
+            terminate_group(pgid, &mut child);
+            return report(Exit::SpawnFailed(format!("pipe setup failed: {error}")), Vec::new(), false, String::new());
+        }
     }
 
-    let stdout = Arc::new(Mutex::new(Vec::new()));
-    let overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stdout_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if let Some(mut pipe) = child.stdout.take() {
-        let (buffer, overflow, done) = (Arc::clone(&stdout), Arc::clone(&overflow), Arc::clone(&stdout_done));
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 8192];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut buffer = buffer.lock().expect("stdout buffer");
-                        if buffer.len() + n > STDOUT_MAX_BYTES {
-                            overflow.store(true, std::sync::atomic::Ordering::SeqCst);
-                            break;
-                        }
-                        buffer.extend_from_slice(&chunk[..n]);
-                    }
-                }
-            }
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
-    } else {
-        stdout_done.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-    let stderr = Arc::new(Mutex::new(Vec::new()));
-    let stderr_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if let Some(mut pipe) = child.stderr.take() {
-        let (buffer, done) = (Arc::clone(&stderr), Arc::clone(&stderr_done));
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 8192];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut buffer = buffer.lock().expect("stderr buffer");
-                        buffer.extend_from_slice(&chunk[..n]);
-                        let excess = buffer.len().saturating_sub(STDERR_TAIL_BYTES);
-                        if excess > 0 {
-                            buffer.drain(..excess);
-                        }
-                    }
-                }
-            }
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
-    } else {
-        stderr_done.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
+    let mut io = Pumped::default();
     let exit = loop {
-        if overflow.load(std::sync::atomic::Ordering::SeqCst) {
+        let progressed = io.pump(&mut stdin_pipe, &mut stdout_pipe, &mut stderr_pipe, stdin, mode);
+        if io.overflow {
             terminate_group(pgid, &mut child);
             break Exit::StdoutOverflow;
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break Exit::Exited { code: status.code() },
-            Ok(None) => {}
+        match leader_exited(pgid) {
+            Ok(true) => {
+                let late = Instant::now() >= cutoff;
+                // The leader is a zombie, so its id (the group id) cannot have been reused yet.
+                signal_group(pgid, SIGKILL);
+                let status = child.wait();
+                if late {
+                    break Exit::CutOff;
+                }
+                break match status {
+                    Ok(status) => Exit::Exited { code: status.code() },
+                    Err(error) => Exit::SpawnFailed(format!("wait failed: {error}")),
+                };
+            }
+            Ok(false) => {}
             Err(error) => {
                 terminate_group(pgid, &mut child);
                 break Exit::SpawnFailed(format!("wait failed: {error}"));
@@ -405,69 +423,205 @@ pub fn run_with_env(
             terminate_group(pgid, &mut child);
             break Exit::CutOff;
         }
-        std::thread::sleep(POLL);
+        if !progressed {
+            std::thread::sleep(POLL);
+        }
     };
-    // Whatever is left of the group goes now (the child itself is already reaped).
-    signal_group(pgid, SIGKILL);
+    // Stdin has nobody left to read it.
+    drop(stdin_pipe.take());
 
-    let join_by = Instant::now() + READER_JOIN_BUDGET;
-    while Instant::now() < join_by
-        && !(stdout_done.load(std::sync::atomic::Ordering::SeqCst)
-            && stderr_done.load(std::sync::atomic::Ordering::SeqCst))
-    {
-        std::thread::sleep(POLL);
+    // The group is gone; give the read ends a bounded time to reach EOF.
+    let drain_by = Instant::now() + READER_JOIN_BUDGET;
+    while (stdout_pipe.is_some() || stderr_pipe.is_some()) && Instant::now() < drain_by && !io.overflow {
+        if !io.pump(&mut stdin_pipe, &mut stdout_pipe, &mut stderr_pipe, stdin, mode) {
+            std::thread::sleep(POLL);
+        }
     }
+    let stdout_complete = stdout_pipe.is_none() && !io.stdout_failed && !io.overflow;
+    // Close every read end now: nothing outlives this call.
+    drop(stdout_pipe);
+    drop(stderr_pipe);
     // An overflow that raced the exit still counts.
-    let exit = if overflow.load(std::sync::atomic::Ordering::SeqCst) {
-        Exit::StdoutOverflow
-    } else {
-        exit
-    };
-    let stdout = std::mem::take(&mut *stdout.lock().expect("stdout buffer"));
-    let stderr_tail = String::from_utf8_lossy(&stderr.lock().expect("stderr buffer")).into_owned();
-    report(exit, stdout, stderr_tail)
+    let exit = if io.overflow { Exit::StdoutOverflow } else { exit };
+    let stderr_tail = String::from_utf8_lossy(&io.stderr).into_owned();
+    report(exit, io.stdout, stdout_complete, stderr_tail)
 }
 
-const SIGTERM: i32 = 15;
-const SIGKILL: i32 = 9;
+/// What the supervisor has moved so far.
+#[derive(Default)]
+struct Pumped {
+    written: usize,
+    stdout: Vec<u8>,
+    stdout_failed: bool,
+    overflow: bool,
+    stderr: Vec<u8>,
+}
 
-/// SIGTERM the group, wait out the grace, SIGKILL the group, reap the child.
+impl Pumped {
+    /// One non-blocking pass over all three pipes. Returns whether any byte moved.
+    fn pump(
+        &mut self,
+        stdin_pipe: &mut Option<std::process::ChildStdin>,
+        stdout_pipe: &mut Option<std::process::ChildStdout>,
+        stderr_pipe: &mut Option<std::process::ChildStderr>,
+        payload: &[u8],
+        mode: StdoutMode,
+    ) -> bool {
+        let mut progressed = pump_write(stdin_pipe, payload, &mut self.written);
+        let (stdout, overflow) = (&mut self.stdout, &mut self.overflow);
+        match pump_read(stdout_pipe, |chunk| {
+            if mode == StdoutMode::Keep && !*overflow {
+                if stdout.len() + chunk.len() > STDOUT_MAX_BYTES {
+                    *overflow = true;
+                } else {
+                    stdout.extend_from_slice(chunk);
+                }
+            }
+        }) {
+            Ok(moved) => progressed |= moved,
+            Err(()) => self.stdout_failed = true,
+        }
+        let stderr = &mut self.stderr;
+        if let Ok(moved) = pump_read(stderr_pipe, |chunk| {
+            stderr.extend_from_slice(chunk);
+            let excess = stderr.len().saturating_sub(STDERR_TAIL_BYTES);
+            if excess > 0 {
+                stderr.drain(..excess);
+            }
+        }) {
+            progressed |= moved;
+        }
+        progressed
+    }
+}
+
+/// The most chunks one pump reads from one pipe before the loop checks the exit and the cutoff
+/// again, so an endless writer cannot pin the supervisor inside a read loop.
+const PUMP_CHUNKS: usize = 16;
+
+/// Read what is available now. `Ok(progressed)`; EOF closes the pipe (sets it to `None`); a read
+/// error closes it and is reported as `Err(())` (stdout is then not complete).
+fn pump_read<R: Read>(pipe: &mut Option<R>, mut sink: impl FnMut(&[u8])) -> Result<bool, ()> {
+    let Some(reader) = pipe.as_mut() else {
+        return Ok(false);
+    };
+    let mut chunk = [0u8; 8192];
+    let mut progressed = false;
+    for _ in 0..PUMP_CHUNKS {
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                *pipe = None;
+                return Ok(true);
+            }
+            Ok(n) => {
+                sink(&chunk[..n]);
+                progressed = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(progressed),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                *pipe = None;
+                return Err(());
+            }
+        }
+    }
+    Ok(progressed)
+}
+
+/// Write what the pipe takes now; close stdin once everything is written. A broken pipe (the hook
+/// exited or closed stdin early) just closes it: the exit status decides, not the write.
+fn pump_write(pipe: &mut Option<std::process::ChildStdin>, payload: &[u8], written: &mut usize) -> bool {
+    let Some(writer) = pipe.as_mut() else {
+        return false;
+    };
+    let mut progressed = false;
+    while *written < payload.len() {
+        match writer.write(&payload[*written..]) {
+            Ok(0) => {
+                *pipe = None;
+                return true;
+            }
+            Ok(n) => {
+                *written += n;
+                progressed = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return progressed,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                *pipe = None;
+                return true;
+            }
+        }
+    }
+    *pipe = None;
+    true
+}
+
+fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl on a descriptor owned by a live Child pipe for the duration of the call.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether child `pid` has exited, WITHOUT reaping it (`WNOWAIT`): until it is reaped its pid, and
+/// so the group id, stays reserved.
+fn leader_exited(pid: u32) -> std::io::Result<bool> {
+    // SAFETY: an all-zero siginfo_t is a valid value; waitid only writes into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid on our own child with a valid out-pointer.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // With WNOHANG and no state change the structure is left zeroed (POSIX: si_pid 0); a change
+    // fills it in with SIGCHLD.
+    Ok(info.si_signo != 0)
+}
+
+const SIGTERM: i32 = libc::SIGTERM;
+const SIGKILL: i32 = libc::SIGKILL;
+
+/// SIGTERM the group, wait out the grace, SIGKILL the group, then reap the leader. The leader is
+/// observed without reaping throughout, so both signals address a group whose id is still ours.
 fn terminate_group(pgid: u32, child: &mut std::process::Child) {
     signal_group(pgid, SIGTERM);
     let grace_until = Instant::now() + KILL_GRACE;
     while Instant::now() < grace_until {
-        if matches!(child.try_wait(), Ok(Some(_))) {
+        if !matches!(leader_exited(pgid), Ok(false)) {
             break;
         }
         std::thread::sleep(POLL);
     }
     signal_group(pgid, SIGKILL);
-    let _ = child.kill();
     let _ = child.wait();
 }
 
 /// `kill(-pgid, sig)`, refusing the widening ids 0 and 1. Errors (ESRCH: the group is gone) are
 /// ignored: there is nothing left to stop.
 fn signal_group(pgid: u32, sig: i32) {
-    #[cfg(unix)]
-    {
-        unsafe extern "C" {
-            fn kill(pid: std::ffi::c_int, sig: std::ffi::c_int) -> std::ffi::c_int;
-        }
-        let Ok(pgid) = std::ffi::c_int::try_from(pgid) else {
-            return;
-        };
-        if pgid <= 1 {
-            return;
-        }
-        // SAFETY: kill(2) takes two ints and touches no memory of ours.
-        unsafe {
-            kill(-pgid, sig);
-        }
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    if pgid <= 1 {
+        return;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (pgid, sig);
+    // SAFETY: kill(2) takes two ints and touches no memory of ours.
+    unsafe {
+        libc::kill(-pgid, sig);
     }
 }
 
@@ -633,16 +787,50 @@ mod tests {
     }
 
     #[test]
-    fn a_background_worker_holding_stdout_does_not_hold_the_runner() {
+    fn a_worker_that_left_the_group_holding_stdout_neither_holds_the_runner_nor_passes_a_prefix() {
         let started = Instant::now();
-        // The worker leaves the group (setsid) and keeps the pipe open; the runner must still return.
+        // The worker leaves the group (setsid) and keeps the pipe open. The runner must return,
+        // and must NOT accept what it read so far: more bytes could still arrive on that pipe.
         let report = run_sh(
-            r#"setsid sh -c 'sleep 20' & printf '{"status":"done","answer":"ok"}'"#,
+            // The pause lets the worker reach setsid() before the post-exit group kill.
+            r#"setsid sh -c 'sleep 20' & sleep 0.5; printf '{"status":"done","answer":"ok"}'"#,
             b"",
             Duration::from_secs(20),
         );
         assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
-        assert!(matches!(classify_job(&report, CAP), JobOutcome::Answer(_)), "{:?}", report);
+        assert_eq!(report.exit, Exit::Exited { code: Some(0) });
+        assert!(!report.stdout_complete);
+        let outcome = classify_job(&report, CAP);
+        assert!(matches!(&outcome, JobOutcome::Broken(why) if why.contains("not complete")), "{outcome:?}");
+        assert!(outcome.strikes());
+    }
+
+    #[test]
+    fn a_worker_that_left_the_group_with_its_own_stdout_is_fine() {
+        let report = run_sh(
+            r#"setsid sh -c 'sleep 20' >/dev/null 2>&1 </dev/null & sleep 0.5; printf '{"status":"done","answer":"ok"}'"#,
+            b"",
+            Duration::from_secs(20),
+        );
+        assert!(report.stdout_complete);
+        assert!(matches!(classify_job(&report, CAP), JobOutcome::Answer(_)), "{report:?}");
+    }
+
+    #[test]
+    fn the_group_is_killed_when_the_hook_exits_and_the_answer_still_counts() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let marker = dir.path().join("grandchild-alive");
+        // The grandchild stays in the group and inherits stdout; the post-exit group kill must
+        // stop it (and so close the pipe) before it can write.
+        let script = format!(
+            r#"(sleep 2; touch {}) & printf '{{"status":"done","answer":"ok"}}'"#,
+            marker.display()
+        );
+        let report = run(&sh(&script), b"", dir.path(), Instant::now() + Duration::from_secs(20));
+        assert!(report.stdout_complete);
+        assert!(matches!(classify_job(&report, CAP), JobOutcome::Answer(_)), "{report:?}");
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(!marker.exists(), "the grandchild must die with the group");
     }
 
     #[test]
@@ -679,5 +867,15 @@ mod tests {
         assert!(ping_healthy(&run_sh("cat >/dev/null; exit 0", &ping_event(PingReason::Boot), Duration::from_secs(10))));
         assert!(!ping_healthy(&run_sh("exit 1", &ping_event(PingReason::Boot), Duration::from_secs(10))));
         assert!(!ping_healthy(&run_sh("sleep 5", &ping_event(PingReason::Boot), Duration::from_millis(200))));
+    }
+
+    #[test]
+    fn a_noisy_ping_is_still_healthy_because_control_stdout_is_discarded() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let noisy = sh("head -c 3000000 /dev/zero; exit 0");
+        let report = run_control(&noisy, &ping_event(PingReason::Interval), dir.path(), Instant::now() + Duration::from_secs(20));
+        assert_eq!(report.exit, Exit::Exited { code: Some(0) });
+        assert!(report.stdout.is_empty(), "control stdout is never kept");
+        assert!(ping(&noisy, dir.path(), PingReason::Interval).is_ok());
     }
 }
