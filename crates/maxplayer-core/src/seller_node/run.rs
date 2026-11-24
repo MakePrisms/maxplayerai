@@ -474,6 +474,9 @@ enum SkipReason {
     AgentUnavailable,
     /// The live roster cannot satisfy the signed model/family/capability request.
     CapabilityUnavailable,
+    /// docs/specs/hook-agents.md §3: no serving entry is eligible for this offer's SHAPE with its
+    /// own capability (e.g. only a hook entry, and the offer is git-only or a contribution).
+    NoEligibleAgent,
     /// §2.1: the offer states `payment=none` and this seat has not opted in to free work
     /// (`[seller] takes_no_payment = false`, the default).
     ///
@@ -522,6 +525,9 @@ impl SkipReason {
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::CapabilityUnavailable => "requested model, family or capabilities unavailable on this node",
             Self::AgentUnavailable => "requested agent harness not available on this node",
+            Self::NoEligibleAgent => {
+                "no configured agent can serve this offer's shape (a hook entry serves inline, non-contribution offers only)"
+            }
             Self::FreeNotOffered => {
                 "free offer (payment=none) and this seat does not work for free (set [seller] \
                  takes_no_payment=true, which also requires rate_sats=0, to opt in)"
@@ -8488,6 +8494,26 @@ impl SellerNodeRunner {
             }
         }
 
+        // docs/specs/hook-agents.md §3 — ONE selection per claim: the first serving entry whose kind
+        // admits this offer's shape and whose OWN capability meets the request. It drives the
+        // claim's tags, the private dispatch block and the pin; nothing re-derives it later.
+        let shape = crate::seller_roster::OfferShape {
+            inline: offer.accepts_inline_delivery(),
+            contribution: contribution.is_some()
+                || self.node.store().contribution_pin(job_id).ok().flatten().is_some(),
+        };
+        let request = offer_capability_request(offer);
+        let Some((selected_index, selected_entry)) = self
+            .agents
+            .select(offer.requested_agent.as_deref(), shape, |cap| {
+                crate::buyer::lifecycle::capability_meets_request(cap, &request).is_ok()
+            })
+            .map(|s| (s.index, s.agent.clone()))
+        else {
+            opline!("seller node offer skip id={job_id}: {}", SkipReason::NoEligibleAgent.reason());
+            return ClaimOutcome::Declined;
+        };
+
         // #591: persist the contribution pin BEFORE record_offer. execute_job only runs on an awarded
         // claim, which requires the recorded offer — so writing the pin first makes pin ≤ offer ≤
         // claim: a crash can never leave an offer recorded (hence claimable) without its pin, which
@@ -8584,7 +8610,10 @@ impl SellerNodeRunner {
         // names came from one moment and whose models came from another would attribute a model to a
         // harness the seat was not offering when it said so — and nothing downstream could detect it,
         // because both halves parse.
-        let roster = self.agents.advertisement();
+        // The claim describes the SELECTED entry only (§4): the buyer's award filter reads the claim,
+        // so it judges exactly what will run. The beat stays seat-wide.
+        let selected_names: Vec<String> = selected_entry.name.clone().into_iter().collect();
+        let selected_capability = self.agents.entry_capability(selected_index);
         let claim = claim_draft(
             job_id,
             buyer_pubkey,
@@ -8595,17 +8624,15 @@ impl SellerNodeRunner {
                 Some(creq) => gateway::ClaimPayment::Sat(&creq),
                 None => gateway::ClaimPayment::None,
             },
-            &roster.names,
-            // The claim holds the declared colour and emits none of it: `claim_draft` asks only for
-            // the filterable tags. Passing it is not a leak, and passing a stub here instead would
-            // make this the one site whose capability came from somewhere other than the config.
-            &roster.capability(&self.node.home().config.seat),
+            &selected_names,
+            &selected_capability,
         );
         // Session jobs (docs/specs/session-jobs.md §2.2): `["session","1"]` only when
         // `[sessions] enabled` AND this is a docker seat on the container-delivery path. With the
         // flag off `advertise_on_claim` is a no-op, so the claim bytes are today's.
         let mut claim = claim;
-        {
+        // A hook entry advertises no session in this build (hook sessions are the next stage).
+        if !selected_entry.kind.is_hook() {
             let config = &self.node.home().config;
             let docker_container_seat = config.sandbox.as_ref().is_some_and(|sandbox| {
                 sandbox.mode == crate::home::SandboxMode::Docker
@@ -8619,19 +8646,19 @@ impl SellerNodeRunner {
                 &runsc_gate,
             );
         }
-        let chosen = offer.requested_agent.as_ref().or_else(|| roster.names.first()).cloned();
-        let capability = roster.capability(&self.node.home().config.seat);
-        let family = chosen.as_deref().and_then(crate::agent_presets::harness_family_for_preset).map(str::to_owned);
-        let model = family.as_ref().and_then(|f| capability.models.iter().find(|m| &m.family == f)).map(|m| m.model.clone());
+        let chosen = selected_entry.name.clone();
+        let family = selected_entry.family();
+        let model = selected_capability.models.first().map(|m| m.model.clone());
+        let capability = selected_capability.clone();
         let dispatch = crate::private_content::Dispatch { agent: chosen, harness_family: family,
             harness_model: model, capabilities: (!capability.capabilities.is_empty()).then_some(capability.capabilities) };
-        let claim = match super::privacy::project(self.node.home(), seller_pubkey, job_id, claim, Some(dispatch)) {
-            Ok(claim) => claim,
-            Err(e) => { opline!("seller private claim refused job_id={job_id}: {e}"); return ClaimOutcome::ReachedReview; }
-        };
         // Reserve-at-claim: a fully loaded node has no free slot and simply does not claim, which is
         // how it stays invisible to the market. The gate is consulted only here on the event loop,
         // never concurrently with itself, so two offers can never both take the last slot.
+        //
+        // Reserved BEFORE the private claim intent is prepared (hook-agents §3): a capacity skip must
+        // leave no prepared intent behind, or a later re-drive with a different selection would
+        // contradict it.
         let reserved = self.slots.try_reserve(job_id);
         if reserved == Reserve::Full {
             opline!("seller node offer skip id={job_id}: {}", SkipReason::SlotsBusy.reason());
@@ -8649,7 +8676,20 @@ impl SellerNodeRunner {
                 runner.slots.release(job_id);
             }
         };
-        match self.node.store().claim_and_enqueue(
+        let claim = match super::privacy::project(self.node.home(), seller_pubkey, job_id, claim, Some(dispatch)) {
+            Ok(claim) => claim,
+            Err(e) => {
+                opline!("seller private claim refused job_id={job_id}: {e}");
+                release_on_no_claim(self);
+                return ClaimOutcome::ReachedReview;
+            }
+        };
+        let pin = selected_entry.name.clone().map(|label| super::store::ClaimPin {
+            label,
+            kind: selected_entry.kind.as_str().to_owned(),
+            fingerprint: selected_entry.fingerprint(),
+        });
+        match self.node.store().claim_and_enqueue_pinned(
             job_id,
             job_id,
             creq.as_deref(),
@@ -8657,6 +8697,7 @@ impl SellerNodeRunner {
             now,
             now + CLAIM_PUBLISH_WINDOW_SECS,
             now,
+            pin.as_ref(),
         ) {
             Ok(super::store::Claimed::New) => {
                 opline!(
@@ -9659,15 +9700,29 @@ impl SellerNodeRunner {
         // award-is-payment the sats were committed at award, upstream of this arm. Never read this
         // code as protecting money (see `ReasonCode::CapabilityMissing`).
         let requested_agent = offer.requested_agent.clone();
-        let Some(selected) = self.agents.dispatch(requested_agent.as_deref()) else {
+        // hook-agents §3: a pinned claim runs on exactly the entry it described (label + fingerprint);
+        // an unpinned one (an older build's claim, or the unlabelled hatch) dispatches as before but
+        // over ACP entries only, so a hook added later never picks up work that never admitted hooks.
+        let pin = self.node.store().claim_pin(job_id).ok().flatten();
+        let selected = match &pin {
+            Some(pin) => self.agents.by_pin(&pin.label, &pin.fingerprint),
+            None => self.agents.dispatch_acp(requested_agent.as_deref()),
+        };
+        let Some(selected) = selected else {
             opline!(
-                "seller node execute fail job_id={job_id}: requested agent {:?} is not available on \
-                 this node (never substituted)",
-                requested_agent.as_deref().unwrap_or("<any>")
+                "seller node execute fail job_id={job_id}: {} (never substituted)",
+                match &pin {
+                    Some(pin) => format!("pinned agent {:?} changed or is gone since the claim", pin.label),
+                    None => format!(
+                        "requested agent {:?} is not available on this node",
+                        requested_agent.as_deref().unwrap_or("<any>")
+                    ),
+                }
             );
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, UNDISPATCHABLE_REASON_CODE, CAPABILITY_MISSING_FEEDBACK, None).await;
             return;
         };
+        let agent_kind = selected.agent.kind.clone();
         let agent_command = selected.agent.argv.clone();
         let agent_label = selected.agent.name.clone();
         // The registry index travels with the run: reporting a fault happens long after dispatch, and
@@ -9687,6 +9742,21 @@ impl SellerNodeRunner {
         // Move awarded -> executing (idempotent). A failed mark is logged, never fatal.
         if let Err(error) = self.node.store().mark_executing(job_id, now_unix()) {
             opline!("seller node execute job_id={job_id}: mark_executing failed (continuing): {error}");
+        }
+        // hook-agents §7: a hook entry runs the seller's own agent behind its command; nothing below
+        // (container, workdir git, ACP) applies.
+        if agent_kind.is_hook() {
+            self.execute_hook_job(
+                job_id,
+                &offer,
+                &stored_creq,
+                harness,
+                &agent_command,
+                agent_label.as_deref().unwrap_or("<hook>"),
+                &agent_kind,
+            )
+            .await;
+            return;
         }
 
         let seller_pubkey = self.seller_pubkey.to_hex();
@@ -12172,6 +12242,8 @@ impl SellerNodeRunner {
 
 #[path = "session_run.rs"]
 mod session_run;
+#[path = "hook_run.rs"]
+mod hook_run;
 
 /// The relay event kinds the lane has a handler for; anything else is never queued.
 fn handled_event_kind(kind: Kind) -> bool {
