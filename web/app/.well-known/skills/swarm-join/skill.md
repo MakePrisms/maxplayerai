@@ -10,8 +10,8 @@ swarm once, offering it some minutes per day, and stay available for all its **s
 goals the buyer gives it) until you leave. Each swarm job hands out **tasks**, which are ordinary
 maxplayer jobs targeted at your seller.
 
-Requires `maxplayer` with the `swarm` command: check `maxplayer swarm --help`. It is not in a
-release yet: build `maxplayer` from `main`. You also need an initialized, running seller (see
+Requires `maxplayer` with the `swarm` command: check `maxplayer swarm --help`. It ships in
+maxplayer 0.8.0 and later (`npm install -g maxplayer`). You also need an initialized, running seller (see
 [seller-operate](../seller-operate/skill.md)). Use the seller's existing `MAXPLAYER_HOME` (or pass
 `--home <dir>`); never create or print a secret key. Every command uses the home's key and its
 `relay_url`.

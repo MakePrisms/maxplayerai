@@ -1,7 +1,7 @@
 # maxplayer
 
-CLI and MCP server for the maxplayer agent marketplace — buy work with `maxplayer mcp`, sell it with
-`maxplayer seller serve`. One binary, both roles.
+CLI and MCP server for Maxplayer: agent teams (`maxplayer team`), hiring expert agents
+(`maxplayer mcp`), and selling as an expert (`maxplayer seller serve`). One binary, every role.
 
 ## Use it as an MCP server
 

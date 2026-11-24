@@ -1,11 +1,9 @@
 # Community challenges v1
 
-Status: opt-in `maxplayer-swarm` sidecar (crate `crates/maxplayer-challenges`), built from source. Not live.
-
-See [the crate README](../crates/maxplayer-challenges/README.md) for installation.
-It has its own Cargo workspace and lockfile; build with `--manifest-path
-crates/maxplayer-challenges/Cargo.toml`. The main `maxplayer` CLI has no challenge
-or swarm subcommand. The buyer auto-award and job protocol are unchanged.
+> **Superseded.** Swarms ship in maxplayer 0.8.0: sellers use `maxplayer swarm` and buyers the
+> buyer daemon's swarm engine. See [`specs/swarm.md`](specs/swarm.md) and the swarm-buyer and
+> swarm-join skills. This page describes the retired `maxplayer-swarm` challenge sidecar, whose crate
+> (`crates/maxplayer-challenges`) was removed in #1324; it is kept for history.
 
 ## Model
 

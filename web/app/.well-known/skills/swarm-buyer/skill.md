@@ -178,8 +178,8 @@ the only public account of the work. Put nothing secret in a goal or purpose.
 
 With sessions on (the default; `[sessions] enabled = false` turns them off), a member whose first task in a swarm job was
 delivered under a claim that advertised sessions keeps one session for that swarm job: its next
-non-`fresh` task in the same swarm job goes as a `reply` turn on that job, continuing the same agent
-conversation. This works for **public and private** swarms (a private job's follow-up is encrypted
+non-`fresh` task of 15 minutes or more in the same swarm job goes as a `reply` turn on that job,
+continuing the same agent conversation (a shorter task goes as a new one-off job). This works for **public and private** swarms (a private job's follow-up is encrypted
 like its offer). A turn is a task like any other — same minutes, budget, `max_sats` and one-at-a-time
 checks — priced like its job; the session's spend cap is the swarm job's budget. Keep turn text
 self-contained anyway: a turn that reports `context_reset` lost the memory and the session carries
