@@ -4560,6 +4560,20 @@ pub async fn probe_configured_harnesses(
     let mut verdicts = Vec::with_capacity(registry.entries().len());
     for (index, entry) in registry.entries().iter().enumerate() {
         let label = entry.name.clone().unwrap_or_else(|| "<unlabelled>".to_owned());
+        // hook-agents §9: a hook entry proves itself with a `boot` ping, run on the host as the
+        // seller's own program — no sandbox, no sentinel turn. Its model is self-reported config.
+        if entry.kind.is_hook() {
+            let (argv, cwd) = (entry.argv.clone(), home.root.clone());
+            let result = tokio::task::spawn_blocking(move || {
+                crate::hook::ping(&argv, &cwd, crate::hook::PingReason::Boot)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("ping task failed: {error}")))
+            .map(|()| None)
+            .map_err(|reason| (reason, Fault::Unproven));
+            verdicts.push(HarnessProbeVerdict { index, name: entry.name.clone(), result });
+            continue;
+        }
         let result = probe_one_harness(index, &entry.argv, &label, &sandbox, &identity, home).await;
         verdicts.push(HarnessProbeVerdict {
             index,
@@ -4670,6 +4684,15 @@ pub async fn boot_advertising_only_proven(
     // the kind-0 publish, rather than advertising a silently shorter set: a buyer commits sats on this
     // field, so "we could not check" must never look like "checked, and no". The proven set is recorded
     // into the roster below, before the first heartbeat or claim can read it.
+    // hook-agents §9: a hook-only seat runs nothing of ours, so there is no job environment to
+    // measure: it advertises no capability tokens and skips the probe (and its sandbox gate).
+    let hook_only = boot_agent_registry(&home)
+        .map(|registry| !registry.entries().is_empty() && registry.entries().iter().all(|e| e.kind.is_hook()))
+        .unwrap_or(false);
+    let (capabilities, job_nix) = if hook_only {
+        opline!("seller node: hook-only seat — no job environment of ours to probe; advertising no capability tokens");
+        (Vec::new(), false)
+    } else {
     let sandbox = crate::seller_exec::SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(format!("capability probe policy: {error}")))?;
     let probe_dir = crate::seller_exec::ProbeWorkdir::create(&home)
@@ -4691,6 +4714,8 @@ pub async fn boot_advertising_only_proven(
         }
     };
     drop(probe_dir);
+    (capabilities, job_nix)
+    };
     opline!("seller node capability probe proved: [{}]", capabilities.join(", "));
     opline!(
         "seller node job environment nix: {}",
@@ -4867,6 +4892,9 @@ pub struct SellerNodeRunner {
     /// probe ([`crate::capability::probe_seat_nix`]). Read into every job prompt. `false` until
     /// measured, so a node booted without the probe keeps the generic install advice.
     job_nix: std::sync::atomic::AtomicBool,
+    /// hook-agents §9: per hook entry, when its last interval ping started, whether one is in
+    /// flight, and its consecutive interval-ping failures.
+    hook_pings: Arc<std::sync::Mutex<std::collections::HashMap<usize, hook_run::PingTrack>>>,
     /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
     /// the off-loop execution tasks; see [`SlotGate`].
     /// The seat's held tools (the Holder route, `[[sandbox.held_tools]]`): one holder container per
@@ -5401,6 +5429,7 @@ impl SellerNodeRunner {
             announced_serving_generation: std::sync::atomic::AtomicU64::new(0),
             announced_free_slots: std::sync::atomic::AtomicU32::new(u32::MAX),
             job_nix: std::sync::atomic::AtomicBool::new(false),
+            hook_pings: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             held_tools,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
@@ -9226,6 +9255,10 @@ impl SellerNodeRunner {
                 continue;
             };
             let roster = Arc::clone(&self.agents);
+            if self.agents.entry(harness).is_some_and(|e| e.kind.is_hook()) {
+                self.start_hook_restore_ping(harness, argv, roster);
+                continue;
+            }
             // A `[sandbox]` that does not resolve grounds the harness rather than restoring it under
             // a pass-through: a probe that ran unsandboxed would prove nothing about the executor an
             // awarded job actually gets.
@@ -12099,6 +12132,7 @@ impl SellerNodeRunner {
                 self.redrive_followups().await;
                 self.reconsider_capacity_skips().await;
                 self.start_due_harness_probes();
+                self.start_hook_interval_pings();
             }
             schedule::Work::Backfill => {
                 let wraps = self.run_wrap_backfill().await;

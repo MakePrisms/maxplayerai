@@ -2541,6 +2541,9 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
 /// `MAXPLAYER_*` spelling, so excluding them costs no config coverage.
 const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_HOME",
+    // Set by the daemon for a hook agent (docs/specs/hook-agents.md §5.1), so a `maxplayer` command
+    // the seller's agent runs does not refuse it as an unknown config field.
+    "MAXPLAYER_HOOK_V",
     "MAXPLAYER_VERBOSE",
     "MAXPLAYER_HEARTBEAT_INTERVAL_SECS",
     "MAXPLAYER_HEARTBEAT_ENABLED",

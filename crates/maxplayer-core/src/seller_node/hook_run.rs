@@ -209,6 +209,109 @@ impl SellerNodeRunner {
     }
 }
 
+/// Interval-ping bookkeeping for one hook entry (§9).
+#[derive(Debug, Default, Clone)]
+pub(super) struct PingTrack {
+    pub last_started: Option<std::time::Instant>,
+    pub in_flight: bool,
+    pub consecutive_failures: u32,
+}
+
+/// Two consecutive failed interval pings fault a hook (a single blip does not).
+pub(super) const INTERVAL_PING_FAILURES_TO_FAULT: u32 = 2;
+
+impl SellerNodeRunner {
+    /// A dropped hook entry's due re-probe is a `restore` ping, off the loop. A pass restores it
+    /// (with the roster's backoff and strike history); a failure re-faults it.
+    pub(super) fn start_hook_restore_ping(
+        &self,
+        harness: usize,
+        argv: Vec<String>,
+        roster: Arc<LiveRoster>,
+    ) {
+        let cwd = self.node.home().root.clone();
+        tokio::task::spawn_local(async move {
+            let label = roster.label(harness).unwrap_or_else(|| "<hook>".to_owned());
+            let result = tokio::task::spawn_blocking(move || {
+                hook::ping(&argv, &cwd, hook::PingReason::Restore)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("ping task failed: {error}")));
+            match result {
+                Ok(()) => {
+                    roster.restore(harness);
+                    opline!("seller node hook RESTORED {label}: restore ping passed");
+                }
+                Err(reason) => {
+                    let state = roster.fault(harness, Fault::Unproven, std::time::Instant::now());
+                    opline!("seller node hook restore ping FAILED {label}: {reason} — {}", state.reason());
+                }
+            }
+        });
+    }
+
+    /// Ping every SERVING hook entry once per heartbeat interval (whether or not beats are
+    /// published), off the loop. Two consecutive failures fault it; a pass never restores (only a
+    /// `restore` ping does). A result is applied only if the entry is still serving, so a stale
+    /// ping cannot strike an entry a job already dropped.
+    pub(super) fn start_hook_interval_pings(&self) {
+        let interval = std::time::Duration::from_secs(
+            crate::heartbeat::resolve_interval_secs(&self.node.home().config.seller_heartbeat).max(30),
+        );
+        let now = std::time::Instant::now();
+        for index in 0..self.agents.entry_count() {
+            let Some(entry) = self.agents.entry(index) else { continue };
+            if !entry.kind.is_hook() || self.agents.unavailable(index).is_some() {
+                continue;
+            }
+            {
+                let mut pings = self.hook_pings.lock().expect("hook pings");
+                let track = pings.entry(index).or_default();
+                let due = track.last_started.is_none_or(|t| now.duration_since(t) >= interval);
+                if track.in_flight || !due {
+                    continue;
+                }
+                track.in_flight = true;
+                track.last_started = Some(now);
+            }
+            let (roster, pings, cwd) = (Arc::clone(&self.agents), Arc::clone(&self.hook_pings), self.node.home().root.clone());
+            let argv = entry.argv.clone();
+            let label = entry.name.clone().unwrap_or_else(|| "<hook>".to_owned());
+            tokio::task::spawn_local(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    hook::ping(&argv, &cwd, hook::PingReason::Interval)
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("ping task failed: {error}")));
+                let fault_now = {
+                    let mut pings = pings.lock().expect("hook pings");
+                    let track = pings.entry(index).or_default();
+                    track.in_flight = false;
+                    match &result {
+                        Ok(()) => {
+                            track.consecutive_failures = 0;
+                            false
+                        }
+                        Err(_) => {
+                            track.consecutive_failures += 1;
+                            track.consecutive_failures >= INTERVAL_PING_FAILURES_TO_FAULT
+                        }
+                    }
+                };
+                if let Err(reason) = result {
+                    if fault_now && roster.unavailable(index).is_none() {
+                        let state = roster.fault(index, Fault::Unproven, std::time::Instant::now());
+                        pings.lock().expect("hook pings").entry(index).or_default().consecutive_failures = 0;
+                        opline!("seller node hook {label} DROPPED after failed interval pings: {reason} — {}", state.reason());
+                    } else {
+                        opline!("seller node hook {label} interval ping failed ({reason})");
+                    }
+                }
+            });
+        }
+    }
+}
+
 /// The result's exec metadata for a hook: the entry label as harness, `usage_transport=hook`, the
 /// configured (self-reported) model when set, and the daemon-measured wall time.
 pub(super) fn hook_exec_metadata(

@@ -274,8 +274,22 @@ pub fn ping_healthy(report: &RunReport) -> bool {
     matches!(report.exit, Exit::Exited { code: Some(0) })
 }
 
-/// Run `argv` once under the supervision rules, feeding `stdin`, in `cwd`, until `cutoff`.
+/// Run `argv` once under the supervision rules, feeding `stdin`, in `cwd`, until `cutoff`. The
+/// child gets the daemon's environment minus every `MAXPLAYER_*` variable, plus
+/// [`HOOK_VERSION_ENV`].
 pub fn run(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunReport {
+    run_with_env(argv, stdin, cwd, cutoff, std::env::vars_os())
+}
+
+/// [`run`] with the parent environment passed in, so the scrub is testable without mutating the
+/// process environment (which every concurrently running test shares).
+pub fn run_with_env(
+    argv: &[String],
+    stdin: &[u8],
+    cwd: &Path,
+    cutoff: Instant,
+    parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> RunReport {
     let started = Instant::now();
     let report = |exit, stdout, stderr_tail| RunReport {
         exit,
@@ -296,9 +310,10 @@ pub fn run(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunRep
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("MAXPLAYER_") {
-            command.env_remove(&key);
+    command.env_clear();
+    for (key, value) in parent_env {
+        if !key.to_string_lossy().starts_with("MAXPLAYER_") {
+            command.env(key, value);
         }
     }
     command.env(HOOK_VERSION_ENV, HOOK_CONTRACT_VERSION.to_string());
@@ -632,15 +647,17 @@ mod tests {
 
     #[test]
     fn stdin_carries_the_event_and_the_env_is_scrubbed() {
-        // SAFETY: test-only; no other test reads this variable.
-        unsafe { std::env::set_var("MAXPLAYER_SECRETISH_TEST", "leak") };
+        // The parent env is injected (never the process env: tests share it).
+        let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+            .filter(|(k, _)| !k.to_string_lossy().starts_with("MAXPLAYER_"))
+            .collect();
+        env.push(("MAXPLAYER_SECRETISH_TEST".into(), "leak".into()));
+        env.push(("MAXPLAYER_HOME".into(), "/home/seller/.maxplayer".into()));
         let event = job_event("inv1", 1, 4076, "job1", 2, true, "the task, verbatim \"quoted\"", None, None, 99);
-        let report = run_sh(
+        let dir = tempfile::tempdir().expect("tmp");
+        let report = run_with_env(&sh(
             r#"in=$(cat); env | grep '^MAXPLAYER_' | sort > /dev/stderr; printf '%s' "$in" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"status":"done","answer":d["prompt"]+"|"+d["invocation"]+"|"+str(d["turn"])+"|"+str(d["output"])+"|"+str(d["inputs_dir"])}))'"#,
-            &event,
-            Duration::from_secs(10),
-        );
-        unsafe { std::env::remove_var("MAXPLAYER_SECRETISH_TEST") };
+), &event, dir.path(), Instant::now() + Duration::from_secs(10), env);
         assert_eq!(report.stderr_tail.trim(), "MAXPLAYER_HOOK_V=1");
         match classify_job(&report, CAP) {
             JobOutcome::Answer(answer) => {
