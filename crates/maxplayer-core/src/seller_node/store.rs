@@ -48,7 +48,7 @@ use crate::gateway::EventDraft;
 /// v15 (session jobs, docs/specs/session-jobs.md §5.4) adds the `sessions` and `session_turns`
 /// tables. Additive only: no existing table or CHECK changes, and both stay empty while
 /// `[sessions] enabled = false`.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// #1203: the most follow-ups of one ENDED session job that are ever answered with a refusal.
 pub const ENDED_REFUSALS_PER_JOB: i64 = 8;
@@ -939,6 +939,27 @@ impl JobState {
     }
 }
 
+/// The roster entry a claim was made for (docs/specs/hook-agents.md §3): journaled in the same
+/// transaction as the claim row, and the only thing execution dispatches by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimPin {
+    pub label: String,
+    /// `acp` | `hook`.
+    pub kind: String,
+    pub fingerprint: String,
+}
+
+/// A hook's validated outcome, staged before anything is signed or bound (spec §7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookOutcomeRow {
+    pub invocation: String,
+    pub job_id: String,
+    pub turn: u32,
+    pub status: String,
+    pub answer: String,
+    pub wall_time_ms: u64,
+}
+
 /// Outcome of parking a claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Claimed {
@@ -1439,6 +1460,37 @@ impl SellerStore {
         if !Self::column_exists(conn, "fee_remittances", "spending_quote_id")? {
             conn.execute_batch("ALTER TABLE fee_remittances ADD COLUMN spending_quote_id TEXT;")?;
         }
+        // v16 (hook agents): the claim pin. NULL on older rows, which dispatch as before but over
+        // ACP entries only. Additive + idempotent.
+        for column in ["agent_label", "agent_kind", "agent_fingerprint"] {
+            if !Self::column_exists(conn, "claims", column)? {
+                conn.execute_batch(&format!("ALTER TABLE claims ADD COLUMN {column} TEXT;"))?;
+            }
+        }
+        if !Self::column_exists(conn, "sessions", "kind")? {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN kind TEXT;")?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hook_outcomes (
+                 invocation      TEXT PRIMARY KEY,
+                 job_id          TEXT NOT NULL,
+                 turn            INTEGER NOT NULL,
+                 status          TEXT NOT NULL,
+                 answer          TEXT NOT NULL,
+                 wall_time_ms    INTEGER NOT NULL,
+                 created_at_unix INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS hook_outcomes_job ON hook_outcomes (job_id);
+             CREATE TABLE IF NOT EXISTS hook_runs (
+                 invocation      TEXT PRIMARY KEY,
+                 job_id          TEXT NOT NULL,
+                 attempt         INTEGER NOT NULL,
+                 pgid            INTEGER,
+                 pgid_start      TEXT,
+                 updated_at_unix INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS hook_runs_job ON hook_runs (job_id);",
+        )?;
         Ok(())
     }
 
@@ -1703,6 +1755,25 @@ impl SellerStore {
         expires_at_unix: i64,
         now_unix: i64,
     ) -> Result<Claimed, StoreError> {
+        self.claim_and_enqueue_pinned(
+            job_id, offer_id, creq, draft, created_at_unix, expires_at_unix, now_unix, None,
+        )
+    }
+
+    /// [`Self::claim_and_enqueue`] with the claim's roster pin written in the SAME transaction as
+    /// the claim row and its outbox draft, so the published claim and the pin can never disagree.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_and_enqueue_pinned(
+        &self,
+        job_id: &str,
+        offer_id: &str,
+        creq: Option<&str>,
+        draft: &EventDraft,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+        now_unix: i64,
+        pin: Option<&ClaimPin>,
+    ) -> Result<Claimed, StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if claim_state(&tx, job_id)?.is_some() {
@@ -1710,9 +1781,18 @@ impl SellerStore {
             return Ok(Claimed::Idempotent);
         }
         tx.execute(
-            "INSERT INTO claims (job_id, offer_id, state, creq, created_at_unix, updated_at_unix)
-             VALUES (?1, ?2, 'claimed', ?3, ?4, ?4)",
-            params![job_id, offer_id, creq.unwrap_or(""), now_unix],
+            "INSERT INTO claims (job_id, offer_id, state, creq, created_at_unix, updated_at_unix,
+                                 agent_label, agent_kind, agent_fingerprint)
+             VALUES (?1, ?2, 'claimed', ?3, ?4, ?4, ?5, ?6, ?7)",
+            params![
+                job_id,
+                offer_id,
+                creq.unwrap_or(""),
+                now_unix,
+                pin.map(|p| p.label.as_str()),
+                pin.map(|p| p.kind.as_str()),
+                pin.map(|p| p.fingerprint.as_str()),
+            ],
         )?;
         enqueue_event(
             &tx,
@@ -3566,6 +3646,190 @@ impl SellerStore {
         Ok(creq)
     }
 
+    /// The roster pin a claim was made for. `None` only for an existing claim whose three pin columns
+    /// are ALL empty (an older build's claim, or the unlabelled hatch). A partly filled pin, or no
+    /// claim row at all, is an error: neither may fall through to legacy dispatch.
+    pub fn claim_pin(&self, job_id: &str) -> Result<Option<ClaimPin>, StoreError> {
+        let conn = self.lock()?;
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT agent_label, agent_kind, agent_fingerprint FROM claims WHERE job_id = ?1",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        match row {
+            Some((Some(label), Some(kind), Some(fingerprint))) => Ok(Some(ClaimPin { label, kind, fingerprint })),
+            Some((None, None, None)) => Ok(None),
+            Some(_) => Err(StoreError(format!("claim pin of {job_id} is incomplete"))),
+            None => Err(StoreError(format!("no claim row for {job_id}"))),
+        }
+    }
+
+    /// Stage a validated hook outcome. Idempotent: an invocation's FIRST outcome wins, so a
+    /// re-drive can never replace the answer that may already be bound.
+    pub fn stage_hook_outcome(&self, row: &HookOutcomeRow, now_unix: i64) -> Result<HookOutcomeRow, StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO hook_outcomes
+                 (invocation, job_id, turn, status, answer, wall_time_ms, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                row.invocation,
+                row.job_id,
+                row.turn,
+                row.status,
+                row.answer,
+                i64::try_from(row.wall_time_ms).unwrap_or(i64::MAX),
+                now_unix
+            ],
+        )?;
+        drop(conn);
+        Ok(self
+            .hook_outcome(&row.invocation)?
+            .expect("a just-inserted (or existing) row reads back"))
+    }
+
+    /// The staged outcome for `invocation`, if any.
+    pub fn hook_outcome(&self, invocation: &str) -> Result<Option<HookOutcomeRow>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT invocation, job_id, turn, status, answer, wall_time_ms
+                 FROM hook_outcomes WHERE invocation = ?1",
+                [invocation],
+                |row| {
+                    Ok(HookOutcomeRow {
+                        invocation: row.get(0)?,
+                        job_id: row.get(1)?,
+                        turn: row.get(2)?,
+                        status: row.get(3)?,
+                        answer: row.get(4)?,
+                        wall_time_ms: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Drop every staged outcome and run record of a job (job or session ended).
+    pub fn clear_hook_outcomes(&self, job_id: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM hook_outcomes WHERE job_id = ?1", [job_id])?;
+        conn.execute("DELETE FROM hook_runs WHERE job_id = ?1", [job_id])?;
+        Ok(())
+    }
+
+    /// Start a new call of `invocation` (§5.1): its attempt number, 1 for the first call and one more
+    /// for every re-drive. `None` while an earlier call's group is still journaled: that group was not
+    /// resolved (reaped and cleared), so nothing may run the invocation again yet.
+    pub fn begin_hook_attempt(&self, invocation: &str, job_id: &str, now_unix: i64) -> Result<Option<u32>, StoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "INSERT INTO hook_runs (invocation, job_id, attempt, pgid, pgid_start, updated_at_unix)
+             VALUES (?1, ?2, 1, NULL, NULL, ?3)
+             ON CONFLICT(invocation) DO UPDATE SET
+                 attempt = attempt + 1, updated_at_unix = ?3
+             WHERE hook_runs.pgid IS NULL",
+            params![invocation, job_id, now_unix],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let attempt: i64 =
+            conn.query_row("SELECT attempt FROM hook_runs WHERE invocation = ?1", [invocation], |row| row.get(0))?;
+        Ok(Some(u32::try_from(attempt).unwrap_or(u32::MAX)))
+    }
+
+    /// Whether `job_id` has any hook state (a staged outcome or a run record).
+    pub fn has_hook_state(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM hook_outcomes WHERE job_id = ?1 UNION ALL SELECT 1 FROM hook_runs WHERE job_id = ?1 LIMIT 1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Whether any invocation of `job_id` still has a journaled group (one not yet resolved).
+    pub fn hook_group_journaled(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let found: Option<i64> = conn
+            .query_row("SELECT 1 FROM hook_runs WHERE job_id = ?1 AND pgid IS NOT NULL LIMIT 1", [job_id], |row| row.get(0))
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Journal the running group of `invocation`, BEFORE the hook is released from its gate.
+    pub fn record_hook_group(&self, invocation: &str, pgid: u32, start: Option<&str>, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE hook_runs SET pgid = ?2, pgid_start = ?3, updated_at_unix = ?4 WHERE invocation = ?1",
+            params![invocation, i64::from(pgid), start, now_unix],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError(format!("hook run {invocation} has no attempt row")))
+        }
+    }
+
+    /// The group of `invocation` has been killed and reaped: nothing to reap at the next boot.
+    pub fn clear_hook_group(&self, invocation: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute("UPDATE hook_runs SET pgid = NULL, pgid_start = NULL WHERE invocation = ?1", [invocation])?;
+        Ok(())
+    }
+
+    /// Tests elsewhere in the seller node: run one raw SQL statement (e.g. corrupt a row).
+    #[cfg(test)]
+    pub(crate) fn exec_sql_for_test(&self, sql: &str) {
+        self.lock().expect("lock").execute(sql, []).expect("test sql");
+    }
+
+    /// Tests elsewhere in the seller node: put a job row in an exact state (direct SQL).
+    #[cfg(test)]
+    pub(crate) fn insert_job_for_test(&self, job_id: &str, state: JobState) {
+        let conn = self.lock().expect("lock");
+        conn.execute(
+            "INSERT INTO jobs (job_id, offer_id, agent_name, state, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, NULL, ?3, 1, 1)",
+            params![job_id, format!("offer-{job_id}"), state.as_str()],
+        )
+        .expect("insert job");
+    }
+
+    /// Every job that has any hook state (a staged outcome or a run record), for boot reconciliation.
+    pub fn hook_job_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT job_id FROM hook_outcomes UNION SELECT job_id FROM hook_runs ORDER BY job_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every journaled group a previous daemon may have left running: `(invocation, pgid, start)`.
+    pub fn journaled_hook_groups(&self) -> Result<Vec<(String, u32, Option<String>)>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement =
+            conn.prepare("SELECT invocation, pgid, pgid_start FROM hook_runs WHERE pgid IS NOT NULL ORDER BY invocation")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (invocation, pgid, start) = row?;
+            if let Ok(pgid) = u32::try_from(pgid) {
+                out.push((invocation, pgid, start));
+            }
+        }
+        Ok(out)
+    }
+
     /// The assigned agent for a job, if any. Inspection/tests.
     pub fn job_agent(&self, job_id: &str) -> Result<Option<String>, StoreError> {
         let conn = self.lock()?;
@@ -4069,6 +4333,65 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = SellerStore::open(&path).expect("open");
         (store, path)
+    }
+
+    #[test]
+    fn hook_runs_count_attempts_and_journal_groups_until_cleared() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
+        assert!(store.record_hook_group("inv", 42, Some("7"), 1).is_err(), "no attempt row yet");
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 1).expect("begin"), Some(1));
+        store.record_hook_group("inv", 42, Some("7"), 2).expect("record");
+        assert_eq!(store.journaled_hook_groups().expect("list"), vec![("inv".to_owned(), 42, Some("7".to_owned()))]);
+        assert!(store.hook_group_journaled("job-h").expect("read"));
+        // codex r2 #2: no next attempt while the previous group is journaled (not yet resolved), and
+        // its identity is not overwritten.
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 3).expect("begin"), None);
+        assert_eq!(store.journaled_hook_groups().expect("list"), vec![("inv".to_owned(), 42, Some("7".to_owned()))]);
+        // Once the caller resolved and cleared it, a re-drive is the next attempt.
+        store.clear_hook_group("inv").expect("clear");
+        assert!(!store.hook_group_journaled("job-h").expect("read"));
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 3).expect("begin"), Some(2));
+        assert!(store.journaled_hook_groups().expect("list").is_empty());
+        store.record_hook_group("inv", 43, None, 4).expect("record");
+        store.clear_hook_group("inv").expect("clear");
+        assert!(store.journaled_hook_groups().expect("list").is_empty());
+        store.clear_hook_outcomes("job-h").expect("clear job");
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 5).expect("begin"), Some(1), "job end drops the run record");
+    }
+
+    #[test]
+    fn the_claim_pin_lands_with_the_claim_and_hook_outcomes_stage_first_wins() {
+        let (store, _path) = fresh_store("claim-pin");
+        let draft = EventDraft::new(3402, vec![], "");
+        let pin = ClaimPin { label: "my-hook".into(), kind: "hook".into(), fingerprint: "fp".into() };
+        store
+            .claim_and_enqueue_pinned("job-p", "job-p", None, &draft, 1, 100, 1, Some(&pin))
+            .expect("claim");
+        assert_eq!(store.claim_pin("job-p").expect("read"), Some(pin));
+        store.claim_and_enqueue("job-u", "job-u", None, &draft, 1, 100, 1).expect("claim");
+        assert_eq!(store.claim_pin("job-u").expect("read"), None, "unpinned claim reads None");
+        // codex r2 #6: a partly filled pin, or no claim at all, is an error, never "unpinned".
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute("UPDATE claims SET agent_label = 'half' WHERE job_id = 'job-u'", []).expect("partial pin");
+        }
+        assert!(store.claim_pin("job-u").is_err(), "a partial pin must not read as legacy");
+        assert!(store.claim_pin("job-none").is_err(), "no claim row must not read as legacy");
+
+        let first = HookOutcomeRow {
+            invocation: "inv".into(), job_id: "job-p".into(), turn: 1,
+            status: "done".into(), answer: "first".into(), wall_time_ms: 5,
+        };
+        assert_eq!(store.stage_hook_outcome(&first, 1).expect("stage").answer, "first");
+        let second = HookOutcomeRow { answer: "second".into(), ..first.clone() };
+        assert_eq!(
+            store.stage_hook_outcome(&second, 2).expect("stage").answer,
+            "first",
+            "a re-drive can never replace a staged answer"
+        );
+        store.clear_hook_outcomes("job-p").expect("clear");
+        assert_eq!(store.hook_outcome("inv").expect("read"), None);
     }
 
     /// Put a job row in an exact state. Direct SQL on purpose: driving five states through the
@@ -6308,7 +6631,7 @@ mod tests {
             store.health().expect("health").schema_version,
             SCHEMA_VERSION
         );
-        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(SCHEMA_VERSION, 16);
         let spending = store
             .in_flight_remittance()
             .expect("row")
@@ -6580,8 +6903,8 @@ mod free_lane_tests {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 15,
-            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger; v11 its ownership and settlement provenance; v12 the spending mark; v13 the quote bound at admission; v14 queued-offer capability requirements; v15 session jobs"
+            SCHEMA_VERSION, 16,
+            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger; v11 its ownership and settlement provenance; v12 the spending mark; v13 the quote bound at admission; v14 queued-offer capability requirements; v15 session jobs; v16 hook agents (claim pin, staged hook outcomes)"
         );
 
         // The legacy rows SURVIVE and read as PAID — correct by construction, because every job

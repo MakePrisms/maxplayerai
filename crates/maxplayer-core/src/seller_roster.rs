@@ -53,7 +53,27 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::seller_agents::{normalize_request, AgentRegistry, RegisteredAgent};
+use crate::seller_agents::{normalize_request, AgentKind, AgentRegistry, RegisteredAgent};
+
+/// What eligibility needs to know about an offer (docs/specs/hook-agents.md §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfferShape {
+    /// The buyer declared it can read an inline answer.
+    pub inline: bool,
+    /// A contribution pin was resolved for this offer.
+    pub contribution: bool,
+}
+
+impl OfferShape {
+    /// Whether an entry of `kind` may serve this shape. An ACP entry serves every shape; a hook
+    /// delivers inline only and never a contribution.
+    pub fn admits(&self, kind: &AgentKind) -> bool {
+        match kind {
+            AgentKind::Acp => true,
+            AgentKind::Hook { .. } => self.inline && !self.contribution,
+        }
+    }
+}
 
 /// Bounded backoff before a dropped harness is probed again: 1m, 2m, 4m, 8m, then 10m for every strike
 /// after. Short at the start because a drop is most often transient, and every minute a seat's only
@@ -196,6 +216,9 @@ struct HarnessState {
     /// without this the tick would launch a new probe on every tick and the harness would be running
     /// a dozen concurrent turns of our own tokens.
     probing: bool,
+    /// Bumped by every drop and every restore of this entry, so a verdict that started before one
+    /// can tell it is stale ([`LiveRoster::fault_if_unchanged`]).
+    revision: u64,
 }
 
 /// The harnesses a booted node is serving with right now: its resolved registry plus live
@@ -268,6 +291,10 @@ pub struct Advertisement {
     /// [`Self::serving`], so `harnesses.available > 0` and `serving` cannot disagree. Unlike
     /// [`Self::names`] it counts the unlabelled hatch too.
     pub harnesses: crate::heartbeat::ServingCount,
+    /// Self-reported `(family, model)` of each SERVING hook entry, from its preset (never the
+    /// observed-model slot). Merged into the capability so a custom-named hook's configured family
+    /// reaches the beat.
+    pub hook_reports: Vec<(String, Option<String>)>,
 }
 
 impl Advertisement {
@@ -295,6 +322,17 @@ impl Advertisement {
     /// function does not have to remember which field is which, and neither does its caller.
     pub fn capability(&self, display: &crate::home::SeatConfig) -> crate::heartbeat::SeatCapability {
         let mut capability = crate::heartbeat::SeatCapability::from_roster(&self.names, &self.models);
+        for (family, model) in &self.hook_reports {
+            if !capability.harness_families.contains(family) {
+                capability.harness_families.push(family.clone());
+            }
+            if let Some(model) = model {
+                let pair = crate::heartbeat::HarnessModel { family: family.clone(), model: model.clone() };
+                if !capability.models.contains(&pair) {
+                    capability.models.push(pair);
+                }
+            }
+        }
         capability.capabilities = self.capabilities.clone();
         capability.harness_variant = display.harness_variant.clone();
         capability.hardware = display.hardware.clone();
@@ -355,6 +393,7 @@ impl LiveRoster {
                 available: 0,
                 configured: u32::try_from(self.registry.entries().len()).unwrap_or(u32::MAX),
             },
+            hook_reports: Vec::new(),
         };
         for (index, entry) in self.registry.entries().iter().enumerate() {
             if !Self::serving(&state, &index) {
@@ -362,6 +401,17 @@ impl LiveRoster {
             }
             ad.serving = true;
             ad.harnesses.available = ad.harnesses.available.saturating_add(1);
+            if let AgentKind::Hook { model, .. } = &entry.kind {
+                // A hook's family/model are SELF-REPORTED from its preset; the observed-model slot
+                // (job/probe writers) is never read for it.
+                if let Some(family) = entry.family() {
+                    ad.hook_reports.push((family, model.clone()));
+                }
+                if let Some(name) = entry.name.clone() {
+                    ad.names.push(name);
+                }
+                continue;
+            }
             let Some(name) = entry.name.clone() else {
                 // The unlabelled `--agent-argv` hatch serves without a name. It may well have an
                 // observed model, but a model tag is keyed by the harness it belongs to, so a model
@@ -401,6 +451,7 @@ impl LiveRoster {
                 strikes: 0,
                 probing: false,
                 model: None,
+                revision: 0,
             })
             .model = model;
     }
@@ -441,6 +492,131 @@ impl LiveRoster {
         self.dispatch(requested).is_some()
     }
 
+    /// The ONE claim-time selection (docs/specs/hook-agents.md §3): the first serving entry, in
+    /// roster order, whose kind admits `shape`, whose name matches a named request (normalized as
+    /// [`Self::dispatch`] does), and whose OWN capability satisfies `meets`. `None` ⇒ decline.
+    ///
+    /// `meets` is the buyer-side capability predicate, passed in so this module stays free of the
+    /// wallet feature. Judging each entry on its own capability is what stops a request passing on
+    /// one entry's family/model/tokens and then running on another.
+    ///
+    /// Returns the capability snapshot `meets` actually judged, so the claim's tags and private
+    /// dispatch block carry exactly what passed (a later re-read could see a probe's newer model).
+    pub fn select(
+        &self,
+        requested: Option<&str>,
+        shape: OfferShape,
+        meets: impl Fn(&crate::heartbeat::SeatCapability) -> bool,
+    ) -> Option<(Selected<'_>, crate::heartbeat::SeatCapability)> {
+        let state = self.state.lock().expect("live roster poisoned");
+        let capabilities = self.capabilities.lock().expect("live roster poisoned").clone();
+        let wanted = normalize_request(requested);
+        self.registry
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Self::serving(&state, index))
+            .filter(|(_, entry)| shape.admits(&entry.kind))
+            // The same name rule as [`Self::dispatch`] (exact label against the normalized request), so
+            // the admission gate and the selection cannot disagree on a mixed-case label.
+            .filter(|(_, entry)| match &wanted {
+                None => true,
+                Some(name) => entry.name.as_deref() == Some(name.as_str()),
+            })
+            .find_map(|(index, agent)| {
+                let capability =
+                    Self::capability_of(agent, state.get(&index).and_then(|h| h.model.clone()), &capabilities);
+                meets(&capability).then_some((Selected { index, agent }, capability))
+            })
+    }
+
+    /// One entry's own filterable capability: its name, its family, its model (configured for a
+    /// hook, observed for an ACP entry), and the seat's measured tokens for an ACP entry only — a
+    /// hook runs on the seller's host, where nothing was measured.
+    pub fn entry_capability(&self, index: usize) -> crate::heartbeat::SeatCapability {
+        let state = self.state.lock().expect("live roster poisoned");
+        let capabilities = self.capabilities.lock().expect("live roster poisoned").clone();
+        match self.registry.entries().get(index) {
+            Some(entry) => Self::capability_of(entry, state.get(&index).and_then(|h| h.model.clone()), &capabilities),
+            None => Default::default(),
+        }
+    }
+
+    fn capability_of(
+        entry: &RegisteredAgent,
+        observed: Option<String>,
+        seat_tokens: &[String],
+    ) -> crate::heartbeat::SeatCapability {
+        let family = entry.family();
+        let model = match &entry.kind {
+            AgentKind::Hook { model, .. } => model.clone(),
+            AgentKind::Acp => observed,
+        };
+        crate::heartbeat::SeatCapability {
+            harness_families: family.clone().into_iter().collect(),
+            models: match (family, model) {
+                (Some(family), Some(model)) => vec![crate::heartbeat::HarnessModel { family, model }],
+                _ => Vec::new(),
+            },
+            capabilities: if entry.kind.is_hook() { Vec::new() } else { seat_tokens.to_vec() },
+            ..Default::default()
+        }
+    }
+
+    /// The entry a claim pinned, by its exact registry label (never request-normalized), if it still
+    /// has the pinned fingerprint. `None` ⇒ fail closed. Serving state is deliberately NOT checked:
+    /// the award is committed, and running on the entry the claim described is the only honest
+    /// outcome (docs/specs/hook-agents.md §9) — a dropped entry's run is its own best test.
+    pub fn by_pin(&self, label: &str, kind: &str, fingerprint: &str) -> Option<Selected<'_>> {
+        self.registry
+            .entries()
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.name.as_deref() == Some(label))
+            .filter(|(_, entry)| entry.kind.as_str() == kind && entry.fingerprint() == fingerprint)
+            .map(|(index, agent)| Selected { index, agent })
+    }
+
+    /// The ONE executable-dispatch resolver (turn 1 and session follow-ups alike): a pinned claim runs
+    /// on exactly its pinned entry (label, kind, fingerprint); an unpinned one (an older build's
+    /// claim, or the unlabelled hatch) dispatches as before over ACP entries only. `allow_hook` is
+    /// false for a session follow-up: hook sessions are a later stage, so a follow-up never reaches a
+    /// hook, pinned or not. `None` ⇒ fail closed, never substitute.
+    pub fn for_execution(
+        &self,
+        pin: Option<(&str, &str, &str)>,
+        requested: Option<&str>,
+        allow_hook: bool,
+    ) -> Option<Selected<'_>> {
+        let selected = match pin {
+            Some((label, kind, fingerprint)) => self.by_pin(label, kind, fingerprint),
+            None => self.dispatch_acp(requested),
+        }?;
+        (allow_hook || !selected.agent.kind.is_hook()).then_some(selected)
+    }
+
+    /// Today's unpinned dispatch restricted to ACP entries: a job claimed before pins existed (or by
+    /// the unlabelled hatch) never admitted hooks, so a hook added later must not pick it up.
+    pub fn dispatch_acp(&self, requested: Option<&str>) -> Option<Selected<'_>> {
+        let state = self.state.lock().expect("live roster poisoned");
+        let wanted = normalize_request(requested);
+        self.registry
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| Self::serving(&state, index) && !entry.kind.is_hook())
+            .find(|(_, entry)| match &wanted {
+                None => true,
+                Some(name) => entry.name.as_deref() == Some(name.as_str()),
+            })
+            .map(|(index, agent)| Selected { index, agent })
+    }
+
+    /// The entry at `index`, serving or not.
+    pub fn entry(&self, index: usize) -> Option<RegisteredAgent> {
+        self.registry.entries().get(index).cloned()
+    }
+
     /// Record a typed execution failure. Deadline expiry is a deliberate no-op; harness faults retain
     /// the existing drop/incapable rule through [`Self::fault`].
     pub fn execution_failure(
@@ -462,14 +638,31 @@ impl LiveRoster {
     /// [`Fault::Incapable`] does not schedule a probe at all.
     pub fn fault(&self, index: usize, fault: Fault, now: Instant) -> Unavailable {
         let mut state = self.state.lock().expect("live roster poisoned");
+        let (unavailable, was_serving) = Self::record_fault(&mut state, index, fault, now);
+        drop(state);
+        if was_serving {
+            self.bump_generation();
+        }
+        unavailable
+    }
+
+    /// The body of [`Self::fault`], on the locked state. Returns the state and whether it was serving.
+    fn record_fault(
+        state: &mut BTreeMap<usize, HarnessState>,
+        index: usize,
+        fault: Fault,
+        now: Instant,
+    ) -> (Unavailable, bool) {
         let entry = state.entry(index).or_insert(HarnessState {
             unavailable: None,
             strikes: 0,
             probing: false,
             model: None,
+            revision: 0,
         });
         // Whatever a probe was testing, its answer arrived: this fault IS the answer.
         entry.probing = false;
+        entry.revision = entry.revision.wrapping_add(1);
         let was_serving = entry.unavailable.is_none();
         let unavailable = match fault {
             Fault::Incapable(capability) => Unavailable::Incapable(capability),
@@ -482,11 +675,30 @@ impl LiveRoster {
             }
         };
         entry.unavailable = Some(unavailable.clone());
+        (unavailable, was_serving)
+    }
+
+    /// This entry's revision: bumped by every drop ([`Self::fault`]) and every restore.
+    pub fn revision(&self, index: usize) -> u64 {
+        self.state.lock().expect("live roster poisoned").get(&index).map_or(0, |entry| entry.revision)
+    }
+
+    /// [`Self::fault`] for a verdict that may be STALE (a hook interval ping runs off the loop for up
+    /// to 30 s): recorded, in the same locked step as the check, only while the entry still serves at
+    /// `revision` (what [`Self::revision`] gave when the ping started). A drop and restore in
+    /// between, or a drop still in force, makes it stale: `None`, nothing recorded.
+    pub fn fault_if_unchanged(&self, index: usize, revision: u64, fault: Fault, now: Instant) -> Option<Unavailable> {
+        let mut state = self.state.lock().expect("live roster poisoned");
+        let current = state.get(&index);
+        if current.map_or(0, |entry| entry.revision) != revision || current.is_some_and(|entry| entry.unavailable.is_some()) {
+            return None;
+        }
+        let (unavailable, was_serving) = Self::record_fault(&mut state, index, fault, now);
         drop(state);
         if was_serving {
             self.bump_generation();
         }
-        unavailable
+        Some(unavailable)
     }
 
     /// Put a harness back in service. The ONLY restoration path, and it is meant to be called after
@@ -494,6 +706,29 @@ impl LiveRoster {
     /// award the test and a buyer would pay for our diagnostic.
     ///
     /// Strike history survives, so a harness that flaps escalates instead of resetting to 1m.
+    /// [`Self::restore`] for a probe whose verdict may be STALE (a hook restore ping runs off the
+    /// loop for up to 30 s): restores only while this entry's probe is still in flight. Any newer
+    /// verdict — a job strike, which [`Self::fault`] records by clearing `probing` — wins, so a ping
+    /// that passed before the strike can never put the just-struck entry back (hook-agents §9 races).
+    /// Returns whether it restored.
+    pub fn restore_if_probing(&self, index: usize) -> bool {
+        let restored = match self.state.lock().expect("live roster poisoned").get_mut(&index) {
+            Some(entry) if entry.probing => {
+                entry.probing = false;
+                let restored = entry.unavailable.take().is_some();
+                if restored {
+                    entry.revision = entry.revision.wrapping_add(1);
+                }
+                restored
+            }
+            _ => false,
+        };
+        if restored {
+            self.bump_generation();
+        }
+        restored
+    }
+
     pub fn restore(&self, index: usize) {
         let restored = match self
             .state
@@ -503,7 +738,11 @@ impl LiveRoster {
         {
             Some(entry) => {
                 entry.probing = false;
-                entry.unavailable.take().is_some()
+                let restored = entry.unavailable.take().is_some();
+                if restored {
+                    entry.revision = entry.revision.wrapping_add(1);
+                }
+                restored
             }
             None => false,
         };
@@ -632,9 +871,177 @@ mod tests {
                 .map(|name| RegisteredAgent {
                     name: name.map(str::to_owned),
                     argv: vec![format!("{}-acp", name.unwrap_or("hatch"))],
+                    kind: Default::default(),
                 })
                 .collect(),
         ))
+    }
+
+    fn mixed() -> LiveRoster {
+        // [my-hook (claude-code / hook-model), claude (ACP), codex (ACP)]
+        LiveRoster::new(AgentRegistry::new(vec![
+            RegisteredAgent {
+                name: Some("my-hook".into()),
+                argv: vec!["/bin/hook".into()],
+                kind: AgentKind::Hook { family: Some("claude-code".into()), model: Some("hook-model".into()) },
+            },
+            RegisteredAgent { name: Some("claude".into()), argv: vec!["claude-acp".into()], kind: AgentKind::Acp },
+            RegisteredAgent { name: Some("codex".into()), argv: vec!["codex-acp".into()], kind: AgentKind::Acp },
+        ]))
+    }
+
+    const INLINE: OfferShape = OfferShape { inline: true, contribution: false };
+    const GIT_ONLY: OfferShape = OfferShape { inline: false, contribution: false };
+    const CONTRIB: OfferShape = OfferShape { inline: true, contribution: true };
+
+    fn picked(roster: &LiveRoster, req: Option<&str>, shape: OfferShape, meets: impl Fn(&crate::heartbeat::SeatCapability) -> bool) -> Option<String> {
+        roster.select(req, shape, meets).and_then(|(s, _)| s.agent.name.clone())
+    }
+
+    #[test]
+    fn select_and_the_admission_gate_name_entries_the_same_way() {
+        // A mixed-case label: the aggregate gate (`dispatch`) matches the exact label against the
+        // normalized request, so selection must too, or one admits what the other refuses.
+        let roster = LiveRoster::new(AgentRegistry::new(vec![RegisteredAgent {
+            name: Some("MyHook".into()),
+            argv: vec!["/bin/hook".into()],
+            kind: AgentKind::Hook { family: None, model: None },
+        }]));
+        for request in ["MyHook", "myhook"] {
+            assert_eq!(
+                roster.dispatch(Some(request)).is_some(),
+                roster.select(Some(request), INLINE, |_| true).is_some(),
+                "{request}"
+            );
+        }
+        assert!(roster.select(None, INLINE, |_| true).is_some());
+    }
+
+    #[test]
+    fn select_returns_the_capability_it_judged() {
+        let roster = mixed();
+        roster.record_model(1, Some("opus".into()));
+        let wants_opus = |c: &crate::heartbeat::SeatCapability| c.models.iter().any(|m| m.model == "opus");
+        let (selected, judged) = roster.select(None, GIT_ONLY, wants_opus).expect("claude");
+        // A probe updates the model after the judgement: the claim must still carry what passed.
+        roster.record_model(selected.index, Some("sonnet".into()));
+        assert_eq!(judged.models[0].model, "opus");
+        assert_eq!(roster.entry_capability(selected.index).models[0].model, "sonnet");
+    }
+
+    #[test]
+    fn select_routes_by_shape_and_never_puts_a_hook_on_git_or_contribution_work() {
+        let roster = mixed();
+        assert_eq!(picked(&roster, None, INLINE, |_| true).as_deref(), Some("my-hook"));
+        assert_eq!(picked(&roster, None, GIT_ONLY, |_| true).as_deref(), Some("claude"));
+        assert_eq!(picked(&roster, None, CONTRIB, |_| true).as_deref(), Some("claude"));
+        assert_eq!(picked(&roster, Some("my-hook"), GIT_ONLY, |_| true), None, "named hook on git-only declines");
+        assert_eq!(picked(&roster, Some("My-Hook"), INLINE, |_| true).as_deref(), Some("my-hook"));
+    }
+
+    #[test]
+    fn select_judges_each_entry_on_its_own_capability() {
+        let roster = mixed();
+        roster.record_capabilities(vec!["python".into()]);
+        roster.record_model(1, Some("opus".into()));
+        // a family=codex request on an inline offer passes on codex, not on the first entry
+        let fam = |c: &crate::heartbeat::SeatCapability| c.harness_families.iter().any(|f| f == "codex");
+        assert_eq!(picked(&roster, None, INLINE, fam).as_deref(), Some("codex"));
+        // seat tokens never make the hook eligible
+        let py = |c: &crate::heartbeat::SeatCapability| c.capabilities.iter().any(|t| t == "python");
+        assert_eq!(picked(&roster, None, INLINE, py).as_deref(), Some("claude"));
+        // the hook's configured pair stays its own: claude's observed model is not lent to it
+        let pair = |c: &crate::heartbeat::SeatCapability| c.models.iter().any(|m| m.model == "opus");
+        assert_eq!(picked(&roster, None, INLINE, pair).as_deref(), Some("claude"));
+        assert_eq!(roster.entry_capability(0).models[0].model, "hook-model");
+        assert!(roster.entry_capability(0).capabilities.is_empty());
+    }
+
+    #[test]
+    fn a_hooks_configured_model_survives_observations_and_reaches_the_advertisement() {
+        let roster = mixed();
+        roster.record_model(0, None);
+        let cap = roster.advertisement().capability(&Default::default());
+        assert!(cap.models.iter().any(|m| m.family == "claude-code" && m.model == "hook-model"), "{cap:?}");
+        assert!(roster.advertisement().names.contains(&"my-hook".to_owned()));
+    }
+
+    #[test]
+    fn the_pin_resolves_by_exact_label_and_fingerprint_and_unpinned_work_never_reaches_a_hook() {
+        let roster = mixed();
+        let fp = roster.entry(0).unwrap().fingerprint();
+        assert_eq!(roster.by_pin("my-hook", "hook", &fp).map(|s| s.index), Some(0));
+        assert!(roster.by_pin("my-hook", "hook", "different").is_none(), "changed entry fails closed");
+        assert!(roster.by_pin("MY-HOOK", "hook", &fp).is_none(), "exact label only");
+        assert!(roster.by_pin("my-hook", "acp", &fp).is_none(), "the pinned kind must match");
+        assert_eq!(roster.dispatch_acp(None).and_then(|s| s.agent.name.clone()).as_deref(), Some("claude"));
+        assert!(roster.dispatch_acp(Some("my-hook")).is_none());
+        roster.fault(0, Fault::Unproven, Instant::now());
+        assert_eq!(
+            roster.by_pin("my-hook", "hook", &fp).map(|s| s.index),
+            Some(0),
+            "an awarded job still runs on its pinned entry while that entry is dropped"
+        );
+    }
+
+    /// Review r1 #1/#4: one resolver for turn 1 AND session follow-ups. A pinned follow-up runs on
+    /// its pinned ACP entry (not the preferred one); an unpinned follow-up never reaches a hook
+    /// added in front; a follow-up never runs a hook even when pinned to one.
+    #[test]
+    fn followups_resolve_through_the_pin_and_never_reach_a_hook() {
+        let roster = mixed();
+        let codex_fp = roster.entry(2).unwrap().fingerprint();
+        let hook_fp = roster.entry(0).unwrap().fingerprint();
+        assert_eq!(
+            roster.for_execution(Some(("codex", "acp", &codex_fp)), None, false).map(|s| s.index),
+            Some(2),
+            "an unnamed session pinned to codex stays on codex for turn n"
+        );
+        assert_eq!(
+            roster.for_execution(None, None, false).map(|s| s.index),
+            Some(1),
+            "an unpinned follow-up skips the hook in front"
+        );
+        assert!(roster.for_execution(Some(("my-hook", "hook", &hook_fp)), None, false).is_none());
+        assert_eq!(roster.for_execution(Some(("my-hook", "hook", &hook_fp)), None, true).map(|s| s.index), Some(0));
+        assert!(roster.for_execution(Some(("codex", "hook", &codex_fp)), None, true).is_none());
+    }
+
+    /// codex r2 #7: an interval-ping failure that started before a drop and restore of the entry is
+    /// stale and faults nothing; one at the current revision does; none applies while dropped.
+    #[test]
+    fn a_stale_interval_verdict_cannot_fault_an_entry_that_changed_since() {
+        let roster = mixed();
+        let t0 = Instant::now();
+        let before = roster.revision(0);
+        roster.fault(0, Fault::Unproven, t0);
+        roster.restore(0);
+        assert!(roster.unavailable(0).is_none());
+        assert!(roster.fault_if_unchanged(0, before, Fault::Unproven, t0).is_none(), "started before the drop and restore");
+        assert!(roster.unavailable(0).is_none(), "the restored entry keeps serving");
+        let current = roster.revision(0);
+        assert_ne!(current, before);
+        assert!(roster.fault_if_unchanged(0, current, Fault::Unproven, t0).is_some());
+        assert!(roster.unavailable(0).is_some());
+        let dropped = roster.revision(0);
+        assert!(roster.fault_if_unchanged(0, dropped, Fault::Unproven, t0).is_none(), "already dropped: nothing more");
+    }
+
+    /// Review r1 #7: a restore ping that passed is stale once a job struck the entry meanwhile.
+    #[test]
+    fn a_stale_restore_ping_cannot_restore_an_entry_struck_after_it_started() {
+        let roster = mixed();
+        let t0 = Instant::now();
+        roster.fault(0, Fault::Unproven, t0);
+        assert_eq!(roster.claim_due_probes(t0 + Duration::from_secs(3600)), vec![0]);
+        // An already-awarded job strikes the hook while its restore ping is in flight.
+        roster.fault(0, Fault::Unproven, t0 + Duration::from_secs(3601));
+        assert!(!roster.restore_if_probing(0), "the stale pass loses to the newer strike");
+        assert!(roster.unavailable(0).is_some());
+        // Without an intervening strike the pass restores.
+        assert_eq!(roster.claim_due_probes(t0 + Duration::from_secs(100_000)), vec![0]);
+        assert!(roster.restore_if_probing(0));
+        assert!(roster.unavailable(0).is_none());
     }
 
     fn named(names: &[&str]) -> LiveRoster {

@@ -474,6 +474,9 @@ enum SkipReason {
     AgentUnavailable,
     /// The live roster cannot satisfy the signed model/family/capability request.
     CapabilityUnavailable,
+    /// docs/specs/hook-agents.md §3: no serving entry is eligible for this offer's SHAPE with its
+    /// own capability (e.g. only a hook entry, and the offer is git-only or a contribution).
+    NoEligibleAgent,
     /// §2.1: the offer states `payment=none` and this seat has not opted in to free work
     /// (`[seller] takes_no_payment = false`, the default).
     ///
@@ -522,6 +525,9 @@ impl SkipReason {
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::CapabilityUnavailable => "requested model, family or capabilities unavailable on this node",
             Self::AgentUnavailable => "requested agent harness not available on this node",
+            Self::NoEligibleAgent => {
+                "no configured agent can serve this offer's shape (a hook entry serves inline, non-contribution offers only)"
+            }
             Self::FreeNotOffered => {
                 "free offer (payment=none) and this seat does not work for free (set [seller] \
                  takes_no_payment=true, which also requires rate_sats=0, to opt in)"
@@ -4541,6 +4547,17 @@ pub async fn probe_configured_harnesses(
     home: &MaxplayerHome,
 ) -> Result<Vec<HarnessProbeVerdict>, NodeError> {
     let registry = boot_agent_registry(home)?;
+    // hook-agents §9: a hook-only seat runs nothing of ours, so NONE of the sandbox-side gates below
+    // apply (sandbox policy, token-mode gate, forward_env/mcp lines, holder reap) — any of them could
+    // refuse a host with no docker at all. Decided by the one shared predicate the doctor also uses.
+    if crate::seller_agents::hook_only_home(home) {
+        opline!("seller node: hook-only seat — no sandbox, token-mode gate or containment holders apply; each hook proves itself with a boot ping");
+        let mut verdicts = Vec::with_capacity(registry.entries().len());
+        for (index, entry) in registry.entries().iter().enumerate() {
+            verdicts.push(hook_boot_verdict(index, entry, home).await);
+        }
+        return Ok(verdicts);
+    }
     // A `[sandbox]` that does not resolve into an executor refuses the boot gate outright: probing
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
@@ -4623,6 +4640,12 @@ pub async fn probe_configured_harnesses(
     let mut verdicts = Vec::with_capacity(registry.entries().len());
     for (index, entry) in registry.entries().iter().enumerate() {
         let label = entry.name.clone().unwrap_or_else(|| "<unlabelled>".to_owned());
+        // hook-agents §9: a hook entry proves itself with a `boot` ping, run on the host as the
+        // seller's own program — no sandbox, no sentinel turn. Its model is self-reported config.
+        if entry.kind.is_hook() {
+            verdicts.push(hook_boot_verdict(index, entry, home).await);
+            continue;
+        }
         let result = probe_one_harness(index, &entry.argv, &label, &sandbox, &identity, home).await;
         verdicts.push(HarnessProbeVerdict {
             index,
@@ -4631,6 +4654,23 @@ pub async fn probe_configured_harnesses(
         });
     }
     Ok(verdicts)
+}
+
+/// A hook entry's boot verdict: one `boot` ping on the host, as the seller's own program (§9).
+async fn hook_boot_verdict(
+    index: usize,
+    entry: &crate::seller_agents::RegisteredAgent,
+    home: &MaxplayerHome,
+) -> HarnessProbeVerdict {
+    let (argv, cwd) = (entry.argv.clone(), home.root.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        crate::hook::ping(&argv, &cwd, crate::hook::PingReason::Boot)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("ping task failed: {error}")))
+    .map(|()| None)
+    .map_err(|reason| (reason, Fault::Unproven));
+    HarnessProbeVerdict { index, name: entry.name.clone(), result }
 }
 
 /// The pure decision the pre-advertise gate turns on: the registry indices that PROVED they can
@@ -4733,6 +4773,13 @@ pub async fn boot_advertising_only_proven(
     // the kind-0 publish, rather than advertising a silently shorter set: a buyer commits sats on this
     // field, so "we could not check" must never look like "checked, and no". The proven set is recorded
     // into the roster below, before the first heartbeat or claim can read it.
+    // hook-agents §9: a hook-only seat runs nothing of ours, so there is no job environment to
+    // measure: it advertises no capability tokens and skips the probe (and its sandbox gate).
+    let hook_only = crate::seller_agents::hook_only_home(&home);
+    let (capabilities, job_nix) = if hook_only {
+        opline!("seller node: hook-only seat — no job environment of ours to probe; advertising no capability tokens");
+        (Vec::new(), false)
+    } else {
     let sandbox = crate::seller_exec::SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(format!("capability probe policy: {error}")))?;
     let probe_dir = crate::seller_exec::ProbeWorkdir::create(&home)
@@ -4754,6 +4801,8 @@ pub async fn boot_advertising_only_proven(
         }
     };
     drop(probe_dir);
+    (capabilities, job_nix)
+    };
     opline!("seller node capability probe proved: [{}]", capabilities.join(", "));
     opline!(
         "seller node job environment nix: {}",
@@ -4930,6 +4979,9 @@ pub struct SellerNodeRunner {
     /// probe ([`crate::capability::probe_seat_nix`]). Read into every job prompt. `false` until
     /// measured, so a node booted without the probe keeps the generic install advice.
     job_nix: std::sync::atomic::AtomicBool,
+    /// hook-agents §9: per hook entry, when its last interval ping started, whether one is in
+    /// flight, and its consecutive interval-ping failures.
+    hook_pings: Arc<std::sync::Mutex<std::collections::HashMap<usize, hook_run::PingTrack>>>,
     /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
     /// the off-loop execution tasks; see [`SlotGate`].
     /// The seat's held tools (the Holder route, `[[sandbox.held_tools]]`): one holder container per
@@ -5268,17 +5320,26 @@ impl SellerNodeRunner {
         // and narrows from there as harnesses prove they cannot deliver.
         let agents = Arc::new(LiveRoster::new(boot_agent_registry(node.home())?));
 
+        // hook-agents §5.1: a hook group a killed daemon left running is stopped before anything
+        // can re-drive its job (each verified against its journaled start time).
+        hook_run::reap_journaled_groups(node.store(), None);
+        hook_run::reconcile_terminal_hook_state(node.store(), node.home());
+
         // The Holder route: start the seat's holder containers BEFORE anything goes on the wire, so
         // a REQUIRED tool that cannot start refuses the boot rather than a seat that advertises and
         // fails every job. An optional tool that cannot start is logged, and the seat serves without
         // it — the posture a vendor outage would give. Several tools start concurrently: each start
         // waits on its own vendor's enrolment.
         let held_tools = {
+            // A hook-only seat runs no container, so it starts no holder (a REQUIRED one that cannot
+            // start would otherwise refuse a seat that never uses it). Same predicate as the doctor.
+            let hook_only = crate::seller_agents::hook_only_home(node.home());
             let cfgs: Vec<&crate::home::HeldToolConfig> = node
                 .home()
                 .config
                 .sandbox
                 .as_ref()
+                .filter(|_| !hook_only)
                 .map(|sandbox| sandbox.held_tools.iter().collect())
                 .unwrap_or_default();
             let (uid, gid) = job_identity();
@@ -5470,6 +5531,7 @@ impl SellerNodeRunner {
             announced_serving_generation: std::sync::atomic::AtomicU64::new(0),
             announced_free_slots: std::sync::atomic::AtomicU32::new(u32::MAX),
             job_nix: std::sync::atomic::AtomicBool::new(false),
+            hook_pings: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             held_tools,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
@@ -6600,6 +6662,9 @@ impl SellerNodeRunner {
                 // an unlistened SIGTERM used to be.
                 reason = shutdown::next_request(&mut shutdown_rx) => {
                     opline!("seller node: shutdown requested ({reason}); retracting the seat and ending the loop");
+                    // hook-agents §5.1: running hook groups get SIGTERM, the grace, then SIGKILL.
+                    // Their journal entries stay, so a boot after an unclean exit still reaps.
+                    let _ = tokio::task::spawn_blocking(crate::hook::terminate_all).await;
                     break;
                 }
                 // Expired-container sweep. SPAWNED, never awaited here: the pass is bounded by
@@ -8608,6 +8673,40 @@ impl SellerNodeRunner {
             }
         }
 
+        // docs/specs/hook-agents.md §3 — ONE selection per claim: the first serving entry whose kind
+        // admits this offer's shape and whose OWN capability meets the request. It drives the
+        // claim's tags, the private dispatch block and the pin; nothing re-derives it later.
+        // A contribution pin that cannot be read is not an absent one: a capacity re-drive of a
+        // contribution offer could otherwise be admitted to an entry that cannot take it (a hook).
+        let contribution_pinned = if contribution.is_some() {
+            true
+        } else {
+            match self.node.store().contribution_pin(job_id) {
+                Ok(pin) => pin.is_some(),
+                Err(error) => {
+                    self.log_offer_deferred(
+                        job_id,
+                        format!("seller node offer skip id={job_id}: contribution pin unreadable ({error})"),
+                    );
+                    return ClaimOutcome::Deferred;
+                }
+            }
+        };
+        let shape = crate::seller_roster::OfferShape { inline: offer.accepts_inline_delivery(), contribution: contribution_pinned };
+        let request = offer_capability_request(offer);
+        // `selected_capability` is the snapshot the request was judged on; the claim tags and the
+        // private dispatch block below carry exactly it (never a later re-read of the roster).
+        let Some((selected_entry, selected_capability)) = self
+            .agents
+            .select(offer.requested_agent.as_deref(), shape, |cap| {
+                crate::buyer::lifecycle::capability_meets_request(cap, &request).is_ok()
+            })
+            .map(|(s, capability)| (s.agent.clone(), capability))
+        else {
+            opline!("seller node offer skip id={job_id}: {}", SkipReason::NoEligibleAgent.reason());
+            return ClaimOutcome::Declined;
+        };
+
         // #591: persist the contribution pin BEFORE record_offer. execute_job only runs on an awarded
         // claim, which requires the recorded offer — so writing the pin first makes pin ≤ offer ≤
         // claim: a crash can never leave an offer recorded (hence claimable) without its pin, which
@@ -8704,7 +8803,9 @@ impl SellerNodeRunner {
         // names came from one moment and whose models came from another would attribute a model to a
         // harness the seat was not offering when it said so — and nothing downstream could detect it,
         // because both halves parse.
-        let roster = self.agents.advertisement();
+        // The claim describes the SELECTED entry only (§4): the buyer's award filter reads the claim,
+        // so it judges exactly what will run. The beat stays seat-wide.
+        let selected_names: Vec<String> = selected_entry.name.clone().into_iter().collect();
         let claim = claim_draft(
             job_id,
             buyer_pubkey,
@@ -8715,17 +8816,15 @@ impl SellerNodeRunner {
                 Some(creq) => gateway::ClaimPayment::Sat(&creq),
                 None => gateway::ClaimPayment::None,
             },
-            &roster.names,
-            // The claim holds the declared colour and emits none of it: `claim_draft` asks only for
-            // the filterable tags. Passing it is not a leak, and passing a stub here instead would
-            // make this the one site whose capability came from somewhere other than the config.
-            &roster.capability(&self.node.home().config.seat),
+            &selected_names,
+            &selected_capability,
         );
         // Session jobs (docs/specs/session-jobs.md §2.2): `["session","1"]` only when
         // `[sessions] enabled` AND this is a docker seat on the container-delivery path. With the
         // flag off `advertise_on_claim` is a no-op, so the claim bytes are today's.
         let mut claim = claim;
-        {
+        // A hook entry advertises no session in this build (hook sessions are the next stage).
+        if !selected_entry.kind.is_hook() {
             let config = &self.node.home().config;
             let docker_container_seat = config.sandbox.as_ref().is_some_and(|sandbox| {
                 sandbox.mode == crate::home::SandboxMode::Docker
@@ -8739,19 +8838,19 @@ impl SellerNodeRunner {
                 &runsc_gate,
             );
         }
-        let chosen = offer.requested_agent.as_ref().or_else(|| roster.names.first()).cloned();
-        let capability = roster.capability(&self.node.home().config.seat);
-        let family = chosen.as_deref().and_then(crate::agent_presets::harness_family_for_preset).map(str::to_owned);
-        let model = family.as_ref().and_then(|f| capability.models.iter().find(|m| &m.family == f)).map(|m| m.model.clone());
+        let chosen = selected_entry.name.clone();
+        let family = selected_entry.family();
+        let model = selected_capability.models.first().map(|m| m.model.clone());
+        let capability = selected_capability.clone();
         let dispatch = crate::private_content::Dispatch { agent: chosen, harness_family: family,
             harness_model: model, capabilities: (!capability.capabilities.is_empty()).then_some(capability.capabilities) };
-        let claim = match super::privacy::project(self.node.home(), seller_pubkey, job_id, claim, Some(dispatch)) {
-            Ok(claim) => claim,
-            Err(e) => { opline!("seller private claim refused job_id={job_id}: {e}"); return ClaimOutcome::ReachedReview; }
-        };
         // Reserve-at-claim: a fully loaded node has no free slot and simply does not claim, which is
         // how it stays invisible to the market. The gate is consulted only here on the event loop,
         // never concurrently with itself, so two offers can never both take the last slot.
+        //
+        // Reserved BEFORE the private claim intent is prepared (hook-agents §3): a capacity skip must
+        // leave no prepared intent behind, or a later re-drive with a different selection would
+        // contradict it.
         let reserved = self.slots.try_reserve(job_id);
         if reserved == Reserve::Full {
             opline!("seller node offer skip id={job_id}: {}", SkipReason::SlotsBusy.reason());
@@ -8769,7 +8868,20 @@ impl SellerNodeRunner {
                 runner.slots.release(job_id);
             }
         };
-        match self.node.store().claim_and_enqueue(
+        let claim = match super::privacy::project(self.node.home(), seller_pubkey, job_id, claim, Some(dispatch)) {
+            Ok(claim) => claim,
+            Err(e) => {
+                opline!("seller private claim refused job_id={job_id}: {e}");
+                release_on_no_claim(self);
+                return ClaimOutcome::ReachedReview;
+            }
+        };
+        let pin = selected_entry.name.clone().map(|label| super::store::ClaimPin {
+            label,
+            kind: selected_entry.kind.as_str().to_owned(),
+            fingerprint: selected_entry.fingerprint(),
+        });
+        match self.node.store().claim_and_enqueue_pinned(
             job_id,
             job_id,
             creq.as_deref(),
@@ -8777,6 +8889,7 @@ impl SellerNodeRunner {
             now,
             now + CLAIM_PUBLISH_WINDOW_SECS,
             now,
+            pin.as_ref(),
         ) {
             Ok(super::store::Claimed::New) => {
                 opline!(
@@ -9308,6 +9421,10 @@ impl SellerNodeRunner {
                 continue;
             };
             let roster = Arc::clone(&self.agents);
+            if self.agents.entry(harness).is_some_and(|e| e.kind.is_hook()) {
+                self.start_hook_restore_ping(harness, argv, roster);
+                continue;
+            }
             // A `[sandbox]` that does not resolve grounds the harness rather than restoring it under
             // a pass-through: a probe that ran unsandboxed would prove nothing about the executor an
             // awarded job actually gets.
@@ -9781,16 +9898,55 @@ impl SellerNodeRunner {
         // ⛔ This is a LABEL, not a guard. It changes nothing about whether the job is paid: under
         // award-is-payment the sats were committed at award, upstream of this arm. Never read this
         // code as protecting money (see `ReasonCode::CapabilityMissing`).
+        // hook-agents §7.1: a staged hook answer is re-delivered, never re-run, and BEFORE the current
+        // roster is consulted: the answer may already be bound, and a hook removed or edited since
+        // the claim must not strand it. Only a NEW execution faces the pin check below. A staged row
+        // that cannot be read is not an absent one: defer rather than run the hook again.
+        match self.node.store().hook_outcome(job_id) {
+            Ok(Some(row)) => {
+                self.redeliver_staged_hook_outcome(job_id, &offer, &stored_creq, row).await;
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                opline!(
+                    "seller node execute defer job_id={job_id}: staged hook outcome unreadable ({error}); retried on the next re-drive"
+                );
+                return;
+            }
+        }
         let requested_agent = offer.requested_agent.clone();
-        let Some(selected) = self.agents.dispatch(requested_agent.as_deref()) else {
+        // hook-agents §3: a pinned claim runs on exactly the entry it described (label + fingerprint);
+        // an unpinned one (an older build's claim, or the unlabelled hatch) dispatches as before but
+        // over ACP entries only, so a hook added later never picks up work that never admitted hooks.
+        // A pin READ error is not an unpinned claim: retrying beats running unrelated ACP work.
+        let pin = match self.node.store().claim_pin(job_id) {
+            Ok(pin) => pin,
+            Err(error) => {
+                opline!("seller node execute defer job_id={job_id}: claim pin unreadable ({error}); retried on the next re-drive");
+                return;
+            }
+        };
+        let selected = self.agents.for_execution(
+            pin.as_ref().map(|p| (p.label.as_str(), p.kind.as_str(), p.fingerprint.as_str())),
+            requested_agent.as_deref(),
+            true,
+        );
+        let Some(selected) = selected else {
             opline!(
-                "seller node execute fail job_id={job_id}: requested agent {:?} is not available on \
-                 this node (never substituted)",
-                requested_agent.as_deref().unwrap_or("<any>")
+                "seller node execute fail job_id={job_id}: {} (never substituted)",
+                match &pin {
+                    Some(pin) => format!("pinned agent {:?} changed or is gone since the claim", pin.label),
+                    None => format!(
+                        "requested agent {:?} is not available on this node",
+                        requested_agent.as_deref().unwrap_or("<any>")
+                    ),
+                }
             );
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, UNDISPATCHABLE_REASON_CODE, CAPABILITY_MISSING_FEEDBACK, None).await;
             return;
         };
+        let agent_kind = selected.agent.kind.clone();
         let agent_command = selected.agent.argv.clone();
         let agent_label = selected.agent.name.clone();
         // The registry index travels with the run: reporting a fault happens long after dispatch, and
@@ -9810,6 +9966,21 @@ impl SellerNodeRunner {
         // Move awarded -> executing (idempotent). A failed mark is logged, never fatal.
         if let Err(error) = self.node.store().mark_executing(job_id, now_unix()) {
             opline!("seller node execute job_id={job_id}: mark_executing failed (continuing): {error}");
+        }
+        // hook-agents §7: a hook entry runs the seller's own agent behind its command; nothing below
+        // (container, workdir git, ACP) applies.
+        if agent_kind.is_hook() {
+            self.execute_hook_job(
+                job_id,
+                &offer,
+                &stored_creq,
+                harness,
+                &agent_command,
+                agent_label.as_deref().unwrap_or("<hook>"),
+                &agent_kind,
+            )
+            .await;
+            return;
         }
 
         let seller_pubkey = self.seller_pubkey.to_hex();
@@ -11998,6 +12169,9 @@ impl SellerNodeRunner {
                 opline!("seller node job_id={job_id}: fail_job write error (continuing): {error}")
             }
         }
+        // hook-agents §6/§7.1: a failed hook job's state (staged answer, run record, directory) goes
+        // with it, whichever path failed it. A job with no hook state is not touched.
+        hook_run::clear_terminal_hook_state(self.node.store(), self.node.home(), job_id);
     }
 
     /// The job row's state, for a LOG that must name why a write moved nothing. Never fails the
@@ -12155,6 +12329,7 @@ impl SellerNodeRunner {
                 self.redrive_followups().await;
                 self.reconsider_capacity_skips().await;
                 self.start_due_harness_probes();
+                self.start_hook_interval_pings();
             }
             schedule::Work::Backfill => {
                 let wraps = self.run_wrap_backfill().await;
@@ -12298,6 +12473,8 @@ impl SellerNodeRunner {
 
 #[path = "session_run.rs"]
 mod session_run;
+#[path = "hook_run.rs"]
+mod hook_run;
 
 /// The relay event kinds the lane has a handler for; anything else is never queued.
 fn handled_event_kind(kind: Kind) -> bool {
@@ -13183,6 +13360,7 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
         ]))
     }
@@ -14568,10 +14746,12 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
             crate::seller_agents::RegisteredAgent {
                 name: Some("codex".to_owned()),
                 argv: vec!["codex-acp".to_owned()],
+                kind: Default::default(),
             },
         ]));
         assert_eq!(
@@ -14598,6 +14778,7 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
         ]));
         let untargeted = offer(5, Some(SELLER), NOW + 600);
@@ -14984,10 +15165,12 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
             crate::seller_agents::RegisteredAgent {
                 name: Some("codex".to_owned()),
                 argv: vec!["codex-acp".to_owned()],
+                kind: Default::default(),
             },
         ]);
         let dispatched = registry
@@ -18844,6 +19027,339 @@ mod tests {
         store
             .record_award(&"a".repeat(64), job_id, buyer_hex, now)
             .expect("award");
+    }
+
+    // ── hook agents (docs/specs/hook-agents.md), codex r1 #11: claim pin → award → hook → result ──
+    //
+    // These drive the REAL execute_job against a local relay with a hook entry whose program is a
+    // shell script. What they pin: the hook runs once; the result carries exactly its decoded answer;
+    // the seller's co-signature verifies over the receipt preimage built from that answer's digest; a
+    // staged answer is re-delivered without re-running; a delivered job never re-runs; a claim whose
+    // pin does not match (or carries none) never reaches a hook.
+
+    const HOOK_ANSWER: &str = "héllo\nbuyer — exact bytes";
+
+    /// Boot a 1-slot hook-only seller. The hook appends a line to <root>/runs per call and answers
+    /// [HOOK_ANSWER].
+    async fn boot_hook_seller(label: &str, relay_url: &str) -> (SellerNodeRunner, Keys, std::path::PathBuf) {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay_url.to_string();
+        let mut seller = seller_cfg(1, false);
+        seller.claim_award_timeout_secs = Some(0);
+        seller.offer_backfill_secs = 0;
+        seller.agents = vec!["my-hook".to_owned()];
+        home.config.seller = Some(seller);
+        // No reviewer on the fixture relay: the seller's own offer review is switched off.
+        home.config.review.seller_offer = false;
+        let runs = root.join("runs");
+        let script = format!(
+            r#"cat >/dev/null; echo run >> '{}'; printf '%s' '{{"status":"done","answer":"héllo\nbuyer — exact bytes"}}'"#,
+            runs.display()
+        );
+        let mut preset = crate::home::AgentPresetConfig::hook(vec!["sh".into(), "-c".into(), script]);
+        preset.family = Some("claude-code".into());
+        preset.model = Some("my-model".into());
+        home.config.agents.insert("my-hook".to_owned(), preset);
+        let secret = crate::home::read_secret_key_hex(&home).expect("read seller secret");
+        let keys = Keys::parse(&secret).expect("parse seller keys");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot the hook seller");
+        (runner, keys, root)
+    }
+
+    fn hook_runs(root: &std::path::Path) -> usize {
+        std::fs::read_to_string(root.join("runs")).map(|s| s.lines().count()).unwrap_or(0)
+    }
+
+    /// An awarded inline job, claimed with `pin`.
+    fn seed_awarded_inline_job(runner: &SellerNodeRunner, job_id: &str, buyer_hex: &str, pin: Option<&crate::seller_node::store::ClaimPin>) {
+        let now = now_unix();
+        let store = runner.node.store();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    accepts_delivery: vec![gateway::DELIVERY_MODE_INLINE.to_owned()],
+                    payment_mode: crate::gateway::PaymentMode::Sat,
+                    offer_id: job_id.to_owned(),
+                    buyer_pubkey: buyer_hex.to_owned(),
+                    amount_sats: 100,
+                    unit: "sat".to_owned(),
+                    task: "answer me".to_owned(),
+                    deadline_unix: now + 3_600,
+                    targeted: true,
+                    capability_request: Some(Default::default()),
+                    requested_agent: None,
+                    output: Some("text/plain".to_owned()),
+                },
+                now,
+            )
+            .expect("record offer");
+        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), crate::gateway::ClaimPayment::Sat("creq"), &[], &Default::default());
+        store
+            .claim_and_enqueue_pinned(job_id, job_id, Some("creq"), &draft, now, now + 3_600, now, pin)
+            .expect("claim");
+        // A distinct award event per job (award ids are unique).
+        store.record_award(&Keys::generate().public_key().to_hex(), job_id, buyer_hex, now).expect("award");
+    }
+
+    fn hook_pin(runner: &SellerNodeRunner) -> crate::seller_node::store::ClaimPin {
+        let entry = runner.agents.entry(0).expect("hook entry");
+        crate::seller_node::store::ClaimPin { label: "my-hook".into(), kind: "hook".into(), fingerprint: entry.fingerprint() }
+    }
+
+    async fn fetch_results(observer: &Client, job_id: &str) -> Vec<nostr_sdk::Event> {
+        observer
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(crate::kinds::JOB_RESULT_KIND))
+                    .event(nostr_sdk::EventId::from_hex(job_id).expect("job id")),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fetch results")
+            .into_iter()
+            .collect()
+    }
+
+    fn tag_value(event: &nostr_sdk::Event, name: &str, index: usize) -> Option<String> {
+        event.tags.iter().map(|t| t.as_slice()).find(|t| t.first().map(String::as_str) == Some(name)).and_then(|t| t.get(index).cloned())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_job_runs_once_and_its_exact_answer_is_the_signed_result() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, seller_keys, root) = boot_hook_seller("hook-e2e", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "7".repeat(64);
+        let pin = hook_pin(&runner);
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&pin));
+
+        runner.execute_job(&job_id, None, false).await;
+
+        let store = runner.node.store();
+        assert_eq!(hook_runs(&root), 1, "the hook runs exactly once");
+        assert!(store.has_delivery(&job_id).expect("has_delivery"), "the answer was journaled as the delivery");
+        assert!(store.hook_job_ids().expect("ids").is_empty(), "terminal: staged answer and run record cleared");
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        assert_eq!(results.len(), 1, "one result");
+        let result = &results[0];
+        assert_eq!(result.content, HOOK_ANSWER, "the result carries the hook's decoded answer byte-for-byte");
+        assert_eq!(tag_value(result, "harness", 1).as_deref(), Some("my-hook"), "names the pinned entry");
+        assert_eq!(tag_value(result, "usage_transport", 1).as_deref(), Some("hook"));
+        assert_eq!(tag_value(result, "model", 1).as_deref(), Some("my-model"));
+        // The co-signature binds THIS answer: rebuild the preimage from its digest and verify.
+        let preimage = delivery_receipt_preimage(
+            &job_id,
+            "answer me",
+            100,
+            &buyer_hex,
+            &seller_keys.public_key().to_hex(),
+            &crate::receipt::result_content_hash_hex(HOOK_ANSWER),
+            crate::receipt::DeliveryKind::Inline.as_str(),
+            Some("creq"),
+        );
+        let sig_hex = tag_value(result, "sig", 2).expect("sig seller tag");
+        let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&hex::decode(&sig_hex).expect("sig hex"))
+            .expect("sig bytes");
+        let message = nostr_sdk::secp256k1::Message::from_digest(preimage.digest_bytes());
+        nostr_sdk::secp256k1::Secp256k1::verification_only()
+            .verify_schnorr(&sig, &message, &seller_keys.public_key().xonly().expect("xonly"))
+            .expect("the seller co-signed the receipt preimage of exactly this answer");
+
+        // A redundant re-drive of the delivered job never runs the hook again nor emits a second result.
+        runner.execute_job(&job_id, None, true).await;
+        assert_eq!(hook_runs(&root), 1);
+        assert_eq!(fetch_results(&observer, &job_id).await.len(), 1);
+
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_hook_answer_is_redelivered_without_rerunning_the_hook() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-staged", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "8".repeat(64);
+        let pin = hook_pin(&runner);
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&pin));
+        // The crash: the hook ran and its answer was staged, but the daemon died before delivery.
+        runner
+            .node
+            .store()
+            .stage_hook_outcome(
+                &crate::seller_node::store::HookOutcomeRow {
+                    invocation: job_id.clone(),
+                    job_id: job_id.clone(),
+                    turn: 1,
+                    status: "done".into(),
+                    answer: "the staged answer".into(),
+                    wall_time_ms: 5,
+                },
+                now_unix(),
+            )
+            .expect("stage");
+
+        runner.execute_job(&job_id, None, true).await;
+
+        assert_eq!(hook_runs(&root), 0, "a staged answer is re-delivered, never re-run");
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "the staged answer");
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex r2 #8: a job failed on a path outside the hook runner (here: the hook was edited since
+    /// the claim) still loses the hook state an earlier attempt left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_job_failed_before_dispatch_still_loses_its_hook_state() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-fail-cleanup", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "3".repeat(64);
+        let changed = crate::seller_node::store::ClaimPin { fingerprint: "the-entry-at-claim-time".into(), ..hook_pin(&runner) };
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&changed));
+        let store = runner.node.store();
+        assert_eq!(store.begin_hook_attempt(&job_id, &job_id, now_unix()).expect("begin"), Some(1));
+        let workdir = job_workdir(runner.node.home(), &job_id);
+        std::fs::create_dir_all(&workdir).expect("dir");
+
+        runner.execute_job(&job_id, None, true).await;
+
+        assert_eq!(store.job_state(&job_id).expect("state"), Some(crate::seller_node::store::JobState::Failed));
+        assert!(store.hook_job_ids().expect("ids").is_empty(), "the run record went with the failure");
+        assert!(!workdir.exists(), "and so did the directory");
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex r2 #6: a partly written claim pin is neither the pinned entry nor "unpinned": the job is
+    /// deferred (left awarded for the next re-drive), not failed and not dispatched anywhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_claim_pin_defers_the_job() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-partial-pin", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "4".repeat(64);
+        let pin = hook_pin(&runner);
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&pin));
+        runner.node.store().exec_sql_for_test("UPDATE claims SET agent_kind = NULL");
+
+        runner.execute_job(&job_id, None, false).await;
+
+        assert_eq!(hook_runs(&root), 0, "nothing runs on a partial pin");
+        let store = runner.node.store();
+        assert_eq!(
+            store.job_state(&job_id).expect("state"),
+            Some(crate::seller_node::store::JobState::Awarded),
+            "deferred, not failed"
+        );
+        let observer = connect_observer(&relay_url).await;
+        assert!(fetch_results(&observer, &job_id).await.is_empty());
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex r2 #3: the hook was edited after the claim (its fingerprint no longer matches the pin)
+    /// while a staged answer waited for delivery. The staged answer is still delivered, naming the
+    /// pinned entry, and the edited hook is not run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_hook_answer_is_delivered_even_after_the_hook_changed() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-staged-changed", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "5".repeat(64);
+        let then = crate::seller_node::store::ClaimPin { fingerprint: "the-entry-at-claim-time".into(), ..hook_pin(&runner) };
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&then));
+        runner
+            .node
+            .store()
+            .stage_hook_outcome(
+                &crate::seller_node::store::HookOutcomeRow {
+                    invocation: job_id.clone(),
+                    job_id: job_id.clone(),
+                    turn: 1,
+                    status: "done".into(),
+                    answer: "staged before the edit".into(),
+                    wall_time_ms: 5,
+                },
+                now_unix(),
+            )
+            .expect("stage");
+
+        runner.execute_job(&job_id, None, true).await;
+
+        assert_eq!(hook_runs(&root), 0, "the edited hook is never run for it");
+        let store = runner.node.store();
+        assert!(store.has_delivery(&job_id).expect("has_delivery"));
+        assert!(store.hook_job_ids().expect("ids").is_empty(), "delivered: hook state cleared");
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "staged before the edit");
+        assert_eq!(tag_value(&results[0], "harness", 1).as_deref(), Some("my-hook"), "names the pinned entry");
+        assert_eq!(tag_value(&results[0], "model", 1), None, "the edited entry's model is not claimed for it");
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_whose_pin_does_not_match_or_is_absent_never_reaches_the_hook() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-pin", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let changed = crate::seller_node::store::ClaimPin { fingerprint: "not-the-configured-entry".into(), ..hook_pin(&runner) };
+        let (mismatch, unpinned) = ("9".repeat(64), "6".repeat(64));
+        seed_awarded_inline_job(&runner, &mismatch, &buyer_hex, Some(&changed));
+        seed_awarded_inline_job(&runner, &unpinned, &buyer_hex, None);
+
+        runner.execute_job(&mismatch, None, false).await;
+        runner.execute_job(&unpinned, None, false).await;
+
+        assert_eq!(hook_runs(&root), 0, "neither claim may run the hook");
+        let store = runner.node.store();
+        for job in [&mismatch, &unpinned] {
+            assert_eq!(store.job_state(job).expect("state"), Some(crate::seller_node::store::JobState::Failed), "{job}");
+            assert!(!store.has_delivery(job).expect("has_delivery"));
+        }
+        let observer = connect_observer(&relay_url).await;
+        assert!(fetch_results(&observer, &mismatch).await.is_empty());
+        assert!(fetch_results(&observer, &unpinned).await.is_empty());
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Compose the resume decision exactly as `execute_job` does on resume: read every durable marker
@@ -24166,6 +24682,50 @@ mod tests {
     // at spawn with ENOENT (no process created), and the healthy case injects a passing verdict so
     // no agent is ever spawned.
 
+    /// hook-agents §9 / codex r1 #9: a hook-only seat must not reach ANY sandbox-side boot gate. The
+    /// `[sandbox]` here cannot even resolve into an executor; before the fix the probe refused the
+    /// boot on it (`NodeError::Sandbox`) although no job of this seat ever runs in a sandbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_only_seat_boots_past_an_unresolvable_sandbox_on_its_ping() {
+        use crate::home::SandboxConfig;
+        let root = throwaway_root("hookonly-boot");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        // Harness session settings are docker-only: on a launcher they refuse to resolve.
+        let mut sandbox: SandboxConfig = crate::home::parse_config_toml(
+            "[sandbox]\nmode='docker'\n[sandbox.harnesses.codex]\nmodel='gpt-5.6-sol'\nreasoning_effort='high'\n",
+        )
+        .expect("parse")
+        .sandbox
+        .expect("sandbox");
+        sandbox.mode = crate::home::SandboxMode::Launcher;
+        assert!(
+            crate::seller_exec::SandboxPolicy::from_config(Some(&sandbox)).is_err(),
+            "precondition: this [sandbox] refuses to resolve"
+        );
+        crate::home::save_config(&mut home, |config| {
+            let mut seller = seller_cfg(1, false);
+            seller.agents = vec!["my-hook".to_owned()];
+            config.seller = Some(seller);
+            config.agents.insert(
+                "my-hook".to_owned(),
+                crate::home::AgentPresetConfig::hook(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "cat >/dev/null; exit 0".to_owned(),
+                ]),
+            );
+            config.sandbox = Some(sandbox);
+        })
+        .expect("persist config");
+        assert!(crate::seller_agents::hook_only_home(&home));
+        let verdicts = probe_configured_harnesses(&home)
+            .await
+            .expect("a hook-only seat never reaches the sandbox gate");
+        assert_eq!(verdicts.len(), 1);
+        assert!(verdicts[0].result.is_ok(), "{:?}", verdicts[0].result);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A seat whose every configured harness FAILS its pre-advertise probe must publish nothing: no
     /// kind-0 identity and no kind-30340 announcement. The `[sandbox]` launcher is unresolvable, so
     /// the probe's spawn fails ENOENT before any agent runs.
@@ -24577,9 +25137,7 @@ mod tests {
             // real ACP adapter would make this a test of the CI image rather than of the wiring.
             config.agents.insert(
                 "claude".to_owned(),
-                crate::home::AgentPresetConfig {
-                    argv: vec!["true".to_owned()],
-                },
+                crate::home::AgentPresetConfig::acp(vec!["true".to_owned()]),
             );
             config.relay_url = fixture.url();
         })
@@ -24874,9 +25432,7 @@ mod tests {
             config.seller = Some(seller);
             config.agents.insert(
                 "claude".to_owned(),
-                crate::home::AgentPresetConfig {
-                    argv: stub_argv(&script),
-                },
+                crate::home::AgentPresetConfig::acp(stub_argv(&script)),
             );
             config.relay_url = fixture.url();
         })
@@ -25207,6 +25763,7 @@ mod supervised_probe_tests {
         let roster = Arc::new(LiveRoster::new(AgentRegistry::new(vec![RegisteredAgent {
             name: Some("claude".to_owned()),
             argv: vec!["claude-acp".to_owned()],
+            kind: Default::default(),
         }])));
         roster.fault(0, Fault::Unproven, now);
         let due = now + Duration::from_secs(24 * 60 * 60);
@@ -25326,6 +25883,7 @@ mod supervised_probe_tests {
         let roster = Arc::new(LiveRoster::new(AgentRegistry::new(vec![RegisteredAgent {
             name: Some("claude".to_owned()),
             argv: vec!["claude-acp".to_owned()],
+            kind: Default::default(),
         }])));
         let now = Instant::now();
         roster.fault(0, Fault::Unproven, now);

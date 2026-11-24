@@ -172,6 +172,10 @@ pub mod sandbox_net;
 /// contains the job are decided here, so they are compiled and tested on every build.
 pub mod sandbox_netns;
 pub mod seller;
+/// The hook runner: a seller's own agent behind a blocking command (docs/specs/hook-agents.md §5).
+/// Seller-node only (`wallet`, which carries `libc` for the non-blocking pipes and `waitid`).
+#[cfg(feature = "wallet")]
+pub mod hook;
 // Session (multi-turn) jobs: wire shapes and pure rules. Inert unless `[sessions] enabled`.
 pub mod session;
 /// The seller's harness registry: the agent harnesses one node enables, what it advertises for

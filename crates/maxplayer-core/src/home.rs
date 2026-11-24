@@ -195,11 +195,18 @@ pub const DEFAULT_RELAY_GIT_REPO: &str = "maxplayer-seller";
 /// Seller daemon config (`[seller]` in config.toml). Key never lives here.
 ///
 /// `agent_command` MUST be an argv array — a TOML string/shell value is refused at parse
-/// (no-shell by construction).
+/// (no-shell by construction). It is the UNLABELLED fallback harness, used only when `agents` is
+/// empty, so it may be absent when `agents` names the harnesses (a hook-only seat has no ACP
+/// fallback to name); `require_seller_config` refuses a config with neither. Present-but-empty is
+/// still refused at parse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SellerConfig {
-    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_agent_command_argv"
+    )]
     pub agent_command: Vec<String>,
     pub rate_sats: u64,
     /// This seat TAKES NO PAYMENT (§2.1, §4.1). Default **false**. Opting in does two things and
@@ -1610,6 +1617,13 @@ where
     deserializer.deserialize_any(EndpointArgsVisitor)
 }
 
+fn deserialize_optional_agent_argv<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_agent_command_argv(deserializer).map(Some)
+}
+
 fn deserialize_agent_command_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1651,13 +1665,106 @@ where
     deserializer.deserialize_any(ArgvVisitor)
 }
 
-/// One custom agent preset (`[agents.<name>] argv = [...]`). The argv is a launch command
-/// for the seller ACP driver — same no-shell argv-array rule as `agent_command`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One custom agent preset. Exactly one of two forms (docs/specs/hook-agents.md §2):
+///
+/// - `[agents.<name>] argv = [...]` — a launch command for the seller ACP driver, run in our
+///   sandbox, same no-shell argv-array rule as `agent_command`.
+/// - `[agents.<name>] hook = [...]` — the seller's OWN agent behind a command the daemon runs once
+///   per turn (the hook contract). It serves inline, non-contribution jobs only. `family`/`model`
+///   are optional SELF-REPORTED filter values for a hook; refused on an `argv` preset, whose
+///   harness reports its own model.
+///
+/// The one-of rule is checked by [`AgentPresetConfig::validate`] at config load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentPresetConfig {
-    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_agent_command_argv"
+    )]
     pub argv: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_agent_argv"
+    )]
+    pub hook: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl AgentPresetConfig {
+    /// An ACP preset from its argv (the historical form).
+    pub fn acp(argv: Vec<String>) -> Self {
+        Self {
+            argv,
+            ..Self::default()
+        }
+    }
+
+    /// A hook preset from its argv.
+    pub fn hook(argv: Vec<String>) -> Self {
+        Self {
+            hook: Some(argv),
+            ..Self::default()
+        }
+    }
+
+    /// Whether this preset is a hook (the seller's own agent behind a command).
+    pub fn is_hook(&self) -> bool {
+        self.hook.is_some()
+    }
+
+    /// The one-of rule and the self-report rules, for preset `name`.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        match (self.argv.is_empty(), &self.hook) {
+            (false, Some(_)) => {
+                return Err(format!(
+                    "[agents.{name}]: set exactly one of `argv` (an ACP harness) or `hook` (your own agent), not both"
+                ));
+            }
+            (true, None) => {
+                return Err(format!(
+                    "[agents.{name}]: set `argv` (an ACP harness) or `hook` (your own agent)"
+                ));
+            }
+            _ => {}
+        }
+        if !self.is_hook() && (self.family.is_some() || self.model.is_some()) {
+            return Err(format!(
+                "[agents.{name}]: `family`/`model` apply to a `hook` preset only (an ACP harness reports its own model)"
+            ));
+        }
+        if let Some(family) = self.family.as_deref() {
+            if !crate::agent_presets::HARNESS_FAMILIES.contains(&family) {
+                return Err(format!(
+                    "[agents.{name}]: unknown family {family:?} (want one of {})",
+                    crate::agent_presets::HARNESS_FAMILIES.join("|")
+                ));
+            }
+            if let Some(derived) = crate::agent_presets::builtin_family_for_name(name) {
+                if derived != family {
+                    return Err(format!(
+                        "[agents.{name}]: family {family:?} contradicts the built-in name {name:?} (family {derived:?})"
+                    ));
+                }
+            }
+        }
+        if let Some(model) = self.model.as_deref() {
+            if model.trim().is_empty() {
+                return Err(format!("[agents.{name}]: `model` must not be empty"));
+            }
+            if self.family.is_none() && crate::agent_presets::builtin_family_for_name(name).is_none() {
+                return Err(format!(
+                    "[agents.{name}]: `model` needs `family` (a model is advertised per harness family)"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `[buyer]` new-award policy and hop planner knobs.
@@ -2456,6 +2563,11 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
         .try_into()
         .map_err(|error| HomeError::Config(format!("config.toml: {error}")))?;
     config.review.validate().map_err(HomeError::Config)?;
+    for (name, preset) in &config.agents {
+        preset
+            .validate(name)
+            .map_err(|error| HomeError::Config(format!("config.toml: {error}")))?;
+    }
     Ok(config)
 }
 
@@ -2466,6 +2578,9 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
 /// `MAXPLAYER_*` spelling, so excluding them costs no config coverage.
 const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_HOME",
+    // Set by the daemon for a hook agent (docs/specs/hook-agents.md §5.1), so a `maxplayer` command
+    // the seller's agent runs does not refuse it as an unknown config field.
+    "MAXPLAYER_HOOK_V",
     "MAXPLAYER_VERBOSE",
     "MAXPLAYER_HEARTBEAT_INTERVAL_SECS",
     "MAXPLAYER_HEARTBEAT_ENABLED",
@@ -3239,6 +3354,47 @@ mod tests {
                 "{why}: `{entry}` cannot match a wire pubkey and must not be counted as a route in"
             );
         }
+    }
+
+    #[test]
+    fn hook_preset_parses_round_trips_and_enforces_one_of_and_self_report_rules() {
+        let base = "relay_url = 'r'\nmint_url = 'm'\nper_job_budget_sats = 1\ntotal_budget_sats = 2\n";
+        let ok = format!(
+            "{base}[agents.mine]\nhook = ['/bin/my-hook', '--x']\nfamily = 'claude-code'\nmodel = 'claude-opus-5'\n"
+        );
+        let config = parse_config_toml(&ok).expect("parse hook preset");
+        let preset = config.agents.get("mine").expect("mine");
+        assert!(preset.is_hook());
+        assert!(preset.argv.is_empty());
+        assert_eq!(preset.hook.as_deref(), Some(&["/bin/my-hook".to_owned(), "--x".to_owned()][..]));
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        assert!(!serialized.contains("argv"), "an empty argv must not be written: {serialized}");
+        assert_eq!(parse_config_toml(&serialized).expect("reparse"), config);
+
+        // A hook named after a built-in derives its family; model alone is then enough.
+        parse_config_toml(&format!("{base}[agents.claude]\nhook = ['h']\nmodel = 'm'\n"))
+            .expect("built-in name supplies the family");
+
+        for (body, why) in [
+            ("hook = ['h']\nargv = ['a']\n", "both argv and hook"),
+            ("family = 'codex'\n", "neither argv nor hook"),
+            ("hook = 'h --x'\n", "shell-string hook"),
+            ("hook = []\n", "empty hook argv"),
+            ("argv = ['a']\nfamily = 'codex'\n", "family on an ACP preset"),
+            ("argv = ['a']\nmodel = 'm'\n", "model on an ACP preset"),
+            ("hook = ['h']\nfamily = 'nope'\n", "unknown family"),
+            ("hook = ['h']\nmodel = 'm'\n", "model without a family"),
+            ("hook = ['h']\nfamily = 'codex'\nmodel = '  '\n", "blank model"),
+        ] {
+            assert!(
+                parse_config_toml(&format!("{base}[agents.mine]\n{body}")).is_err(),
+                "{why} must be refused"
+            );
+        }
+        assert!(
+            parse_config_toml(&format!("{base}[agents.claude]\nhook = ['h']\nfamily = 'codex'\n")).is_err(),
+            "a family contradicting a built-in name must be refused"
+        );
     }
 
     #[test]

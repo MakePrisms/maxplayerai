@@ -64,6 +64,18 @@ pub const HARNESS_FAMILIES: [&str; 4] = ["claude-code", "codex", "cursor", "goos
 /// A custom preset spelled EXACTLY as a spec family maps to that family. That is exact equality
 /// against the closed vocabulary, never a nearest match, and it is how `goose` reaches the wire
 /// without a code change once someone configures a goose preset.
+/// The family a BUILT-IN preset name implies (`claude` ⇒ `claude-code`, …), or `None` for any other
+/// name. Unlike [`harness_family_for_preset`] this never matches a bare family name, so a custom
+/// preset called `codex-mine` or `goose` is not mistaken for a built-in.
+pub fn builtin_family_for_name(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "claude" => Some("claude-code"),
+        "codex" => Some("codex"),
+        "cursor" => Some("cursor"),
+        _ => None,
+    }
+}
+
 pub fn harness_family_for_preset(preset: &str) -> Option<&'static str> {
     let key = preset.trim().to_ascii_lowercase();
     match key.as_str() {
@@ -102,10 +114,13 @@ pub fn resolve_agent_preset_in(
         .get_key_value(trimmed)
         .or_else(|| custom.get_key_value(key.as_str()))
     {
-        if preset.argv.is_empty() {
+        // A hook preset launches its hook argv (run by the hook runner, never the ACP driver; the
+        // registry records which).
+        let argv = preset.hook.clone().unwrap_or_else(|| preset.argv.clone());
+        if argv.is_empty() {
             return Err(format!("agent preset {configured:?} has an empty argv"));
         }
-        return Ok((configured.clone(), preset.argv.clone()));
+        return Ok((configured.clone(), argv));
     }
     match key.as_str() {
         "claude" => resolve_claude(host).map(|argv| ("claude".into(), argv)),
@@ -162,7 +177,8 @@ pub fn detect_available_agents(custom: &BTreeMap<String, AgentPresetConfig>) -> 
 }
 
 fn custom_preset_available(preset: &AgentPresetConfig) -> bool {
-    match preset.argv.first() {
+    let argv = preset.hook.as_ref().unwrap_or(&preset.argv);
+    match argv.first() {
         Some(argv0) => which(argv0).is_some() || Path::new(argv0).is_file(),
         None => false,
     }
@@ -277,9 +293,7 @@ mod tests {
             .map(|(name, argv)| {
                 (
                     (*name).to_owned(),
-                    AgentPresetConfig {
-                        argv: argv.iter().map(|a| (*a).to_owned()).collect(),
-                    },
+                    AgentPresetConfig::acp(argv.iter().map(|a| (*a).to_owned()).collect()),
                 )
             })
             .collect()

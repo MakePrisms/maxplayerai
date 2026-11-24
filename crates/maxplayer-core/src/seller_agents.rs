@@ -53,8 +53,72 @@ pub struct RegisteredAgent {
     /// a job's request. `None` for the raw `--agent-argv` hatch: an argv with no preset label has
     /// no harness name we can honestly publish.
     pub name: Option<String>,
-    /// The launch argv for the ACP driver (no shell).
+    /// The launch argv: for the ACP driver (`Acp`) or the hook runner (`Hook`). No shell.
     pub argv: Vec<String>,
+    /// What runs behind `argv` (docs/specs/hook-agents.md §2).
+    pub kind: AgentKind,
+}
+
+/// Whether an entry is an ACP harness we run in our sandbox, or the seller's own agent behind a
+/// hook command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AgentKind {
+    #[default]
+    Acp,
+    /// Self-reported `family`/`model` from the preset, both optional.
+    Hook {
+        family: Option<String>,
+        model: Option<String>,
+    },
+}
+
+impl AgentKind {
+    pub fn is_hook(&self) -> bool {
+        matches!(self, Self::Hook { .. })
+    }
+    /// `acp` | `hook`, as journaled on the claim pin.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Acp => "acp",
+            Self::Hook { .. } => "hook",
+        }
+    }
+}
+
+impl RegisteredAgent {
+    /// The harness family this entry advertises: a hook's configured family, else the family a
+    /// built-in name implies (`claude` ⇒ `claude-code`), else for an ACP entry the existing
+    /// name-based mapping. `None` ⇒ no family/model tags for it.
+    pub fn family(&self) -> Option<String> {
+        let name = self.name.as_deref()?;
+        match &self.kind {
+            AgentKind::Hook { family, .. } => family
+                .clone()
+                .or_else(|| crate::agent_presets::builtin_family_for_name(name).map(str::to_owned)),
+            AgentKind::Acp => {
+                crate::agent_presets::harness_family_for_preset(name).map(str::to_owned)
+            }
+        }
+    }
+
+    /// A stable fingerprint of everything that decides what runs: kind, argv, family, model.
+    /// Pinned on the claim so a restart with a changed entry fails closed instead of running
+    /// something the claim did not describe.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let (family, model) = match &self.kind {
+            AgentKind::Hook { family, model } => (family.clone(), model.clone()),
+            AgentKind::Acp => (None, None),
+        };
+        let canonical = serde_json::json!({
+            "kind": self.kind.as_str(),
+            "name": self.name,
+            "argv": self.argv,
+            "family": family,
+            "model": model,
+        });
+        hex::encode(Sha256::digest(canonical.to_string().as_bytes()))
+    }
 }
 
 /// One listed preset's boot verdict. A FAIL never names an argv — it names the reason, so the
@@ -174,6 +238,46 @@ impl AgentRegistry {
     }
 }
 
+/// docs/specs/hook-agents.md §9: whether every configured `[seller] agents` entry is a `hook` preset,
+/// so nothing of ours runs a job on this box (no sandbox, no job environment, no held tools).
+///
+/// THE one answer to "is this seat hook-only": the doctor, the boot gates, the capability probe and
+/// held-tool startup all ask it, so they cannot disagree. Read from config, not a resolved registry,
+/// so the doctor can ask before anything resolves. An empty list (the unlabelled `agent_command`
+/// fallback) is never hook-only.
+pub fn hook_only_seat(seller: &SellerConfig, presets: &BTreeMap<String, AgentPresetConfig>) -> bool {
+    !seller.agents.is_empty()
+        && seller
+            .agents
+            .iter()
+            .all(|name| presets.get(name.trim()).is_some_and(AgentPresetConfig::is_hook))
+}
+
+/// [`hook_only_seat`] for a home: `false` without a `[seller]` section.
+pub fn hook_only_home(home: &crate::home::MaxplayerHome) -> bool {
+    home.config
+        .seller
+        .as_ref()
+        .is_some_and(|seller| hook_only_seat(seller, &home.config.agents))
+}
+
+/// The `agent_command` a first run or relaunch should store when `label` resolved to `argv`.
+/// `agent_command` is only the UNLABELLED fallback (used when `agents` is empty), so a hook preset's
+/// argv must never land there: it would run as an ACP agent if the list were ever emptied. A hook
+/// keeps whatever fallback was there before (possibly none).
+pub fn fallback_command_for(
+    label: &str,
+    argv: Vec<String>,
+    presets: &BTreeMap<String, AgentPresetConfig>,
+    previous: Option<&[String]>,
+) -> Vec<String> {
+    if presets.get(label.trim()).is_some_and(AgentPresetConfig::is_hook) {
+        previous.map(<[String]>::to_vec).unwrap_or_default()
+    } else {
+        argv
+    }
+}
+
 /// Canonicalise a requested harness: trims, lowercases, and maps both absence and [`AGENT_ANY`]
 /// (and an empty value) to "no preference", so `None`, `""`, `"any"` and `" ANY "` are one case.
 pub fn normalize_request(requested: Option<&str>) -> Option<String> {
@@ -284,9 +388,20 @@ pub fn resolve(
                     .iter()
                     .any(|e: &RegisteredAgent| e.name.as_deref() == Some(label.as_str()))
                 {
+                    let kind = match presets
+                        .get(label.as_str())
+                        .filter(|preset| preset.is_hook())
+                    {
+                        Some(preset) => AgentKind::Hook {
+                            family: preset.family.clone(),
+                            model: preset.model.clone(),
+                        },
+                        None => AgentKind::Acp,
+                    };
                     entries.push(RegisteredAgent {
                         name: Some(label),
                         argv,
+                        kind,
                     });
                 }
             }
@@ -318,6 +433,7 @@ fn fallback_registry(seller: &SellerConfig) -> Result<ResolvedRegistry, Registry
         registry: AgentRegistry::new(vec![RegisteredAgent {
             name: None,
             argv: seller.agent_command.clone(),
+            kind: Default::default(),
         }]),
         verdicts: Vec::new(),
     })
@@ -326,6 +442,31 @@ fn fallback_registry(seller: &SellerConfig) -> Result<ResolvedRegistry, Registry
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_only_is_every_listed_entry_a_hook_and_never_the_unlabelled_fallback() {
+        let mut presets = BTreeMap::new();
+        presets.insert("h1".to_owned(), AgentPresetConfig::hook(vec!["/bin/h1".into()]));
+        presets.insert("h2".to_owned(), AgentPresetConfig::hook(vec!["/bin/h2".into()]));
+        assert!(hook_only_seat(&seller_with(vec!["h1".into(), "h2".into()]), &presets));
+        assert!(!hook_only_seat(&seller_with(vec!["h1".into(), "claude".into()]), &presets), "mixed");
+        assert!(!hook_only_seat(&seller_with(Vec::new()), &presets), "agent_command fallback");
+        assert!(!hook_only_seat(&seller_with(vec!["unknown".into()]), &presets));
+    }
+
+    #[test]
+    fn a_hook_preset_never_becomes_the_acp_fallback() {
+        let mut presets = BTreeMap::new();
+        presets.insert("h".to_owned(), AgentPresetConfig::hook(vec!["/bin/h".into()]));
+        let previous = vec!["claude-acp".to_owned()];
+        assert_eq!(fallback_command_for("h", vec!["/bin/h".into()], &presets, Some(&previous)), previous);
+        assert!(fallback_command_for("h", vec!["/bin/h".into()], &presets, None).is_empty());
+        assert_eq!(
+            fallback_command_for("claude", vec!["claude-acp".into()], &presets, None),
+            vec!["claude-acp".to_owned()],
+            "an ACP preset still stores its argv, as before"
+        );
+    }
 
     fn seller_with(agents: Vec<String>) -> SellerConfig {
         SellerConfig {
@@ -356,9 +497,7 @@ mod tests {
             .map(|(name, argv)| {
                 (
                     (*name).to_owned(),
-                    AgentPresetConfig {
-                        argv: argv.iter().map(|a| (*a).to_owned()).collect(),
-                    },
+                    AgentPresetConfig::acp(argv.iter().map(|a| (*a).to_owned()).collect()),
                 )
             })
             .collect()
@@ -371,6 +510,7 @@ mod tests {
                 .map(|name| RegisteredAgent {
                     name: Some((*name).to_owned()),
                     argv: vec![format!("{name}-acp")],
+                    kind: Default::default(),
                 })
                 .collect(),
         )
@@ -509,6 +649,7 @@ mod tests {
         RegisteredAgent {
             name: Some(name.to_owned()),
             argv: vec![format!("{name}-acp")],
+            kind: Default::default(),
         }
     }
 
@@ -526,6 +667,7 @@ mod tests {
                 "claude-agent-acp".into(),
                 "/home/seat/.claude/bin/claude".into(),
             ],
+            kind: Default::default(),
         };
         assert_eq!(
             harness_credential_dirs(&hatch, home),

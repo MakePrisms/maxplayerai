@@ -865,9 +865,16 @@ impl SellerNodeRunner {
             .container_delivery()
             .ok_or_else(|| setup("container delivery is not enabled for this seat"))?;
         let (agent_command, agent_label, harness) = {
+            // Same resolver as turn 1 (review r1 #1): the claim pin decides, an unpinned session
+            // stays on ACP entries, and a follow-up never reaches a hook in this stage.
+            let pin = store.claim_pin(job_id).map_err(setup)?;
             let selected = self
                 .agents
-                .dispatch(offer.requested_agent.as_deref())
+                .for_execution(
+                    pin.as_ref().map(|p| (p.label.as_str(), p.kind.as_str(), p.fingerprint.as_str())),
+                    offer.requested_agent.as_deref(),
+                    false,
+                )
                 .ok_or((
                     ReasonCode::CapabilityMissing,
                     "requested agent unavailable".to_owned(),

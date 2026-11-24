@@ -729,6 +729,14 @@ message on a turn whose `turn_status` is `out_of_time`. Single-turn jobs have ne
 
 A buyer MUST refuse to bind an inline result to a `contribution`-class offer.
 
+**Hook agents** (docs/specs/hook-agents.md). A seller MAY serve a job with its own agent behind a
+hook command instead of a harness it runs. Such a job has no work tree of the seller daemon's: files
+the seller's agent writes are not part of any delivery, so the snapshot rule above is vacuous and the
+job settles inline or not at all. The hook's exit-0 envelope `{"status":"done","answer":…}` is the
+success opt-in that stands in for the §8.3 marker. `needs_input` and `out_of_time` remain
+session-turn-only: on a single-turn job the seller MUST NOT deliver them. A hook entry is never
+selected for a `contribution`-class offer or one that does not declare `inline`.
+
 This document does not yet specify the contribution tags field by field. An offer is
 contribution-class when it carries `["job-class","contribution"]`; it pins its target with
 `target-repo`, `base` and `accepts` (only `fork` today), and the seller's result adds `fork-ref` and
@@ -1009,7 +1017,9 @@ ask to be paid for it.
 
 The marker is an opt-in for SUCCESS and carries no failure value. Every UNMARKED outcome — an error
 string, a turn that said nothing, a decline the model did not mark — takes the refusal path
-unchanged. The only exceptions are the two session-turn cases in §6.4.
+unchanged. The only exceptions are the two session-turn cases in §6.4. A hook agent's
+envelope (§6.4) carries the same opt-in explicitly: only `status = done` with a non-empty answer is a
+deliverable, and an adapter MUST NOT wrap a failed run's text as `answer`.
 
 A reader MUST NOT treat the marker as proof of correctness, and MUST NOT treat it as proof that the
 task was done. A model that marks an answer and then writes that it could not determine one is
