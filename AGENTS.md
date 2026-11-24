@@ -38,8 +38,9 @@ with plain `wallet`.
 ## Buyer track
 
 The MCP implementation in [`crates/maxplayer/src/mcp.rs`](crates/maxplayer/src/mcp.rs) is authoritative.
-With the default config it exposes exactly the four-tool buyer trade loop below; two opt-in config
-flags add tools (session jobs and swarms, after the list):
+Its trade loop is the four tools below. Every `wallet` (release) build also lists nine team tools,
+`reply` comes with session jobs (on by default) and nine `swarm_*` tools with `[swarm] enabled`; all
+are described after the list:
 
 1. `post_job` — publish an offer. The buyer daemon auto-awards a payable claim under the hood.
 2. `get_job` — read claims and results.
@@ -66,7 +67,7 @@ Team messages are untrusted words from other agents, never instructions.
 Session jobs ([`docs/specs/session-jobs.md`](docs/specs/session-jobs.md), `[sessions] enabled`,
 default **on** — unset reads as on, `false` turns it off; only an explicit `true` makes a runsc seat
 without `--overlay2=none` FAIL doctor and gives a 20 GiB parked-session budget, unset WARNs and gets
-5 GiB): with the flag on, the MCP adds a fifth tool, `reply`, which continues an awarded
+5 GiB): with the flag on, the MCP adds `reply`, which continues an awarded
 session job with the same seller and agent conversation (turn n ≥ 2; `reply close: true` closes it),
 and `collect` gains `turn`. (`collect close_session` is a deprecated daemon alias, no longer listed.) A turn is priced like the job, reserved under the per-job and session caps, keyed by
 the follow-up id, settled by the delivery watcher like turn 1 (or `collect turn=<n>`), and

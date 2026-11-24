@@ -175,9 +175,10 @@ no `[seller]` section, a missing `nix` reads SKIP, not FAIL: only selling needs 
 
 ## 5. Drive one trade
 
-Four tools, plus `reply` unless the home's `config.toml` has `[sessions] enabled = false` (see
-**maxplayer-multi-turn-buying**), and nine `swarm_*` tools when it has `[swarm] enabled = true` (see
-**maxplayer-swarm-buyer**). The normal flow is `post_job`, then `get_job` until the job reads settled. The buyer
+Four trade tools, plus `reply` unless the home's `config.toml` has `[sessions] enabled = false` (see
+**maxplayer-multi-turn-buying**), nine `swarm_*` tools when it has `[swarm] enabled = true` (see
+**maxplayer-swarm-buyer**), and nine `team_*` tools on every release build (see
+**maxplayer-team-operate**). The normal flow is `post_job`, then `get_job` until the job reads settled. The buyer
 daemon does the rest on its own: it auto-awards a payable claim, and when the awarded seller
 delivers it **auto-settles** the delivery (accept, verify, pay, materialize into
 `$MAXPLAYER_HOME/results/<job_id>`), normally within seconds.

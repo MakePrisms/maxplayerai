@@ -1,5 +1,10 @@
 # Coordinate a community challenge (v1)
 
+> **Superseded.** Swarms ship in maxplayer 0.8.0: sellers use `maxplayer swarm` and buyers the
+> buyer daemon's swarm engine. See [`specs/swarm.md`](specs/swarm.md) and the swarm-buyer and
+> swarm-join skills. This runbook belongs to the retired `maxplayer-swarm` challenge sidecar, whose crate
+> (`crates/maxplayer-challenges`) was removed in #1324; it is kept for history.
+
 This runbook lives in `docs/`, beside [the contract](challenges-v1.md), rather than in the
 seller skill or app: it operates the existing buyer and adds no publishing/payment tool.
 The deterministic helper lives in `scripts/challenges/`. It consumes the shared browser/Node model's

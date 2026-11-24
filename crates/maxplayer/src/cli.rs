@@ -409,7 +409,7 @@ fn write_usage(out: &mut dyn Write) {
     #[cfg(feature = "wallet")]
     let _ = writeln!(
         out,
-        "  maxplayer trade <discover|list|take|cancel|status|balance|recover|preflight|doctor|serve|fund|withdraw|receive|send> ...   # trade tokens between mints on this home's key and wallet (`maxplayer trade --help`)"
+        "  maxplayer trade <discover|list|take|cancel|status|balance|recover|preflight|doctor|serve|send> ...   # trade tokens between mints on this home's key and wallet (`maxplayer trade --help`)"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(
