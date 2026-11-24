@@ -205,13 +205,58 @@ pub fn job_cutoff(deadline_unix: u64, now_unix: u64, now: Instant) -> Instant {
     now + Duration::from_secs(remaining)
 }
 
-#[derive(serde::Deserialize)]
+/// The answer object as the hook wrote it: a JSON object with no duplicate key at all (known or
+/// unknown), decoded strictly (§5.1 "Answer").
 struct WireAnswer {
     status: String,
-    #[serde(default)]
     answer: Option<String>,
-    #[serde(default)]
     reason: Option<String>,
+}
+
+/// A top-level JSON object that refuses any repeated key — serde_json's own map keeps the last.
+struct StrictObject(serde_json::Map<String, serde_json::Value>);
+
+impl<'de> serde::Deserialize<'de> for StrictObject {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StrictObject;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<StrictObject, A::Error> {
+                let mut out = serde_json::Map::new();
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    if out.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!("duplicate key {key:?}")));
+                    }
+                    out.insert(key, value);
+                }
+                Ok(StrictObject(out))
+            }
+        }
+        // `deserialize_map`, not `deserialize_any`: an array (a positional struct) is refused.
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+impl WireAnswer {
+    fn decode(stdout: &[u8]) -> Result<Self, String> {
+        let StrictObject(map) = serde_json::from_slice(stdout).map_err(|e| e.to_string())?;
+        // A present field must have its type; `null` is not "absent".
+        let field = |name: &str| -> Result<Option<String>, String> {
+            match map.get(name) {
+                None => Ok(None),
+                Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+                Some(other) => Err(format!("{name:?} must be a string, not {other}")),
+            }
+        };
+        Ok(Self {
+            status: field("status")?.ok_or("missing \"status\"")?,
+            answer: field("answer")?,
+            reason: field("reason")?,
+        })
+    }
 }
 
 /// Interpret a finished run as a `job` outcome (§5.1). `cap` is the inline answer cap in bytes.
@@ -233,9 +278,9 @@ pub fn classify_job(report: &RunReport, cap: usize) -> JobOutcome {
             READER_JOIN_BUDGET.as_secs()
         ));
     }
-    // serde_json refuses invalid UTF-8, trailing non-whitespace and (for a derived struct) a
-    // duplicate field; unknown extra fields are tolerated.
-    let wire: WireAnswer = match serde_json::from_slice(&report.stdout) {
+    // serde_json refuses invalid UTF-8 and trailing non-whitespace; `decode` refuses a non-object,
+    // any duplicate key and a wrongly typed (or null) known field. Unknown fields are tolerated.
+    let wire = match WireAnswer::decode(&report.stdout) {
         Ok(wire) => wire,
         Err(error) => return JobOutcome::Broken(format!("stdout is not the answer object: {error}")),
     };
@@ -801,6 +846,15 @@ mod tests {
             r#"printf '{"status":"done","answer":"a"} trailing'"#,
             r#"printf '{"status":"done"}'"#,
             r#"printf '\377\376'"#,
+            // Not an object: a positional array.
+            r#"printf '["done","a"]'"#,
+            // A duplicate UNKNOWN key is a duplicate too.
+            r#"printf '{"status":"done","answer":"a","x":1,"x":2}'"#,
+            // A present known field must have its type; null is not absent.
+            r#"printf '{"status":"done","answer":null}'"#,
+            r#"printf '{"status":"done","answer":7}'"#,
+            r#"printf '{"status":null,"answer":"a"}'"#,
+            r#"printf '{"status":"cannot_deliver","reason":null}'"#,
         ] {
             let outcome = classify_job(&run_sh(script, b"", Duration::from_secs(10)), CAP);
             assert!(matches!(outcome, JobOutcome::Broken(_)), "{script}: {outcome:?}");
