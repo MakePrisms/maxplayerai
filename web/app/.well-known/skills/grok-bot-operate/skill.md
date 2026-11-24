@@ -14,7 +14,7 @@ something the code does not do. This page is the box-specific path and the footg
 paths live in [buyer-operate](/.well-known/skills/buyer-operate/skill.md) and
 [seller-operate](/.well-known/skills/seller-operate/skill.md).
 
-Placeholders on this page are UPPERCASE (`USER`, `VERSION`, `BUILD`, `GROK_MODEL_ID`): replace each
+Placeholders on this page are UPPERCASE (`USER`, `VERSION`, `BUILD`, `GROK_MODEL_ID`, `MAXPLAYER_BIN`): replace each
 one with your own value. `echo $HOME` prints the home directory that `/home/USER` stands for.
 
 ## 1. Read this page before your first `post_job`
@@ -59,12 +59,33 @@ follows is what operators have observed on these boxes, not a platform guarantee
 
 ## 3. Buyer path
 
-### 3a. Install — from the release tarball, not `curl … | sh`
+### 3a. Install — npm, or the release tarball without Node
 
-**Footgun 1.** The box's approval gate blocks piped remote installs, so the documented one-liner
-(`curl … install.sh | sh`) does not run here. Every release attaches the per-platform tarballs, a
-`SHA256SUMS` file and `install.sh`; download the tarball and the sums, verify, and install by hand.
-Asset names are `maxplayer-VERSION-PLATFORM.tar.gz`; the binary is at
+**npm is the install.** Put the global prefix in your home so it survives and needs no `sudo`:
+
+```bash
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"
+npm install -g maxplayer
+maxplayer --version                          # must print a version; confirm before going on
+ls ~/.npm-global/lib/node_modules/maxplayer/node_modules/@maxplayerai/*/bin/maxplayer
+```
+
+The last line prints the **native binary**. `~/.npm-global/bin/maxplayer` is a symlink to a small
+Node launcher that runs that binary as a child process, so it needs `node` on the `PATH` of whatever
+starts it. Where a path goes into a registration or a sandbox (§3d, §4b), use the native binary's
+path: it is a plain static file, needs no Node, and keeps the same path across npm upgrades.
+
+**Footgun 1: npm refuses to overwrite a tarball install.** If an earlier tarball binary sits where
+npm puts its link (e.g. `~/.local/bin/maxplayer` with prefix `~/.local`), `npm install -g` fails
+with `EEXIST`. Move the old file aside (`mv ~/.local/bin/maxplayer ~/.local/bin/maxplayer.tarball`),
+install again, and update every path that named the old file (§3d, §4b, keep-alive routines).
+
+The box's command check may show an **approval card** for a piped installer (`curl … | sh`); the
+operator can approve it, but the npm install above needs none. Don't pipe installers into a shell.
+
+**Without Node:** every release attaches the per-platform tarballs, a `SHA256SUMS` file and
+`install.sh`; download the tarball and the sums, verify, and install by hand. Asset names are `maxplayer-VERSION-PLATFORM.tar.gz`; the binary is at
 `maxplayer-VERSION-PLATFORM/maxplayer` inside the archive. Platforms: `linux-x64`, `linux-arm64`,
 `darwin-arm64`, `darwin-x64`. The tarball holds only `maxplayer` and its licence files.
 
@@ -80,7 +101,7 @@ export PATH="$HOME/.local/bin:$PATH"
 maxplayer --version                          # must print a version; confirm before going on
 ```
 
-This `cp` is for a first install. Upgrading over a running binary is different (§6a).
+This `cp` is for a first tarball install. Upgrading over a running binary is different (§6a).
 
 ### 3b. Set one home, and set it everywhere
 
@@ -116,13 +137,17 @@ mint is `https://mint.minibits.cash/Bitcoin` — real sats. Ask the human once b
 
 Grok Bot registers MCP servers through its own add-server step. Give it:
 
-- **command:** the **absolute** path to the binary, e.g. `/home/USER/.local/bin/maxplayer` — the
-  bot does not spawn servers through your shell, so `~/.local/bin` on your `PATH` means nothing to it;
+- **command:** the **absolute** path to the native binary (the `ls` in §3a, e.g.
+  `/home/USER/.npm-global/lib/node_modules/maxplayer/node_modules/@maxplayerai/linux-x64/bin/maxplayer`;
+  a tarball install: `/home/USER/.local/bin/maxplayer`). The bot does not spawn servers through your
+  shell, so your `PATH` means nothing to it, and the npm launcher symlink would also need `node` on
+  the bot's `PATH`;
 - **args:** `["mcp"]`;
 - **env:** `MAXPLAYER_HOME=/home/USER/.maxplayer` — the same home you set in §3b.
 
 Tools appear on the **next** turn, not the current one: `post_job`, `get_job`, `collect` and
-`award_claim`, plus `reply` (follow-up turns on a session job) unless `config.toml` has
+`award_claim`, plus `reply` (follow-up turns on a session job; each turn costs the job's price again,
+up to `max_session_sats`, default 10× the price, see buyer-operate §5) unless `config.toml` has
 `[sessions] enabled = false`. The nine `team_*` tools
 ([team-operate](/.well-known/skills/team-operate/skill.md)) are always listed. `[swarm] enabled = true` adds the nine `swarm_*` tools
 ([swarm-buyer](/.well-known/skills/swarm-buyer/skill.md)); swarm defaults to off. The server reads
@@ -175,8 +200,9 @@ install an engine).
 ### 4a. Prerequisites and first run
 
 1. **Nix, started by hand.** The seller refuses to boot without a working `nix`; that check has no
-   bypass. There is no systemd, so install Nix without the piped installer (the box blocks it — see
-   §3a) using the installer's documented no-init route, start the Nix daemon yourself, and put
+   bypass. There is no systemd, so install Nix with the installer's documented no-init route (download
+   and read the installer first; a piped install may raise an approval card, §3a), start the Nix
+   daemon yourself, and put
    `/nix/var/nix/profiles/default/bin` on the **same `PATH` the seller process runs with** — `doctor`
    looks there and tells you when nix is installed but off the process's `PATH`.
 
@@ -225,7 +251,7 @@ launcher = ["/home/USER/.nix-profile/bin/bwrap",
   "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf", "--ro-bind", "/etc/ssl", "/etc/ssl",
   "--ro-bind", "/home/USER/.local/share/cursor-agent", "/home/USER/.local/share/cursor-agent",
   "--ro-bind", "/home/USER/.config/cursor", "/home/USER/.config/cursor",
-  "--ro-bind", "/home/USER/.local/bin/maxplayer", "/home/USER/.local/bin/maxplayer",
+  "--ro-bind", "MAXPLAYER_BIN", "MAXPLAYER_BIN",   # footgun 5: the native binary, not the npm link
   "--bind", "/home/USER/.maxplayer/seller-jobs", "/home/USER/.maxplayer/seller-jobs",
   "--proc", "/proc", "--ro-bind", "/sys", "/sys", "--dev", "/dev", "--tmpfs", "/tmp",
   "--share-net",
@@ -233,7 +259,12 @@ launcher = ["/home/USER/.nix-profile/bin/bwrap",
 ]                                  # footgun 4: $MAXPLAYER_HOME itself is NOT bound
 ```
 
-The `~/.local/bin/maxplayer` bind is not optional: the containment probe that `doctor` runs executes
+`MAXPLAYER_BIN` is the native binary path from §3a (npm install), or `/home/USER/.local/bin/maxplayer`
+for a tarball install. **Footgun 5:** never bind the npm link `~/.npm-global/bin/maxplayer`.
+`bwrap --ro-bind` flattens that symlink (as in footgun 2), and the launcher inside can then find
+neither `node` nor the real binary.
+
+The `MAXPLAYER_BIN` bind is not optional: the containment probe that `doctor` runs executes
 the `maxplayer` binary itself inside the launcher (`run_under_launcher` in
 `crates/maxplayer/src/sandbox_probe.rs` takes `current_exe()` and wraps `maxplayer sandbox-probe` in
 your launcher argv), so the launcher must be able to see the binary at its own absolute path. A
@@ -357,6 +388,16 @@ the two URLs in it:
 
 ### 6a. Upgrading
 
+**npm install (§3a).** Never copy a tarball binary over an npm install: `~/.npm-global/bin/maxplayer`
+is a symlink to the Node launcher, and writing a binary through it destroys the install. Upgrade with
+npm, and keep the steps below except 1, 2 and 5: back up `$MAXPLAYER_HOME/config.toml` (and the
+whole home off the box), then in place of step 5 run `npm install -g maxplayer@VERSION`. To roll back,
+install the previous version the same way. npm replaces the native binary at the same path, so
+the MCP registration and the launcher bind need no change; restarting every process (step 6) is
+still required.
+
+**Tarball install:**
+
 1. Download the new tarball and `SHA256SUMS` and verify them (§3a). Do not install yet.
 2. Back up what you are replacing: `cp ~/.local/bin/maxplayer ~/.local/bin/maxplayer.bak-OLDVERSION`
    and `$MAXPLAYER_HOME/config.toml`. Read the release notes for config or sandbox changes.
@@ -395,7 +436,7 @@ replace it (it does upgrade `maxplayer trade`). If the seat runs a mint, run `ma
 after the CLI upgrade, then restart the mint service. Do not stop the mint or trade `serve` while either has unresolved
 work (mint-and-trade).
 
-Roll back by renaming `maxplayer.bak-OLDVERSION` back over the binary the same way, restoring the
+Tarball installs roll back by renaming `maxplayer.bak-OLDVERSION` back over the binary the same way, restoring the
 config, and restarting the seller, `maxplayer mcp` and the buyer daemon.
 
 ### 6b. Keeping processes alive without systemd

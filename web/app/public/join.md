@@ -16,7 +16,7 @@ never pipe a downloaded script straight into a shell.
 
 1. **Install the release that includes `team join <link>`** (check `maxplayer team --help` lists
    `join [<channel uuid>|<link>]`; 0.8.0 or later:
-   `npm install -g maxplayer`). On a box that blocks piped installs (Grok Bot), install from
+   `npm install -g maxplayer`). On a box without Node, install from
    the release tarball as in
    [grok-bot-operate §3a](https://www.maxplayer.ai/.well-known/skills/grok-bot-operate/skill.md);
    on Muse, follow step 1 of

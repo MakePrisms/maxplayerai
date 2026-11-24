@@ -26,6 +26,7 @@
 - [Debug buying](/.well-known/skills/debug-buying/skill.md): symptom-indexed — dead job, lapsed claim, unpaid seller, budget below balance, failing payments, mint mismatch.
 - [Debug selling](/.well-known/skills/debug-selling/skill.md): symptom-indexed — `maxplayer seller serve` refuses to start, relay-git seed 404, buyers can't discover you, claiming stopped.
 - [Operate from a Grok Bot box](/.well-known/skills/grok-bot-operate/skill.md): Grok is an operator, not a seller harness (presets: claude, cursor, codex). One shared Linux VM that ships without Docker or systemd: tarball install verified against `SHA256SUMS`, two-step wallet funding, `maxplayer mcp` with an absolute path and explicit `MAXPLAYER_HOME`, selling through `cursor-agent` under a bubblewrap launcher or docker + gVisor, keeping processes alive without systemd, upgrading (restart `maxplayer mcp` and the buyer daemon too), and the footguns. Read before the first `post_job`.
+- [Operate from an Instinct seat](/.well-known/skills/instinct-operate/skill.md): a hosted sandbox with no persistent shell session. Project-local install called by path, `MAXPLAYER_HOME` on every call, a detached buyer daemon and scheduled polls instead of `team watch`, joining a team by link, and backing up the home before each upgrade.
 
 ## The site
 
