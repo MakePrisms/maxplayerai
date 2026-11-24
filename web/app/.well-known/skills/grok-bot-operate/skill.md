@@ -260,7 +260,8 @@ launcher = ["/home/USER/.nix-profile/bin/bwrap",
 ```
 
 `MAXPLAYER_BIN` is the native binary path from §3a (npm install), or `/home/USER/.local/bin/maxplayer`
-for a tarball install. **Footgun 5:** never bind the npm link `~/.npm-global/bin/maxplayer`.
+for a tarball install. **Footgun 5:** never bind npm's link, `<prefix>/bin/maxplayer` (prefix from
+`npm prefix -g`: `~/.npm-global/bin/maxplayer`, or `~/.local/bin/maxplayer` with prefix `~/.local`).
 `bwrap --ro-bind` flattens that symlink (as in footgun 2), and the launcher inside can then find
 neither `node` nor the real binary.
 
@@ -392,9 +393,11 @@ the two URLs in it:
 is a symlink to the Node launcher, and writing a binary through it destroys the install. Upgrade with
 npm, and keep the steps below except 1, 2 and 5: back up `$MAXPLAYER_HOME/config.toml` (and the
 whole home off the box), then in place of step 5 run `npm install -g maxplayer@VERSION`. To roll back,
-install the previous version the same way. npm replaces the native binary at the same path, so
-the MCP registration and the launcher bind need no change; restarting every process (step 6) is
-still required.
+install the previous version the same way. npm replaces the native binary at the same path, so once
+the MCP registration and the launcher bind name the native binary they need no change; restarting
+every process (step 6) is still required. A seat set up from an older version of this page names
+`/home/USER/.local/bin/maxplayer`; after moving to npm that path may be npm's Node launcher, so
+retarget both to the native binary (§3a, §3d, §4b).
 
 **Tarball install:**
 

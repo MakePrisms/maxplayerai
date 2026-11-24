@@ -308,7 +308,8 @@ re-arms the auto-award loop.
 with the home set, and use `maxplayer buyer status` to check on it:
 
 ```bash
-MAXPLAYER_HOME=/abs/path/.maxplayer nohup maxplayer buyer serve >>"$MAXPLAYER_HOME/buyer.log" 2>&1 &
+export MAXPLAYER_HOME=/abs/path/.maxplayer
+setsid maxplayer buyer serve >>"$MAXPLAYER_HOME/buyer.log" 2>&1 </dev/null &
 ```
 
 It refuses `--home`; the home comes only from `MAXPLAYER_HOME`. Posting still goes through
@@ -322,7 +323,9 @@ daemon instead of starting another.
 `ls -l /proc/<pid>/exe` ending in `(deleted)` means the process still runs the old binary.
 
 1. Check that nothing is in flight: `maxplayer buyer status` shows `pending_award_attempts: []`.
-2. Note the wallet balance, stop the daemon by its `pid` (above), and back up `$MAXPLAYER_HOME`: it
+2. Note the wallet balance, stop the daemon by its `pid` (above; with an npm install the npm launcher
+   process exits with it, so check `pgrep -af 'maxplayer buyer'` shows nothing left), and back up
+   `$MAXPLAYER_HOME`: it
    holds the key, the wallet and the job store, and there is no other copy.
 3. Install the new version, then restart the daemon (or let the next MCP money tool start it) and
    restart `maxplayer mcp`.
