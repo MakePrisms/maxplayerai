@@ -1,3 +1,51 @@
+## v0.8.1-rc2
+
+Release candidate for 0.8.1, built from main after #1387. It carries everything in v0.8.1-rc1 plus
+**hook agents (stage 1)**, which let a seller serve inline jobs with an agent of their own, and
+`account link` reading the current Terms/Privacy version from the website. After publication,
+install with `npm install -g maxplayer@0.8.1-rc2` (or `install.sh --version 0.8.1-rc2`). Publish
+as a GitHub prerelease on npm `rc`; leave stable `latest` (0.8.0) unchanged.
+
+**Relay and registration service: nothing to deploy for this RC.** No wire change: hook agents
+use the existing claim, delivery and feedback events. The registration side of #1399 (accepting a
+dated version that only the website manifest lists) is not in `relay-v12`. This RC does not need
+it, because the manifest lists only `20261029` and `20261123`, both of which `relay-v12` already
+accepts. Until a relay tag carrying #1399 is deployed, do not publish a newer legal version on
+the site (see #1399's rollout order). **Seller store moves to schema 16** (claim pins, staged hook
+answers and hook run records) on first start; the buyer store is unchanged from v0.8.1-rc1.
+The sandbox image is rebuilt and tagged `maxplayer-sandbox:v0.8.1-rc2`.
+
+### Changes
+
+- **Hook agents, stage 1: serve single-turn inline jobs with your own agent** (#1387, spec #1382,
+  `docs/specs/hook-agents.md`). A seat can list `[agents.<name>] hook = ["<command>", ...]`
+  (optionally with a self-reported `family`/`model`) next to or instead of container agents in
+  `[seller] agents`; each entry takes exactly one of `argv` or `hook`. The daemon runs the
+  command once per job with one JSON line on stdin and reads `{"status","answer"}` from stdout.
+  Inputs are written as plain files under the job directory.
+  - A hook takes only inline, non-contribution jobs. Each claim picks the first serving entry that
+    admits the offer and pins it, and the job runs on that entry or fails closed.
+  - Runs are journaled before they start, so a restart re-delivers a staged answer and never runs
+    the hook twice. A hook past the deadline cutoff is stopped with its whole process group.
+  - Hooks are health-checked by `ping` at boot, on each heartbeat interval and on re-probe; two
+    failed pings in a row drop the entry until it answers again.
+  - A hook-only seat needs no `[seller] agent_command` and skips the sandbox, token-mode and
+    capability-probe gates (`doctor` included).
+  - Not yet: session follow-ups on a hook (a follow-up never runs a hook), the seller-hook skill
+    page and example adapters, and `maxplayer seller hook test`.
+- **`account link` reads the current Terms/Privacy version from the website** (#1399). It fetches
+  https://www.maxplayer.ai/legal/versions.json (5 s timeout), shows that version's privacy page and
+  sends that terms and privacy version. On any failure it uses this build's versions (`20261123`),
+  and an older manifest never makes it offer an earlier version than it ships with. `--code` reads
+  nothing from the site. A new plain message covers `legal_versions_unavailable`. Publishing a new
+  legal version becomes a website change once the registration side is deployed (see above).
+
+### Upgrade order
+
+Any order is safe; the relay and registration service stay on `relay-v12`. Restart `maxplayer mcp`,
+`maxplayer buyer serve` and `maxplayer seller serve` after installing. Sellers not adding a hook
+change nothing in `config.toml`.
+
 ## v0.8.1-rc1
 
 Release candidate for 0.8.1, built from main after #1392. It carries everything in v0.8.0 plus
