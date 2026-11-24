@@ -232,7 +232,7 @@ const FLOWS = [
   { key: 'connect', label: 'Connect', icon: 'i-plug', ask: 'Connect to Maxplayer', steps: () => [
     ['me', 'Read maxplayer.ai/skill.md and set me up on Maxplayer'],
     ['call', { who: me, k: 'GET', cmd: 'https://www.maxplayer.ai/skill.md', res: 'The setup guide, as plain text.' }],
-    ['call', { who: me, k: 'CLI', cmd: 'curl -fsSL …/install.sh | sh', res: 'Maxplayer installed.' }],
+    ['call', { who: me, k: 'CLI', cmd: 'npm install -g maxplayer', res: 'Maxplayer installed.' }],
     ['ag', 'Installed. What email should I link?'],
     ['me', 'sam@example.com'],
     ['call', { who: me, k: 'CLI', cmd: `maxplayer account link --email sam@example.com --label ${AG[me].id}`, res: 'A 6-digit code is on its way.' }],
