@@ -297,12 +297,50 @@ enum StdoutMode {
 /// child gets the daemon's environment minus every `MAXPLAYER_*` variable, plus
 /// [`HOOK_VERSION_ENV`].
 pub fn run(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunReport {
-    supervise(argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep)
+    supervise(argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, None)
+}
+
+/// A started hook group's identity, journaled BEFORE the hook is allowed to run (§5.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Started {
+    /// The process-group id (= the leader's pid).
+    pub pgid: u32,
+    /// The leader's start time as the kernel reports it (Linux: `/proc/<pid>/stat` field 22), so a
+    /// later boot can tell our leader from a recycled pid. `None` where it cannot be read.
+    pub start: Option<String>,
+}
+
+/// The gate the hook is exec'd through: it waits for one `go` line on stdin and only then becomes
+/// the hook (same pid, same group). If the daemon dies before sending it, stdin closes, `read`
+/// fails, and the gate exits without the hook ever running.
+const GATE_SCRIPT: &str = r#"IFS= read -r go && [ "$go" = go ] && exec "$@"; exit 125"#;
+const GATE_GO: &[u8] = b"go\n";
+
+/// [`run`] for a `job` call, made idempotent across a daemon crash (§5.1): the hook is spawned
+/// behind a gate, `journal` records its group identity, and only after `journal` returns `Ok` is
+/// the gate released. So either the hook never ran, or its group is on disk for the next boot to
+/// reap. A `journal` error kills the gated group (the hook never ran) and reports `SpawnFailed`.
+pub fn run_gated(
+    argv: &[String],
+    stdin: &[u8],
+    cwd: &Path,
+    cutoff: Instant,
+    journal: &mut dyn FnMut(&Started) -> Result<(), String>,
+) -> RunReport {
+    if argv.is_empty() {
+        return supervise(argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, None);
+    }
+    let mut gated: Vec<String> =
+        vec!["/bin/sh".into(), "-c".into(), GATE_SCRIPT.into(), "maxplayer-hook-gate".into()];
+    gated.extend(argv.iter().cloned());
+    let mut payload = GATE_GO.to_vec();
+    payload.extend_from_slice(stdin);
+    supervise(&gated, &payload, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, Some(journal))
 }
 
 /// [`run`] for a control event: the same supervision, with stdout discarded (§5.2: ignored).
 pub fn run_control(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunReport {
-    supervise(argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Discard)
+    supervise(argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Discard, None)
 }
 
 /// [`run`] with the parent environment passed in, so the scrub is testable without mutating the
@@ -314,7 +352,7 @@ pub fn run_with_env(
     cutoff: Instant,
     parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> RunReport {
-    supervise(argv, stdin, cwd, cutoff, parent_env, StdoutMode::Keep)
+    supervise(argv, stdin, cwd, cutoff, parent_env, StdoutMode::Keep, None)
 }
 
 /// The one supervisor. Single-threaded on purpose: all three pipes are non-blocking and pumped
@@ -338,6 +376,7 @@ fn supervise(
     cutoff: Instant,
     parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     mode: StdoutMode,
+    journal: Option<&mut dyn FnMut(&Started) -> Result<(), String>>,
 ) -> RunReport {
     let started = Instant::now();
     let report = |exit, stdout, stdout_complete, stderr_tail| RunReport {
@@ -376,6 +415,15 @@ fn supervise(
         Err(error) => return report(Exit::SpawnFailed(error.to_string()), Vec::new(), false, String::new()),
     };
     let pgid = child.id();
+    active_groups().insert(pgid);
+    if let Some(journal) = journal {
+        // Nothing has been written to stdin yet, so a gated hook is still parked in the gate.
+        let started = Started { pgid, start: process_start(pgid) };
+        if let Err(error) = journal(&started) {
+            terminate_group(pgid, &mut child);
+            return report(Exit::SpawnFailed(format!("journal: {error}")), Vec::new(), false, String::new());
+        }
+    }
     let mut stdin_pipe = child.stdin.take();
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
@@ -404,6 +452,7 @@ fn supervise(
                 let late = Instant::now() >= cutoff;
                 // The leader is a zombie, so its id (the group id) cannot have been reused yet.
                 signal_group(pgid, SIGKILL);
+                active_groups().remove(&pgid);
                 let status = child.wait();
                 if late {
                     break Exit::CutOff;
@@ -607,7 +656,80 @@ fn terminate_group(pgid: u32, child: &mut std::process::Child) {
         std::thread::sleep(POLL);
     }
     signal_group(pgid, SIGKILL);
+    active_groups().remove(&pgid);
     let _ = child.wait();
+}
+
+/// The hook groups this process is supervising right now. A group is removed only while its
+/// leader is still an unreaped zombie, so [`terminate_all`] (which signals under this lock) can
+/// never reach a recycled id.
+fn active_groups() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<u32>> {
+    static ACTIVE: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Daemon shutdown (§5.1): SIGTERM every running hook group, wait out the grace, SIGKILL them.
+/// Blocking; returns at once when nothing runs.
+pub fn terminate_all() {
+    {
+        let active = active_groups();
+        if active.is_empty() {
+            return;
+        }
+        for pgid in active.iter() {
+            signal_group(*pgid, SIGTERM);
+        }
+    }
+    std::thread::sleep(KILL_GRACE);
+    let active = active_groups();
+    for pgid in active.iter() {
+        signal_group(*pgid, SIGKILL);
+    }
+}
+
+/// A process's start time, for telling it from a later process that reused its pid. Linux reads
+/// `/proc/<pid>/stat` field 22; elsewhere (and for a pid that does not exist) `None`.
+pub fn process_start(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) is parenthesised and may contain spaces: count from the LAST ')'.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19).map(str::to_owned)
+}
+
+/// What [`reap_stale_group`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleReap {
+    /// Our old group was found and killed (SIGTERM, grace, SIGKILL).
+    Killed,
+    /// The id now belongs to an unrelated process: our group is long gone. Nothing signalled.
+    Gone,
+    /// No start time was recorded (no `/proc`): the group cannot be verified, so it is left alone.
+    Unverifiable,
+}
+
+/// Stop a hook group a previous daemon journaled (§5.1), verified so a recycled id is never hit:
+/// - the leader pid is alive with the recorded start time ⇒ it is ours: kill the group;
+/// - no process has that pid ⇒ only remnants of OUR group can still carry that pgid (the kernel
+///   does not hand out a pid that is still some group's id), so signalling it is safe (ESRCH if
+///   none are left);
+/// - the pid is alive with another start time ⇒ it was recycled, so our group is gone entirely.
+pub fn reap_stale_group(pgid: u32, recorded_start: Option<&str>) -> StaleReap {
+    let Some(recorded) = recorded_start else {
+        return StaleReap::Unverifiable;
+    };
+    match process_start(pgid) {
+        Some(now) if now != recorded => StaleReap::Gone,
+        _ => {
+            signal_group(pgid, SIGTERM);
+            let grace_until = Instant::now() + KILL_GRACE;
+            while Instant::now() < grace_until && process_start(pgid).as_deref() == Some(recorded) {
+                std::thread::sleep(POLL);
+            }
+            signal_group(pgid, SIGKILL);
+            StaleReap::Killed
+        }
+    }
 }
 
 /// `kill(-pgid, sig)`, refusing the widening ids 0 and 1. Errors (ESRCH: the group is gone) are
@@ -867,6 +989,87 @@ mod tests {
         assert!(ping_healthy(&run_sh("cat >/dev/null; exit 0", &ping_event(PingReason::Boot), Duration::from_secs(10))));
         assert!(!ping_healthy(&run_sh("exit 1", &ping_event(PingReason::Boot), Duration::from_secs(10))));
         assert!(!ping_healthy(&run_sh("sleep 5", &ping_event(PingReason::Boot), Duration::from_millis(200))));
+    }
+
+    #[test]
+    fn a_gated_job_runs_only_after_its_group_is_journaled_and_sees_the_event_intact() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut journaled = Vec::new();
+        let report = run_gated(
+            &sh(r#"in=$(cat); printf '{"status":"done","answer":"%s"}' "$in""#),
+            b"EVENT",
+            dir.path(),
+            Instant::now() + Duration::from_secs(10),
+            &mut |started| {
+                journaled.push(started.clone());
+                Ok(())
+            },
+        );
+        assert_eq!(journaled.len(), 1);
+        assert!(journaled[0].pgid > 1);
+        if cfg!(target_os = "linux") {
+            assert!(journaled[0].start.is_some(), "the leader's start time is recorded on Linux");
+        }
+        // The gate consumed exactly its `go` line: the hook read the event and nothing else.
+        match classify_job(&report, CAP) {
+            JobOutcome::Answer(answer) => assert_eq!(answer.answer, "EVENT"),
+            other => panic!("{other:?} stderr={}", report.stderr_tail),
+        }
+    }
+
+    #[test]
+    fn a_failed_journal_means_the_hook_never_ran() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let marker = dir.path().join("ran");
+        let report = run_gated(
+            &sh(&format!("touch {}", marker.display())),
+            b"{}",
+            dir.path(),
+            Instant::now() + Duration::from_secs(10),
+            &mut |_| Err("disk full".into()),
+        );
+        assert!(matches!(&report.exit, Exit::SpawnFailed(why) if why.contains("journal")), "{:?}", report.exit);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "the gate must never release a hook whose group was not journaled");
+    }
+
+    #[test]
+    fn a_gate_whose_daemon_died_before_go_exits_without_running_the_hook() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let marker = dir.path().join("ran");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", GATE_SCRIPT, "maxplayer-hook-gate", "touch"])
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn gate");
+        drop(child.stdin.take()); // the daemon is gone: stdin closes with no `go`
+        let status = child.wait().expect("wait");
+        assert_eq!(status.code(), Some(125));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stale_group_is_killed_only_when_its_leader_is_verified() {
+        use std::os::unix::process::CommandExt;
+        let spawn = || {
+            Command::new("sh").args(["-c", "sleep 30"]).process_group(0).spawn().expect("spawn")
+        };
+        // A recycled pid (start time differs): never signalled.
+        let mut other = spawn();
+        assert_eq!(reap_stale_group(other.id(), Some("1")), StaleReap::Gone);
+        assert!(other.try_wait().expect("try_wait").is_none(), "an unverified group must be left alone");
+        let _ = other.kill();
+        let _ = other.wait();
+        // No recorded start time: unverifiable, left alone.
+        assert_eq!(reap_stale_group(1, None), StaleReap::Unverifiable);
+        // Our leader (start time matches): the whole group dies.
+        let mut ours = spawn();
+        let start = process_start(ours.id()).expect("start time");
+        assert_eq!(reap_stale_group(ours.id(), Some(&start)), StaleReap::Killed);
+        let status = ours.wait().expect("wait");
+        assert!(status.code().is_none(), "killed by a signal: {status:?}");
     }
 
     #[test]

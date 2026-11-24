@@ -46,6 +46,18 @@ impl SellerNodeRunner {
                 (row.status, row.answer, row.wall_time_ms)
             }
             None => {
+                // §5.1: a group a crashed daemon left running for THIS invocation dies before the
+                // re-drive touches its directory; then the new call gets the next attempt number.
+                reap_journaled_groups(self.node.store(), Some(&invocation));
+                let attempt = match self.node.store().begin_hook_attempt(&invocation, job_id, now_unix()) {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        opline!("seller node hook job_id={job_id}: attempt journal failed ({error})");
+                        self.fail_job_with_feedback(job_id, &buyer, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None)
+                            .await;
+                        return;
+                    }
+                };
                 let inputs = match self.prepare_hook_dir(job_id, &workdir) {
                     Ok(inputs) => inputs,
                     Err(error) => {
@@ -60,7 +72,7 @@ impl SellerNodeRunner {
                 let now = u64::try_from(now_unix()).unwrap_or(0);
                 let event = hook::job_event(
                     &invocation,
-                    1,
+                    attempt,
                     HOOK_ANSWER_MAX_BYTES,
                     job_id,
                     1,
@@ -72,8 +84,21 @@ impl SellerNodeRunner {
                 );
                 let cutoff = hook::job_cutoff(deadline, now, std::time::Instant::now());
                 let (argv_owned, dir) = (argv.to_vec(), workdir.clone());
-                opline!("seller node hook job_id={job_id}: running {label}");
-                let report = match tokio::task::spawn_blocking(move || hook::run(&argv_owned, &event, &dir, cutoff)).await {
+                let (store, inv) = (self.node.store().clone(), invocation.clone());
+                opline!("seller node hook job_id={job_id}: running {label} (attempt {attempt})");
+                let report = match tokio::task::spawn_blocking(move || {
+                    // The group is journaled before the gate releases the hook, and forgotten once
+                    // the runner has killed and reaped it (§5.1).
+                    let report = hook::run_gated(&argv_owned, &event, &dir, cutoff, &mut |started| {
+                        store
+                            .record_hook_group(&inv, started.pgid, started.start.as_deref(), now_unix())
+                            .map_err(|e| e.to_string())
+                    });
+                    let _ = store.clear_hook_group(&inv);
+                    report
+                })
+                .await
+                {
                     Ok(report) => report,
                     Err(error) => {
                         opline!("seller node hook job_id={job_id}: runner task failed ({error})");
@@ -206,6 +231,34 @@ impl SellerNodeRunner {
         }
         std::fs::rename(&staging, &dest).map_err(|e| format!("inputs publish: {e}"))?;
         Ok(Some(dest))
+    }
+}
+
+/// Stop hook groups a previous daemon journaled and may have left running (§5.1): every one at boot
+/// (`only = None`), or just `only`'s before it is re-driven. Each is verified against its recorded
+/// start time before any signal ([`hook::reap_stale_group`]); its journal entry is then cleared.
+pub(super) fn reap_journaled_groups(store: &crate::seller_node::store::SellerStore, only: Option<&str>) {
+    let groups = match store.journaled_hook_groups() {
+        Ok(groups) => groups,
+        Err(error) => {
+            opline!("seller node hook: could not read journaled hook groups ({error})");
+            return;
+        }
+    };
+    for (invocation, pgid, start) in groups {
+        if only.is_some_and(|only| only != invocation) {
+            continue;
+        }
+        match hook::reap_stale_group(pgid, start.as_deref()) {
+            hook::StaleReap::Killed => {
+                opline!("seller node hook: stopped the hook group {pgid} an earlier run left for {invocation}")
+            }
+            hook::StaleReap::Gone => {}
+            hook::StaleReap::Unverifiable => opline!(
+                "seller node hook: hook group {pgid} for {invocation} cannot be verified on this host (no /proc); left alone"
+            ),
+        }
+        let _ = store.clear_hook_group(&invocation);
     }
 }
 
@@ -426,6 +479,33 @@ mod tests {
         let sig = git2::Signature::new("t", "t@t", &git2::Time::new(0, 0)).expect("sig");
         let oid = repo.commit(None, &sig, &sig, "b", &tree, &[]).expect("commit");
         (dir, oid.to_string())
+    }
+
+    /// codex r1 #3: the daemon died after the hook started and before it staged an answer; the
+    /// hook is still running. The next boot (or the re-drive) must stop it before anything runs
+    /// the invocation again, and forget it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hook_left_running_by_a_dead_daemon_is_reaped_from_the_journal() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = crate::seller_node::store::SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
+        let mut orphan = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        store.begin_hook_attempt("job-x", "job-x", 1).expect("begin");
+        let start = crate::hook::process_start(orphan.id());
+        store.record_hook_group("job-x", orphan.id(), start.as_deref(), 2).expect("record");
+        // Another invocation's group is not touched by a targeted reap.
+        reap_journaled_groups(&store, Some("job-other"));
+        assert!(orphan.try_wait().expect("try_wait").is_none());
+        reap_journaled_groups(&store, None);
+        let status = orphan.wait().expect("wait");
+        assert!(status.code().is_none(), "the orphan was killed: {status:?}");
+        assert!(store.journaled_hook_groups().expect("list").is_empty(), "its journal entry is cleared");
+        assert_eq!(store.begin_hook_attempt("job-x", "job-x", 3).expect("begin"), 2, "the re-drive is attempt 2");
     }
 
     #[test]

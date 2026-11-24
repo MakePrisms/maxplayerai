@@ -5245,6 +5245,10 @@ impl SellerNodeRunner {
         // and narrows from there as harnesses prove they cannot deliver.
         let agents = Arc::new(LiveRoster::new(boot_agent_registry(node.home())?));
 
+        // hook-agents §5.1: a hook group a killed daemon left running is stopped before anything
+        // can re-drive its job (each verified against its journaled start time).
+        hook_run::reap_journaled_groups(node.store(), None);
+
         // The Holder route: start the seat's holder containers BEFORE anything goes on the wire, so
         // a REQUIRED tool that cannot start refuses the boot rather than a seat that advertises and
         // fails every job. An optional tool that cannot start is logged, and the seat serves without
@@ -6582,6 +6586,9 @@ impl SellerNodeRunner {
                 // an unlistened SIGTERM used to be.
                 reason = shutdown::next_request(&mut shutdown_rx) => {
                     opline!("seller node: shutdown requested ({reason}); retracting the seat and ending the loop");
+                    // hook-agents §5.1: running hook groups get SIGTERM, the grace, then SIGKILL.
+                    // Their journal entries stay, so a boot after an unclean exit still reaps.
+                    let _ = tokio::task::spawn_blocking(crate::hook::terminate_all).await;
                     break;
                 }
                 // Expired-container sweep. SPAWNED, never awaited here: the pass is bounded by

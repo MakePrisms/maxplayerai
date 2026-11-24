@@ -352,8 +352,19 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
   The hook is the seller's own program running as the seller.
 - An unknown event: exit code 64 means "unsupported" and is never a strike, so new events can be
   added without breaking old adapters.
-- On daemon shutdown every running hook group gets the same SIGTERM/grace/SIGKILL. The group id is
-  journaled while the hook runs, and a restart kills a stale group before re-running.
+- On daemon shutdown every running hook group gets the same SIGTERM/grace/SIGKILL.
+- **Crash idempotency.** A `job` call is spawned behind a gate (`/bin/sh -c 'IFS= read -r go &&
+  [ "$go" = go ] && exec "$@"'`): the gate already has its own process group but waits for one
+  `go` line on stdin. The order is: write the attempt row (`hook_runs`, attempt n+1) → spawn the
+  gate → journal its pid (= group id) and the leader's start time (`/proc/<pid>/stat` field 22) →
+  write `go` and then the event. If the daemon dies before the journal write, its end of stdin
+  closes, `read` fails and the gate exits without ever running the hook. So either the hook never
+  ran or its group is on disk. At boot, and again before an invocation is re-driven, every
+  journaled group is reaped only if verified: leader alive with the recorded start time ⇒ kill the
+  group; no process with that pid ⇒ only our group's remnants can still carry that id, so kill it;
+  pid alive with another start time ⇒ recycled, our group is gone, nothing is signalled. Without a
+  recorded start time (no `/proc`) a group is left alone and logged. The re-drive then gets
+  `attempt` n+1.
 
 ### 5.2 `ping`
 

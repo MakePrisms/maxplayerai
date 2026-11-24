@@ -1477,7 +1477,16 @@ impl SellerStore {
                  wall_time_ms    INTEGER NOT NULL,
                  created_at_unix INTEGER NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS hook_outcomes_job ON hook_outcomes (job_id);",
+             CREATE INDEX IF NOT EXISTS hook_outcomes_job ON hook_outcomes (job_id);
+             CREATE TABLE IF NOT EXISTS hook_runs (
+                 invocation      TEXT PRIMARY KEY,
+                 job_id          TEXT NOT NULL,
+                 attempt         INTEGER NOT NULL,
+                 pgid            INTEGER,
+                 pgid_start      TEXT,
+                 updated_at_unix INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS hook_runs_job ON hook_runs (job_id);",
         )?;
         Ok(())
     }
@@ -3622,11 +3631,67 @@ impl SellerStore {
             .optional()?)
     }
 
-    /// Drop every staged outcome of a job (job or session ended).
+    /// Drop every staged outcome and run record of a job (job or session ended).
     pub fn clear_hook_outcomes(&self, job_id: &str) -> Result<(), StoreError> {
         let conn = self.lock()?;
         conn.execute("DELETE FROM hook_outcomes WHERE job_id = ?1", [job_id])?;
+        conn.execute("DELETE FROM hook_runs WHERE job_id = ?1", [job_id])?;
         Ok(())
+    }
+
+    /// Start a new call of `invocation` (§5.1): its attempt number, 1 for the first call and one more
+    /// for every re-drive. Any previously journaled group is forgotten — the caller reaped it first.
+    pub fn begin_hook_attempt(&self, invocation: &str, job_id: &str, now_unix: i64) -> Result<u32, StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO hook_runs (invocation, job_id, attempt, pgid, pgid_start, updated_at_unix)
+             VALUES (?1, ?2, 1, NULL, NULL, ?3)
+             ON CONFLICT(invocation) DO UPDATE SET
+                 attempt = attempt + 1, pgid = NULL, pgid_start = NULL, updated_at_unix = ?3",
+            params![invocation, job_id, now_unix],
+        )?;
+        let attempt: i64 =
+            conn.query_row("SELECT attempt FROM hook_runs WHERE invocation = ?1", [invocation], |row| row.get(0))?;
+        Ok(u32::try_from(attempt).unwrap_or(u32::MAX))
+    }
+
+    /// Journal the running group of `invocation`, BEFORE the hook is released from its gate.
+    pub fn record_hook_group(&self, invocation: &str, pgid: u32, start: Option<&str>, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE hook_runs SET pgid = ?2, pgid_start = ?3, updated_at_unix = ?4 WHERE invocation = ?1",
+            params![invocation, i64::from(pgid), start, now_unix],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError(format!("hook run {invocation} has no attempt row")))
+        }
+    }
+
+    /// The group of `invocation` has been killed and reaped: nothing to reap at the next boot.
+    pub fn clear_hook_group(&self, invocation: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute("UPDATE hook_runs SET pgid = NULL, pgid_start = NULL WHERE invocation = ?1", [invocation])?;
+        Ok(())
+    }
+
+    /// Every journaled group a previous daemon may have left running: `(invocation, pgid, start)`.
+    pub fn journaled_hook_groups(&self) -> Result<Vec<(String, u32, Option<String>)>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement =
+            conn.prepare("SELECT invocation, pgid, pgid_start FROM hook_runs WHERE pgid IS NOT NULL ORDER BY invocation")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (invocation, pgid, start) = row?;
+            if let Ok(pgid) = u32::try_from(pgid) {
+                out.push((invocation, pgid, start));
+            }
+        }
+        Ok(out)
     }
 
     /// The assigned agent for a job, if any. Inspection/tests.
@@ -4048,6 +4113,24 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = SellerStore::open(&path).expect("open");
         (store, path)
+    }
+
+    #[test]
+    fn hook_runs_count_attempts_and_journal_groups_until_cleared() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
+        assert!(store.record_hook_group("inv", 42, Some("7"), 1).is_err(), "no attempt row yet");
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 1).expect("begin"), 1);
+        store.record_hook_group("inv", 42, Some("7"), 2).expect("record");
+        assert_eq!(store.journaled_hook_groups().expect("list"), vec![("inv".to_owned(), 42, Some("7".to_owned()))]);
+        // A re-drive is the next attempt and forgets the previous group (the caller reaped it).
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 3).expect("begin"), 2);
+        assert!(store.journaled_hook_groups().expect("list").is_empty());
+        store.record_hook_group("inv", 43, None, 4).expect("record");
+        store.clear_hook_group("inv").expect("clear");
+        assert!(store.journaled_hook_groups().expect("list").is_empty());
+        store.clear_hook_outcomes("job-h").expect("clear job");
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 5).expect("begin"), 1, "job end drops the run record");
     }
 
     #[test]
