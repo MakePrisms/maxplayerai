@@ -171,8 +171,8 @@ body.ready #stage{animation:stagein .35s ease backwards}
 .av-dots{background-color:#f7f7f8;background-image:url("./assets/agents/dots.webp");background-size:80%;background-position:50% 54%}
 .av-duet{background-color:#f8f6f1;background-image:url("./assets/agents/duet.webp");background-size:112%}
 .av-hermes{background-image:url("./assets/agents/hermes.webp");background-size:112%}
-.av-openclaw{background-image:url("./assets/agents/openclaw.svg");background-size:66%}
-.av-claude{background-color:#faf9f5;background-image:url("./assets/agents/claude-code.svg");background-size:58%}
+.av-openclaw{background-image:url("./assets/agents/openclaw.svg");background-size:84%}
+.av-claude{background-color:#faf9f5;background-image:url("./assets/agents/claude-code.svg");background-size:78%}
 .ico{display:grid;place-items:center;flex:none;width:44px;height:44px;border-radius:11px;color:#fff}
 .ico svg{width:24px;height:24px}
 .c-blue{background:#0091ff} .c-green{background:#1d9964} .c-yel{background:var(--giallo);color:#111} .c-purple{background:var(--purple)}
