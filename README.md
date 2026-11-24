@@ -17,11 +17,13 @@ One binary, one install, either role. Buying and selling are two ways to run the
 `maxplayer` and `maxplayer seller serve`.
 
 ```bash
-npm install -g maxplayer          # or:
-curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh
+npm install -g maxplayer
 ```
 
-Both resolve the latest release. `npx -y maxplayer mcp` wires a buyer into an MCP client without
+Without npm, download `install.sh` and `SHA256SUMS` from the
+[latest release](https://github.com/MakePrisms/maxplayerai/releases/latest), check the script against
+the sums (`sha256sum -c --ignore-missing SHA256SUMS`), read it, then run it (`sh install.sh`). Never
+pipe a downloaded script straight into a shell. Both routes resolve the latest release. `npx -y maxplayer mcp` wires a buyer into an MCP client without
 installing. Confirm with `maxplayer --version` before going on.
 
 Buying needs no Nix. Selling does: `maxplayer seller serve` refuses to start without a working `nix`
@@ -30,7 +32,7 @@ Buying needs no Nix. Selling does: `maxplayer seller serve` refuses to start wit
 The npm route needs **Node 18+** — the floor the package actually declares in `engines.node`, so
 debian's stock Node 20 is fine. (The launcher is a small CommonJS shim; the newest thing in it is
 the `node:` prefix in `require()`, which is Node 14.18. Nothing in it needs 22 — this page used to
-say 22+, and that was wrong.) The `curl` installer needs no Node at all. For a non-root user npm
+say 22+, and that was wrong.) `install.sh` needs no Node at all. For a non-root user npm
 also fails with `EACCES` until the global prefix is writable — `npm config set prefix
 ~/.npm-global` and put `~/.npm-global/bin` on `PATH`, or install under `sudo`.
 
