@@ -495,12 +495,15 @@ impl LiveRoster {
     /// `meets` is the buyer-side capability predicate, passed in so this module stays free of the
     /// wallet feature. Judging each entry on its own capability is what stops a request passing on
     /// one entry's family/model/tokens and then running on another.
+    ///
+    /// Returns the capability snapshot `meets` actually judged, so the claim's tags and private
+    /// dispatch block carry exactly what passed (a later re-read could see a probe's newer model).
     pub fn select(
         &self,
         requested: Option<&str>,
         shape: OfferShape,
         meets: impl Fn(&crate::heartbeat::SeatCapability) -> bool,
-    ) -> Option<Selected<'_>> {
+    ) -> Option<(Selected<'_>, crate::heartbeat::SeatCapability)> {
         let state = self.state.lock().expect("live roster poisoned");
         let capabilities = self.capabilities.lock().expect("live roster poisoned").clone();
         let wanted = normalize_request(requested);
@@ -510,14 +513,17 @@ impl LiveRoster {
             .enumerate()
             .filter(|(index, _)| Self::serving(&state, index))
             .filter(|(_, entry)| shape.admits(&entry.kind))
+            // The same name rule as [`Self::dispatch`] (exact label against the normalized request), so
+            // the admission gate and the selection cannot disagree on a mixed-case label.
             .filter(|(_, entry)| match &wanted {
                 None => true,
-                Some(name) => entry.name.as_deref().map(str::to_ascii_lowercase).as_deref() == Some(name.as_str()),
+                Some(name) => entry.name.as_deref() == Some(name.as_str()),
             })
-            .find(|(index, entry)| {
-                meets(&Self::capability_of(entry, state.get(index).and_then(|h| h.model.clone()), &capabilities))
+            .find_map(|(index, agent)| {
+                let capability =
+                    Self::capability_of(agent, state.get(&index).and_then(|h| h.model.clone()), &capabilities);
+                meets(&capability).then_some((Selected { index, agent }, capability))
             })
-            .map(|(index, agent)| Selected { index, agent })
     }
 
     /// One entry's own filterable capability: its name, its family, its model (configured for a
@@ -841,7 +847,38 @@ mod tests {
     const CONTRIB: OfferShape = OfferShape { inline: true, contribution: true };
 
     fn picked(roster: &LiveRoster, req: Option<&str>, shape: OfferShape, meets: impl Fn(&crate::heartbeat::SeatCapability) -> bool) -> Option<String> {
-        roster.select(req, shape, meets).and_then(|s| s.agent.name.clone())
+        roster.select(req, shape, meets).and_then(|(s, _)| s.agent.name.clone())
+    }
+
+    #[test]
+    fn select_and_the_admission_gate_name_entries_the_same_way() {
+        // A mixed-case label: the aggregate gate (`dispatch`) matches the exact label against the
+        // normalized request, so selection must too, or one admits what the other refuses.
+        let roster = LiveRoster::new(AgentRegistry::new(vec![RegisteredAgent {
+            name: Some("MyHook".into()),
+            argv: vec!["/bin/hook".into()],
+            kind: AgentKind::Hook { family: None, model: None },
+        }]));
+        for request in ["MyHook", "myhook"] {
+            assert_eq!(
+                roster.dispatch(Some(request)).is_some(),
+                roster.select(Some(request), INLINE, |_| true).is_some(),
+                "{request}"
+            );
+        }
+        assert!(roster.select(None, INLINE, |_| true).is_some());
+    }
+
+    #[test]
+    fn select_returns_the_capability_it_judged() {
+        let roster = mixed();
+        roster.record_model(1, Some("opus".into()));
+        let wants_opus = |c: &crate::heartbeat::SeatCapability| c.models.iter().any(|m| m.model == "opus");
+        let (selected, judged) = roster.select(None, GIT_ONLY, wants_opus).expect("claude");
+        // A probe updates the model after the judgement: the claim must still carry what passed.
+        roster.record_model(selected.index, Some("sonnet".into()));
+        assert_eq!(judged.models[0].model, "opus");
+        assert_eq!(roster.entry_capability(selected.index).models[0].model, "sonnet");
     }
 
     #[test]

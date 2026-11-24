@@ -8532,12 +8532,14 @@ impl SellerNodeRunner {
                 || self.node.store().contribution_pin(job_id).ok().flatten().is_some(),
         };
         let request = offer_capability_request(offer);
-        let Some((selected_index, selected_entry)) = self
+        // `selected_capability` is the snapshot the request was judged on; the claim tags and the
+        // private dispatch block below carry exactly it (never a later re-read of the roster).
+        let Some((selected_entry, selected_capability)) = self
             .agents
             .select(offer.requested_agent.as_deref(), shape, |cap| {
                 crate::buyer::lifecycle::capability_meets_request(cap, &request).is_ok()
             })
-            .map(|s| (s.index, s.agent.clone()))
+            .map(|(s, capability)| (s.agent.clone(), capability))
         else {
             opline!("seller node offer skip id={job_id}: {}", SkipReason::NoEligibleAgent.reason());
             return ClaimOutcome::Declined;
@@ -8642,7 +8644,6 @@ impl SellerNodeRunner {
         // The claim describes the SELECTED entry only (§4): the buyer's award filter reads the claim,
         // so it judges exactly what will run. The beat stays seat-wide.
         let selected_names: Vec<String> = selected_entry.name.clone().into_iter().collect();
-        let selected_capability = self.agents.entry_capability(selected_index);
         let claim = claim_draft(
             job_id,
             buyer_pubkey,
