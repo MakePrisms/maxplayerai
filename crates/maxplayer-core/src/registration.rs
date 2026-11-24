@@ -33,7 +33,123 @@ pub const PRIVACY_URL: &str = "https://www.maxplayer.ai/privacy/20261123";
 
 /// Spec §3 step 1: shown when the CLI asks for the email, or before it sends one given by flag.
 pub fn privacy_notice() -> String {
-    format!("Your email is used as described in our Privacy Policy: {PRIVACY_URL}")
+    LegalVersions::builtin().privacy_notice()
+}
+
+/// The website's legal versions manifest (`web/app/public/legal/versions.json`). Its `current`
+/// entry is the terms and privacy version a new `account link` offers, so a new version needs no
+/// release; the registration service accepts the versions it lists. [`LEGAL_VERSIONS_ENV`] points
+/// it elsewhere (tests; empty = this build's versions only).
+pub const LEGAL_VERSIONS_URL: &str = "https://www.maxplayer.ai/legal/versions.json";
+pub const LEGAL_VERSIONS_ENV: &str = "MAXPLAYER_LEGAL_VERSIONS_URL";
+const LEGAL_VERSIONS_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+
+/// The terms and privacy versions one `account link` shows and sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegalVersions {
+    pub terms: String,
+    pub privacy: String,
+}
+
+#[derive(Deserialize)]
+struct ManifestCurrent {
+    terms: String,
+    privacy: String,
+}
+
+#[derive(Deserialize)]
+struct Manifest {
+    current: ManifestCurrent,
+    terms: Vec<String>,
+    privacy: Vec<String>,
+}
+
+fn is_dated_version(v: &str) -> bool {
+    v.len() == 8 && v.bytes().all(|b| b.is_ascii_digit())
+}
+
+impl LegalVersions {
+    /// The versions this build ships with ([`TERMS_VERSION`], [`PRIVACY_VERSION`]).
+    pub fn builtin() -> Self {
+        Self {
+            terms: TERMS_VERSION.to_owned(),
+            privacy: PRIVACY_VERSION.to_owned(),
+        }
+    }
+
+    /// The site's current versions, read from the manifest at `url`. This build's versions when
+    /// `url` is `None`/empty or the manifest cannot be read, so linking never depends on the
+    /// site being up.
+    pub fn current(url: Option<&str>) -> Self {
+        let builtin = Self::builtin();
+        match url.filter(|u| !u.is_empty()).and_then(fetch_manifest) {
+            Some(body) => builtin.with_manifest(&body),
+            None => builtin,
+        }
+    }
+
+    /// The manifest's `current` versions when it is well formed (every entry `YYYYMMDD`,
+    /// `current` listed). Each document only moves forward: a manifest older than this build
+    /// (a stale cache, a rollback) never makes it offer an earlier version.
+    pub fn with_manifest(self, body: &[u8]) -> Self {
+        let Ok(m) = serde_json::from_slice::<Manifest>(body) else {
+            return self;
+        };
+        let valid = |list: &[String], current: &str| {
+            !list.is_empty()
+                && list.iter().all(|v| is_dated_version(v))
+                && list.iter().any(|v| v == current)
+        };
+        if !valid(&m.terms, &m.current.terms) || !valid(&m.privacy, &m.current.privacy) {
+            return self;
+        }
+        // Same-length digit strings compare as dates.
+        let newer = |site: String, ours: String| if site > ours { site } else { ours };
+        Self {
+            terms: newer(m.current.terms, self.terms),
+            privacy: newer(m.current.privacy, self.privacy),
+        }
+    }
+
+    pub fn terms_url(&self) -> String {
+        format!("https://www.maxplayer.ai/terms/{}", self.terms)
+    }
+
+    pub fn privacy_url(&self) -> String {
+        format!("https://www.maxplayer.ai/privacy/{}", self.privacy)
+    }
+
+    /// Spec §3 step 1, naming this privacy version's page.
+    pub fn privacy_notice(&self) -> String {
+        format!(
+            "Your email is used as described in our Privacy Policy: {}",
+            self.privacy_url()
+        )
+    }
+}
+
+/// The manifest's bytes, or `None` on any failure (no redirects, 5 s, at most 64 KiB).
+fn fetch_manifest(url: &str) -> Option<Vec<u8>> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .connect_timeout(LEGAL_VERSIONS_TIMEOUT)
+        .timeout(LEGAL_VERSIONS_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("maxplayer/", env!("CARGO_PKG_VERSION")));
+    if is_loopback_host(url) {
+        builder = builder.no_proxy();
+    }
+    let response = builder.build().ok()?.get(url).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let mut body = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(response, MAX_MANIFEST_BYTES + 1),
+        &mut body,
+    )
+    .ok()?;
+    (body.len() as u64 <= MAX_MANIFEST_BYTES).then_some(body)
 }
 
 /// Spec §3 step 6 / §8.1, text version [`MARKETING_NOTICE_VERSION`]. Product news is automatic
@@ -290,10 +406,14 @@ pub fn plain_message_for(api: &ApiError, link: &str) -> String {
         "invalid_label" => {
             "The label must be 1-64 letters, digits, spaces, '.', '_' or '-'.".to_owned()
         }
-        "unknown_terms_version" | "unknown_privacy_version" | "unknown_notice_version" => format!(
-            "The registration service no longer accepts the terms or privacy version this \
-             maxplayer offers ({TERMS_VERSION}). Update maxplayer and try again."
-        ),
+        "unknown_terms_version" | "unknown_privacy_version" | "unknown_notice_version" => {
+            "The registration service does not accept the terms or privacy version this \
+             maxplayer offered. Update maxplayer and try again."
+                .to_owned()
+        }
+        "legal_versions_unavailable" => "The registration service could not check the terms \
+             version this maxplayer offered. Try again in a few minutes."
+            .to_owned(),
         "invalid_entered_by" | "invalid_body" | "invalid_channel" => format!(
             "The registration service did not accept this request ({}). Update maxplayer and try \
              again.",
@@ -538,8 +658,14 @@ impl RegistrationClient {
         format!("{}{path}", self.base)
     }
 
-    /// Spec §3 steps 3–4: ask the service to email a 6-digit code to `email`.
-    pub fn request_code(&self, email: &str, label: &str) -> Result<CodeSent, RegistrationError> {
+    /// Spec §3 steps 3–4: ask the service to email a 6-digit code to `email`, accepting
+    /// `legal`'s terms and privacy versions.
+    pub fn request_code(
+        &self,
+        email: &str,
+        label: &str,
+        legal: &LegalVersions,
+    ) -> Result<CodeSent, RegistrationError> {
         let email = email.trim();
         if !looks_like_email(email) {
             return Err(RegistrationError::Input(
@@ -554,8 +680,8 @@ impl RegistrationClient {
         let body = serde_json::json!({
             "email": email,
             "label": label,
-            "terms_version": TERMS_VERSION,
-            "privacy_version": PRIVACY_VERSION,
+            "terms_version": legal.terms,
+            "privacy_version": legal.privacy,
             "notice_version": MARKETING_NOTICE_VERSION,
         });
         self.send("POST", PATH_LINK_REQUEST, Some(&body))
@@ -883,6 +1009,7 @@ mod tests {
             "unknown_terms_version",
             "unknown_privacy_version",
             "unknown_notice_version",
+            "legal_versions_unavailable",
             "invalid_entered_by",
             "rate_limited",
             "email_send_failed",
@@ -982,6 +1109,60 @@ mod tests {
             target_hits.load(Ordering::SeqCst),
             0,
             "the redirect target was never contacted"
+        );
+    }
+
+    #[test]
+    fn the_sites_manifest_only_moves_each_version_forward() {
+        let built = LegalVersions::builtin();
+        assert_eq!(
+            (built.terms.as_str(), built.privacy.as_str()),
+            (TERMS_VERSION, PRIVACY_VERSION)
+        );
+        assert_eq!(built.terms_url(), TERMS_URL);
+        assert_eq!(built.privacy_url(), PRIVACY_URL);
+        assert_eq!(built.privacy_notice(), privacy_notice());
+        let with = |body: &str| LegalVersions::builtin().with_manifest(body.as_bytes());
+        let newer = with(
+            r#"{"current":{"terms":"20990101","privacy":"20990202"},
+                "terms":["20261123","20990101"],"privacy":["20990202"],"fees":["x"]}"#,
+        );
+        assert_eq!(
+            (newer.terms.as_str(), newer.privacy.as_str()),
+            ("20990101", "20990202")
+        );
+        assert_eq!(newer.terms_url(), "https://www.maxplayer.ai/terms/20990101");
+        assert!(
+            newer
+                .privacy_notice()
+                .ends_with("https://www.maxplayer.ai/privacy/20990202")
+        );
+        // Per document: an older privacy entry keeps this build's.
+        let mixed = with(
+            r#"{"current":{"terms":"20990101","privacy":"20261029"},
+                "terms":["20990101"],"privacy":["20261029"]}"#,
+        );
+        assert_eq!(
+            (mixed.terms.as_str(), mixed.privacy.as_str()),
+            ("20990101", PRIVACY_VERSION)
+        );
+        for bad in [
+            "",
+            "<!doctype html><title>Maxplayer</title>",
+            r#"{"current":{"terms":"20990101","privacy":"20990101"},"terms":["20261123"],"privacy":["20990101"]}"#,
+            r#"{"current":{"terms":"20990101","privacy":"20990101"},"terms":["20990101","v2"],"privacy":["20990101"]}"#,
+            r#"{"current":{"terms":"2099010","privacy":"20990101"},"terms":["2099010"],"privacy":["20990101"]}"#,
+            r#"{"current":{"terms":"20990101","privacy":"20990101"},"terms":[],"privacy":["20990101"]}"#,
+            r#"{"terms":["20990101"],"privacy":["20990101"]}"#,
+        ] {
+            assert_eq!(with(bad), LegalVersions::builtin(), "{bad}");
+        }
+        // No URL, or one that cannot answer: this build's versions.
+        assert_eq!(LegalVersions::current(None), LegalVersions::builtin());
+        assert_eq!(LegalVersions::current(Some("")), LegalVersions::builtin());
+        assert_eq!(
+            LegalVersions::current(Some("http://127.0.0.1:9/legal/versions.json")),
+            LegalVersions::builtin()
         );
     }
 

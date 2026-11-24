@@ -41,6 +41,14 @@ proven by a local build or a preview deployment.
 
 `/sell` redirects to `/market#sell`. The top nav is Teams and Market on every page.
 
+Legal pages are one file per effective date (`public/terms-<YYYYMMDD>.html`, served at `/terms/<date>` by a
+`vercel.json` rewrite; `/terms` and `/privacy` redirect to the current date). `public/legal/versions.json` lists
+every published terms and privacy date plus `current`. The registration service accepts a version it lists, and
+`maxplayer account link` offers `current`, so a new version needs no service deploy or CLI release: add the page,
+its rewrite, its `PAGES` entry in `scripts/build.mjs`, its date in the manifest, and move the redirect and
+`current` together. Merge it on the effective date. `test/legal-versions.test.mjs` checks the manifest against the
+pages, rewrites and redirects.
+
 The two new pages share `site.css` (colours, type, nav, buttons, the phone mock-up and its chat) and `fonts.css`.
 `/` is a scripted presentation: it opens no relay and makes no request. `/market` reads the live market. Both hide
 what the script positions until it has run; `nojs.css`, linked inside `<noscript>`, shows it when there is no script.

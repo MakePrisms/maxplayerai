@@ -76,6 +76,10 @@ struct State {
     requests: Vec<Recorded>,
     /// What confirm and status report as `relay_member` (`added` unless a test changes it).
     relay_member: String,
+    /// What `GET /legal/versions.json` serves (the website's manifest); `None` = 404. Like the
+    /// real service, link requests also accept the versions it lists.
+    legal_manifest: Option<Value>,
+    legal_fetches: usize,
 }
 
 pub struct FakeRegistration {
@@ -139,6 +143,8 @@ impl FakeRegistration {
             confirm_calls: 0,
             requests: Vec::new(),
             relay_member: "added".into(),
+            legal_manifest: None,
+            legal_fetches: 0,
         }));
         let shared = state.clone();
         std::thread::spawn(move || {
@@ -153,6 +159,15 @@ impl FakeRegistration {
     /// What `registration_url` must be set to.
     pub fn base_url(&self) -> String {
         self.base.clone()
+    }
+
+    /// Served at `/legal/versions.json`, where the CLI tests point `MAXPLAYER_LEGAL_VERSIONS_URL`.
+    pub fn set_legal_manifest(&self, manifest: Value) {
+        self.state.lock().unwrap().legal_manifest = Some(manifest);
+    }
+
+    pub fn legal_fetches(&self) -> usize {
+        self.state.lock().unwrap().legal_fetches
     }
 
     /// The code the next `link/request` "emails".
@@ -256,6 +271,18 @@ fn serve(stream: TcpStream, state: &Mutex<State>) {
     if reader.read_exact(&mut body).is_err() {
         return;
     }
+    if method == "GET" && path == "/legal/versions.json" {
+        // The website, not the service: unsigned, and not one of the recorded requests.
+        let answer = {
+            let mut state = state.lock().unwrap();
+            state.legal_fetches += 1;
+            match &state.legal_manifest {
+                Some(manifest) => ok(200, manifest.clone()),
+                None => fail(404, "not_found", "no such page"),
+            }
+        };
+        return write_answer(stream, answer);
+    }
     let answer = {
         let mut state = state.lock().unwrap();
         let (answer, event) = handle(&mut state, &method, &path, auth.as_deref(), &body);
@@ -268,6 +295,10 @@ fn serve(stream: TcpStream, state: &Mutex<State>) {
         });
         answer
     };
+    write_answer(stream, answer);
+}
+
+fn write_answer(stream: TcpStream, answer: Answer) {
     let text = answer.body.to_string();
     let reason = match answer.status {
         200 => "OK",
@@ -435,10 +466,20 @@ fn link_request(state: &mut State, pk: &str, body: &Value) -> Answer {
             "label must be 1-64 letters, digits, spaces, '.', '_' or '-'",
         );
     }
-    if !OFFERED_VERSIONS.contains(&terms.as_str()) {
+    let offered = |doc: &str, version: &str| {
+        OFFERED_VERSIONS.contains(&version)
+            || (version.len() == 8
+                && state.legal_manifest.as_ref().is_some_and(|m| {
+                    m[doc]
+                        .as_array()
+                        .is_some_and(|list| list.iter().any(|v| v == version))
+                }))
+    };
+    let (terms_offered, privacy_offered) = (offered("terms", &terms), offered("privacy", &privacy));
+    if !terms_offered {
         return fail(400, "unknown_terms_version", "terms version is not offered");
     }
-    if !OFFERED_VERSIONS.contains(&privacy.as_str()) {
+    if !privacy_offered {
         return fail(
             400,
             "unknown_privacy_version",
