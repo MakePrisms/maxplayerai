@@ -86,6 +86,9 @@ pub enum JobOutcome {
     Broken(String),
     /// Cut at the cutoff, or the cutoff had already passed. `execution_failed`, NO strike (job clock).
     OutOfTime { started: bool },
+    /// Daemon shutdown interrupted it: no verdict, no strike, the job is NOT failed. Its journal
+    /// stays, and the next start re-drives it (§5.1).
+    Interrupted,
 }
 
 impl JobOutcome {
@@ -108,6 +111,9 @@ pub enum Exit {
     NotStarted,
     /// The program could not be spawned at all.
     SpawnFailed(String),
+    /// Daemon shutdown stopped it, or latched before it was released or registered: no verdict on
+    /// the hook. Never `Exited { code: Some(0) }`: an answer finished before the stop still counts.
+    Shutdown,
 }
 
 /// One supervised run.
@@ -263,6 +269,7 @@ impl WireAnswer {
 pub fn classify_job(report: &RunReport, cap: usize) -> JobOutcome {
     match &report.exit {
         Exit::NotStarted => return JobOutcome::OutOfTime { started: false },
+        Exit::Shutdown => return JobOutcome::Interrupted,
         Exit::CutOff => return JobOutcome::OutOfTime { started: true },
         Exit::StdoutOverflow => {
             return JobOutcome::Broken(format!("stdout over {STDOUT_MAX_BYTES} bytes"));
@@ -315,6 +322,7 @@ pub fn ping(argv: &[String], cwd: &Path, reason: PingReason) -> Result<(), Strin
             Exit::SpawnFailed(error) => format!("ping could not start: {error}"),
             Exit::StdoutOverflow => "ping stdout over the ceiling".into(),
             Exit::NotStarted => "ping not started".into(),
+            Exit::Shutdown => "ping interrupted by daemon shutdown".into(),
         })
     }
 }
@@ -342,7 +350,7 @@ enum StdoutMode {
 /// child gets the daemon's environment minus every `MAXPLAYER_*` variable, plus
 /// [`HOOK_VERSION_ENV`].
 pub fn run(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunReport {
-    supervise(argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, None)
+    supervise(&SUPERVISION, argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, None)
 }
 
 /// A started hook group's identity, journaled BEFORE the hook is allowed to run (§5.1).
@@ -372,20 +380,30 @@ pub fn run_gated(
     cutoff: Instant,
     journal: &mut dyn FnMut(&Started) -> Result<(), String>,
 ) -> RunReport {
+    run_gated_in(&SUPERVISION, argv, stdin, cwd, cutoff, journal)
+}
+
+fn run_gated_in(
+    supervision: &Supervision,
+    argv: &[String],
+    stdin: &[u8],
+    cwd: &Path,
+    cutoff: Instant,
+    journal: &mut dyn FnMut(&Started) -> Result<(), String>,
+) -> RunReport {
     if argv.is_empty() {
-        return supervise(argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, None);
+        return supervise(supervision, argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, None);
     }
     let mut gated: Vec<String> =
         vec!["/bin/sh".into(), "-c".into(), GATE_SCRIPT.into(), "maxplayer-hook-gate".into()];
     gated.extend(argv.iter().cloned());
-    let mut payload = GATE_GO.to_vec();
-    payload.extend_from_slice(stdin);
-    supervise(&gated, &payload, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, Some(journal))
+    // `go` is written by the supervisor itself, under the shutdown lock, once the group is journaled.
+    supervise(supervision, &gated, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Keep, Some(journal))
 }
 
 /// [`run`] for a control event: the same supervision, with stdout discarded (§5.2: ignored).
 pub fn run_control(argv: &[String], stdin: &[u8], cwd: &Path, cutoff: Instant) -> RunReport {
-    supervise(argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Discard, None)
+    supervise(&SUPERVISION, argv, stdin, cwd, cutoff, std::env::vars_os(), StdoutMode::Discard, None)
 }
 
 /// [`run`] with the parent environment passed in, so the scrub is testable without mutating the
@@ -397,24 +415,34 @@ pub fn run_with_env(
     cutoff: Instant,
     parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> RunReport {
-    supervise(argv, stdin, cwd, cutoff, parent_env, StdoutMode::Keep, None)
+    supervise(&SUPERVISION, argv, stdin, cwd, cutoff, parent_env, StdoutMode::Keep, None)
 }
 
 /// The one supervisor. Single-threaded on purpose: all three pipes are non-blocking and pumped
 /// from this loop, so nothing can be left blocked on a pipe after it returns — every pipe is
 /// closed (dropped) before the report is built.
 ///
-/// Order of resolution, decided once:
-/// 1. stdout overflow (Keep mode) ⇒ kill the group, [`Exit::StdoutOverflow`];
+/// A gated call (`journal` set) releases its hook only after the journal returned `Ok`, only before
+/// the cutoff, and only under the [`Supervision`] lock while shutdown has not latched.
+///
+/// Order of resolution, decided once, at the point it is observed:
+/// 1. stdout overflow (Keep mode) ⇒ kill the group; [`Exit::StdoutOverflow`], unless first seen at
+///    or after the cutoff: then [`Exit::CutOff`] (the deadline wins over a late violation);
 /// 2. the leader has exited ⇒ if that is first observed at or after the cutoff, [`Exit::CutOff`]
-///    (the deadline wins over a late exit); else its status;
+///    (the deadline wins over a late exit); a non-zero end while shutdown has latched is
+///    [`Exit::Shutdown`]; else its status;
 /// 3. the cutoff ⇒ SIGTERM, grace, SIGKILL, [`Exit::CutOff`].
+///
+/// An overflow seen while draining after the exit changes only an ordinary exit status: a resolved
+/// cutoff or shutdown stands.
 ///
 /// Exit is detected WITHOUT reaping (`waitid(WNOWAIT)`): the zombie leader keeps its pid — the group id —
 /// reserved while the rest of the group is SIGKILLed, so the signal cannot reach a recycled group.
 /// Only then is the leader reaped. After the exit, stdout gets [`READER_JOIN_BUDGET`] to reach EOF; a
 /// pipe still open then (a process outside the group kept it) means stdout is NOT complete.
+#[allow(clippy::too_many_arguments)]
 fn supervise(
+    supervision: &Supervision,
     argv: &[String],
     stdin: &[u8],
     cwd: &Path,
@@ -460,12 +488,23 @@ fn supervise(
         Err(error) => return report(Exit::SpawnFailed(error.to_string()), Vec::new(), false, String::new()),
     };
     let pgid = child.id();
-    active_groups().insert(pgid);
+    {
+        // Registered under the lock shutdown latches under: after the latch nothing is registered
+        // (so nothing escapes its signals), and this launch stops here.
+        let mut state = supervision.lock();
+        if state.shutting_down {
+            drop(state);
+            terminate_group(supervision, pgid, &mut child);
+            return report(Exit::Shutdown, Vec::new(), false, String::new());
+        }
+        state.groups.insert(pgid);
+    }
+    let gated = journal.is_some();
     if let Some(journal) = journal {
         // Nothing has been written to stdin yet, so a gated hook is still parked in the gate.
         let started = Started { pgid, start: process_identity(pgid) };
         if let Err(error) = journal(&started) {
-            terminate_group(pgid, &mut child);
+            terminate_group(supervision, pgid, &mut child);
             return report(Exit::SpawnFailed(format!("journal: {error}")), Vec::new(), false, String::new());
         }
     }
@@ -480,8 +519,29 @@ fn supervise(
             stderr_pipe.as_ref().map(|p| p.as_raw_fd()),
         ];
         if let Some(error) = fds.into_iter().flatten().find_map(|fd| set_nonblocking(fd).err()) {
-            terminate_group(pgid, &mut child);
+            terminate_group(supervision, pgid, &mut child);
             return report(Exit::SpawnFailed(format!("pipe setup failed: {error}")), Vec::new(), false, String::new());
+        }
+    }
+    if gated {
+        // The journal may have blocked: a hook released now would start with its window closed.
+        if Instant::now() >= cutoff {
+            terminate_group(supervision, pgid, &mut child);
+            return report(Exit::NotStarted, Vec::new(), false, String::new());
+        }
+        let state = supervision.lock();
+        if state.shutting_down {
+            drop(state);
+            terminate_group(supervision, pgid, &mut child);
+            return report(Exit::Shutdown, Vec::new(), false, String::new());
+        }
+        // Released under the lock: shutdown either latched first (then never released) or comes
+        // after and signals this registered group. `go` is 3 bytes into an empty pipe: one write.
+        let released = stdin_pipe.as_mut().map(|pipe| pipe.write(GATE_GO));
+        drop(state);
+        if !matches!(released, Some(Ok(n)) if n == GATE_GO.len()) {
+            terminate_group(supervision, pgid, &mut child);
+            return report(Exit::SpawnFailed("gate release failed".into()), Vec::new(), false, String::new());
         }
     }
 
@@ -489,32 +549,38 @@ fn supervise(
     let exit = loop {
         let progressed = io.pump(&mut stdin_pipe, &mut stdout_pipe, &mut stderr_pipe, stdin, mode);
         if io.overflow {
-            terminate_group(pgid, &mut child);
-            break Exit::StdoutOverflow;
+            let late = Instant::now() >= cutoff;
+            terminate_group(supervision, pgid, &mut child);
+            break if late { Exit::CutOff } else { Exit::StdoutOverflow };
         }
         match leader_exited(pgid) {
             Ok(true) => {
                 let late = Instant::now() >= cutoff;
                 // The leader is a zombie, so its id (the group id) cannot have been reused yet.
                 signal_group(pgid, SIGKILL);
-                active_groups().remove(&pgid);
+                let shutting_down = {
+                    let mut state = supervision.lock();
+                    state.groups.remove(&pgid);
+                    state.shutting_down
+                };
                 let status = child.wait();
                 if late {
                     break Exit::CutOff;
                 }
                 break match status {
+                    Ok(status) if shutting_down && status.code() != Some(0) => Exit::Shutdown,
                     Ok(status) => Exit::Exited { code: status.code() },
                     Err(error) => Exit::SpawnFailed(format!("wait failed: {error}")),
                 };
             }
             Ok(false) => {}
             Err(error) => {
-                terminate_group(pgid, &mut child);
+                terminate_group(supervision, pgid, &mut child);
                 break Exit::SpawnFailed(format!("wait failed: {error}"));
             }
         }
         if Instant::now() >= cutoff {
-            terminate_group(pgid, &mut child);
+            terminate_group(supervision, pgid, &mut child);
             break Exit::CutOff;
         }
         if !progressed {
@@ -535,8 +601,8 @@ fn supervise(
     // Close every read end now: nothing outlives this call.
     drop(stdout_pipe);
     drop(stderr_pipe);
-    // An overflow that raced the exit still counts.
-    let exit = if io.overflow { Exit::StdoutOverflow } else { exit };
+    // An overflow that raced an ordinary exit still counts; a resolved cutoff or shutdown stands.
+    let exit = if io.overflow && matches!(exit, Exit::Exited { .. }) { Exit::StdoutOverflow } else { exit };
     let stderr_tail = String::from_utf8_lossy(&io.stderr).into_owned();
     report(exit, io.stdout, stdout_complete, stderr_tail)
 }
@@ -691,46 +757,89 @@ const SIGKILL: i32 = libc::SIGKILL;
 
 /// SIGTERM the group, wait out the grace, SIGKILL the group, then reap the leader. The leader is
 /// observed without reaping throughout, so both signals address a group whose id is still ours.
-fn terminate_group(pgid: u32, child: &mut std::process::Child) {
+/// The grace belongs to the whole group: it ends early only once the leader has exited AND (on
+/// Linux, where members can be listed) no other live process is left in the group.
+fn terminate_group(supervision: &Supervision, pgid: u32, child: &mut std::process::Child) {
     signal_group(pgid, SIGTERM);
     let grace_until = Instant::now() + KILL_GRACE;
     while Instant::now() < grace_until {
-        if !matches!(leader_exited(pgid), Ok(false)) {
+        if !matches!(leader_exited(pgid), Ok(false)) && !group_has_live_members(pgid) {
             break;
         }
         std::thread::sleep(POLL);
     }
     signal_group(pgid, SIGKILL);
-    active_groups().remove(&pgid);
+    supervision.lock().groups.remove(&pgid);
     let _ = child.wait();
 }
 
-/// The hook groups this process is supervising right now. A group is removed only while its
-/// leader is still an unreaped zombie, so [`terminate_all`] (which signals under this lock) can
-/// never reach a recycled id.
-fn active_groups() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<u32>> {
-    static ACTIVE: std::sync::Mutex<std::collections::BTreeSet<u32>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
-    ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Whether a live (non-zombie) process is still in `pgid`. Linux only; elsewhere `false`.
+fn group_has_live_members(pgid: u32) -> bool {
+    cfg!(target_os = "linux") && live_group_members(pgid).map(|members| !members.is_empty()).unwrap_or(false)
 }
 
-/// Daemon shutdown (§5.1): SIGTERM every running hook group, wait out the grace, SIGKILL them.
+/// The hook groups this process supervises, and whether daemon shutdown has latched (§5.1). One
+/// lock covers registration, gate release and the latch, so a launch is either registered and
+/// released before shutdown (and then signalled by it) or stopped without its hook ever running.
+/// A group leaves the set only while its leader is still an unreaped zombie, so a signal sent
+/// under this lock can never reach a recycled id.
+struct Supervision(std::sync::Mutex<SupervisionState>);
+
+struct SupervisionState {
+    groups: std::collections::BTreeSet<u32>,
+    shutting_down: bool,
+}
+
+impl Supervision {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(SupervisionState { groups: std::collections::BTreeSet::new(), shutting_down: false }))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SupervisionState> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+static SUPERVISION: Supervision = Supervision::new();
+
+/// How long shutdown waits, after SIGKILL, for the supervisors to reap their groups.
+const SHUTDOWN_SETTLE: Duration = Duration::from_secs(2);
+
+/// Daemon shutdown (§5.1): latch shutdown (nothing is registered or released after this), SIGTERM
+/// every running group, wait out the grace (ending early once every supervisor has reaped its
+/// group), SIGKILL what is left, then wait (bounded) for the supervisors to finish their teardown.
 /// Blocking; returns at once when nothing runs.
 pub fn terminate_all() {
+    terminate_all_in(&SUPERVISION);
+}
+
+fn terminate_all_in(supervision: &Supervision) {
     {
-        let active = active_groups();
-        if active.is_empty() {
-            return;
-        }
-        for pgid in active.iter() {
+        let mut state = supervision.lock();
+        state.shutting_down = true;
+        for pgid in &state.groups {
             signal_group(*pgid, SIGTERM);
         }
     }
-    std::thread::sleep(KILL_GRACE);
-    let active = active_groups();
-    for pgid in active.iter() {
-        signal_group(*pgid, SIGKILL);
+    let settled = |until: Instant| loop {
+        if supervision.lock().groups.is_empty() {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(POLL);
+    };
+    if settled(Instant::now() + KILL_GRACE) {
+        return;
     }
+    {
+        let state = supervision.lock();
+        for pgid in &state.groups {
+            signal_group(*pgid, SIGKILL);
+        }
+    }
+    settled(Instant::now() + SHUTDOWN_SETTLE);
 }
 
 /// What `/proc` says about a pid right now (Linux).
@@ -1374,6 +1483,115 @@ mod tests {
             std::thread::sleep(POLL);
         }
         assert_eq!(reap_stale_group(pgid, Some(&identity)), StaleReap::Gone);
+    }
+
+    /// codex r2 #4: a journal write that outlasts the cutoff must not release the hook: it would
+    /// start with its window already closed.
+    #[test]
+    fn a_journal_that_outlasts_the_cutoff_never_releases_the_hook() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let marker = dir.path().join("ran");
+        let argv = sh(&format!("touch '{}'; cat >/dev/null; sleep 30", marker.display()));
+        let report = run_gated(&argv, b"{}\n", dir.path(), Instant::now() + Duration::from_millis(300), &mut |_| {
+            std::thread::sleep(Duration::from_millis(600));
+            Ok(())
+        });
+        assert_eq!(report.exit, Exit::NotStarted);
+        assert_eq!(classify_job(&report, CAP), JobOutcome::OutOfTime { started: false });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!marker.exists(), "the hook never ran");
+    }
+
+    /// codex r2 #4: an overflow first seen while draining after the cutoff (here from a worker that
+    /// left the group) leaves the no-strike cutoff standing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overflow_seen_after_the_cutoff_keeps_the_cutoff() {
+        let report = run_sh(
+            "setsid sh -c 'sleep 0.6; head -c 3000000 /dev/zero' & cat >/dev/null; sleep 30",
+            b"",
+            Duration::from_millis(300),
+        );
+        assert_eq!(report.exit, Exit::CutOff);
+        assert_eq!(classify_job(&report, CAP), JobOutcome::OutOfTime { started: true });
+    }
+
+    /// codex r2 #4: the grace belongs to the whole group. A member still finishing its SIGTERM
+    /// handling after the leader exited gets the rest of the grace, not an immediate SIGKILL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_cutoff_grace_covers_members_that_outlive_the_leader() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let marker = dir.path().join("finished");
+        let script = format!(
+            r#"(trap 'sleep 0.5; touch "{}"; exit 0' TERM; while :; do sleep 0.1; done) & trap 'exit 0' TERM; while :; do sleep 0.1; done"#,
+            marker.display()
+        );
+        let report = run(&sh(&script), b"", dir.path(), Instant::now() + Duration::from_millis(400));
+        assert_eq!(report.exit, Exit::CutOff);
+        assert!(marker.exists(), "the member finished its SIGTERM handling within the grace");
+    }
+
+    /// codex r2 #5: once shutdown has latched, a launch never releases its hook.
+    #[test]
+    fn after_shutdown_latched_a_launch_never_releases_its_hook() {
+        let supervision = Supervision::new();
+        terminate_all_in(&supervision);
+        let dir = tempfile::tempdir().expect("tmp");
+        let marker = dir.path().join("ran");
+        let argv = sh(&format!("touch '{}'", marker.display()));
+        let report =
+            run_gated_in(&supervision, &argv, b"{}\n", dir.path(), Instant::now() + Duration::from_secs(10), &mut |_| Ok(()));
+        assert_eq!(report.exit, Exit::Shutdown);
+        assert_eq!(classify_job(&report, CAP), JobOutcome::Interrupted);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!marker.exists(), "the hook never ran");
+        assert!(supervision.lock().groups.is_empty());
+    }
+
+    /// codex r2 #5: shutdown latching while the launch is still journaling: the gate is never
+    /// released, and shutdown waits for that supervisor's teardown.
+    #[test]
+    fn shutdown_during_the_journal_write_never_releases_the_hook() {
+        let supervision = Supervision::new();
+        let dir = tempfile::tempdir().expect("tmp");
+        let marker = dir.path().join("ran");
+        let argv = sh(&format!("touch '{}'", marker.display()));
+        std::thread::scope(|scope| {
+            let report = run_gated_in(&supervision, &argv, b"{}\n", dir.path(), Instant::now() + Duration::from_secs(10), &mut |_| {
+                scope.spawn(|| terminate_all_in(&supervision));
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            });
+            assert_eq!(report.exit, Exit::Shutdown);
+        });
+        assert!(!marker.exists(), "the hook never ran");
+        assert!(supervision.lock().groups.is_empty());
+    }
+
+    /// codex r2 #5: a hook stopped by daemon shutdown is interrupted, not broken: no strike, and the
+    /// job is not failed (the next start re-drives it).
+    #[test]
+    fn a_hook_stopped_by_shutdown_is_interrupted_not_broken() {
+        let supervision = Supervision::new();
+        let dir = tempfile::tempdir().expect("tmp");
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                terminate_all_in(&supervision);
+            });
+            let report = run_gated_in(
+                &supervision,
+                &sh("cat >/dev/null; sleep 30"),
+                b"{}\n",
+                dir.path(),
+                Instant::now() + Duration::from_secs(20),
+                &mut |_| Ok(()),
+            );
+            assert_eq!(report.exit, Exit::Shutdown);
+            assert_eq!(classify_job(&report, CAP), JobOutcome::Interrupted);
+            assert!(!classify_job(&report, CAP).strikes());
+        });
     }
 
     #[test]

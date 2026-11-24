@@ -181,6 +181,12 @@ impl SellerNodeRunner {
                         self.hook_refused(job_id, &buyer, &workdir).await;
                         return;
                     }
+                    // §5.1: daemon shutdown stopped it. No verdict, no strike, not failed: the group is
+                    // gone and the next start re-drives the job (attempt n+1).
+                    JobOutcome::Interrupted => {
+                        opline!("seller node hook job_id={job_id}: interrupted by daemon shutdown; re-driven at the next start");
+                        return;
+                    }
                     JobOutcome::OutOfTime { started } => {
                         opline!(
                             "seller node hook job_id={job_id}: {} the deadline cutoff; no strike",
