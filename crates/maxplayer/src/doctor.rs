@@ -2748,7 +2748,17 @@ fn build_checks(
     home: &maxplayer_core::home::MaxplayerHome,
     unsafe_no_sandbox: bool,
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
-    build_checks_with_environment(home, unsafe_no_sandbox, build_environment_checks())
+    build_checks_with_environment(home, unsafe_no_sandbox, environment_checks_for(home))
+}
+
+/// [`build_environment_checks`], or a SKIP row on a hook-only seat (see [`hook_only_seat`]).
+#[cfg(all(feature = "wallet", any(feature = "acp", test)))]
+fn environment_checks_for(home: &maxplayer_core::home::MaxplayerHome) -> Vec<Box<dyn FnOnce() -> Check>> {
+    if hook_only_seat(home) {
+        vec![Box::new(|| Check::skip("nix", "not applicable", HOOK_ONLY_WHY))]
+    } else {
+        build_environment_checks()
+    }
 }
 
 /// The registry `maxplayer doctor` reports. Nix is a SELLER requirement (#723/#745: "every buyer
@@ -2823,6 +2833,7 @@ fn build_checks_with_environment(
     let sessions_for_runsc = home.config.sessions.clone();
     let sandbox_for_egress = sandbox.clone();
     let sandbox_for_token_policy = sandbox.clone();
+    let hook_only = hook_only_seat(home);
     // The probe runs in the seat's OWN home, because that is where a launcher's config points.
     let home_root = home.root.clone();
     // Reaching this box with stranger-written code is what the containment gate is about, and there
@@ -2891,6 +2902,28 @@ fn build_checks_with_environment(
     checks.push(Box::new(move || checks::check_telemetry(telemetry)));
     // The seller boot gate blocks on this (issue #357): a launcher that cannot spawn would let the
     // node advertise and then fail every job. Bypassable, like every check, via --skip-doctor.
+    if hook_only {
+        // hook-agents §9: no job of ours runs here, so none of the sandbox rows describes a
+        // requirement. Reported, not hidden: the seller should know the agent runs uncontained.
+        checks.push(Box::new(|| {
+            Check::warn(
+                "sandbox",
+                "hook-only seat: buyer tasks and input files go to your own agent on this host, uncontained",
+                "run the hook's agent as a separate user if that matters to you",
+            )
+        }));
+        checks.push(Box::new(move || checks::check_seat_reachability(exposure)));
+        checks.push(Box::new(move || {
+            checks::check_home_permissions(perms_home_root, perms_wallet_dir, serves_strangers)
+        }));
+        if let Some(check) = checks::held_sagas_check(held_sagas) {
+            checks.push(Box::new(move || check));
+        }
+        let _ = (sandbox_for_launcher, sandbox_for_creds, sandbox_for_egress, sandbox_for_image,
+            sandbox_for_engine, sandbox_for_runsc_sessions, sessions_for_runsc, sandbox, home_root,
+            unsafe_no_sandbox, seller_for_creds, custom_agents_for_creds, user_home, agent_host);
+        return checks;
+    }
     checks.push(Box::new(move || checks::check_sandbox_launcher(sandbox_for_launcher)));
     // #647 P2: the credential proxy contains every KNOWN model-credential variable. What it cannot
     // recognize is an operator-added forward_env var (which may itself be a credential), so this WARNs
@@ -2976,6 +3009,27 @@ fn build_checks_with_environment(
 fn build_environment_checks() -> Vec<Box<dyn FnOnce() -> Check>> {
     vec![Box::new(real_nix_probe())]
 }
+
+/// docs/specs/hook-agents.md §9: every configured `[seller] agents` entry is a `hook` preset, so
+/// nothing of ours runs a job on this box — no sandbox, no nix job environment. Those checks are
+/// then not applicable (an exception to #745 keyed on the resolved roster, not a bypass).
+#[cfg(feature = "wallet")]
+fn hook_only_seat(home: &maxplayer_core::home::MaxplayerHome) -> bool {
+    let Some(seller) = home.config.seller.as_ref() else {
+        return false;
+    };
+    !seller.agents.is_empty()
+        && seller.agents.iter().all(|name| {
+            home.config
+                .agents
+                .get(name.trim())
+                .is_some_and(maxplayer_core::home::AgentPresetConfig::is_hook)
+        })
+}
+
+#[cfg(feature = "wallet")]
+const HOOK_ONLY_WHY: &str =
+    "hook-only seat: every agent is the seller's own program behind a hook, so no job runs in an environment of ours";
 
 /// The production nix probe: the one [`build_environment_checks`] runs for the gate and
 /// [`run_doctor`] hands to [`build_report_checks`], so the two cannot drift.
@@ -3105,7 +3159,7 @@ pub fn sell_readiness_gate(
              whether it is ready right now, and #745 rules out any bypass for it"
         );
         return run_readiness_with_retry(
-            || run_checks(build_environment_checks()),
+            || run_checks(environment_checks_for(home)),
             READINESS_MAX_ATTEMPTS,
             readiness_backoff,
             std::thread::sleep,
