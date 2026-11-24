@@ -263,9 +263,15 @@ builds, the `wrap backfill (periodic): fetching` line). Do not grep for `online`
 `heartbeat published` — no such success line exists. The **absence** of heartbeat-failure lines
 is normal and healthy.
 
-**Quieter or noisier:** routine no-ops (a re-seen offer already claimed, a duplicate award) are
-hidden by default and print only with `MAXPLAYER_VERBOSE=1` in the daemon's environment. Nothing
-that reports a state change or a failure is behind that flag.
+**Quieter or noisier:** routine no-ops are hidden by default and print only with
+`MAXPLAYER_VERBOSE=1` in the daemon's environment: a re-seen offer already claimed, a duplicate
+award, awards and acceptances for other sellers' jobs, pay-binds for jobs already awarded here,
+lapsed or aged offers re-read from relay history, a relay `CLOSED` for a subscription that is not
+ours, and follow-ups to ended sessions. After a reconnect these can be hundreds of lines, so instead
+the status tick prints one `seller node routine (since last status): …` line counting them; it is
+informational, not a problem. A lapsed offer aimed at this seat and authored within the last hour
+still prints its `offer skip` line (check the buyer's deadline and this host's clock). Nothing that
+reports a state change or a failure is behind that flag.
 
 **Dead end → report it:** if you see `seller node live:` but the periodic `seller node status:`
 line never repeats, the loop may be wedged — file on **MakePrisms/maxplayerai** with the last few
