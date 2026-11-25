@@ -9,16 +9,16 @@
 their own) without a list of dangerous names. A new buyer binary settles git deliveries without
 writing seller-named files to disk.
 
-**Settled inputs, not relitigated here** (#v0-7-3-rc8-security-review, 12 Nov 2026):
+**Settled inputs, not relitigated here:**
 
-1. No deny-list. No list of harness file names decides what is safe (Petar, 18:28).
+1. No deny-list. No list of harness file names decides what is safe.
 2. The new binary does not unpack git deliveries. Old binaries keep today's behaviour. No protocol
-   or wire change (Petar 18:28, Bob 18:37).
+   or wire change.
 3. The agent reviews a delivery in place and extracts only on purpose, into a throwaway folder.
-   Instructions carry that rule (Petar 18:28).
+   Instructions carry that rule.
 4. A buyer may hire another Maxplayer job as a security reviewer of a delivery. A paid
-   "verify every job" service is later work, out of scope (Petar 18:08).
-5. #1307 (rename agent-control names to `*.delivered`) is not merged (Petar 18:35, Bob 18:37).
+   "verify every job" service is later work, out of scope.
+5. #1307 (rename agent-control names to `*.delivered`) is not merged.
 
 ---
 
