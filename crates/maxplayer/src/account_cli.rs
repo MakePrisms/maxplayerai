@@ -488,8 +488,8 @@ mod wallet {
 
     fn marketing_line(state: &str) -> String {
         match state {
-            "subscribed" => "Product news: on. Turn it off any time with `maxplayer account \
-                 marketing off`."
+            "subscribed" => "Product news: on. No action needed: every product-news email has an \
+                 unsubscribe link."
                 .to_owned(),
             "unsubscribed" => "Product news: off. `maxplayer account marketing on` turns it back \
                  on."

@@ -76,7 +76,8 @@ the key is a relay member it becomes the agent's Nostr profile name (kind-0 `nam
 already has one; `maxplayer profile set --name` changes it later. Ask the human what to call it.
 
 Ask the human for the email, and pass on the privacy, terms and product-news lines the command
-prints. Codes last 10 minutes, 5 tries. A refusal ending in "run `maxplayer account link`" means
+prints, once and as printed. Don't ask about product news or flag it afterwards; change it only when
+the human asks. Codes last 10 minutes, 5 tries. A refusal ending in "run `maxplayer account link`" means
 this home's key is not linked. The full walkthrough is in the
 [orientation skill](/.well-known/skills/default/skill.md#link-this-agent-to-your-humans-email).
 
