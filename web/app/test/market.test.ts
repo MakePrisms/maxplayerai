@@ -13,7 +13,7 @@ import { parseEvent } from "../src/model/events.js";
 import { OFFER, CLAIM, AWARD, RESULT, RECEIPT, ACCEPT, FEEDBACK, HEARTBEAT, PROFILE } from "../src/model/kinds.js";
 import { createCache } from "../src/store/cache.js";
 import { buildTrades, marketMetrics } from "../src/market/trades.js";
-import { buyerBoard, sellerBoard, inProgressJobs, participantActivity, relatedActivity, JOB_OVERDUE, JOB_WORKING, withinWindow } from "../src/market/participants.js";
+import { buyerBoard, sellerBoard, inProgressJobs, participantActivity, relatedActivity, JOB_OVERDUE, JOB_WORKING, withinWindow, LIVE_WITHIN_SECONDS } from "../src/market/participants.js";
 import { activeTradeJobs, createEngine, rankClimbs, ACTIVE_GRACE_SECONDS } from "../src/market/engine.js";
 import type { RawEvent } from "../src/model/events.js";
 
@@ -435,4 +435,27 @@ test("overdue historical jobs do not put a buyer on a window it did nothing in",
   const live = offer(T0, { deadline: now + 1000 });
   const current = [live, claim(live.id, SELLER, T0 + 1), award(live.id, SELLER, T0 + 2)];
   assert.equal(buyerBoard([], now, current).length, 1, "current work still adds the buyer, as on the seller board");
+});
+
+test("online survives one late heartbeat at the default 300 s cadence", () => {
+  const now = T0 + 86400;
+  const online = (age: number, tags: string[][] = []) =>
+    sellerBoard([ev(HEARTBEAT, SELLER, now - age, [["d", "seat"], ...tags])], now)[0]!.online;
+  assert.equal(online(0), true);
+  // A beat due at 300 s that lands late (seen live at ~500-670 s) must not read Offline.
+  assert.equal(online(600), true, "one late beat keeps the seat online");
+  assert.equal(online(LIVE_WITHIN_SECONDS), true);
+  assert.equal(online(LIVE_WITHIN_SECONDS + 1), false, "a seat that stopped beating goes offline");
+  assert.ok(LIVE_WITHIN_SECONDS >= 2 * 300, "at least two default intervals of slack");
+});
+
+test("online is judged on the latest heartbeat, and a retraction is not online", () => {
+  const now = T0 + 86400;
+  const open = ev(HEARTBEAT, SELLER, now - 60, [["d", "seat"], ["accepting", "y"]]);
+  const retracted = ev(HEARTBEAT, SELLER, now - 10, [["d", "seat"], ["accepting", "n"]]);
+  for (const events of [[open, retracted], [retracted, open]]) {
+    assert.equal(sellerBoard(events, now)[0]!.online, false, "the newest beat retracted the seat");
+  }
+  const reopened = ev(HEARTBEAT, SELLER, now - 5, [["d", "seat"], ["accepting", "y"]]);
+  assert.equal(sellerBoard([open, retracted, reopened], now)[0]!.online, true);
 });
