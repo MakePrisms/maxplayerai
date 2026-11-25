@@ -503,10 +503,10 @@ impl SellerNodeRunner {
             Err(error) => opline!("seller node session job_id={job_id}: end task failed ({error})"),
         }
         // hook-agents §5.3: the session's hook hears `close` once, after its directory is gone,
-        // and only from the ender that won the parked → ended step.
-        if hook
-            && matches!(&ended, Ok(Ok(errors)) if !errors.iter().any(|e| e == session_gc::HOOK_SESSION_NOT_PARKED))
-        {
+        // and only from the ender that won the parked → ended step. An end that kept the directory
+        // (a still-journaled group, a failed removal) sends none: `close` is best effort, and the
+        // adapter must not be told the session is gone while a call may still run in it.
+        if hook && matches!(&ended, Ok(Ok(errors)) if errors.is_empty()) {
             self.send_hook_close(&job_id);
         }
     }
@@ -645,7 +645,15 @@ impl SellerNodeRunner {
         };
         // hook-agents §8.2: a hook session has no container, holder or orchestrator to check.
         if record.kind == session::SessionKind::Hook {
-            let _ = store.set_session_state(&job_id, SessionState::Running, now_secs());
+            // `parked → running` as one compare-and-set: an ender (buyer close, lifetime tick) that
+            // won since the read above leaves this turn nothing to run on, and while the session
+            // is running no ender can win (`end_parked_session` needs it parked).
+            if !matches!(store.start_parked_turn(&job_id), Ok(true)) {
+                let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
+                self.turn_feedback(&job_id, &buyer, fid, ReasonCode::SessionExpired)
+                    .await;
+                return;
+            }
             let _ = store.set_turn_state(fid, TurnState::Reviewing, None, None, now_secs());
             let end = self.run_hook_turn(&turn, &offer, &record).await;
             let _ = store.set_session_state(&job_id, SessionState::Parked, now_secs());
@@ -1589,12 +1597,13 @@ impl SellerNodeRunner {
             Ok(execution) => execution.is_some(),
             Err(error) => return refuse(setup(error)),
         };
-        let texts = match store.turn_texts(job_id, n) {
-            Ok(texts) => texts,
+        // Exactly this follow-up's message: the one its review and result name. A turn journaled
+        // without its text (a crash between the two writes) is refused, never run on another
+        // follow-up's message.
+        let text = match store.turn_text(fid) {
+            Ok(Some(text)) => text,
+            Ok(None) => return refuse(setup("follow-up message missing")),
             Err(error) => return refuse(setup(error)),
-        };
-        let Some(text) = texts.last().cloned() else {
-            return refuse(setup("follow-up message missing"));
         };
         let buyer = offer.buyer_pubkey.clone();
         // 1. The review, exactly as the container turn builds it, awaited: the buyer's text reaches
@@ -1742,7 +1751,9 @@ impl SellerNodeRunner {
     ) -> Result<(String, String, u64), HookTurnEnd> {
         use crate::hook::{self, JobOutcome};
         let store = self.node.store();
-        if !super::hook_run::reap_journaled_groups(store, Some(fid)) {
+        // Every hook group of this SESSION, not only this follow-up's: a retried turn (a fresh
+        // follow-up id) must not run beside an earlier call still alive in the same directory.
+        if !super::hook_run::reap_journaled_groups_of_job(store, job_id) {
             opline!(
                 "seller node session job_id={job_id}: turn {n}: an earlier hook call is not resolved; deferred"
             );
@@ -1930,6 +1941,14 @@ impl SellerNodeRunner {
                     "seller node session resume: job_id={} stopped and parked",
                     record.job_id
                 );
+                // A buyer close that arrived while the interrupted turn ran was journaled, not
+                // honored (the session was running): honor it now, before any re-drive.
+                if record.kind == session::SessionKind::Hook
+                    && store.session_close_requested(&record.job_id).unwrap_or(false)
+                    && let Ok(Some(parked)) = store.session(&record.job_id)
+                {
+                    self.end_session_now(parked, SessionState::Closed).await;
+                }
             }
         }
         let now = now_secs();

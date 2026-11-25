@@ -19400,6 +19400,111 @@ esac"#,
         store.set_turn_text(fid, text).expect("turn text");
     }
 
+    // codex #1416 r1 (High): a turn journaled without its own text (a crash between the two writes)
+    // is refused; it never runs the hook on an EARLIER follow-up's message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_turn_without_its_own_text_never_runs_on_an_earlier_message() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_hook_session_seller("hook-session-own-text", &relay_url, "done", 0).await;
+        let runner = Arc::new(runner);
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "1".repeat(64);
+        seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
+        runner.execute_job(&job_id, None, false).await;
+        let store = runner.node.store();
+
+        // Turn 2: an earlier follow-up with its message, settled (a free turn reads as paid).
+        let turn2 = "2".repeat(64);
+        record_hook_followup(&runner, &turn2, &job_id, 2, "the older message");
+        store
+            .set_turn_state(
+                &turn2,
+                crate::session::TurnState::Paid,
+                None,
+                None,
+                now_secs_for_test(),
+            )
+            .expect("settle turn 2");
+        assert_eq!(hook_events(&root).len(), 1, "premise: only turn 1 ran");
+
+        let turn3 = "3".repeat(64);
+        store
+            .record_turn(
+                &turn3,
+                &job_id,
+                3,
+                now_secs_for_test() + 3_600,
+                crate::session::TurnState::Received,
+                now_secs_for_test(),
+            )
+            .expect("record turn");
+        tokio::task::LocalSet::new()
+            .run_until(runner.run_turn(&turn3))
+            .await;
+        assert_eq!(
+            hook_events(&root).len(),
+            1,
+            "turn 3 has no text of its own: the hook is not called"
+        );
+        assert_eq!(
+            store.turn(&turn3).expect("read").map(|t| t.state),
+            Some(crate::session::TurnState::Refused)
+        );
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // codex #1416 r1 (High): a retried turn (a fresh follow-up id) does not run beside an earlier
+    // call of the same session whose group is still journaled and cannot be resolved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_turn_waits_for_every_unresolved_group_of_its_session() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_hook_session_seller("hook-session-other-group", &relay_url, "done", 0).await;
+        let runner = Arc::new(runner);
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "4".repeat(64);
+        seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
+        runner.execute_job(&job_id, None, false).await;
+        let store = runner.node.store();
+
+        // An earlier attempt at turn 2 (another follow-up id) left a group with no recorded
+        // identity: it cannot be proven gone, so it stays unresolved.
+        let earlier = "5".repeat(64);
+        store
+            .begin_hook_attempt(&earlier, &job_id, now_unix())
+            .expect("attempt");
+        store
+            .record_hook_group(&earlier, 4_000_000, None, now_unix())
+            .expect("journal");
+
+        let retry = "7".repeat(64);
+        record_hook_followup(&runner, &retry, &job_id, 2, "retry");
+        tokio::task::LocalSet::new()
+            .run_until(runner.run_turn(&retry))
+            .await;
+        assert_eq!(
+            hook_events(&root).len(),
+            1,
+            "the retry does not run while the session has an unresolved group"
+        );
+        assert_ne!(
+            store.turn(&retry).expect("read").map(|t| t.state),
+            Some(crate::session::TurnState::Delivered)
+        );
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn now_secs_for_test() -> u64 {
         u64::try_from(now_unix()).expect("clock")
     }

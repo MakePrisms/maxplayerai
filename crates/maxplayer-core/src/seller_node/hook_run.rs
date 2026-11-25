@@ -457,6 +457,23 @@ pub(super) fn reap_journaled_groups(store: &crate::seller_node::store::SellerSto
     resolved
 }
 
+/// [`reap_journaled_groups`] for every invocation of `job_id` (a session's turns share one
+/// directory): `true` only when none of its groups is still journaled afterwards.
+pub(super) fn reap_journaled_groups_of_job(store: &crate::seller_node::store::SellerStore, job_id: &str) -> bool {
+    let invocations = match store.journaled_hook_invocations(job_id) {
+        Ok(invocations) => invocations,
+        Err(error) => {
+            opline!("seller node hook job_id={job_id}: could not read journaled hook groups ({error})");
+            return false;
+        }
+    };
+    let mut resolved = true;
+    for invocation in invocations {
+        resolved &= reap_journaled_groups(store, Some(&invocation));
+    }
+    resolved && matches!(store.hook_group_journaled(job_id), Ok(false))
+}
+
 /// Drop a job's hook state (staged answer, run record, per-job directory) if the job is terminal.
 /// A live job keeps its staged answer: it may still be re-delivered (§7.1). The directory goes
 /// FIRST and the rows only once it is gone: the rows are how a later boot finds a directory that a

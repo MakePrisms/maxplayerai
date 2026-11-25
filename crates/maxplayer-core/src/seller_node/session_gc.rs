@@ -910,7 +910,7 @@ pub fn end_hook_session(
     paths: &SessionPaths,
     state: SessionState,
 ) -> Result<Vec<String>, StoreError> {
-    if !store.end_parked_session(&record.job_id, state)? {
+    if !store.end_parked_session(&record.job_id, state, record.last_turn_at)? {
         return Ok(vec![HOOK_SESSION_NOT_PARKED.into()]);
     }
     if store.hook_group_journaled(&record.job_id)? {

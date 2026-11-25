@@ -2342,17 +2342,33 @@ impl SellerStore {
 
     /// End a PARKED session (hook-agents §8.3): `parked → state` as one compare-and-set, so of two
     /// enders (a buyer close and the lifetime tick) exactly one wins and runs the destructive steps.
-    /// `false`: the session was not parked (running, already ended, or absent); nothing changed.
+    /// `parked_at` is the `last_turn_at` the ender read: a session that ran a turn and parked again
+    /// since (a stale expiry scan) is not ended. `false`: the session was not parked at that time
+    /// (running, re-parked, already ended, or absent); nothing changed.
     pub fn end_parked_session(
         &self,
         job_id: &str,
         state: crate::session::SessionState,
+        parked_at: u64,
     ) -> Result<bool, StoreError> {
         let conn = self.lock()?;
         let n = conn.execute(
             "UPDATE sessions SET state = ?2
-             WHERE job_id = ?1 AND state = 'parked' AND ?2 IN ('closed','expired')",
-            params![job_id, state.as_str()],
+             WHERE job_id = ?1 AND state = 'parked' AND last_turn_at = ?3
+               AND ?2 IN ('closed','expired')",
+            params![job_id, state.as_str(), parked_at as i64],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Start a turn on a PARKED hook session (hook-agents §8.2): `parked → running` as one
+    /// compare-and-set, so a turn and an ender (buyer close, lifetime tick) never both win. `false`:
+    /// the session was not parked (ended, or another turn holds it); the turn must not run.
+    pub fn start_parked_turn(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE sessions SET state = 'running' WHERE job_id = ?1 AND state = 'parked'",
+            params![job_id],
         )?;
         Ok(n == 1)
     }
@@ -2569,6 +2585,19 @@ impl SellerStore {
             params![followup_id, text],
         )?;
         Ok(())
+    }
+
+    /// The buyer's message of exactly this follow-up (`None`: not journaled).
+    pub fn turn_text(&self, followup_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT text FROM session_turns WHERE followup_id = ?1",
+                [followup_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Buyer messages of turns 2..=`up_to`, oldest first (§6.3).
@@ -3872,6 +3901,16 @@ impl SellerStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// The invocations of `job_id` whose group is still journaled.
+    pub fn journaled_hook_invocations(&self, job_id: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT invocation FROM hook_runs WHERE job_id = ?1 AND pgid IS NOT NULL ORDER BY invocation",
+        )?;
+        let rows = statement.query_map([job_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Every journaled group a previous daemon may have left running: `(invocation, pgid, start)`.
     pub fn journaled_hook_groups(&self) -> Result<Vec<(String, u32, Option<String>)>, StoreError> {
         let conn = self.lock()?;
@@ -4190,15 +4229,37 @@ mod tests {
                 .expect("replay")
         );
 
-        // Ending: parked → closed once; a second ender changes nothing.
+        // A turn takes a parked session once; while it runs no ender wins (codex #1416 r1).
+        let parked_at = store.session(&job).expect("read").expect("row").last_turn_at;
+        assert!(store.start_parked_turn(&job).expect("start"));
+        assert!(!store.start_parked_turn(&job).expect("second turn"));
+        assert!(
+            !store
+                .end_parked_session(&job, crate::session::SessionState::Closed, parked_at)
+                .expect("end while running")
+        );
         assert!(
             store
-                .end_parked_session(&job, crate::session::SessionState::Closed)
+                .set_session_state(&job, crate::session::SessionState::Parked, 6)
+                .expect("park")
+        );
+
+        // Ending: parked → closed once; a second ender changes nothing. An ender that read an
+        // older park (a stale expiry scan) changes nothing either.
+        let parked_at = store.session(&job).expect("read").expect("row").last_turn_at;
+        assert!(
+            !store
+                .end_parked_session(&job, crate::session::SessionState::Expired, parked_at + 1)
+                .expect("stale")
+        );
+        assert!(
+            store
+                .end_parked_session(&job, crate::session::SessionState::Closed, parked_at)
                 .expect("end")
         );
         assert!(
             !store
-                .end_parked_session(&job, crate::session::SessionState::Expired)
+                .end_parked_session(&job, crate::session::SessionState::Expired, parked_at)
                 .expect("again")
         );
         assert_eq!(
