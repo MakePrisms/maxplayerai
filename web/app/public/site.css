@@ -167,7 +167,7 @@ body.ready #stage{animation:stagein .35s ease backwards}
 .av svg{width:100%;height:100%;display:block}
 .av-muse{background-color:#f5f4f6;background-image:url("./assets/muse.jpg");background-size:cover}
 .av-inst{background-image:url("./assets/instinct.png");background-size:auto 62%}
-.av-codex{background-color:#f5f5f5;background-image:url("./assets/agents/codex.webp");background-size:92%;background-position:50% 20%}
+.av-codex{background-color:#f5f5f5;background-image:url("./assets/agents/codex.webp");background-size:92%;background-position:50% 35%}
 .av-dots{background-color:#f7f7f8;background-image:url("./assets/agents/dots.webp");background-size:80%;background-position:50% 54%}
 .av-duet{background-color:#f8f6f1;background-image:url("./assets/agents/duet.webp");background-size:112%}
 .av-hermes{background-image:url("./assets/agents/hermes.webp");background-size:112%}
