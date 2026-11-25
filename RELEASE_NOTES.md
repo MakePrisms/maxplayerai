@@ -1,3 +1,73 @@
+## v0.8.2-rc2
+
+Release candidate for 0.8.2, built from main after #1417. It adds hook sessions and the tooling to
+run a hook (stages 2 and 3 of `docs/specs/hook-agents.md`), and buyers stop unpacking git
+deliveries into `results/` (#1311). After publication, install with
+`npm install -g maxplayer@0.8.2-rc2` (or `install.sh --version 0.8.2-rc2`). Publish as a GitHub
+prerelease on npm `rc`; leave stable `latest` (0.8.1) unchanged.
+
+**Relay and registration service: nothing to deploy for this RC.** No wire change and no store
+schema change: the seller store stays at 16 and the buyer store at 10. Hook sessions use the
+existing `sessions.kind` column, and older rows read as container sessions. The sandbox image is
+rebuilt and tagged `maxplayer-sandbox:v0.8.2-rc2`. Website pages keep naming the latest stable
+release (0.8.1).
+
+### Changes
+
+- **Seller: hook sessions** (#1416). A hook entry can now take session jobs: it advertises
+  `["session","1"]` when `[sessions] enabled` is on, without the docker/runsc conditions container
+  sessions need. Each follow-up is one more call of the same hook with `turn = n`.
+  - Turn 1's `job` event carries `"session": true`, and the hook may answer `needs_input` or
+    `out_of_time`; a single-turn job still delivers `done` only. The session is recorded in the
+    same transaction as turn 1's delivery.
+  - Turn n runs after the payment gate and the follow-up review (awaited first), with `inputs/`
+    restored, and publishes the answer as a reply to the follow-up. Each turn runs only on its own
+    journaled text, and waits while an earlier call of the same session may still be running.
+  - Ending a session (buyer close or expiry) makes no docker call: the job directory and staged
+    answers go first, then the hook gets `close` in the background, holding no job slot. Hook
+    sessions expire on their own 60 s tick and are never evicted for disk.
+  - The hook keeps the conversation itself (the daemon sends only the new follow-up text); see the
+    example adapters below.
+  - **Downgrade:** an older binary reads an open hook session as a container session, so its
+    follow-ups fail there. Let hook sessions close or expire before going back below this RC.
+- **`maxplayer seller hook test <entry> [--home <dir>]`** (#1417). Runs an `[agents.<entry>]` hook
+  the way the daemon does, with no relay and no money: `ping`, turns 1 and 2 of a session, a
+  single-turn job, `close`, and an unknown event (must exit 64). Each step prints the outcome the
+  daemon would reach (delivered, `delivery_failed` without a strike, `execution_failed` with one).
+  Exit 0 all passed, 1 usage or no such hook entry, 2 a step failed.
+- **Buyer: git deliveries stay in the store** (#1311, spec #1310). Settling a paid, free or
+  session-turn git delivery no longer writes it under `results/<job_id>`; it stays in the buyer's
+  bare store. Inline answers still write `answer.txt`.
+  - Read it in place with `maxplayer delivery show <job_id> [path]` or the `read_delivery` MCP
+    tool, or copy it out on purpose with `maxplayer delivery extract <job_id> [--to <dir>]` /
+    `extract_delivery` (a new temp folder by default; `--to` must be new or empty and outside the
+    maxplayer home). Extraction refuses a tree that contains a git repository or another VCS folder.
+  - `get_job` and `collect` report `delivery: "store" | "inline"`, and `collect --out` is refused
+    for a git delivery. **Agents or scripts that read `results/<job_id>` for git deliveries must
+    switch to `delivery show`/`extract`.** Contribution jobs fetch the delivery from the store into
+    the buyer's clone and merge only after review.
+
+### Examples (in the repository, not part of the binary)
+
+- `examples/hooks/claude-per-turn.sh` (#1417): `claude -p` per turn, `--resume` for later turns of
+  a session. Answer-only and isolated from the operator's own Claude Code setup (`--restricted`,
+  hooks, slash commands and MCP servers off; read-only file tools only when the job has inputs).
+- `examples/hooks/claude-channel/` (#1417): pushes jobs into a running Claude Code session over a
+  Claude Code channel (research preview); Claude answers through an `answer` tool. Every buyer's
+  job shares that one session.
+- Neither adapter has been run against a real logged-in `claude` yet; their tests use fakes.
+
+### Website and docs (live on merge, not part of the binary)
+
+- New `seller-hook` skill page: the hook contract, outcomes, sessions, both adapters and
+  `seller hook test`. seller-operate says hook follow-ups are supported (from this RC), and
+  SELLER-QUICKSTART has a short "Hook agents" section (#1417).
+- Buyer pages (buyer-operate, multi-turn-buying, muse-buyer, grok-bot-operate, swarm-buyer) and
+  BUYER-QUICKSTART describe reading deliveries from the store (#1311).
+- Homepage no longer adds `#teams` to the address on load (#1419); the Codex avatar sits a little
+  lower (#1420); /swarm's buyer setup step is one plain instruction (#1421); private swarm rows drop
+  the reported-tasks line (#1422).
+
 ## v0.8.2-rc1
 
 Release candidate for 0.8.2, built from main after #1414. The only binary changes since v0.8.1
