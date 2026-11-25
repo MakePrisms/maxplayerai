@@ -25,6 +25,8 @@ const SAMPLE_INPUT_TEXT: &str = "maxplayer seller hook test: a sample input file
 const TURN1_PROMPT: &str = "This is `maxplayer seller hook test`, not a buyer. Read inputs/sample.txt and reply with one short sentence saying what it contains.";
 const TURN2_PROMPT: &str =
     "Follow-up from the same test: repeat your previous answer in five words or fewer.";
+const SINGLE_TURN_PROMPT: &str =
+    "This is `maxplayer seller hook test`, not a buyer. Reply with one short sentence.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Options {
@@ -147,21 +149,37 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         "seller hook test: [agents.{}] hook = {:?}",
         options.entry, argv
     );
-    let passed = run_steps(&argv, &home.root, out);
-    if passed {
+    let (passed, compatible) = run_all_steps(&argv, &home.root, out);
+    if passed && compatible {
         let _ = writeln!(out, "\nPASS: the daemon would serve this hook.");
         SUCCESS
+    } else if passed {
+        let _ = writeln!(
+            out,
+            "\nFAIL (compatibility): the hook does not exit 64 on an event it does not know. Today's \
+             daemon sends no such event, so current jobs are unaffected; a later contract version that \
+             adds an event would break this hook."
+        );
+        FAILED
     } else {
         let _ = writeln!(
             out,
-            "\nFAIL: fix the steps marked FAIL; the daemon would strike or drop this entry."
+            "\nFAIL: fix the steps marked FAIL; each line says what the daemon would do."
         );
         FAILED
     }
 }
 
-/// Every step, in the daemon's order. Returns whether all passed.
+/// Every step, in the daemon's order. Returns whether all passed (the unknown-event check included).
+#[cfg(test)]
 fn run_steps(argv: &[String], home_root: &Path, out: &mut dyn Write) -> bool {
+    let (passed, compatible) = run_all_steps(argv, home_root, out);
+    passed && compatible
+}
+
+/// Every step, in the daemon's order: `(the events the daemon sends all passed, the unknown-event
+/// compatibility check passed)`.
+fn run_all_steps(argv: &[String], home_root: &Path, out: &mut dyn Write) -> (bool, bool) {
     let mut passed = true;
     // 1. ping (boot): exit 0 within the control budget, stdout ignored (§5.2).
     let started = Instant::now();
@@ -179,19 +197,45 @@ fn run_steps(argv: &[String], home_root: &Path, out: &mut dyn Write) -> bool {
         Ok(dir) => dir,
         Err(error) => {
             let _ = writeln!(out, "FAIL  job directory: {error}");
-            return false;
+            return (false, false);
         }
     };
-    // 2. job, turn 1, with an input file. 3. job, turn 2 of the same job, a new invocation.
+    // 2. job, turn 1 of a session, with an input file. 3. job, turn 2 of the same job, a new
+    // invocation.
+    let inputs = dir.join("inputs");
     for (turn, invocation, prompt) in [
         (1u32, job_id.clone(), TURN1_PROMPT),
         (2, random_hex(), TURN2_PROMPT),
     ] {
-        passed &= job_step(out, argv, &dir, &job_id, &invocation, turn, prompt);
+        let label = format!("job turn {turn}");
+        passed &= job_step(out, argv, &dir, &job_id, &invocation, turn, prompt, true, Some(&inputs), &label);
     }
     let _ = std::fs::remove_dir_all(&dir);
+    // 4. a single-turn job (no session, no inputs): only `done` is delivered there.
+    let single_id = random_hex();
+    match job_dir(&single_id) {
+        Ok(single_dir) => {
+            passed &= job_step(
+                out,
+                argv,
+                &single_dir,
+                &single_id,
+                &single_id,
+                1,
+                SINGLE_TURN_PROMPT,
+                false,
+                None,
+                "job single-turn",
+            );
+            let _ = std::fs::remove_dir_all(&single_dir);
+        }
+        Err(error) => {
+            let _ = writeln!(out, "FAIL  job directory: {error}");
+            passed = false;
+        }
+    }
 
-    // 4. close: best effort, exit status ignored by the daemon; reported here for the operator.
+    // 5. close: best effort, exit status ignored by the daemon; reported here for the operator.
     let started = Instant::now();
     let report = hook::run_control(
         argv,
@@ -212,7 +256,8 @@ fn run_steps(argv: &[String], home_root: &Path, out: &mut dyn Write) -> bool {
         started.elapsed().as_millis()
     );
 
-    // 5. an event this contract version does not define: exit 64 means "unsupported", never a strike.
+    // 6. an event this contract version does not define: exit 64 means "unsupported", never a
+    // strike. The daemon sends none today, so this is reported as compatibility, not as a verdict.
     let started = Instant::now();
     let unknown = b"{\"v\":1,\"event\":\"maxplayer-hook-test-unknown\"}\n";
     let report = hook::run_control(
@@ -224,14 +269,16 @@ fn run_steps(argv: &[String], home_root: &Path, out: &mut dyn Write) -> bool {
     let failure = match report.exit {
         Exit::Exited { code: Some(64) } => None,
         ref other => Some(format!(
-            "{}; a hook must exit 64 on an event it does not know, so later contract versions can add events",
+            "{}; a hook must exit 64 on an event it does not know, so later contract versions can add events \
+             (compatibility only: today's daemon never sends one)",
             describe_exit(other)
         )),
     };
-    passed &= step(out, "unknown event", started, failure.as_deref(), "exit 64");
-    passed
+    let compatible = step(out, "unknown event", started, failure.as_deref(), "exit 64");
+    (passed, compatible)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn job_step(
     out: &mut dyn Write,
     argv: &[String],
@@ -240,6 +287,9 @@ fn job_step(
     invocation: &str,
     turn: u32,
     prompt: &str,
+    session: bool,
+    inputs: Option<&Path>,
+    label: &str,
 ) -> bool {
     let cap = maxplayer_core::seller_node::run::INLINE_ANSWER_MAX_BYTES;
     let now = now_unix();
@@ -250,15 +300,14 @@ fn job_step(
         cap,
         job_id,
         turn,
-        true,
+        session,
         prompt,
         Some("text/plain"),
-        Some(&dir.join("inputs")),
+        inputs,
         deadline.saturating_sub(hook::PUBLISH_MARGIN_SECS),
     );
     let started = Instant::now();
     let report = hook::run(argv, &event, dir, hook::job_cutoff(deadline, now, started));
-    let label = format!("job turn {turn}");
     if !report.stderr_tail.trim().is_empty() {
         let _ = writeln!(
             out,
@@ -266,14 +315,27 @@ fn job_step(
             report.stderr_tail.trim().replace('\n', " | ")
         );
     }
-    let (failure, verdict) = verdict(&report, cap);
-    step(out, &label, started, failure.as_deref(), &verdict)
+    let (failure, verdict) = verdict(&report, cap, session);
+    step(out, label, started, failure.as_deref(), &verdict)
 }
 
 /// The daemon's verdict on a `job` call (§5.1 "Outcomes"): `(None, what it would do)` when it would
-/// deliver, `(Some(why), …)` when it would fail the job.
-fn verdict(report: &RunReport, cap: usize) -> (Option<String>, String) {
+/// deliver, `(Some(why), …)` when it would fail the job. `session`: whether the call was a session
+/// turn; a single-turn job delivers `done` only (§5.0 rule 3, as `hook_run` decides).
+fn verdict(report: &RunReport, cap: usize, session: bool) -> (Option<String>, String) {
     match hook::classify_job(report, cap) {
+        JobOutcome::Answer(answer)
+            if !session && answer.status != hook::HookStatus::Done =>
+        {
+            (
+                Some(format!(
+                    "status {} on a single-turn job: nothing delivered, the job fails delivery_failed, \
+                     no strike (a single-turn job has no next turn; answer it with \"done\")",
+                    answer.status.as_str()
+                )),
+                String::new(),
+            )
+        }
         JobOutcome::Answer(answer) => {
             let preview: String = answer.answer.chars().take(120).collect();
             let more = if answer.answer.chars().count() > 120 {
@@ -305,7 +367,9 @@ fn verdict(report: &RunReport, cap: usize) -> (Option<String>, String) {
         ),
         JobOutcome::OutOfTime { .. } => (
             Some(format!(
-                "still running at the cutoff ({} s): killed, execution_failed",
+                "still running at the cutoff ({} s): killed, execution_failed. If the hook hands jobs to \
+                 a running agent session, check that the agent answered through the adapter: a reply \
+                 in the agent's own chat is never delivered",
                 TEST_JOB_SECS - hook::PUBLISH_MARGIN_SECS
             )),
             String::new(),
@@ -428,7 +492,8 @@ mod tests {
         let script = r#"line=$(cat)
 case "$line" in
   *'"event":"ping"'*|*'"event":"close"'*) exit 0;;
-  *'"event":"job"'*) dir=$(printf '%s' "$line" | sed 's/.*"inputs_dir":"\([^"]*\)".*/\1/'); test -f "$dir/sample.txt" || exit 3
+  *'"event":"job"'*) case "$line" in *'"inputs_dir":"'*)
+       dir=$(printf '%s' "$line" | sed 's/.*"inputs_dir":"\([^"]*\)".*/\1/'); test -f "$dir/sample.txt" || exit 3;; esac
      printf '%s' '{"status":"done","answer":"it is a sample"}';;
   *) exit 64;;
 esac"#;
@@ -439,6 +504,7 @@ esac"#;
             "ok    ping (boot)",
             "ok    job turn 1",
             "ok    job turn 2",
+            "ok    job single-turn",
             "ok    close",
             "ok    unknown event",
             "PASS",
@@ -463,6 +529,50 @@ esac"#;
         );
         assert!(
             out.contains("FAIL  unknown event") && out.contains("exit 64"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex #1417 r3: a status other than `done` passes on a session turn but fails the single-turn
+    /// job, exactly as the daemon refuses it there (no strike).
+    #[test]
+    fn needs_input_passes_on_a_session_turn_and_fails_a_single_turn_job() {
+        let script = r#"line=$(cat)
+case "$line" in
+  *'"event":"ping"'*|*'"event":"close"'*) exit 0;;
+  *'"event":"job"'*) printf '%s' '{"status":"needs_input","answer":"which file?"}';;
+  *) exit 64;;
+esac"#;
+        let root = home_with_hook("needs-input", script);
+        let (code, out, _) = run_test(&root, "my-hook");
+        assert_eq!(code, FAILED, "{out}");
+        assert!(out.contains("ok    job turn 1") && out.contains("ok    job turn 2"), "{out}");
+        assert!(
+            out.contains("FAIL  job single-turn")
+                && out.contains("status needs_input on a single-turn job")
+                && out.contains("no strike"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex #1417 r3: a hook that serves every event the daemon sends but exits 0 on an unknown one
+    /// fails as a compatibility issue, not with a strike-or-drop verdict.
+    #[test]
+    fn an_unknown_event_failure_is_reported_as_compatibility() {
+        let script = r#"line=$(cat)
+case "$line" in
+  *'"event":"job"'*) printf '%s' '{"status":"done","answer":"fine"}';;
+  *) exit 0;;
+esac"#;
+        let root = home_with_hook("compat", script);
+        let (code, out, _) = run_test(&root, "my-hook");
+        assert_eq!(code, FAILED, "{out}");
+        assert!(out.contains("ok    job single-turn"), "{out}");
+        assert!(out.contains("FAIL  unknown event"), "{out}");
+        assert!(
+            out.contains("FAIL (compatibility)") && !out.contains("strike or drop"),
             "{out}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -518,11 +628,19 @@ esac"#;
             format!(
                 r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "0.0.0 (fake)"; exit 0; fi
-resume=none; prev=
-for a in "$@"; do [ "$prev" = "--resume" ] && resume="$a"; prev="$a"; done
+resume=none; prev=; restricted=no; nohooks=no
+for a in "$@"; do
+  [ "$prev" = "--resume" ] && resume="$a"
+  [ "$a" = "--restricted" ] && restricted=yes
+  [ "$prev" = "--settings" ] && [ "$a" = '{{"disableAllHooks":true}}' ] && nohooks=yes
+  prev="$a"
+done
 cat >/dev/null
+if [ "$restricted$nohooks" != yesyes ]; then
+  jq -nc '{{type:"result",subtype:"success",is_error:false,result:"UNISOLATED: your hooks saw the prompt"}}'; exit 0
+fi
 echo x >> '{counter}'; n=$(wc -l < '{counter}' | tr -d ' ')
-jq -nc --arg r "turn answer (resumed: $resume)" --arg s "sess-$n" '{{type:"result",is_error:false,result:$r,session_id:$s}}'
+jq -nc --arg r "turn answer (resumed: $resume)" --arg s "sess-$n" '{{type:"result",subtype:"success",is_error:false,result:$r,session_id:$s}}'
 "#,
                 counter = counter.display()
             ),
@@ -557,6 +675,10 @@ jq -nc --arg r "turn answer (resumed: $resume)" --arg s "sess-$n" '{{type:"resul
             out.contains("turn answer (resumed: sess-1)"),
             "turn 2 resumes it:\n{out}"
         );
+        assert!(
+            !out.contains("UNISOLATED"),
+            "claude runs --restricted with hooks off:\n{out}"
+        );
         let left: Vec<_> = std::fs::read_dir(&state).unwrap().collect();
         assert!(
             left.is_empty(),
@@ -566,8 +688,60 @@ jq -nc --arg r "turn answer (resumed: $resume)" --arg s "sess-$n" '{{type:"resul
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The shipped channel adapter: `serve` driven by a fake Claude (an MCP client over stdio that
-    /// answers every channel event through the `answer` tool), `push` as the hook. Every step passes;
+    /// codex #1417 r3: only one successful result envelope with a string reply is an answer. A reply
+    /// that is an object (or an envelope without the success subtype) fails the call: nothing is
+    /// printed as an answer and no session state is saved.
+    #[test]
+    fn the_claude_per_turn_adapter_refuses_an_unexpected_result_envelope() {
+        let tmp = scratch("per-turn-bad");
+        let fake = tmp.join("fake-claude");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "0.0.0 (fake)"; exit 0; fi
+cat >/dev/null
+jq -nc '{type:"result",is_error:false,result:{leaked:"object"},session_id:"sess-x"}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &fake,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let state = tmp.join("state");
+        let script = examples_dir()
+            .join("claude-per-turn.sh")
+            .canonicalize()
+            .unwrap();
+        let root = home_with_argv(
+            "per-turn-bad",
+            vec![
+                "env".into(),
+                format!("CLAUDE_BIN={}", fake.display()),
+                format!("MAXPLAYER_HOOK_STATE={}", state.display()),
+                script.display().to_string(),
+            ],
+        );
+        let (code, out, _) = run_test(&root, "my-hook");
+        assert_eq!(code, FAILED, "{out}");
+        assert!(out.contains("FAIL  job turn 1") && out.contains("a strike"), "{out}");
+        assert!(
+            !out.contains("delivered as status"),
+            "the object is never delivered as an answer: {out}"
+        );
+        let left: Vec<_> = std::fs::read_dir(&state)
+            .map(|dir| dir.collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "no session state saved: {left:?}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The shipped channel adapter: `serve` driven by a fake Claude (an MCP client over stdio), `push`
+    /// as the hook. The fake ignores turn 1 (as a session that answered in its chat would) and answers
+    /// it only after the reminder event; it answers turn 2 at once. Every step passes; the answer tool
+    /// asks to load upfront; every job names the full tool name; only the ignored turn is reminded;
     /// a late answer for turn 1 that arrives while turn 2 waits is refused and never becomes turn 2's
     /// answer; with no session attached, ping fails.
     #[test]
@@ -593,6 +767,7 @@ jq -nc --arg r "turn answer (resumed: $resume)" --arg s "sess-$n" '{{type:"resul
             .arg(&script)
             .arg("serve")
             .env("MAXPLAYER_CHANNEL_DIR", &tmp)
+            .env("MAXPLAYER_CHANNEL_REMIND_SECS", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -632,7 +807,11 @@ jq -nc --arg r "turn answer (resumed: $resume)" --arg s "sess-$n" '{{type:"resul
                     let Some(invocation) = meta["invocation"].as_str() else {
                         continue;
                     };
-                    let turn = meta["turn"].as_str().unwrap_or("?").to_owned();
+                    let turn = if meta["event"] == "reminder" {
+                        "1".to_owned()
+                    } else {
+                        meta["turn"].as_str().unwrap_or("?").to_owned()
+                    };
                     let mut answer = |invocation: &str, text: String| {
                         next_id += 1;
                         write(
@@ -644,8 +823,10 @@ jq -nc --arg r "turn answer (resumed: $resume)" --arg s "sess-$n" '{{type:"resul
                         if let Some(first) = first_invocation.clone() {
                             answer(&first, "late answer for turn 1".into());
                         }
-                    } else {
+                    } else if meta["event"] != "reminder" {
+                        // Turn 1 "answered in the chat": no tool call until the reminder.
                         first_invocation = Some(invocation.to_owned());
+                        continue;
                     }
                     answer(invocation, format!("answer to turn {turn}"));
                 }
@@ -661,7 +842,19 @@ jq -nc --arg r "turn answer (resumed: $resume)" --arg s "sess-$n" '{{type:"resul
             std::thread::sleep(Duration::from_millis(50));
         }
         write(serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        write(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
         std::thread::sleep(Duration::from_millis(200));
+        let tools = replies
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == 2)
+            .cloned()
+            .expect("tools/list reply");
+        assert_eq!(
+            tools["result"]["tools"][0]["_meta"]["anthropic/alwaysLoad"], true,
+            "the answer tool asks Claude Code to load it upfront: {tools}"
+        );
 
         let mut out = Vec::new();
         let passed = run_steps(&argv, &tmp, &mut out);
@@ -694,6 +887,39 @@ jq -nc --arg r "turn answer (resumed: $resume)" --arg s "sess-$n" '{{type:"resul
                 .any(|e| e["params"]["meta"]["event"] == "closed"),
             "close reaches the session"
         );
+        let events = events.lock().unwrap().clone();
+        let jobs: Vec<_> = events
+            .iter()
+            .filter(|e| e["params"]["meta"]["turn"].is_string())
+            .collect();
+        assert_eq!(jobs.len(), 3, "session turns 1 and 2, then the single-turn job: {events:?}");
+        for job in &jobs {
+            let invocation = job["params"]["meta"]["invocation"].as_str().unwrap();
+            let content = job["params"]["content"].as_str().unwrap();
+            assert!(
+                content.starts_with(&format!(
+                    "[Maxplayer job. Deliver your answer ONLY by calling the tool mcp__maxplayer__answer with invocation \"{invocation}\"."
+                )) && content.contains("never delivered"),
+                "each job names the full tool and that a chat reply is not delivered: {content}"
+            );
+        }
+        let reminders: Vec<_> = events
+            .iter()
+            .filter(|e| e["params"]["meta"]["event"] == "reminder")
+            .collect();
+        assert_eq!(
+            reminders.len(),
+            2,
+            "only the calls left unanswered (both turn-1 calls) are reminded: {reminders:?}"
+        );
+        assert_eq!(
+            reminders[0]["params"]["meta"]["invocation"],
+            jobs[0]["params"]["meta"]["invocation"]
+        );
+        assert!(reminders[0]["params"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("mcp__maxplayer__answer"));
         let _ = serve.kill();
         let _ = serve.wait();
         drop(reader);

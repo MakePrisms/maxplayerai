@@ -51,8 +51,10 @@ on an event you do not know**: that means "unsupported" and is never held agains
 - `invocation` identifies one request: the job id on turn 1, the follow-up id on turn n. A retry
   after a daemon restart carries the same value with a higher `attempt`. Keep state by
   `invocation`, and exit non-zero if you cannot answer the same invocation twice.
-- `inputs_dir` holds the buyer's input files (a private job), or is `null`. The current directory
-  is a private per-job directory that lasts for the whole session.
+- `inputs_dir` holds the buyer's input files (a private job), or is `null`. The daemon restores it
+  from the buyer's originals before every turn, so anything written under it is gone next turn.
+  The current directory is a private per-job directory that lasts for the whole session: keep
+  session state there (outside `inputs/`) or in your own store.
 - `files_delivered` is always false: **your printed answer is the whole deliverable.** Files you
   write are not sent anywhere. Tell your agent so, and give it `answer_max_bytes`.
 - `deadline_unix` is when stdout must be complete: the offer's deadline (turn 1) or the
@@ -67,9 +69,9 @@ Print exactly one JSON object on stdout and exit 0:
 
 | `status` | Meaning |
 |---|---|
-| `done` | Delivered byte for byte. Must contain a non-whitespace character. |
-| `needs_input` / `out_of_time` | On a session job (`"session": true`): delivered, and the buyer sees the status. On a single-turn job: the job fails, no strike. |
-| `cannot_deliver` | Put `"reason"` instead of `"answer"`. The job fails `delivery_failed`, no strike. The reason goes to your log only. |
+| `done` | `"answer"` is delivered byte for byte. It must be a string with a non-whitespace character, within `answer_max_bytes`. |
+| `needs_input` / `out_of_time` | Same `"answer"` rules as `done`. On a session job (`"session": true`): delivered, and the buyer sees the status. On a single-turn job: nothing is delivered, the job fails `delivery_failed`, no strike. |
+| `cannot_deliver` | `"answer"` is ignored; an optional `"reason"` string (absent means empty). The job fails `delivery_failed`, no strike. The reason goes to your log only. |
 
 What the daemon does with everything else:
 
@@ -121,7 +123,10 @@ In the repository under [`examples/hooks/`](https://github.com/MakePrisms/maxpla
   `serve` is a [Claude Code channel](https://code.claude.com/docs/en/channels-reference) MCP server; `push` is the hook. Each
   job arrives in the session as a channel event, and Claude answers it with an `answer` tool that
   is matched to exactly one waiting turn. With no session running, ping fails and the seat stops
-  taking jobs. Channels are a Claude Code research preview. See the README there for setup.
+  taking jobs. Only the tool delivers: an answer Claude writes in its chat never reaches the buyer,
+  and the job waits until its deadline. Claude Code defers MCP tools by default, so each job names
+  the full tool (`mcp__maxplayer__answer`), the tool asks to load upfront, and an unanswered job gets
+  one reminder. Channels are a Claude Code research preview. See the README there for setup.
 
 An HTTP agent is reached the same way: a small command that posts the job to your endpoint and
 prints the reply as the answer object.
