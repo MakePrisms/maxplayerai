@@ -117,9 +117,12 @@ impl fmt::Debug for RevalidationDependencies {
 #[derive(Clone, PartialEq, Eq)]
 pub struct VerifiedAssertion {
     identity: FederatedIdentity,
+    profile_assertion: Option<super::public_profile::ProfileAssertion>,
     asserted_key: Option<PublicKey>,
+    owner: Option<PublicKey>,
     capabilities: CanonicalCapabilities,
     authority_deadlines: Vec<DateTime<Utc>>,
+    issued_at: DateTime<Utc>,
     assertion_policy_id: AssertionPolicyId,
     transport_contract_id: TransportContractId,
     revalidation_dependencies: RevalidationDependencies,
@@ -133,8 +136,10 @@ impl VerifiedAssertion {
         issuer: String,
         subject: String,
         asserted_key: Option<PublicKey>,
+        owner: Option<PublicKey>,
         capabilities: CanonicalCapabilities,
         authority_deadlines: Vec<DateTime<Utc>>,
+        issued_at: DateTime<Utc>,
         assertion_policy_id: AssertionPolicyId,
         transport_contract_id: TransportContractId,
         revalidation_dependencies: RevalidationDependencies,
@@ -145,13 +150,29 @@ impl VerifiedAssertion {
         );
         Self {
             identity: FederatedIdentity { issuer, subject },
+            profile_assertion: None,
             asserted_key,
+            owner,
             capabilities,
             authority_deadlines,
+            issued_at,
             assertion_policy_id,
             transport_contract_id,
             revalidation_dependencies,
         }
+    }
+
+    /// Optional output-only evidence; absent for OAuth client-subject assertions.
+    pub fn profile_assertion(&self) -> Option<&super::public_profile::ProfileAssertion> {
+        self.profile_assertion.as_ref()
+    }
+
+    pub(super) fn with_profile_assertion(
+        mut self,
+        value: Option<super::public_profile::ProfileAssertion>,
+    ) -> Self {
+        self.profile_assertion = value;
+        self
     }
 
     /// The issuer-qualified identity.
@@ -163,6 +184,12 @@ impl VerifiedAssertion {
     /// this must equal the proven actor.
     pub const fn asserted_key(&self) -> Option<PublicKey> {
         self.asserted_key
+    }
+
+    /// The verified `nostr_owner_pubkey` of an agent assertion; `None` for a
+    /// key acting for itself.
+    pub const fn owner(&self) -> Option<PublicKey> {
+        self.owner
     }
 
     /// The canonical closed claims/capabilities carried by the assertion.
@@ -183,6 +210,12 @@ impl VerifiedAssertion {
             .copied()
             .min()
             .expect("authority_deadlines is non-empty by construction")
+    }
+
+    /// The verified signed `iat`: the time-checked claim, never optional
+    /// profile evidence.  A `revoke_through` cutoff compares against this.
+    pub const fn issued_at(&self) -> DateTime<Utc> {
+        self.issued_at
     }
 
     /// The stable assertion-policy identity.
@@ -212,8 +245,10 @@ impl VerifiedAssertion {
             "https://test.issuer.example".to_owned(),
             "test-subject".to_owned(),
             Some(asserted_key),
+            None,
             CanonicalCapabilities::from_pairs(vec![]),
             vec![Utc::now() + Duration::seconds(3600)],
+            Utc::now(),
             AssertionPolicyId::zero(),
             TransportContractId::zero(),
             RevalidationDependencies::new(
@@ -258,8 +293,11 @@ impl VerifiedAssertion {
                 subject: "test-subject".to_string(),
             },
             asserted_key,
+            profile_assertion: None,
+            owner: None,
             capabilities: CanonicalCapabilities::from_pairs(vec![]),
             authority_deadlines,
+            issued_at: Utc::now(),
             assertion_policy_id: AssertionPolicyId::zero(),
             transport_contract_id: TransportContractId::zero(),
             revalidation_dependencies: RevalidationDependencies {
@@ -271,6 +309,20 @@ impl VerifiedAssertion {
                 },
             },
         }
+    }
+
+    /// Test-only: the same assertion as an agent assertion owned by `owner`.
+    #[must_use]
+    pub fn with_owner_for_test(mut self, owner: PublicKey) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    /// Test-only: the same assertion with verified signed `iat` `issued_at`.
+    #[must_use]
+    pub fn with_issued_at_for_test(mut self, issued_at: DateTime<Utc>) -> Self {
+        self.issued_at = issued_at;
+        self
     }
 }
 

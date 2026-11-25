@@ -30,7 +30,7 @@ impl Fixture {
             .await
             .unwrap();
         let mut state = (*state).clone();
-        // Use production after_connect policy (floor guard, isolation and
+        // Use production after_connect policy (isolation and
         // session timeouts), not raw SQLx pools that mask deployed failures.
         state.db = production_db(buzz_db::DbConfig::default()).await;
         Arc::make_mut(&mut state.config).require_auth_token = true;
@@ -96,17 +96,18 @@ impl Fixture {
             .bind(count).bind(content).execute(&self.pool).await.unwrap();
     }
     async fn reply(&self, n: usize) -> Event {
-        let reply = event(
-            &self.keys,
-            self.channel,
-            9,
+        self.reply_to(
+            &self.root,
             &format!("reply {n}"),
-            Some(&self.root),
             self.root.created_at.as_secs() + n as u64,
-        );
+        )
+        .await
+    }
+    async fn reply_to(&self, root: &Event, content: &str, at: u64) -> Event {
+        let reply = event(&self.keys, self.channel, 9, content, Some(root), at);
         let ts = chrono::DateTime::from_timestamp(reply.created_at.as_secs() as i64, 0).unwrap();
         let root_ts =
-            chrono::DateTime::from_timestamp(self.root.created_at.as_secs() as i64, 0).unwrap();
+            chrono::DateTime::from_timestamp(root.created_at.as_secs() as i64, 0).unwrap();
         self.state
             .db
             .insert_event_with_thread_metadata(
@@ -117,9 +118,9 @@ impl Fixture {
                     event_id: &reply.id.to_bytes(),
                     event_created_at: ts,
                     channel_id: self.channel,
-                    parent_event_id: Some(&self.root.id.to_bytes()),
+                    parent_event_id: Some(&root.id.to_bytes()),
                     parent_event_created_at: Some(root_ts),
-                    root_event_id: Some(&self.root.id.to_bytes()),
+                    root_event_id: Some(&root.id.to_bytes()),
                     root_event_created_at: Some(root_ts),
                     depth: 1,
                     broadcast: false,
@@ -128,6 +129,27 @@ impl Fixture {
             .await
             .unwrap();
         reply
+    }
+    /// Store `event` as historical data that reached the store another way
+    /// would be: ingest's clock check and the store's channel-event floor
+    /// refuse backdated events.
+    async fn insert_raw(&self, event: &Event) {
+        sqlx::query(
+            "INSERT INTO events (community_id,id,pubkey,created_at,kind,tags,content,sig,received_at,channel_id) \
+             VALUES ($1,$2,$3,to_timestamp($4),$5,$6,$7,$8,now(),$9)",
+        )
+        .bind(self.community.as_uuid())
+        .bind(event.id.to_bytes().to_vec())
+        .bind(event.pubkey.to_bytes().to_vec())
+        .bind(event.created_at.as_secs() as f64)
+        .bind(event.kind.as_u16() as i32)
+        .bind(serde_json::to_value(&event.tags).unwrap())
+        .bind(&event.content)
+        .bind(event.sig.serialize().to_vec())
+        .bind(self.channel)
+        .execute(&self.pool)
+        .await
+        .unwrap();
     }
     async fn aux(&self, kind: u16, target: &Event, channel: Option<Uuid>) -> Event {
         let aux = event(
@@ -180,8 +202,13 @@ impl Fixture {
     }
 }
 
-async fn production_db(mut config: buzz_db::DbConfig) -> buzz_db::Db {
-    config.database_url = crate::test_support::database_url();
+async fn production_db(config: buzz_db::DbConfig) -> buzz_db::Db {
+    production_db_at(crate::test_support::database_url(), config).await
+}
+
+/// [`production_db`] at another URL, such as a proxy in front of the test database.
+async fn production_db_at(database_url: String, mut config: buzz_db::DbConfig) -> buzz_db::Db {
+    config.database_url = database_url;
     config.max_connections = 5;
     buzz_db::Db::new(&config).await.unwrap()
 }
@@ -532,3 +559,166 @@ async fn thread_window_router_aux_row_cap_and_corrupt_page() {
 mod failure_postgres_tests;
 
 mod review_postgres_tests;
+
+/// A deletion of an author-only event is private by its `k` tag alone. Neither
+/// window's aux closure returns one to anyone but its signer, and a read by id
+/// stays author-only after its target is physically gone. Ordinary ingest can
+/// build neither case, so both use stored fixtures.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn private_deletions_reach_only_their_signer_through_windows_and_id_reads() {
+    let f = Fixture::new().await;
+    let reply = f.reply(0).await;
+    let reply_reaction = f.aux(7, &reply, Some(f.channel)).await;
+    let root_reaction = f.aux(7, &f.root, Some(f.channel)).await;
+    let signer = Keys::generate();
+    let deletion = |target: &str, k: &str| {
+        EventBuilder::new(Kind::EventDeletion, "")
+            .tags([
+                Tag::parse(["e", target]).unwrap(),
+                Tag::parse(["k", k]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(f.root.created_at.as_secs() + 120))
+            .sign_with_keys(&signer)
+            .unwrap()
+    };
+    let reminder = buzz_core::kind::KIND_EVENT_REMINDER.to_string();
+    let thread_private = deletion(&reply_reaction.id.to_hex(), &reminder);
+    let thread_public = deletion(&reply_reaction.id.to_hex(), "7");
+    let channel_private = deletion(&root_reaction.id.to_hex(), &reminder);
+    let channel_public = deletion(&root_reaction.id.to_hex(), "7");
+    let orphan_private = deletion(&"ab".repeat(32), &reminder);
+    for event in [
+        &thread_private,
+        &thread_public,
+        &channel_private,
+        &channel_public,
+        &orphan_private,
+    ] {
+        f.state
+            .db
+            .insert_event(f.community, event, None)
+            .await
+            .unwrap();
+    }
+
+    let thread = f.query(&f.filter()).await;
+    let thread = ids(&thread, Some(5));
+    assert!(thread.contains(&thread_public.id.to_hex().as_str()));
+    assert!(!thread.contains(&thread_private.id.to_hex().as_str()));
+
+    let window = json!({"top_level":true,"#h":[f.channel],"kinds":[9],"include_aux":true});
+    let window = f.query(&window).await;
+    let window = ids(&window, Some(5));
+    assert!(window.contains(&channel_public.id.to_hex().as_str()));
+    assert!(!window.contains(&channel_private.id.to_hex().as_str()));
+
+    let by_id = json!([{"ids":[orphan_private.id.to_hex()]}]);
+    for (reader, visible) in [(&f.keys, false), (&signer, true)] {
+        let (status, body) = f.post(reader, "/query", by_id.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(ids(&body, Some(5)).len(), usize::from(visible), "{body}");
+    }
+}
+
+/// A deletion stored before deletions applied atomically can sit beside a
+/// target that is still live. Neither window may serve that reaction or edit
+/// without the deletion that cancels it, and no resend can repair the row once
+/// it is older than the ingest timestamp window. The fixtures store each
+/// deletion without soft-deleting its target, the state such a write left.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn torn_deletions_still_cancel_live_targets_in_both_windows() {
+    let f = Fixture::new().await;
+    let reply = f.reply(0).await;
+    let reaction = f.aux(7, &f.root, Some(f.channel)).await;
+    let edit = f.aux(40003, &f.root, Some(f.channel)).await;
+    let reply_reaction = f.aux(7, &reply, Some(f.channel)).await;
+    let reaction_deletion = f.aux(5, &reaction, None).await;
+    let edit_deletion = f.aux(9005, &edit, Some(f.channel)).await;
+    let reply_reaction_deletion = f.aux(5, &reply_reaction, None).await;
+
+    let window = json!({"top_level":true,"#h":[f.channel],"kinds":[9],"include_aux":true});
+    let legacy = json!({"#h":[f.channel],"#e":[f.root.id.to_hex()],"kinds":[9],
+        "depth_limit":2147483647,"include_aux":true});
+    let mut pairs = vec![(&reaction, &reaction_deletion), (&edit, &edit_deletion)];
+    for (filter, path) in [(&window, "channel window"), (&legacy, "legacy thread")] {
+        if path == "legacy thread" {
+            pairs.push((&reply_reaction, &reply_reaction_deletion));
+        }
+        let page = f.query(filter).await;
+        let all = ids(&page, None);
+        for (target, deletion) in &pairs {
+            assert!(
+                all.contains(&target.id.to_hex().as_str()),
+                "{path}: fixture target must still be live: {page}"
+            );
+            assert!(
+                all.contains(&deletion.id.to_hex().as_str()),
+                "{path}: live kind {} served without its deletion: {page}",
+                target.kind.as_u16()
+            );
+        }
+    }
+}
+
+/// Both thread aux hops read from one day before the root (always a target;
+/// the rows are replies): a reaction and a delete-of-reaction inside that
+/// bound come back, ones dated more than a day before it do not. The only
+/// reply is two days newer than the root, so anchoring on the replies alone
+/// drops the in-bound events. Mutation: drop `since: aux_since` → the
+/// out-of-bound events return → RED; drop the root from the bound → the
+/// in-bound events vanish → RED.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn thread_window_aux_hops_read_from_a_day_before_the_root() {
+    let f = Fixture::new().await;
+    let day = 86_400;
+    let reply = f.reply(2 * day as usize).await;
+    let root_at = f.root.created_at.as_secs();
+    let backdated = |kind: u16, target: &Event, at: u64| {
+        event(&f.keys, f.channel, kind, "aux", Some(target), at)
+    };
+    let reaction_in = backdated(7, &f.root, root_at - day + 60);
+    let reaction_out = backdated(7, &reply, root_at - day - 60);
+    let delete_in = backdated(5, &reaction_in, root_at - day + 120);
+    let delete_out = backdated(5, &reaction_in, root_at - day - 120);
+    for aux in [&reaction_in, &reaction_out, &delete_in, &delete_out] {
+        f.insert_raw(aux).await;
+    }
+    let page = f.query(&f.filter()).await;
+    let all = ids(&page, None);
+    let has = |event: &Event| all.contains(&event.id.to_hex().as_str());
+    assert!(has(&reply), "window row: {page}");
+    assert!(has(&reaction_in), "hop 1 inside the bound: {page}");
+    assert!(has(&delete_in), "hop 2 inside the bound: {page}");
+    assert!(!has(&reaction_out), "hop 1 past the bound: {page}");
+    assert!(!has(&delete_out), "hop 2 past the bound: {page}");
+}
+
+/// An ancient root anchors the thread aux bound at its own time, not at the
+/// wall clock or its recent replies: a reaction from the root's own time and
+/// the deletion of that reaction come back. Mutation: anchor on `Utc::now()`,
+/// or drop the root from the bound → both vanish → RED.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn thread_window_aux_bound_follows_an_ancient_root() {
+    let f = Fixture::new().await;
+    let now = f.root.created_at.as_secs();
+    let root_at = now - 60 * 86_400;
+    let root = event(&f.keys, f.channel, 9, "ancient root", None, root_at);
+    f.insert_raw(&root).await;
+    let reply = f.reply_to(&root, "recent reply", now).await;
+    let reaction = event(&f.keys, f.channel, 7, "aux", Some(&root), root_at + 60);
+    let delete = event(&f.keys, f.channel, 5, "aux", Some(&reaction), root_at + 120);
+    f.insert_raw(&reaction).await;
+    f.insert_raw(&delete).await;
+    let mut filter = f.filter();
+    filter["#e"] = json!([root.id.to_hex()]);
+    let page = f.query(&filter).await;
+    let all = ids(&page, None);
+    let has = |event: &Event| all.contains(&event.id.to_hex().as_str());
+    assert!(has(&reply), "window row: {page}");
+    assert!(has(&reaction), "hop 1 at the root's time: {page}");
+    assert!(has(&delete), "hop 2 at the root's time: {page}");
+}

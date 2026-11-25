@@ -259,9 +259,7 @@ async fn harness(service: &Keys, bind_addr: Option<std::net::SocketAddr>) -> Har
     config.media.s3_bucket = "test".into();
     config.media.s3_region = "test".into();
     let db = buzz_db::Db::from_pool(pool.clone());
-    let redis = deadpool_redis::Config::from_url(&redis_url)
-        .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-        .unwrap();
+    let redis = buzz_pubsub::redis_connection(&redis_url).unwrap();
     let pubsub = Arc::new(
         buzz_pubsub::PubSubManager::new(&redis_url, redis.clone())
             .await
@@ -499,6 +497,7 @@ async fn private_http_acl_precedes_manifest_cache_and_provision_replay_is_reject
         refs: BTreeMap::from([(reference, "22".repeat(20))]),
         packs: vec![],
         parent: None,
+        published_at: None,
     };
     let bytes = manifest.canonical_bytes().unwrap();
     let digest = hex::encode(Sha256::digest(&bytes));

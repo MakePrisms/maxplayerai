@@ -48,24 +48,19 @@ async fn state_with_open_read(open_read: bool) -> Arc<AppState> {
 
 #[tokio::test]
 async fn historical_database_failure_closes_without_eose_and_removes_subscription() {
-    let state = crate::state::tests::test_state_with_database_url(UNREACHABLE_DATABASE).await;
+    let state =
+        crate::state::tests::test_state_with_unreachable_database_url(UNREACHABLE_DATABASE).await;
     let keys = nostr::Keys::generate();
     let TestConn {
         conn, mut send_rx, ..
     } = test_conn(authenticated(keys.public_key()), None);
-    // Make the history query the first database access, not access resolution.
-    state.accessible_channels_cache.insert(
-        (
-            conn.tenant.community(),
-            keys.public_key().to_bytes().to_vec(),
-        ),
-        Vec::new(),
-    );
+    // A NIP-43 membership-list read skips channel-access resolution, so the
+    // history query is the first database access.
 
     handle_req(
         "failed-history".into(),
         vec![Filter::new()
-            .kind(nostr::Kind::Custom(3403))
+            .kind(nostr::Kind::Custom(13534))
             .author(keys.public_key())],
         Vec::new(),
         conn.clone(),
@@ -75,11 +70,7 @@ async fn historical_database_failure_closes_without_eose_and_removes_subscriptio
 
     assert_eq!(
         frames(&mut send_rx),
-        vec![json!([
-            "CLOSED",
-            "failed-history",
-            HISTORICAL_QUERY_FAILED_CLOSED
-        ])],
+        vec![json!(["CLOSED", "failed-history", DATABASE_ERROR_CLOSED])],
         "a failed history query must end with CLOSED and never EOSE"
     );
     assert!(conn.subscriptions.lock().await.is_empty());
@@ -134,11 +125,7 @@ async fn open_read_anonymous_history_failure_closes_without_eose() {
     // admitted; the failure must still end in CLOSED, never EOSE.
     assert_eq!(
         frames(&mut send_rx),
-        vec![json!([
-            "CLOSED",
-            "anon-global",
-            HISTORICAL_QUERY_FAILED_CLOSED
-        ])]
+        vec![json!(["CLOSED", "anon-global", DATABASE_ERROR_CLOSED])]
     );
     assert!(conn.subscriptions.lock().await.is_empty());
     assert_eq!(state.sub_registry.total_subscriptions(), 0);

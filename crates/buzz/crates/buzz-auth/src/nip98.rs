@@ -26,7 +26,7 @@
 //!
 //! ## Freshness
 //!
-//! The default is the unconditional ±60 s window: [`verify_nip98_event`] keeps it, so
+//! The default is the unconditional ±120 s window: [`verify_nip98_event`] keeps it, so
 //! every caller that does not opt in behaves as before.
 //!
 //! A caller MAY opt in to a longer life for a **scoped** token with
@@ -36,13 +36,13 @@
 //! ref scope bounds the token to one branch of one repo, so a longer life adds almost no
 //! blast radius. See `docs/superpowers/briefs/2026-08-31-relay-scoped-token-lifetime.md`.
 
-use nostr::{Alphabet, Event, Kind, SingleLetterTag, TagKind, Timestamp};
+use nostr::{Alphabet, Event, Kind, SingleLetterTag, TagKind};
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::error::AuthError;
 
-const TIMESTAMP_TOLERANCE_SECS: u64 = 60;
+use crate::TIMESTAMP_TOLERANCE_SECS;
 
 /// Default cap on the life of a scoped NIP-98 token: 6 hours.
 ///
@@ -55,31 +55,31 @@ pub const DEFAULT_SCOPED_TOKEN_MAX_LIFETIME_SECS: u64 = 21_600;
 
 /// How old a NIP-98 event may be.
 ///
-/// [`STRICT`](Self::STRICT) is the unconditional ±60 s window and the default. A caller
+/// [`STRICT`](Self::STRICT) is the unconditional ±120 s window and the default. A caller
 /// that grants scoped tokens a longer life passes
 /// [`with_scoped_lifetime_cap`](Self::with_scoped_lifetime_cap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Nip98Freshness {
     /// `Some(cap)` grants a scoped token that carries an `expiration` tag a life of up
-    /// to `cap` seconds. `None` applies the ±60 s window to every token.
+    /// to `cap` seconds. `None` applies the ±120 s window to every token.
     scoped_token_max_lifetime_secs: Option<u64>,
 }
 
 impl Nip98Freshness {
-    /// The ±60 s window for every token, scoped or not. This is the historical rule.
+    /// The ±120 s window for every token, scoped or not. This is the historical rule.
     pub const STRICT: Self = Self {
         scoped_token_max_lifetime_secs: None,
     };
 
     /// Grant a scoped token that carries a NIP-40 `expiration` tag a life of up to
-    /// `cap_secs` seconds. Unscoped tokens keep the ±60 s window.
+    /// `cap_secs` seconds. Unscoped tokens keep the ±120 s window.
     ///
     /// `cap_secs == 0` returns [`STRICT`](Self::STRICT) itself, so a zero cap is the exact
     /// historical rule and nothing more. This is the operator's rollback switch: a cap of 0
     /// must behave as though this feature never shipped. `Some(0)` would not do that — it
     /// keeps a token with an `expiration` tag on the scoped path, where an unparseable
     /// tag, an `expiration` that equals `created_at`, or a malformed `ref` tag all refuse a
-    /// request that the ±60 s window accepts. Those refusals are safe, but they are not a
+    /// request that the ±120 s window accepts. Those refusals are safe, but they are not a
     /// rollback.
     pub const fn with_scoped_lifetime_cap(cap_secs: u64) -> Self {
         if cap_secs == 0 {
@@ -173,7 +173,7 @@ pub fn verify_nip98_event(
 ///
 /// Identical to [`verify_nip98_event`] except for two things:
 ///
-/// - `freshness` chooses the age rule. [`Nip98Freshness::STRICT`] is the ±60 s window;
+/// - `freshness` chooses the age rule. [`Nip98Freshness::STRICT`] is the ±120 s window;
 ///   [`Nip98Freshness::with_scoped_lifetime_cap`] lets a scoped token that carries a
 ///   NIP-40 `expiration` tag live until that expiration, up to the cap.
 /// - The return value carries the ref scope the freshness rule read, so the caller
@@ -223,7 +223,7 @@ pub fn verify_nip98_event_with_policy(
         .and_then(|t| t.content());
 
     // 5. Verify created_at is fresh enough under the caller's policy.
-    let now = Timestamp::now().as_secs();
+    let now = crate::wall_now();
     let event_ts = event.created_at.as_secs();
     check_freshness(event_ts, now, ref_tag, expiration_tag, freshness)?;
 
@@ -376,7 +376,7 @@ pub fn verify_nip98_event_with_policy(
 ///
 /// The rule, in order:
 ///
-/// 1. A future-dated token is always rejected: `created_at <= now + 60`. The skew
+/// 1. A future-dated token is always rejected: `created_at <= now + TIMESTAMP_TOLERANCE_SECS`. The skew
 ///    allowance is unchanged, scoped or not.
 /// 2. Under a cap, a `ref` tag that is not a valid ref name is REFUSED, not ignored. A
 ///    caller that grants scoped tokens a longer life is a caller that enforces scopes,
@@ -385,7 +385,7 @@ pub fn verify_nip98_event_with_policy(
 /// 3. A token gets the expiration rule only when ALL of these hold: the caller granted a
 ///    cap, the token is scoped, and the token carries an `expiration` tag. The
 ///    expiration then REPLACES the upper age bound.
-/// 4. Every other token gets the historical ±60 s window. That is the fail-closed path:
+/// 4. Every other token gets the historical ±120 s window. That is the fail-closed path:
 ///    a scoped token with no explicit, capped expiration buys nothing.
 ///
 /// Under [`Nip98Freshness::STRICT`] only rules 1 and 4 can fire, so a caller that does
@@ -447,12 +447,12 @@ fn check_freshness(
         return Ok(());
     }
 
-    // 4. The historical ±60 s window: unscoped tokens, and scoped tokens with no
+    // 4. The historical ±120 s window: unscoped tokens, and scoped tokens with no
     // `expiration` tag.
     within_window(created_at, now)
 }
 
-/// The historical NIP-98 rule: `created_at` within ±60 s of server time.
+/// The historical NIP-98 rule: `created_at` within ±120 s of server time.
 fn within_window(created_at: u64, now: u64) -> Result<(), AuthError> {
     let delta = now.abs_diff(created_at);
     if delta > TIMESTAMP_TOLERANCE_SECS {
@@ -540,12 +540,18 @@ mod tests {
     }
 
     #[test]
-    fn expired_timestamp_rejected() {
+    fn timestamp_tolerance_is_120s_either_way() {
         let keys = Keys::generate();
-        let old_ts = Timestamp::from(Timestamp::now().as_secs().saturating_sub(120));
-        let json = make_nip98_event(&keys, TEST_URL, TEST_METHOD, None, Some(old_ts));
-        let result = verify_nip98_event(&json, TEST_URL, TEST_METHOD, None);
-        assert!(matches!(result, Err(AuthError::Nip98Invalid(_))));
+        let now = 1_800_000_000u64;
+        for (offset, ok) in [(120, true), (-120, true), (121, false), (-121, false)] {
+            let ts = Timestamp::from(now.saturating_add_signed(offset));
+            let json = make_nip98_event(&keys, TEST_URL, TEST_METHOD, None, Some(ts));
+            let result = crate::test_clock::pinned(now, || {
+                verify_nip98_event(&json, TEST_URL, TEST_METHOD, None)
+            });
+            assert_eq!(result.is_ok(), ok, "offset {offset}s");
+            assert!(ok || matches!(result, Err(AuthError::Nip98Invalid(_))));
+        }
     }
 
     #[test]
@@ -976,9 +982,9 @@ mod tests {
         let keys = Keys::generate();
         let created_at = Timestamp::now().as_secs() - 600;
         let json = make_event_with_tags(&keys, created_at, &[["ref", SCOPE]]);
-        let err = verify_scoped(&json).expect_err("no expiration tag ⇒ the ±60s window");
+        let err = verify_scoped(&json).expect_err("no expiration tag ⇒ the ±120s window");
         assert!(
-            err.to_string().contains("±60s window"),
+            err.to_string().contains("±120s window"),
             "expected the window rejection, got {err}"
         );
     }
@@ -1031,21 +1037,22 @@ mod tests {
         );
     }
 
-    /// §5: unscoped, 2 minutes old → rejected, even with an `expiration` tag and the cap
-    /// granted. The scope is what unlocks the longer life; nothing else does.
+    /// §5: unscoped, 3 minutes old → rejected, even with an `expiration` tag and the cap
+    /// granted. The scope is what unlocks the longer life; nothing else does. (120 s is
+    /// still inside the inclusive ±120 s window, so the probe sits past it.)
     #[test]
-    fn unscoped_token_two_minutes_old_is_rejected_even_with_an_expiration() {
+    fn unscoped_token_three_minutes_old_is_rejected_even_with_an_expiration() {
         let keys = Keys::generate();
         let now = Timestamp::now().as_secs();
-        let created_at = now - 120;
+        let created_at = now - 180;
         let json = make_event_with_tags(
             &keys,
             created_at,
             &[["expiration", &(created_at + 3600).to_string()]],
         );
-        let err = verify_scoped(&json).expect_err("an unscoped token keeps the ±60s window");
+        let err = verify_scoped(&json).expect_err("an unscoped token keeps the ±120s window");
         assert!(
-            err.to_string().contains("±60s window"),
+            err.to_string().contains("±120s window"),
             "expected the window rejection, got {err}"
         );
     }
@@ -1065,7 +1072,7 @@ mod tests {
             "",
             "refs/heads/a b",
         ] {
-            // Fresh, so the ±60 s window would have accepted it. Only the ref tag can
+            // Fresh, so the ±120 s window would have accepted it. Only the ref tag can
             // be the reason it fails.
             let json = make_event_with_tags(&keys, now, &[["ref", bad]]);
             let err = verify_scoped(&json)
@@ -1166,7 +1173,7 @@ mod tests {
     }
 
     /// The public [`verify_nip98_event`] entry point — the one every non-git caller uses
-    /// — stays on the ±60 s window, scope and expiration tags notwithstanding.
+    /// — stays on the ±120 s window, scope and expiration tags notwithstanding.
     #[test]
     fn the_strict_entry_point_ignores_the_scope_and_the_expiration() {
         let keys = Keys::generate();
@@ -1182,9 +1189,9 @@ mod tests {
         );
 
         let err = verify_nip98_event(&json, TEST_URL, TEST_METHOD, None)
-            .expect_err("verify_nip98_event must keep the ±60s window");
+            .expect_err("verify_nip98_event must keep the ±120s window");
         assert!(
-            err.to_string().contains("±60s window"),
+            err.to_string().contains("±120s window"),
             "expected the window rejection, got {err}"
         );
 
@@ -1257,7 +1264,7 @@ mod tests {
 
     /// A zero cap is the operator's rollback switch, so it must be STRICT itself and not a
     /// third behaviour. `Some(0)` used to keep a token that carries an `expiration` tag on
-    /// the scoped path, where three inputs are refused that the ±60 s window accepts: an
+    /// the scoped path, where three inputs are refused that the ±120 s window accepts: an
     /// `expiration` equal to `created_at` once the token ages, an unparseable `expiration`,
     /// and a malformed `ref` tag. Each case below is fresh and unremarkable under STRICT, so
     /// each one fails if a zero cap ever stops meaning "off".

@@ -9,11 +9,15 @@ of modifications.
 ## Decision record
 
 ### Source
-block/buzz `main` @ `30873ba46` (2026-10-11), merged into the previous copy so
+block/buzz `main` @ `298543f55` (2026-11-25), merged into the previous copy so
 the open-relay fork's changes and every Maxplayer change carry over. The merge
-took in 1,056 upstream commits.
+took in 816 upstream commits, among them RustSec dependency fixes (hickory
+0.26.3, ctutils 0.4.5), REQ fixes (subscriptions fenced on CLOSE, `#a` filters
+in SQL before LIMIT, saturating filter limits, a failed history read ends with
+CLOSED) and git push publication only when refs changed.
 
-The previous copy was gudnuf/buzz `sync/upstream-recarry-2026-07-24` @
+The copy before that was block/buzz `30873ba46` (2026-10-11, 1,056 commits),
+and before that gudnuf/buzz `sync/upstream-recarry-2026-07-24` @
 `e18020a63` (based on block/buzz `3bd3a014c`, 2026-07-24). It had been chosen
 over `metadex/mobee-kind-scope` (`c2499afd9`) because it fully contained that
 branch's kind commit on a fresher base.
@@ -135,14 +139,14 @@ Two changes serve the maxplayer seller delivery push (see `NOTICE`, part B):
    as before.
 2. **Lifetime.** A SCOPED token that also carries a NIP-40 `["expiration", <unix>]`
    tag is accepted while `now <= expiration`, up to a cap. UNSCOPED tokens keep the
-   ±60 s NIP-98 window, always. The cap is
+   NIP-98 window (±120 s since upstream #9485), always. The cap is
    `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS` (default 21600 s = 6 h; the NixOS option is
    `services.maxplayer.relay.scopedTokenMaxLifetimeSecs`), and the relay advertises the
    effective value in its NIP-11 `limitation` object as
    `scoped_token_max_lifetime_secs`.
 
 The seller mints one token on the host before a sandboxed job starts and pushes with
-it minutes later, so the ±60 s window cannot serve that push. The scope is what makes
+it minutes later, so the ±120 s window cannot serve that push. The scope is what makes
 the longer life safe: a leaked scoped token can only write one branch of one repo.
 Ship the two together — a long-lived UNSCOPED token would be a push-anywhere
 credential. Work order:
@@ -190,44 +194,48 @@ With `BUZZ_AUTO_MIGRATE=1` the relay migrates its database at startup, before
 it binds its port. Each migration runs in its own transaction; if one fails,
 the relay exits without serving and the next start retries it.
 
-- A database migrated by the relay before this sync records the private-job
-  migration as version 25. The relay moves that record to 100025, then applies
-  upstream's 0025–0060 and Maxplayer's 100026.
-- The upgrade is one-way: the earlier relay then refuses to start ("migration
-  26 was previously applied but is missing in the resolved migrations"). Back
-  up right before switching; rolling back means restoring that backup.
-- Migration 0033 rewrites `events` (every partition) under an exclusive lock,
-  so the first start takes longer the bigger `events` is. Because it is
-  partitioned, `pg_total_relation_size('events')` reports 0 bytes; measure it
-  with `SELECT pg_size_pretty(sum(pg_total_relation_size(relid))) FROM
-  pg_partition_tree('events')`.
-- Migration 0049 stops after a 1 s lock wait or a 5 s index build rather than
-  block writes. If `thread_metadata` is large
-  (`SELECT pg_size_pretty(pg_total_relation_size('thread_metadata'))`),
-  prebuild the index first, while the current relay runs, as
-  `docs/thread-window-deployment.md` describes.
-- Several new migrations wait at most 5 s for a table lock. Start the relay
-  while nothing else holds one, for example not during a `pg_dump`.
-- The writer pool default grew from 20 to 50 connections
-  (`BUZZ_DB_POOL_SIZE`).
-- The relocation logs at `buzz_db` info, which the default log filter
-  (`buzz_relay=info`) hides. To check the result, `SELECT version, description
-  FROM _sqlx_migrations WHERE version IN (25, 100025, 100026)` lists `relay
-  invites`, `private job repositories` and `private job repositories write
-  fence`.
+From the `30873ba46` copy (relay-v13 and earlier since #1134) to this one:
+
+- The relay applies upstream's 0061–0106 and Maxplayer's 100028. Right before
+  0090 it drops the private-job table's write-fence trigger (0090 drops the
+  fence functions, and its `DROP FUNCTION` would fail on that trigger), and it
+  records the original 100026 under the retired file's checksum. Both log once
+  at `buzz_db` info, which the default filter (`buzz_relay=info`) hides.
+- The upgrade is one-way: the earlier relay then refuses to start (`VersionMissing`).
+  Back up right before switching; rolling back means restoring that backup.
+- Upstream's `docs/trigger-retirement-deployment.md` requires a "stop build"
+  between old relays and 0089–0095 so no older writer runs beside them. One
+  relay process, stopped before the new one starts, satisfies that.
+- Migration 0083 adds a unique index on listed channel names and refuses to
+  build over duplicates (`docs/channel-name-uniqueness-deployment.md`).
+  Migration 0086 and the indexes before 0076, 0078 and 0081 build at startup
+  under bounded lock and time budgets; a large `events` table should prebuild
+  0086's index first (`docs/private-media-index-deployment.md`,
+  `scripts/maintenance/prebuild-media-edit-index.sql`). Several migrations wait
+  at most 5 s for a table lock; start the relay while nothing else holds one,
+  for example not during a `pg_dump`.
+- Upstream now defaults `BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED` to true. A
+  database whose rows sit in the `events_p_future` catch-all makes that mode
+  log `Failed to ensure partitions` (`operator_required`) on every run, so
+  `nix/relay.nix` pins it to `false`, keeping the earlier behaviour.
+- NIP-11 `version` changes from 0.2.1 to 0.3.0.
+- To check the result: `SELECT max(version), count(*) FROM _sqlx_migrations`
+  gives `100028` and `110`.
 
 ## Syncing upstream again
 
-The merge base for the next sync is block/buzz `30873ba46`.
+The merge base for the next sync is block/buzz `298543f55`.
 
-1. In a block/buzz clone, branch from `30873ba46`, copy this directory over it
+1. In a block/buzz clone, branch from `298543f55`, copy this directory over it
    (`cp -a crates/buzz/. <clone>/`) and commit. That commit is the Maxplayer
    delta.
 2. Merge the new upstream commit. Keep ours for `NOTICE`, `README.md`,
    `.gitignore` and the trimmed `members`, adding any crate the relay newly
    depends on. Take upstream's `Cargo.lock` and let cargo prune it, then check
-   that every version left is upstream's, apart from the sqlite exception
-   NOTICE names. Upstream migrations keep their numbers.
+   that every version left is upstream's. Upstream migrations keep their
+   numbers. Recompute the crate closure from upstream's manifests, dev-dependencies
+   included, and the single files tests and the router read (`include_str!`,
+   `include_bytes!`, `CARGO_MANIFEST_DIR` joins); NOTICE lists both.
 3. Build and test there; the Postgres tests need that full checkout.
 4. Replace this directory with the result: `git rm -rq crates/buzz`, then
    `mkdir crates/buzz && git -C <clone> archive HEAD -- <paths in NOTICE> |

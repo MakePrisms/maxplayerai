@@ -36,7 +36,7 @@ let
     DATABASE_URL = "postgresql:///${cfg.database}?host=/run/postgresql&user=${cfg.user}";
 
     # Schema: buzz applies its OWN, via the embedded sqlx migrator (migrations/: upstream's
-    # 0001..0060 plus Maxplayer's 100025..100026) when this is enabled — main.rs gates db.migrate()
+    # 0001..0106 plus Maxplayer's 100025..100028) when this is enabled — main.rs gates db.migrate()
     # on it, before the relay binds. The migration set is the COMPLETE source of truth (git_* is
     # 0002, the replica fence floor is 0021); schema/ is upstream's desired-state schema, read by
     # tests and deliberately NOT applied. Upgrade notes: crates/buzz/README.md. "1" = on.
@@ -66,6 +66,12 @@ let
     BUZZ_OPEN_READ = lib.boolToString cfg.openRead;
     BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS = toString cfg.scopedTokenMaxLifetimeSecs;
     MAXPLAYER_TEAM_REPOS = lib.boolToString cfg.teamRepos;
+
+    # Partition manager: keep the pre-2026-11 behaviour (upstream #8464 flipped this to true).
+    # Every event since 2026-07 sits in the populated catch-all events_p_future; advancing a
+    # populated catch-all needs an operator, so with this on the relay logs "Failed to ensure
+    # partitions" (operator_required) on every maintenance run. Writes are unaffected either way.
+    BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED = "false";
   }
   // lib.optionalAttrs (cfg.ownerPubkey != null) { RELAY_OWNER_PUBKEY = cfg.ownerPubkey; };
 in
