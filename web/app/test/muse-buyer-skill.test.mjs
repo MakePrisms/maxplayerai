@@ -20,6 +20,8 @@ import { dirname, join, relative, resolve } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { siteVersion } from "./site-version.mjs";
+
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");   // web/app
 const REPO = resolve(root, "..", "..");                             // repository root
 const SKILLS_DIR = join(root, ".well-known", "skills");
@@ -235,12 +237,13 @@ test("the operational core stays inside the 10000-character reusable-skill budge
     `skill.md is ${size} characters; branch detail belongs in references/`);
 });
 
-test("every version the bundle states equals this tree's version, with no stale literal", () => {
-  const cargo = readFileSync(join(REPO, "Cargo.toml"), "utf8");
-  const version = /^version\s*=\s*"(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)"/m.exec(cargo)[1];
+test("every version the bundle states equals the site version, with no stale literal", () => {
+  // The site version is the latest STABLE release (site-version.mjs): an RC tree keeps the
+  // bundle on the previous stable release; a stable cut moves it.
+  const version = siteVersion(REPO);
   assert.match(skillText(), new RegExp(`\\b${version.replace(/\./g, "\\.")}\\b`),
-    `the core must pin this tree's version (${version})`);
-  // EVERY version stated anywhere in the bundle must be this tree's, unless that same
+    `the core must pin the site version (${version})`);
+  // EVERY version stated anywhere in the bundle must be the site version, unless that same
   // statement labels itself a historical field report. The exemption is bound to the
   // matched line, so one labelled Tier-2 line cannot license a stale claim elsewhere.
   let checked = 0;
@@ -252,7 +255,7 @@ test("every version the bundle states equals this tree's version, with no stale 
         checked += 1;
         if (stated === version) continue;
         assert.match(line, /field[- ]report|Tier 2/i,
-          `${relative(root, file)}:${index + 1} states version ${stated}, not this tree's `
+          `${relative(root, file)}:${index + 1} states version ${stated}, not the site's `
           + `${version}, and does not label itself a field report: ${line.trim()}`);
       }
     });

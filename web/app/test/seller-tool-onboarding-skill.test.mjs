@@ -1,8 +1,9 @@
 /**
  * The served seller-tool-onboarding skill: its shipped invariants.
  *
- * 1. The page pins THIS tree's version at each site a reader acts on: the version sentence, the
- *    checkout tag, and the sandbox image tag.
+ * 1. The page pins the site version (site-version.mjs: the latest STABLE release, never a release
+ *    candidate) at each site a reader acts on: the version sentence, the checkout tag, and the
+ *    sandbox image tag.
  * 2. The page states no other version, except the fixed floor: the first release that knows the
  *    two tool tables.
  * 3. The skill index lists the page, with the frontmatter's name and description.
@@ -10,14 +11,17 @@
  *   node --test web/app/test/seller-tool-onboarding-skill.test.mjs
  *
  * Node builtins only. No network, no docker, no daemon. This is a page-and-index gate, not an
- * acceptance run. A release cut bumps the pins, as it does for the Muse buyer bundle. This test
- * makes a forgotten bump fail CI. Without it, the page would name the previous release.
+ * acceptance run. A stable release cut bumps the pins, as it does for the Muse buyer bundle; an RC
+ * bump leaves them on the latest stable release. This test makes a forgotten stable bump, or an
+ * RC pin, fail CI.
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+
+import { siteVersion } from "./site-version.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");   // web/app
 const REPO = resolve(root, "..", "..");                             // repository root
@@ -30,11 +34,11 @@ const SKILL_FILE = join(root, SKILL_PATH.slice(1));
  */
 const FLOOR = "0.5.9";
 
-const version = /^version\s*=\s*"(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)"/m.exec(readFileSync(join(REPO, "Cargo.toml"), "utf8"))[1];
+const version = siteVersion(REPO);
 const page = readFileSync(SKILL_FILE, "utf8");
 const escaped = (v) => v.replace(/\./g, "\\.");
 
-test("the page pins this tree's version at every site a reader acts on", () => {
+test("the page pins the latest stable version at every site a reader acts on", () => {
   assert.match(page, new RegExp(`This page matches maxplayer ${escaped(version)},`),
     `the version sentence must name ${version}`);
   assert.match(page, new RegExp(`git checkout v${escaped(version)}\\b`),
@@ -43,14 +47,14 @@ test("the page pins this tree's version at every site a reader acts on", () => {
     `the Public route must name the v${version} sandbox image`);
 });
 
-test("the page states no version other than this tree's and the fixed floor", () => {
+test("the page states no version other than the site version and the fixed floor", () => {
   let checked = 0;
   page.split("\n").forEach((line, index) => {
     for (const match of line.matchAll(/\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/g)) {
       checked += 1;
       const stated = match[1];
       assert.ok(stated === version || stated === FLOOR,
-        `skill.md:${index + 1} states version ${stated}; this tree is ${version} and the floor is `
+        `skill.md:${index + 1} states version ${stated}; the site names ${version} and the floor is `
         + `${FLOOR}: ${line.trim()}`);
     }
   });

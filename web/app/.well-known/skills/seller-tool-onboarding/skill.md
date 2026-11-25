@@ -8,7 +8,7 @@ description: Offer a third-party tool to a Maxplayer seller's jobs without givin
 You run a Maxplayer seller, and you want your jobs to use a third-party tool. Use this skill in two
 steps. First route the tool to one option. Then configure that option.
 
-**Version.** This page matches maxplayer 0.8.1, the version of the source tree that publishes it.
+**Version.** This page matches maxplayer 0.8.1, the latest stable release.
 Run `maxplayer --version` first. A daemon older than 0.5.9 knows neither `[[sandbox.held_tools]]`
 nor `[[sandbox.mcp_tools]]`. Upgrade it before you continue.
 
