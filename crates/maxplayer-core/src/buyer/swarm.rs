@@ -558,7 +558,9 @@ impl Engine {
                 let outcome = if answer.is_some() {
                     "collected".to_owned()
                 } else {
-                    format!("collected (no inline answer; files under results/{job_id})")
+                    format!(
+                        "collected (no inline answer; git delivery in the buyer store, read_delivery {job_id})"
+                    )
                 };
                 self.finish(t, "collected", &outcome, answer, false, now)?;
                 let seller = t.seller.as_deref().unwrap_or_default();

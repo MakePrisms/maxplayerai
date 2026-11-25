@@ -564,7 +564,7 @@ fn tools_for(sessions: bool) -> Value {
     }
     tools.push(json!({
         "name": "reply",
-        "description": "Continue a SESSION job with the same seller and the same agent conversation: start the next turn with text (a follow-up instruction or the answer to the seller's needs_input question). Works only when the awarded claim advertised sessions (get_job.session.supported) and the previous turn is settled — otherwise it refuses before anything is signed or reserved ('turn n is still settling …; retry reply shortly' while the daemon settles it, 'turn n could not settle automatically (<reason>); run collect for turn n' when it cannot, 'seller does not support sessions; post a new job'). Each turn costs the job's price, is reserved against the per-job cap AND the session cap (max_session_sats, default 10x the price), and is paid when the turn is settled. deadline_secs bounds the turn (default 3600). close: true (no text) ends the session and pays nothing. Retrying after an error re-sends the same signed follow-up; it never starts a second turn. Then wait with get_job wait_for=result: the daemon settles the delivered turn on its own (get_job.settlement for that turn goes settling → settled, files under results/<job_id>-t<n>), so the next reply can follow; collect turn=<n> is only the explicit retry of a failed settle, and it is your call, not the human's (the reply already reserved its price).",
+        "description": "Continue a SESSION job with the same seller and the same agent conversation: start the next turn with text (a follow-up instruction or the answer to the seller's needs_input question). Works only when the awarded claim advertised sessions (get_job.session.supported) and the previous turn is settled — otherwise it refuses before anything is signed or reserved ('turn n is still settling …; retry reply shortly' while the daemon settles it, 'turn n could not settle automatically (<reason>); run collect for turn n' when it cannot, 'seller does not support sessions; post a new job'). Each turn costs the job's price, is reserved against the per-job cap AND the session cap (max_session_sats, default 10x the price), and is paid when the turn is settled. deadline_secs bounds the turn (default 3600). close: true (no text) ends the session and pays nothing. Retrying after an error re-sends the same signed follow-up; it never starts a second turn. Then wait with get_job wait_for=result: the daemon settles the delivered turn on its own (get_job.settlement for that turn goes settling → settled; a git turn stays in the buyer store, read it with read_delivery turn=<n>, and an inline answer goes to results/<job_id>-t<n>/answer.txt), so the next reply can follow; collect turn=<n> is only the explicit retry of a failed settle, and it is your call, not the human's (the reply already reserved its price).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1568,8 +1568,18 @@ mod tests {
                 .collect()
         };
         let on = names(with_swarm_tools(tools(), true));
-        assert_eq!(&on[..4], ["post_job", "get_job", "collect", "award_claim"]);
-        assert_eq!(&on[4..], SWARM_TOOLS);
+        assert_eq!(
+            &on[..6],
+            [
+                "post_job",
+                "get_job",
+                "collect",
+                "award_claim",
+                "read_delivery",
+                "extract_delivery"
+            ]
+        );
+        assert_eq!(&on[6..], SWARM_TOOLS);
         for tool in with_swarm_tools(tools(), true).as_array().unwrap() {
             assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
             assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{tool}");
@@ -1618,8 +1628,8 @@ mod tests {
         );
         // Sessions are on by default (`[sessions]` unset), so `reply` sits before the swarm tools.
         let listed = names(listed["result"]["tools"].clone());
-        assert_eq!(listed[4], "reply");
-        assert_eq!(listed[5..5 + SWARM_TOOLS.len()], *SWARM_TOOLS);
+        assert_eq!(listed[6], "reply");
+        assert_eq!(listed[7..7 + SWARM_TOOLS.len()], *SWARM_TOOLS);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1689,6 +1699,8 @@ mod tests {
                 "get_job",
                 "collect",
                 "award_claim",
+                "read_delivery",
+                "extract_delivery",
                 "reply",
                 "team_whoami",
                 "team_create",
@@ -1702,8 +1714,8 @@ mod tests {
             ]
         );
         // `reply` is listed because sessions are on by default (`[sessions]` unset).
-        assert_eq!(&names[5..], team::TEAM_TOOLS);
-        for tool in &tools[5..] {
+        assert_eq!(&names[7..], team::TEAM_TOOLS);
+        for tool in &tools[7..] {
             assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
             assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{tool}");
             let description = tool["description"].as_str().unwrap();

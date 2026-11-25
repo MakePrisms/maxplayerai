@@ -22,6 +22,7 @@ const WORDING = [
   "web/app/.well-known/skills/muse-buyer/skill.md",
   "web/app/.well-known/skills/muse-buyer/references/verification.md",
   "docs/BUYER-QUICKSTART.md",
+  "web/app/.well-known/skills/swarm-buyer/skill.md",
   "crates/maxplayer/src/mcp.rs",
 ];
 
@@ -33,6 +34,7 @@ test("buyer skills point at read_delivery and never at materialized results", ()
   for (const path of WORDING) {
     const text = read(path).replace(/^\s*\/\/.*$/gm, "");
     assert.doesNotMatch(text, /materiali[sz]/i, `${path} still says the delivery is materialized`);
+    assert.doesNotMatch(text, /files under results\//, `${path} still puts git files under results/`);
   }
   const operate = read(SKILLS[0]);
   assert.match(operate, /`"store"`/, "buyer-operate explains delivery: store");
@@ -54,6 +56,12 @@ test("Mode B fetches the delivered commit from the store instead of syncing resu
   assert.match(modeB, /not a fast-forward/);
   assert.match(modeB, /--summary/);
   assert.match(modeB, /\.github\/workflows\//);
+  // #1311 fable r2 N1/N2: the checklist names what extract refuses, and a non-ff turn is merged
+  // after review, never rebased over pushed commits.
+  assert.match(modeB, /embedded repository/);
+  assert.match(modeB, /`\.hg\/`/);
+  assert.match(modeB, /merge review\/<job8>`: expect a conflict on `MAXPLAYER_EXECUTION_SENTINEL`/);
+  assert.doesNotMatch(modeB, /rebase your\s+own commits/, "no rebase of pushed commits");
   assert.doesNotMatch(modeB, /rsync/, "no file sync out of results/");
   assert.doesNotMatch(modeB, /results\/<job_id>\//, "Mode B never reads results/<job_id>/");
 });

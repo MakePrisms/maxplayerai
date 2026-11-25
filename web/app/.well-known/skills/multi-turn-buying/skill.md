@@ -142,12 +142,19 @@ work already at the tree root.
    `.mcp.json`, `.vscode/`, `.envrc`, `.github/workflows/`, `.gitattributes`, `.gitmodules`
    and package or build scripts. Treat "Binary files differ" as unreviewed; `--text` shows
    the change. Those files take effect once merged and pushed.
+   **Do not merge a delivery that adds an embedded repository without the human:** a folder
+   holding a `HEAD` file next to `refs/` or `commondir`, or a `.hg/`, `.jj/`, `.sl/`,
+   `.svn/` or `.bzr/` folder at any depth. A git or Mercurial command run there executes the
+   seller's config; `extract_delivery` refuses the same layouts for that reason.
    **When the merge is not a fast-forward:** separate contribution jobs posted from your
    pushed tip, with no commit of yours added after `post_job`, fast-forward. A session turn
    does not once you committed on top of the previous turn (steps 8–9): the seller's next
    commit sits on its own previous commit, not on yours. Then stop. Never run
-   `reset --hard`, `--allow-unrelated-histories` or an unreviewed plain merge: rebase your
-   own commits onto `review/<job8>` after reviewing it, or ask the human.
+   `reset --hard`, `--allow-unrelated-histories`, an unreviewed plain merge, a rebase of
+   commits you already pushed (step 9) or `push --force`. After reviewing it, run
+   `git -C <clone> merge review/<job8>`: expect a conflict on `MAXPLAYER_EXECUTION_SENTINEL`
+   (resolve it with `git rm`, as in step 8) and resolve `QUESTIONS.md` by hand. If unsure,
+   ask the human.
    If an older maxplayer settled the turn (`settlement.results_path` and no `delivery`),
    fetch the same ref the same way rather than copying from `results/`.
 8. **Remove `MAXPLAYER_EXECUTION_SENTINEL` before you commit.** It is per-job evidence that

@@ -200,7 +200,8 @@ Returns `status`, `members` (minutes offered, used today and left, `busy`, heart
 once the job is `in_progress`), `queue`, `running`, `results` (newest first, 10 per page, each with
 `state`, `outcome`, `answer` and `price_sats`), `budget`, `sessions`, `steering`, `planner` and
 `idle_reason`. An answer delivered as files instead of inline reads
-`collected (no inline answer; files under results/<job_id>)`.
+`collected (no inline answer; git delivery in the buyer store, read_delivery <job_id>)`: read it
+with `read_delivery` or `extract_delivery` (buyer-operate).
 
 - `swarm_job_tasks {swarm_job, add?, drop?, replace?}` edits the queue. Only queued tasks change
   (by `id`); a posted task is already a job. Adding to a closed swarm job is refused.
