@@ -108,7 +108,10 @@ impl SellerNodeRunner {
                 );
                 let cutoff = hook::job_cutoff(deadline, now, std::time::Instant::now());
                 opline!("seller node hook job_id={job_id}: running {label} (attempt {attempt})");
-                let report = match self.run_hook_call(job_id, argv, event, &workdir, cutoff, &invocation).await {
+                let report = match self
+                    .run_hook_call(job_id, argv, event, &workdir, cutoff, &invocation)
+                    .await
+                {
                     Ok(report) => report,
                     Err(error) => {
                         opline!("seller node hook job_id={job_id}: runner task failed ({error})");
@@ -122,7 +125,9 @@ impl SellerNodeRunner {
                 match hook::classify_job(&report, HOOK_ANSWER_MAX_BYTES) {
                     // A session claim delivers `needs_input` / `out_of_time` as the result's
                     // `turn_status` (§5.1); a single-turn job delivers `done` only.
-                    JobOutcome::Answer(answer) if answer.status == hook::HookStatus::Done || session_job => {
+                    JobOutcome::Answer(answer)
+                        if answer.status == hook::HookStatus::Done || session_job =>
+                    {
                         let row = crate::seller_node::store::HookOutcomeRow {
                             invocation: invocation.clone(),
                             job_id: job_id.to_owned(),
@@ -248,7 +253,11 @@ impl SellerNodeRunner {
     /// `["session","1"]` and sessions are still on. A claim that cannot be read is no session.
     fn hook_session_job(&self, job_id: &str) -> bool {
         self.node.home().config.sessions.enabled()
-            && self.node.store().claim_advertised_session(job_id).unwrap_or(false)
+            && self
+                .node
+                .store()
+                .claim_advertised_session(job_id)
+                .unwrap_or(false)
     }
 
     /// Deliver a hook's (staged) answer for turn 1 (§7 step 8–9). On a session claim the session row
@@ -272,8 +281,11 @@ impl SellerNodeRunner {
         // A staged non-`done` status exists only for a session claim; sessions switched off since
         // leave nothing to ask the question in (§5.0 rule 3).
         if !session_job && turn_status != Some(crate::session::TurnStatus::Done) {
-            opline!("seller node hook job_id={job_id}: status {status} without a session; nothing delivered");
-            self.hook_refused(job_id, &offer.buyer_pubkey, &workdir).await;
+            opline!(
+                "seller node hook job_id={job_id}: status {status} without a session; nothing delivered"
+            );
+            self.hook_refused(job_id, &offer.buyer_pubkey, &workdir)
+                .await;
             return;
         }
         let metadata = hook_exec_metadata(label, model, wall_ms);
@@ -313,7 +325,9 @@ impl SellerNodeRunner {
             )
             .await;
         if delivered && session_job {
-            opline!("seller node session job_id={job_id}: hook session parked after turn 1 ({label})");
+            opline!(
+                "seller node session job_id={job_id}: hook session parked after turn 1 ({label})"
+            );
             return;
         }
         // Delivered single-turn, or failed by `deliver_inline_with`: terminal, so the staged answer

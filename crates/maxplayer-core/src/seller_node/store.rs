@@ -4112,8 +4112,12 @@ mod tests {
     fn a_hook_turn_one_delivery_and_its_session_commit_together() {
         let (store, path) = fresh_store("hook-session-tx");
         let job = "j".repeat(64);
-        store.claim_and_enqueue(&job, &"o".repeat(64), None, &claim(), 1, 999, 1).expect("claim");
-        store.record_award(&"w".repeat(64), &job, &"b".repeat(64), 2).expect("award");
+        store
+            .claim_and_enqueue(&job, &"o".repeat(64), None, &claim(), 1, 999, 1)
+            .expect("claim");
+        store
+            .record_award(&"w".repeat(64), &job, &"b".repeat(64), 2)
+            .expect("award");
         store.exec_sql_for_test(
             "CREATE TRIGGER fail_session BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'injected'); END",
         );
@@ -4127,26 +4131,80 @@ mod tests {
             5,
             Some(&hook_session(&job)),
         );
-        assert!(failed.is_err(), "the injected session failure fails the delivery");
-        assert!(!store.has_delivery(&job).expect("read"), "no delivery without its session");
-        assert!(store.outbox_row(&format!("result:{job}")).expect("read").is_none(), "nothing to publish");
+        assert!(
+            failed.is_err(),
+            "the injected session failure fails the delivery"
+        );
+        assert!(
+            !store.has_delivery(&job).expect("read"),
+            "no delivery without its session"
+        );
+        assert!(
+            store
+                .outbox_row(&format!("result:{job}"))
+                .expect("read")
+                .is_none(),
+            "nothing to publish"
+        );
         assert!(store.session(&job).expect("read").is_none());
 
         store.exec_sql_for_test("DROP TRIGGER fail_session");
-        assert!(store
-            .deliver_and_enqueue_with_session(&job, "ref-1", crate::gateway::PaymentMode::None, &result(), 4, 999, 5, Some(&hook_session(&job)))
-            .expect("deliver"));
+        assert!(
+            store
+                .deliver_and_enqueue_with_session(
+                    &job,
+                    "ref-1",
+                    crate::gateway::PaymentMode::None,
+                    &result(),
+                    4,
+                    999,
+                    5,
+                    Some(&hook_session(&job))
+                )
+                .expect("deliver")
+        );
         assert!(store.has_delivery(&job).expect("read"));
-        assert!(store.outbox_row(&format!("result:{job}")).expect("read").is_some());
-        assert_eq!(store.session(&job).expect("read"), Some(hook_session(&job)), "the hook session reads back");
-        assert!(!store
-            .deliver_and_enqueue_with_session(&job, "ref-1", crate::gateway::PaymentMode::None, &result(), 4, 999, 6, Some(&hook_session(&job)))
-            .expect("replay"));
+        assert!(
+            store
+                .outbox_row(&format!("result:{job}"))
+                .expect("read")
+                .is_some()
+        );
+        assert_eq!(
+            store.session(&job).expect("read"),
+            Some(hook_session(&job)),
+            "the hook session reads back"
+        );
+        assert!(
+            !store
+                .deliver_and_enqueue_with_session(
+                    &job,
+                    "ref-1",
+                    crate::gateway::PaymentMode::None,
+                    &result(),
+                    4,
+                    999,
+                    6,
+                    Some(&hook_session(&job))
+                )
+                .expect("replay")
+        );
 
         // Ending: parked → closed once; a second ender changes nothing.
-        assert!(store.end_parked_session(&job, crate::session::SessionState::Closed).expect("end"));
-        assert!(!store.end_parked_session(&job, crate::session::SessionState::Expired).expect("again"));
-        assert_eq!(store.session(&job).expect("read").map(|s| s.state), Some(crate::session::SessionState::Closed));
+        assert!(
+            store
+                .end_parked_session(&job, crate::session::SessionState::Closed)
+                .expect("end")
+        );
+        assert!(
+            !store
+                .end_parked_session(&job, crate::session::SessionState::Expired)
+                .expect("again")
+        );
+        assert_eq!(
+            store.session(&job).expect("read").map(|s| s.state),
+            Some(crate::session::SessionState::Closed)
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4183,7 +4241,11 @@ mod tests {
             .expect("the old row survives");
         assert_eq!(old.proxy_host.as_deref(), Some("172.18.0.1"));
         assert_eq!(old.state, crate::session::SessionState::Parked);
-        assert_eq!(old.kind, crate::session::SessionKind::Container, "a row from before hooks is a container session");
+        assert_eq!(
+            old.kind,
+            crate::session::SessionKind::Container,
+            "a row from before hooks is a container session"
+        );
         assert_eq!(
             (
                 old.holder_egress_dev,

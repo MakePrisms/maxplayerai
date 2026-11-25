@@ -11371,8 +11371,17 @@ impl SellerNodeRunner {
         answer: &str,
         exec_metadata: &[gateway::TagSpec],
     ) {
-        self.deliver_inline_with(job_id, offer, seller_pubkey, stored_creq, answer, exec_metadata, None, None)
-            .await;
+        self.deliver_inline_with(
+            job_id,
+            offer,
+            seller_pubkey,
+            stored_creq,
+            answer,
+            exec_metadata,
+            None,
+            None,
+        )
+        .await;
     }
 
     /// [`Self::deliver_inline`] for a hook job (hook-agents §7 step 8, §8.1): `turn_status` is
@@ -19220,7 +19229,8 @@ mod tests {
         turn1_status: &str,
         close_sleep: u32,
     ) -> (SellerNodeRunner, std::path::PathBuf) {
-        boot_hook_session_seller_with(label, relay_url, turn1_status, close_sleep, true, false).await
+        boot_hook_session_seller_with(label, relay_url, turn1_status, close_sleep, true, false)
+            .await
     }
 
     /// `review`: leave the seller's offer/follow-up review ON. The fixture relay has no reviewer, so
@@ -19256,10 +19266,13 @@ case "$line" in
 esac"#,
             events = events.display()
         );
-        let mut preset = crate::home::AgentPresetConfig::hook(vec!["sh".into(), "-c".into(), script]);
+        let mut preset =
+            crate::home::AgentPresetConfig::hook(vec!["sh".into(), "-c".into(), script]);
         preset.model = Some("my-model".into());
         home.config.agents.insert("my-hook".to_owned(), preset);
-        let runner = SellerNodeRunner::boot(home).await.expect("boot the hook session seller");
+        let runner = SellerNodeRunner::boot(home)
+            .await
+            .expect("boot the hook session seller");
         (runner, root)
     }
 
@@ -19296,25 +19309,64 @@ esac"#,
                 now,
             )
             .expect("record offer");
-        let mut draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), crate::gateway::ClaimPayment::None, &[], &Default::default());
+        let mut draft = claim_draft(
+            job_id,
+            buyer_hex,
+            &"s".repeat(64),
+            crate::gateway::ClaimPayment::None,
+            &[],
+            &Default::default(),
+        );
         crate::session::advertise_on_claim(
             &mut draft,
             &runner.node.home().config.sessions,
             true,
             &crate::session::RunscOverlayGate::NotApplicable,
         );
-        assert!(crate::session::claim_supports_sessions(&draft.tags), "premise: the claim advertises a session");
+        assert!(
+            crate::session::claim_supports_sessions(&draft.tags),
+            "premise: the claim advertises a session"
+        );
         store
-            .claim_and_enqueue_pinned(job_id, job_id, None, &draft, now, now + 3_600, now, Some(&hook_pin(runner)))
+            .claim_and_enqueue_pinned(
+                job_id,
+                job_id,
+                None,
+                &draft,
+                now,
+                now + 3_600,
+                now,
+                Some(&hook_pin(runner)),
+            )
             .expect("claim");
-        store.record_award(&Keys::generate().public_key().to_hex(), job_id, buyer_hex, now).expect("award");
+        store
+            .record_award(
+                &Keys::generate().public_key().to_hex(),
+                job_id,
+                buyer_hex,
+                now,
+            )
+            .expect("award");
     }
 
     /// Journal follow-up `fid` as turn `turn` with `text`, as `on_followup` does after admission.
-    fn record_hook_followup(runner: &SellerNodeRunner, fid: &str, job_id: &str, turn: u32, text: &str) {
+    fn record_hook_followup(
+        runner: &SellerNodeRunner,
+        fid: &str,
+        job_id: &str,
+        turn: u32,
+        text: &str,
+    ) {
         let store = runner.node.store();
         store
-            .record_turn(fid, job_id, turn, now_secs_for_test() + 3_600, crate::session::TurnState::Received, now_secs_for_test())
+            .record_turn(
+                fid,
+                job_id,
+                turn,
+                now_secs_for_test() + 3_600,
+                crate::session::TurnState::Received,
+                now_secs_for_test(),
+            )
             .expect("record turn");
         store.set_turn_text(fid, text).expect("turn text");
     }
@@ -19339,7 +19391,8 @@ esac"#,
         let relay = LocalRelay::new(RelayBuilder::default());
         relay.run().await.expect("relay run");
         let relay_url = relay.url().await.to_string();
-        let (runner, root) = boot_hook_session_seller("hook-session-e2e", &relay_url, "done", 0).await;
+        let (runner, root) =
+            boot_hook_session_seller("hook-session-e2e", &relay_url, "done", 0).await;
         let runner = Arc::new(runner);
         let buyer_hex = Keys::generate().public_key().to_hex();
         let job_id = "6".repeat(64);
@@ -19348,43 +19401,92 @@ esac"#,
         runner.execute_job(&job_id, None, false).await;
 
         let store = runner.node.store();
-        let session = store.session(&job_id).expect("read").expect("turn 1 left a session row");
+        let session = store
+            .session(&job_id)
+            .expect("read")
+            .expect("turn 1 left a session row");
         assert_eq!(session.kind, crate::session::SessionKind::Hook);
         assert_eq!(session.state, crate::session::SessionState::Parked);
-        assert_eq!((session.turn, session.harness.as_str(), session.container.as_str()), (1, "my-hook", ""));
-        assert!(store.has_delivery(&job_id).expect("delivery"), "turn 1 was delivered");
-        assert!(!store.hook_job_ids().expect("ids").is_empty(), "a live session keeps the job's hook state");
+        assert_eq!(
+            (
+                session.turn,
+                session.harness.as_str(),
+                session.container.as_str()
+            ),
+            (1, "my-hook", "")
+        );
+        assert!(
+            store.has_delivery(&job_id).expect("delivery"),
+            "turn 1 was delivered"
+        );
+        assert!(
+            !store.hook_job_ids().expect("ids").is_empty(),
+            "a live session keeps the job's hook state"
+        );
         let turn1 = &hook_events(&root)[0];
-        assert_eq!((turn1["turn"].as_u64(), turn1["session"].as_bool()), (Some(1), Some(true)), "turn 1 is told it is a session");
+        assert_eq!(
+            (turn1["turn"].as_u64(), turn1["session"].as_bool()),
+            (Some(1), Some(true)),
+            "turn 1 is told it is a session"
+        );
 
         let fid = "f".repeat(64);
         record_hook_followup(&runner, &fid, &job_id, 2, "and now the follow-up");
-        tokio::task::LocalSet::new().run_until(runner.run_turn(&fid)).await;
+        tokio::task::LocalSet::new()
+            .run_until(runner.run_turn(&fid))
+            .await;
 
         let turn = store.turn(&fid).expect("read").expect("turn row");
-        assert_eq!(turn.state, crate::session::TurnState::Delivered, "turn 2 was delivered");
+        assert_eq!(
+            turn.state,
+            crate::session::TurnState::Delivered,
+            "turn 2 was delivered"
+        );
         let events = hook_events(&root);
         assert_eq!(events.len(), 2, "one call per turn: {events:?}");
         let turn2 = &events[1];
         assert_eq!(turn2["turn"].as_u64(), Some(2));
-        assert_eq!(turn2["invocation"].as_str(), Some(fid.as_str()), "turn n's invocation is its follow-up id");
-        assert_eq!(turn2["prompt"].as_str(), Some("and now the follow-up"), "the follow-up text, verbatim");
+        assert_eq!(
+            turn2["invocation"].as_str(),
+            Some(fid.as_str()),
+            "turn n's invocation is its follow-up id"
+        );
+        assert_eq!(
+            turn2["prompt"].as_str(),
+            Some("and now the follow-up"),
+            "the follow-up text, verbatim"
+        );
         assert_eq!(turn2["session"].as_bool(), Some(true));
         let session = store.session(&job_id).expect("read").expect("row");
-        assert_eq!((session.turn, session.state), (2, crate::session::SessionState::Parked));
+        assert_eq!(
+            (session.turn, session.state),
+            (2, crate::session::SessionState::Parked)
+        );
 
         let observer = connect_observer(&relay_url).await;
         let results = fetch_results(&observer, &job_id).await;
         let turn2_result = results
             .iter()
-            .find(|r| r.tags.iter().any(|t| t.as_slice() == ["e", fid.as_str(), "", "reply"]))
+            .find(|r| {
+                r.tags
+                    .iter()
+                    .any(|t| t.as_slice() == ["e", fid.as_str(), "", "reply"])
+            })
             .expect("turn 2's result answers the follow-up");
         assert_eq!(turn2_result.content, "second");
-        assert_eq!(tag_value(turn2_result, "usage_transport", 1).as_deref(), Some("hook"));
-        assert_eq!(tag_value(turn2_result, "harness", 1).as_deref(), Some("my-hook"));
+        assert_eq!(
+            tag_value(turn2_result, "usage_transport", 1).as_deref(),
+            Some("hook")
+        );
+        assert_eq!(
+            tag_value(turn2_result, "harness", 1).as_deref(),
+            Some("my-hook")
+        );
 
         // A re-drive of the delivered turn neither runs the hook nor publishes again.
-        tokio::task::LocalSet::new().run_until(runner.run_turn(&fid)).await;
+        tokio::task::LocalSet::new()
+            .run_until(runner.run_turn(&fid))
+            .await;
         assert_eq!(hook_events(&root).len(), 2);
 
         observer.disconnect().await;
@@ -19399,7 +19501,9 @@ esac"#,
         let relay = LocalRelay::new(RelayBuilder::default());
         relay.run().await.expect("relay run");
         let relay_url = relay.url().await.to_string();
-        let (runner, root) = boot_hook_session_seller("hook-session-needs-input", &relay_url, "needs_input", 0).await;
+        let (runner, root) =
+            boot_hook_session_seller("hook-session-needs-input", &relay_url, "needs_input", 0)
+                .await;
         let buyer_hex = Keys::generate().public_key().to_hex();
         let job_id = "9".repeat(64);
         seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
@@ -19408,11 +19512,23 @@ esac"#,
 
         let observer = connect_observer(&relay_url).await;
         let results = fetch_results(&observer, &job_id).await;
-        assert_eq!(results.len(), 1, "needs_input on a session claim is delivered");
-        assert_eq!(results[0].content, "first");
-        assert_eq!(tag_value(&results[0], "turn_status", 1).as_deref(), Some("needs_input"));
         assert_eq!(
-            runner.node.store().session(&job_id).expect("read").map(|s| s.state),
+            results.len(),
+            1,
+            "needs_input on a session claim is delivered"
+        );
+        assert_eq!(results[0].content, "first");
+        assert_eq!(
+            tag_value(&results[0], "turn_status", 1).as_deref(),
+            Some("needs_input")
+        );
+        assert_eq!(
+            runner
+                .node
+                .store()
+                .session(&job_id)
+                .expect("read")
+                .map(|s| s.state),
             Some(crate::session::SessionState::Parked),
             "and the session waits for the buyer's answer"
         );
@@ -19429,18 +19545,30 @@ esac"#,
         relay.run().await.expect("relay run");
         let relay_url = relay.url().await.to_string();
         // The hook sleeps 20 s on `close`: the end must not wait for it.
-        let (runner, root) = boot_hook_session_seller("hook-session-close", &relay_url, "done", 20).await;
+        let (runner, root) =
+            boot_hook_session_seller("hook-session-close", &relay_url, "done", 20).await;
         let buyer_hex = Keys::generate().public_key().to_hex();
         let job_id = "a".repeat(64);
         seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
         runner.execute_job(&job_id, None, false).await;
         let workdir = job_workdir(runner.node.home(), &job_id);
-        assert!(workdir.exists(), "premise: the live session kept its directory");
-        let record = runner.node.store().session(&job_id).expect("read").expect("row");
+        assert!(
+            workdir.exists(),
+            "premise: the live session kept its directory"
+        );
+        let record = runner
+            .node
+            .store()
+            .session(&job_id)
+            .expect("read")
+            .expect("row");
 
         let started = std::time::Instant::now();
         runner.close_session(record).await;
-        assert!(started.elapsed() < Duration::from_secs(5), "a hanging close never holds the caller");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a hanging close never holds the caller"
+        );
         assert_eq!(runner.slots.available(), 1, "nor a slot");
 
         let store = runner.node.store();
@@ -19449,16 +19577,32 @@ esac"#,
             Some(crate::session::SessionState::Closed)
         );
         assert!(!workdir.exists(), "the job directory went with the session");
-        assert!(store.hook_job_ids().expect("ids").is_empty(), "and so did the staged outcomes and run records");
-        wait_for(|| hook_events(&root).iter().any(|e| e["event"] == "close"), "the close event").await;
-        let close = hook_events(&root).into_iter().find(|e| e["event"] == "close").expect("close");
+        assert!(
+            store.hook_job_ids().expect("ids").is_empty(),
+            "and so did the staged outcomes and run records"
+        );
+        wait_for(
+            || hook_events(&root).iter().any(|e| e["event"] == "close"),
+            "the close event",
+        )
+        .await;
+        let close = hook_events(&root)
+            .into_iter()
+            .find(|e| e["event"] == "close")
+            .expect("close");
         assert_eq!(close["job_id"].as_str(), Some(job_id.as_str()));
 
         // A second ender (the lifetime tick racing the close) changes nothing and sends no second close.
         let again = store.session(&job_id).expect("read").expect("row");
         runner.close_session(again).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(hook_events(&root).iter().filter(|e| e["event"] == "close").count(), 1);
+        assert_eq!(
+            hook_events(&root)
+                .iter()
+                .filter(|e| e["event"] == "close")
+                .count(),
+            1
+        );
         runner.client.disconnect().await;
         relay.shutdown();
         let _ = std::fs::remove_dir_all(&root);
@@ -19470,27 +19614,48 @@ esac"#,
         let relay = LocalRelay::new(RelayBuilder::default());
         relay.run().await.expect("relay run");
         let relay_url = relay.url().await.to_string();
-        let (runner, root) = boot_hook_session_seller("hook-session-expire", &relay_url, "done", 0).await;
+        let (runner, root) =
+            boot_hook_session_seller("hook-session-expire", &relay_url, "done", 0).await;
         let buyer_hex = Keys::generate().public_key().to_hex();
         let job_id = "b".repeat(64);
         seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
         runner.execute_job(&job_id, None, false).await;
-        assert!(runner.node.home().config.sandbox.is_none(), "premise: a hook-only seat, no sandbox network");
+        assert!(
+            runner.node.home().config.sandbox.is_none(),
+            "premise: a hook-only seat, no sandbox network"
+        );
 
         runner.expire_hook_sessions().await;
         assert_eq!(
-            runner.node.store().session(&job_id).expect("read").map(|s| s.state),
+            runner
+                .node
+                .store()
+                .session(&job_id)
+                .expect("read")
+                .map(|s| s.state),
             Some(crate::session::SessionState::Parked),
             "inside its lifetime the session stays"
         );
-        runner.node.store().exec_sql_for_test("UPDATE sessions SET last_turn_at = 0");
+        runner
+            .node
+            .store()
+            .exec_sql_for_test("UPDATE sessions SET last_turn_at = 0");
         runner.expire_hook_sessions().await;
         assert_eq!(
-            runner.node.store().session(&job_id).expect("read").map(|s| s.state),
+            runner
+                .node
+                .store()
+                .session(&job_id)
+                .expect("read")
+                .map(|s| s.state),
             Some(crate::session::SessionState::Expired)
         );
         assert!(!job_workdir(runner.node.home(), &job_id).exists());
-        wait_for(|| hook_events(&root).iter().any(|e| e["event"] == "close"), "the close event").await;
+        wait_for(
+            || hook_events(&root).iter().any(|e| e["event"] == "close"),
+            "the close event",
+        )
+        .await;
         runner.client.disconnect().await;
         relay.shutdown();
         let _ = std::fs::remove_dir_all(&root);
@@ -19505,7 +19670,8 @@ esac"#,
         relay.run().await.expect("relay run");
         let relay_url = relay.url().await.to_string();
         let (runner, root) =
-            boot_hook_session_seller_with("hook-session-review", &relay_url, "done", 0, true, true).await;
+            boot_hook_session_seller_with("hook-session-review", &relay_url, "done", 0, true, true)
+                .await;
         let buyer_hex = Keys::generate().public_key().to_hex();
         let job_id = "d".repeat(64);
         seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
@@ -19532,23 +19698,49 @@ esac"#,
             holder_proxy_ports: None,
             kind: crate::session::SessionKind::Hook,
         };
-        let draft = gateway::inline_result_draft(&job_id, &buyer_hex, "text/plain", 0, &"h".repeat(64), &"s".repeat(128), "first", &[]);
+        let draft = gateway::inline_result_draft(
+            &job_id,
+            &buyer_hex,
+            "text/plain",
+            0,
+            &"h".repeat(64),
+            &"s".repeat(128),
+            "first",
+            &[],
+        );
         store
-            .deliver_and_enqueue_with_session(&job_id, "ref", crate::gateway::PaymentMode::None, &draft, 1, 2, now_unix(), Some(&session))
+            .deliver_and_enqueue_with_session(
+                &job_id,
+                "ref",
+                crate::gateway::PaymentMode::None,
+                &draft,
+                1,
+                2,
+                now_unix(),
+                Some(&session),
+            )
             .expect("seed turn 1");
         let fid = "e".repeat(64);
         record_hook_followup(&runner, &fid, &job_id, 2, "please run this");
 
-        tokio::task::LocalSet::new().run_until(runner.run_turn(&fid)).await;
+        tokio::task::LocalSet::new()
+            .run_until(runner.run_turn(&fid))
+            .await;
 
-        assert!(hook_events(&root).is_empty(), "the hook never saw the follow-up");
+        assert!(
+            hook_events(&root).is_empty(),
+            "the hook never saw the follow-up"
+        );
         assert_eq!(
             store.turn(&fid).expect("read").map(|t| t.state),
             Some(crate::session::TurnState::Refused),
             "refused, unpaid"
         );
         assert_eq!(
-            store.session(&job_id).expect("read").map(|s| (s.state, s.turn)),
+            store
+                .session(&job_id)
+                .expect("read")
+                .map(|s| (s.state, s.turn)),
             Some((crate::session::SessionState::Parked, 1)),
             "the session stays parked for the buyer to try again"
         );
@@ -19565,9 +19757,16 @@ esac"#,
         let relay = LocalRelay::new(RelayBuilder::default());
         relay.run().await.expect("relay run");
         let relay_url = relay.url().await.to_string();
-        for (enabled, label) in [(true, "hook-claim-session-on"), (false, "hook-claim-session-off")] {
-            let (runner, root) = boot_hook_session_seller_with(label, &relay_url, "done", 0, enabled, false).await;
-            assert!(runner.node.home().config.sandbox.is_none(), "premise: no docker, no sandbox");
+        for (enabled, label) in [
+            (true, "hook-claim-session-on"),
+            (false, "hook-claim-session-off"),
+        ] {
+            let (runner, root) =
+                boot_hook_session_seller_with(label, &relay_url, "done", 0, enabled, false).await;
+            assert!(
+                runner.node.home().config.sandbox.is_none(),
+                "premise: no docker, no sandbox"
+            );
             let buyer = Keys::generate();
             let draft = crate::gateway::OfferDraft::new(
                 &format!("answer me ({label})"),
@@ -19583,9 +19782,18 @@ esac"#,
                 .sign_with_keys(&buyer)
                 .expect("sign offer");
             let job_id = offer.id.to_hex();
-            tokio::task::LocalSet::new().run_until(runner.on_offer(&offer)).await;
+            tokio::task::LocalSet::new()
+                .run_until(runner.on_offer(&offer))
+                .await;
             let store = runner.node.store();
-            assert_eq!(store.claim_row_state(&job_id).expect("claim row").as_deref(), Some("claimed"), "premise: the hook claimed it");
+            assert_eq!(
+                store
+                    .claim_row_state(&job_id)
+                    .expect("claim row")
+                    .as_deref(),
+                Some("claimed"),
+                "premise: the hook claimed it"
+            );
             assert_eq!(
                 store.claim_advertised_session(&job_id).expect("read claim"),
                 enabled,

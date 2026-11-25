@@ -1064,7 +1064,11 @@ mod tests {
     #[test]
     fn a_hook_session_ends_without_docker_and_the_gc_pass_skips_it() {
         let (gc, root) = gc("hook-end");
-        let gc = SessionGc { lifetime_secs: 1, disk_budget_bytes: 0, ..gc };
+        let gc = SessionGc {
+            lifetime_secs: 1,
+            disk_budget_bytes: 0,
+            ..gc
+        };
         let store = gc.store.clone();
         let job = "h".repeat(64);
         let hook = SessionRecord {
@@ -1093,18 +1097,40 @@ mod tests {
         // Far past any lifetime and over any budget: the container GC still leaves it alone.
         let mut cli = Recording::new();
         let report = gc.pass(&mut cli, 1_000_000).unwrap();
-        assert!(report.expired_lifetime.is_empty() && report.evicted_disk.is_empty(), "{report:?}");
-        assert_eq!(store.session(&job).unwrap().unwrap().state, SessionState::Parked);
+        assert!(
+            report.expired_lifetime.is_empty() && report.evicted_disk.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(
+            store.session(&job).unwrap().unwrap().state,
+            SessionState::Parked
+        );
 
-        let errors = end_session(&mut cli, &store, &hook, &paths, SessionState::Closed, 10).unwrap();
+        let errors =
+            end_session(&mut cli, &store, &hook, &paths, SessionState::Closed, 10).unwrap();
         assert!(errors.is_empty(), "{errors:?}");
-        assert!(cli.calls.is_empty(), "no docker call for a hook session: {:?}", cli.calls);
+        assert!(
+            cli.calls.is_empty(),
+            "no docker call for a hook session: {:?}",
+            cli.calls
+        );
         assert!(!paths.workdir.exists());
         assert!(store.hook_job_ids().unwrap().is_empty());
-        assert_eq!(store.session(&job).unwrap().unwrap().state, SessionState::Closed);
-        let again = end_session(&mut cli, &store, &hook, &paths, SessionState::Expired, 11).unwrap();
-        assert_eq!(again, vec![HOOK_SESSION_NOT_PARKED.to_owned()], "the second ender changes nothing");
-        assert_eq!(store.session(&job).unwrap().unwrap().state, SessionState::Closed);
+        assert_eq!(
+            store.session(&job).unwrap().unwrap().state,
+            SessionState::Closed
+        );
+        let again =
+            end_session(&mut cli, &store, &hook, &paths, SessionState::Expired, 11).unwrap();
+        assert_eq!(
+            again,
+            vec![HOOK_SESSION_NOT_PARKED.to_owned()],
+            "the second ender changes nothing"
+        );
+        assert_eq!(
+            store.session(&job).unwrap().unwrap().state,
+            SessionState::Closed
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -829,11 +829,17 @@ impl SellerNodeRunner {
         let home = self.node.home();
         let store = self.node.store();
         let seller_pubkey = self.seller_pubkey.to_hex();
-        Ok(if private
+        Ok(
+            if private
                 && matches!(
-                    self.node.home().config.review.enabled(crate::kinds::SESSION_FOLLOWUP_KIND, buyer),
+                    self.node
+                        .home()
+                        .config
+                        .review
+                        .enabled(crate::kinds::SESSION_FOLLOWUP_KIND, buyer),
                     Ok(true)
-                ) {
+                )
+            {
                 let turns: Vec<SessionTurnRecord> = store
                     .turns(job_id)
                     .map(|turns| {
@@ -869,7 +875,10 @@ impl SellerNodeRunner {
                     fid,
                     &deliveries,
                 ) {
-                    Err(crate::review::private::FollowUpRequestError::TooLarge { needed, limit }) => {
+                    Err(crate::review::private::FollowUpRequestError::TooLarge {
+                        needed,
+                        limit,
+                    }) => {
                         return Err(too_large(needed, limit));
                     }
                     Err(error) => Some(Err(error.to_string())),
@@ -877,7 +886,8 @@ impl SellerNodeRunner {
                 }
             } else {
                 None
-            })
+            },
+        )
     }
 
     /// Start the follow-up review of `fid` (§6.1 step 2) on the local set and return where its
@@ -1380,7 +1390,9 @@ impl SellerNodeRunner {
         };
         let exec_metadata = match &r.exec_metadata {
             Some(metadata) => metadata.clone(),
-            None => seller_exec_metadata(r.agent_command, r.agent_label, wall_time_ms, usage.as_ref()),
+            None => {
+                seller_exec_metadata(r.agent_command, r.agent_label, wall_time_ms, usage.as_ref())
+            }
         };
         let mut draft = match (&commit, &answer) {
             (Some(commit), _) => {
@@ -1557,7 +1569,12 @@ impl SellerNodeRunner {
     /// runs, dispatch by the claim pin, inputs re-materialized, the staged-outcome check keyed by the
     /// follow-up id, one hook call with `turn = n` and the follow-up text, then the turn's RESULT
     /// through [`Self::publish_turn_result`] as an inline delivery. No docker call is made.
-    async fn run_hook_turn(&self, turn: &SessionTurnRecord, offer: &Offer, record: &SessionRecord) -> HookTurnEnd {
+    async fn run_hook_turn(
+        &self,
+        turn: &SessionTurnRecord,
+        offer: &Offer,
+        record: &SessionRecord,
+    ) -> HookTurnEnd {
         let (job_id, fid, n, deadline) = (
             turn.job_id.as_str(),
             turn.followup_id.as_str(),
@@ -1611,7 +1628,9 @@ impl SellerNodeRunner {
         let staged = match store.hook_outcome(fid) {
             Ok(staged) => staged,
             Err(error) => {
-                opline!("seller node session job_id={job_id}: turn {n} staged hook outcome unreadable ({error}); deferred");
+                opline!(
+                    "seller node session job_id={job_id}: turn {n} staged hook outcome unreadable ({error}); deferred"
+                );
                 return HookTurnEnd::Deferred;
             }
         };
@@ -1620,12 +1639,24 @@ impl SellerNodeRunner {
             Ok(pin) => pin,
             Err(error) => return refuse(setup(error)),
         };
-        let label = pin.as_ref().map_or_else(|| record.harness.clone(), |pin| pin.label.clone());
+        let label = pin
+            .as_ref()
+            .map_or_else(|| record.harness.clone(), |pin| pin.label.clone());
         let selected = pin.as_ref().and_then(|pin| {
             self.agents
-                .for_execution(Some((&pin.label, &pin.kind, &pin.fingerprint)), offer.requested_agent.as_deref(), true)
+                .for_execution(
+                    Some((&pin.label, &pin.kind, &pin.fingerprint)),
+                    offer.requested_agent.as_deref(),
+                    true,
+                )
                 .filter(|selected| selected.agent.kind.is_hook())
-                .map(|selected| (selected.index, selected.agent.argv.clone(), selected.agent.kind.clone()))
+                .map(|selected| {
+                    (
+                        selected.index,
+                        selected.agent.argv.clone(),
+                        selected.agent.kind.clone(),
+                    )
+                })
         });
         let model = match selected.as_ref().map(|(_, _, kind)| kind) {
             Some(crate::seller_agents::AgentKind::Hook { model, .. }) => model.clone(),
@@ -1633,24 +1664,35 @@ impl SellerNodeRunner {
         };
         let (status, answer, wall_ms) = match staged {
             Some(row) => {
-                opline!("seller node session job_id={job_id}: turn {n} re-delivering the staged hook outcome (hook not re-run)");
+                opline!(
+                    "seller node session job_id={job_id}: turn {n} re-delivering the staged hook outcome (hook not re-run)"
+                );
                 (row.status, row.answer, row.wall_time_ms)
             }
             None => {
                 let Some((harness, argv, _)) = selected else {
                     return HookTurnEnd::Refused(
                         ReasonCode::CapabilityMissing,
-                        "the hook this session was claimed with is no longer configured as it was".into(),
+                        "the hook this session was claimed with is no longer configured as it was"
+                            .into(),
                     );
                 };
-                match self.call_hook_turn(job_id, fid, n, deadline, &text, offer, harness, &argv, &label).await {
+                match self
+                    .call_hook_turn(
+                        job_id, fid, n, deadline, &text, offer, harness, &argv, &label,
+                    )
+                    .await
+                {
                     Ok(outcome) => outcome,
                     Err(end) => return end,
                 }
             }
         };
         let Some(status) = TurnStatus::parse(&status) else {
-            return HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("staged status {status} unknown"));
+            return HookTurnEnd::Refused(
+                ReasonCode::ExecutionFailed,
+                format!("staged status {status} unknown"),
+            );
         };
         // 4. The turn's RESULT, inline, bound to the follow-up id as every turn's answer is.
         let metadata = super::hook_run::hook_exec_metadata(&label, model.as_deref(), wall_ms);
@@ -1701,23 +1743,35 @@ impl SellerNodeRunner {
         use crate::hook::{self, JobOutcome};
         let store = self.node.store();
         if !super::hook_run::reap_journaled_groups(store, Some(fid)) {
-            opline!("seller node session job_id={job_id}: turn {n}: an earlier hook call is not resolved; deferred");
+            opline!(
+                "seller node session job_id={job_id}: turn {n}: an earlier hook call is not resolved; deferred"
+            );
             return Err(HookTurnEnd::Deferred);
         }
         let attempt = match store.begin_hook_attempt(fid, job_id, now_unix()) {
             Ok(Some(attempt)) => attempt,
             Ok(None) => {
-                opline!("seller node session job_id={job_id}: turn {n}: an earlier hook call is still journaled; deferred");
+                opline!(
+                    "seller node session job_id={job_id}: turn {n}: an earlier hook call is still journaled; deferred"
+                );
                 return Err(HookTurnEnd::Deferred);
             }
-            Err(error) => return Err(HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("attempt journal: {error}"))),
+            Err(error) => {
+                return Err(HookTurnEnd::Refused(
+                    ReasonCode::ExecutionFailed,
+                    format!("attempt journal: {error}"),
+                ));
+            }
         };
         let workdir = job_workdir(self.node.home(), job_id);
         // §6: the inputs are re-materialized from the pinned baseline for every turn, so whatever
         // an earlier turn changed under `inputs/` is restored.
-        let inputs = self
-            .prepare_hook_dir(job_id, &workdir)
-            .map_err(|error| HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("inputs unavailable ({error})")))?;
+        let inputs = self.prepare_hook_dir(job_id, &workdir).map_err(|error| {
+            HookTurnEnd::Refused(
+                ReasonCode::ExecutionFailed,
+                format!("inputs unavailable ({error})"),
+            )
+        })?;
         let event = hook::job_event(
             fid,
             attempt,
@@ -1731,11 +1785,18 @@ impl SellerNodeRunner {
             deadline.saturating_sub(hook::PUBLISH_MARGIN_SECS),
         );
         let cutoff = hook::job_cutoff(deadline, now_secs(), Instant::now());
-        opline!("seller node session job_id={job_id}: turn {n} running {label} (attempt {attempt})");
+        opline!(
+            "seller node session job_id={job_id}: turn {n} running {label} (attempt {attempt})"
+        );
         let report = self
             .run_hook_call(job_id, argv, event, &workdir, cutoff, fid)
             .await
-            .map_err(|error| HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("runner task failed ({error})")))?;
+            .map_err(|error| {
+                HookTurnEnd::Refused(
+                    ReasonCode::ExecutionFailed,
+                    format!("runner task failed ({error})"),
+                )
+            })?;
         let wall_ms = u64::try_from(report.wall.as_millis()).unwrap_or(u64::MAX);
         match hook::classify_job(&report, super::hook_run::HOOK_ANSWER_MAX_BYTES) {
             JobOutcome::Answer(answer) => {
@@ -1749,30 +1810,48 @@ impl SellerNodeRunner {
                 };
                 let row = store
                     .stage_hook_outcome(&row, now_unix())
-                    .map_err(|error| HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("outcome stage failed ({error})")))?;
+                    .map_err(|error| {
+                        HookTurnEnd::Refused(
+                            ReasonCode::ExecutionFailed,
+                            format!("outcome stage failed ({error})"),
+                        )
+                    })?;
                 Ok((row.status, row.answer, row.wall_time_ms))
             }
             JobOutcome::TooLarge { bytes, cap } => Err(HookTurnEnd::Refused(
                 ReasonCode::DeliveryFailed,
                 format!("answer is {bytes} bytes, over the {cap}-byte limit"),
             )),
-            JobOutcome::CannotDeliver(reason) => {
-                Err(HookTurnEnd::Refused(ReasonCode::DeliveryFailed, format!("hook declined to deliver ({reason})")))
-            }
+            JobOutcome::CannotDeliver(reason) => Err(HookTurnEnd::Refused(
+                ReasonCode::DeliveryFailed,
+                format!("hook declined to deliver ({reason})"),
+            )),
             JobOutcome::Interrupted => {
-                opline!("seller node session job_id={job_id}: turn {n} interrupted by daemon shutdown; re-driven at the next start");
+                opline!(
+                    "seller node session job_id={job_id}: turn {n} interrupted by daemon shutdown; re-driven at the next start"
+                );
                 Err(HookTurnEnd::Deferred)
             }
             JobOutcome::OutOfTime { started } => {
                 self.drop_harness(harness, Some(ExecutionFailure::DeadlineExceeded));
                 Err(HookTurnEnd::Refused(
                     ReasonCode::ExecutionFailed,
-                    format!("{} the deadline cutoff", if started { "killed at" } else { "not started: past" }),
+                    format!(
+                        "{} the deadline cutoff",
+                        if started {
+                            "killed at"
+                        } else {
+                            "not started: past"
+                        }
+                    ),
                 ))
             }
             JobOutcome::Broken(why) => {
                 self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
-                Err(HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("hook broke the contract ({why})")))
+                Err(HookTurnEnd::Refused(
+                    ReasonCode::ExecutionFailed,
+                    format!("hook broke the contract ({why})"),
+                ))
             }
         }
     }
@@ -1790,7 +1869,9 @@ impl SellerNodeRunner {
                 .map(|selected| selected.agent.argv.clone())
         });
         let Some(argv) = argv else {
-            opline!("seller node session job_id={job_id}: no close sent (the session's hook is no longer configured as claimed)");
+            opline!(
+                "seller node session job_id={job_id}: no close sent (the session's hook is no longer configured as claimed)"
+            );
             return;
         };
         let (cwd, job) = (self.node.home().root.clone(), job_id.to_owned());
@@ -1798,7 +1879,8 @@ impl SellerNodeRunner {
             let Ok(_permit) = HOOK_CLOSES.acquire().await else {
                 return;
             };
-            let _ = tokio::task::spawn_blocking(move || crate::hook::close(&argv, &cwd, &job)).await;
+            let _ =
+                tokio::task::spawn_blocking(move || crate::hook::close(&argv, &cwd, &job)).await;
         });
     }
 
@@ -1820,7 +1902,8 @@ impl SellerNodeRunner {
         for job in session::expired_by_lifetime(&sizes, now, lifetime) {
             if let Some(record) = parked.iter().find(|s| s.job_id == job) {
                 opline!("seller node: session job_id={job} expired (parked past its lifetime)");
-                self.end_session_now(record.clone(), SessionState::Expired).await;
+                self.end_session_now(record.clone(), SessionState::Expired)
+                    .await;
             }
         }
     }
