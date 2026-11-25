@@ -6676,6 +6676,11 @@ impl SellerNodeRunner {
                     opline!("seller node: shutdown requested ({reason}); retracting the seat and ending the loop");
                     // hook-agents §5.1: running hook groups get SIGTERM, the grace, then SIGKILL.
                     // Their journal entries stay, so a boot after an unclean exit still reaps.
+                    // The latch is process-wide and never unlatches, so in the test binary one
+                    // test's loop shutdown would interrupt every later test's hook; the latch itself
+                    // is covered in `hook::tests` and this wiring is pinned by
+                    // `loop_shutdown_terminates_the_hook_groups`.
+                    #[cfg(not(test))]
                     let _ = tokio::task::spawn_blocking(crate::hook::terminate_all).await;
                     break;
                 }
@@ -8858,27 +8863,26 @@ impl SellerNodeRunner {
         let mut claim = claim;
         // hook-agents §4: a selected HOOK entry advertises sessions iff `[sessions] enabled`. The
         // docker/runsc conditions are about parking containers; a hook session parks nothing.
-        if selected_entry.kind.is_hook() {
-            crate::session::advertise_on_claim(
-                &mut claim,
-                &self.node.home().config.sessions,
-                true,
-                &crate::session::RunscOverlayGate::NotApplicable,
-            );
-        } else {
-            let config = &self.node.home().config;
-            let docker_container_seat = config.sandbox.as_ref().is_some_and(|sandbox| {
+        let config = &self.node.home().config;
+        let hook = selected_entry.kind.is_hook();
+        let docker_container_seat = hook
+            || config.sandbox.as_ref().is_some_and(|sandbox| {
                 sandbox.mode == crate::home::SandboxMode::Docker
                     && sandbox.container_delivery_enabled(crate::seller_exec::job_identity().0)
             });
-            let runsc_gate = self.runsc_gate();
-            crate::session::advertise_on_claim(
-                &mut claim,
-                &config.sessions,
-                docker_container_seat,
-                &runsc_gate,
-            );
-        }
+        let runsc_gate = self.runsc_gate();
+        // hook-agents §4: a hook session parks no container, so the §5.6 gate does not apply.
+        let runsc_gate = if hook {
+            crate::session::RunscOverlayGate::NotApplicable
+        } else {
+            runsc_gate
+        };
+        crate::session::advertise_on_claim(
+            &mut claim,
+            &config.sessions,
+            docker_container_seat,
+            &runsc_gate,
+        );
         let chosen = selected_entry.name.clone();
         let family = selected_entry.family();
         let model = selected_capability.models.first().map(|m| m.model.clone());
@@ -13260,7 +13264,29 @@ mod tests {
     // §5.6 wiring, pinned in the source: the claim and the execution each read the node's LIVE gate
     // (`self.runsc_gate()`), there is exactly one of each call, and the heartbeat refreshes it. A
     // call site that passed `RunscOverlayGate::Open`/`NotApplicable`, or a stale copy, fails here;
-    // the gate functions themselves are covered in `session::tests`.
+    // the gate functions themselves are covered in `session::tests`. The one exception is a selected
+    // HOOK entry (hook-agents §4): it parks no container, so it alone swaps in `NotApplicable`.
+    // hook-agents §5.1 wiring, pinned in the source: the loop's shutdown arm SIGTERMs/SIGKILLs the
+    // running hook groups before it breaks. (Compiled out of the test binary: the latch is
+    // process-wide, so running it here would interrupt every later test's hook.)
+    #[test]
+    fn loop_shutdown_terminates_the_hook_groups() {
+        let source = include_str!("run.rs");
+        let production = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {\n")
+            .expect("tests module")];
+        let arm = production
+            .find("reason = shutdown::next_request(&mut shutdown_rx) => {")
+            .expect("the shutdown arm");
+        let body: String = production[arm..].chars().take(1_200).collect();
+        let body = &body[..body.find("break;").expect("the arm breaks")];
+        assert!(
+            body.contains("#[cfg(not(test))]\n                    let _ = tokio::task::spawn_blocking(crate::hook::terminate_all).await;"),
+            "the shutdown arm must terminate the hook groups before breaking: {body}"
+        );
+        assert_eq!(production.matches("crate::hook::terminate_all").count(), 1);
+    }
+
     #[test]
     fn claim_and_execution_read_the_live_runsc_gate() {
         let source = include_str!("run.rs");
@@ -13278,13 +13304,16 @@ mod tests {
             .unwrap();
         // Char-based windows: the source has multi-byte characters, so byte offsets could split one.
         let before: String = {
-            let mut tail: Vec<char> = production[..claim].chars().rev().take(120).collect();
+            let mut tail: Vec<char> = production[..claim].chars().rev().take(400).collect();
             tail.reverse();
             tail.into_iter().collect()
         };
         let call: String = production[claim..].chars().take(200).collect();
         assert!(
-            before.contains("let runsc_gate = self.runsc_gate();") && call.contains("&runsc_gate,"),
+            before.contains("let runsc_gate = self.runsc_gate();")
+                && before.contains("let runsc_gate = if hook {")
+                && before.contains("} else {\n            runsc_gate\n        };")
+                && call.contains("&runsc_gate,"),
             "the claim must advertise against the live gate: {before}{call}"
         );
         assert_eq!(
