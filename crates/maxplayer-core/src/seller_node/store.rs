@@ -3940,7 +3940,15 @@ impl SellerStore {
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (invocation, attempt, pgid, start) = row?;
+            // A row whose columns cannot even be read (a value of the wrong type) is its own error
+            // too, like an out-of-range one (codex #1403 r3).
+            let (invocation, attempt, pgid, start) = match row {
+                Ok(row) => row,
+                Err(error) => {
+                    out.push(Err(format!("a journaled hook group row is unreadable ({error})")));
+                    continue;
+                }
+            };
             // A group id is a positive pid_t above 1 (0 and 1 widen a group signal).
             out.push(match (u32::try_from(attempt), i32::try_from(pgid)) {
                 (Ok(attempt), Ok(group)) if attempt > 0 && group > 1 => {
@@ -4636,6 +4644,7 @@ mod tests {
             "UPDATE hook_runs SET pgid = 2147483648 WHERE invocation = 'inv'",
             "UPDATE hook_runs SET pgid = 42, attempt = 0 WHERE invocation = 'inv'",
             "UPDATE hook_runs SET pgid = 42, attempt = 5000000000 WHERE invocation = 'inv'",
+            "UPDATE hook_runs SET pgid = 'not a number', attempt = 1 WHERE invocation = 'inv'",
         ] {
             store.lock().expect("lock").execute(bad, []).expect("corrupt");
             let rows = store.journaled_hook_groups(None).expect("list");

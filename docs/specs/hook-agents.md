@@ -387,10 +387,10 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
     id after the listing; each accepted member is signalled through a pidfd that pins it
     (SIGTERM, 2 s, then SIGKILL until none is left; a member that joins during the 2 s gets its
     own SIGTERM). macOS has no pidfd: each member's identity (start time and group) is checked
-    immediately before `kill`. The daemon can be descheduled between the two, so a member
-    that exits in that window and whose pid is handed to a new process would be signalled. macOS assigns pids in sequence, so the freed
-    pid comes back only after the counter wraps; this is accepted rather than leaving every
-    macOS group unresolved;
+    immediately before `kill`. The daemon can be descheduled between the two: if the member
+    exits in that window and its pid is given to a new, unrelated process, that process
+    receives the signal. macOS assigns pids in sequence, so a freed pid comes back only after
+    the counter wraps; this is accepted rather than leaving every macOS group unresolved;
   - no leader (or no recorded identity) ⇒ gone if no process is left in the group; otherwise a
     member whose environment carries this call's `MAXPLAYER_HOOK_RUN` (read after the listing,
     and still the same process afterwards) proves the group ours, and the group is stopped as
@@ -402,8 +402,12 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
   by every listing. The group is over only when `kill(-pgid, 0)` (which delivers nothing) finds
   no process with its id. While the kernel still has one that no listing shows, recovery keeps
   looking until the SIGKILL deadline and then leaves the group unresolved. A group of zombies
-  ends once their parent reaps them; after a daemon crash that is init, at once, and in the
-  daemon that started the group (a re-drive) recovery reaps its own exited children first. One unreadable
+  ends once their parent reaps them. In the daemon that started the group (a re-drive),
+  recovery reaps its own exited children first. After a daemon crash the orphans' parent is
+  PID 1 or the nearest subreaper, so recovery needs one that reaps: init, systemd (system or
+  `--user`), launchd and the image's `tini` all do. Under one that never reaps, the zombies
+  keep the group id and the group stays unresolved: the job waits and lapses at its deadline;
+  nothing is signalled. One unreadable
   process does not stop the others from being checked; it leaves the group unresolved only if
   nothing else proves it ours. A journal row that cannot name a group (attempt 0, a group id of
   0, 1 or above `i32::MAX`) is reported and kept, never skipped, and does not stop the other

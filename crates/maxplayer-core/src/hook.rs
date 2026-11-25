@@ -1934,22 +1934,38 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let mark = dir.path().join("termed");
         let ready = dir.path().join("ready");
+        let termed = dir.path().join("leader-termed");
+        let member = dir.path().join("member-ready");
         // The member is forked by the leader's SIGTERM handler, so it joins strictly after the
-        // first SIGTERM; the leader signals readiness once its handler is installed.
+        // first SIGTERM; each side signals readiness once its own handler is installed.
         let script = format!(
-            "trap '(trap \"echo got > {m}; exit 0\" TERM; while :; do sleep 0.05; done) &' TERM; touch {r}; while :; do sleep 0.05; done",
+            "trap 'touch {t}; (trap \"echo got > {m}; exit 0\" TERM; touch {c}; while :; do sleep 0.05; done) &' TERM; touch {r}; while :; do sleep 0.05; done",
+            t = termed.display(),
             m = mark.display(),
+            c = member.display(),
             r = ready.display()
         );
         let mut ours = spawn_group(&script);
         let pgid = ours.id();
         let identity = process_identity(pgid).expect("identity");
-        let by = Instant::now() + Duration::from_secs(5);
-        while !ready.exists() && Instant::now() < by {
-            std::thread::sleep(POLL);
-        }
-        assert!(ready.exists(), "the leader installed its SIGTERM handler");
-        assert_eq!(reap_stale_group(pgid, Some(&identity), None), StaleReap::Killed);
+        let wait_for = |path: &std::path::Path| {
+            let by = Instant::now() + Duration::from_secs(5);
+            while !path.exists() && Instant::now() < by {
+                std::thread::sleep(POLL);
+            }
+            path.exists()
+        };
+        assert!(wait_for(&ready), "the leader installed its SIGTERM handler");
+        // Once the leader has its SIGTERM, list the group only after the new member has installed
+        // its own handler, so the SIGTERM it gets is never delivered before the trap (codex r3).
+        let list = |pgid: u32| {
+            if termed.exists() {
+                assert!(wait_for(&member), "the member started and installed its SIGTERM handler");
+            }
+            live_group_members(pgid)
+        };
+        let start = identity.split_once('/').expect("boot/start").1.to_owned();
+        assert_eq!(reap_with(pgid, vec![(pgid, start)], None, &list), StaleReap::Killed);
         let _ = ours.wait();
         assert!(mark.exists(), "the member started after the first SIGTERM was sent one too");
     }

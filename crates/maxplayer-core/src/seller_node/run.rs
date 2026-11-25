@@ -19476,14 +19476,19 @@ esac"#,
         runner.execute_job(&job_id, None, false).await;
         let store = runner.node.store();
 
-        // An earlier attempt at turn 2 (another follow-up id) left a group with no recorded
-        // identity: it cannot be proven gone, so it stays unresolved.
+        // An earlier attempt at turn 2 (another follow-up id) left a live group with no recorded
+        // identity and no MAXPLAYER_HOOK_RUN tag: it cannot be proven ours or gone, so it stays
+        // unresolved. (A group id nothing holds would be gone: #1403.)
         let earlier = "5".repeat(64);
+        let mut stranger = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("sleep").arg("30").process_group(0).spawn().expect("spawn")
+        };
         store
             .begin_hook_attempt(&earlier, &job_id, now_unix())
             .expect("attempt");
         store
-            .record_hook_group(&earlier, 4_000_000, None, now_unix())
+            .record_hook_group(&earlier, stranger.id(), None, now_unix())
             .expect("journal");
 
         let retry = "7".repeat(64);
@@ -19500,6 +19505,9 @@ esac"#,
             store.turn(&retry).expect("read").map(|t| t.state),
             Some(crate::session::TurnState::Delivered)
         );
+        assert!(stranger.try_wait().expect("try_wait").is_none(), "an unproven group is never signalled");
+        let _ = stranger.kill();
+        let _ = stranger.wait();
         runner.client.disconnect().await;
         relay.shutdown();
         let _ = std::fs::remove_dir_all(&root);
