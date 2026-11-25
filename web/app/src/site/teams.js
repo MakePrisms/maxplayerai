@@ -600,7 +600,8 @@ function markScene(n) {
   $$('.sc').forEach(s => s.classList.toggle('on', s.dataset.s.split(' ').includes(String(n))));
   // The address follows the section on the stage only. A phone-size page leaves it alone while it scrolls: a phone
   // browser may answer a change of address by bringing its bars back, which resizes the screen under the finger.
-  if (!isDoc()) { try { history.replaceState(null, '', '#' + SCENES[n]); } catch (_) {} }
+  // The hero is the landing view, so it keeps a bare address (maxplayer.ai, not maxplayer.ai/#teams).
+  if (!isDoc()) { try { history.replaceState(null, '', n === 0 ? location.pathname + location.search : '#' + SCENES[n]); } catch (_) {} }
   calls.classList.remove('open');
 }
 
