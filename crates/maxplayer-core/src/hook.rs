@@ -946,24 +946,39 @@ pub fn reap_stale_group(pgid: u32, recorded: Option<&str>, tag: Option<&str>) ->
         None if tag.is_none() => return Unresolved("no process identity was recorded for it".into()),
         None => {}
     }
+    reap_with(pgid, anchors, tag, &live_group_members)
+}
+
+/// [`reap_stale_group`] once the leader check is done, listing members with `list` (a test seam).
+fn reap_with(
+    pgid: u32,
+    mut anchors: Vec<(u32, String)>,
+    tag: Option<&str>,
+    list: &dyn Fn(u32) -> Result<Vec<(u32, String)>, String>,
+) -> StaleReap {
+    use StaleReap::Unresolved;
     let term_until = Instant::now() + KILL_GRACE;
     let kill_until = term_until + STALE_KILL_SETTLE;
-    let mut termed = false;
+    // Members already sent SIGTERM: one that joins the group during the grace gets its own.
+    let mut termed = Vec::new();
     let mut signalled = false;
+    // The previous sweep listed no live member while the group still existed.
+    let mut listed_empty = false;
     loop {
         let killing = Instant::now() >= term_until;
-        let signal = if killing {
-            Some(SIGKILL)
-        } else if termed {
-            None
-        } else {
-            Some(SIGTERM)
-        };
-        match sweep_verified_group(pgid, &mut anchors, tag, signal) {
-            Ok(Sweep::Empty) => return if signalled { StaleReap::Killed } else { StaleReap::Gone },
+        let signal = if killing { SIGKILL } else { SIGTERM };
+        match sweep_verified_group(pgid, &mut anchors, tag, signal, &mut termed, list) {
+            // An empty LISTING is not an empty group: a member forked while the list was taken, by
+            // a process that then exited, is in neither (codex #1403 H3). The group is over when the
+            // kernel has no process with its id (`kill(-pgid, 0)`, which delivers nothing), or when
+            // a second listing is empty too (only zombies are left, and they run nothing).
+            Ok(Sweep::Empty) if listed_empty || !group_exists(pgid) => {
+                return if signalled { StaleReap::Killed } else { StaleReap::Gone };
+            }
+            Ok(Sweep::Empty) => listed_empty = true,
             Ok(Sweep::Live) => {
-                termed = true;
-                signalled |= signal.is_some();
+                listed_empty = false;
+                signalled = true;
             }
             Ok(Sweep::Unanchored(left)) if signalled => {
                 return Unresolved(format!(
@@ -986,7 +1001,7 @@ pub fn reap_stale_group(pgid: u32, recorded: Option<&str>, tag: Option<&str>) ->
 
 /// One pass of [`reap_stale_group`].
 enum Sweep {
-    /// No live process is left in the group.
+    /// The listing found no live process in the group ([`reap_with`] confirms it is over).
     Empty,
     /// Live members remain; all were proven ours (and signalled, if asked).
     Live,
@@ -994,24 +1009,31 @@ enum Sweep {
     Unanchored(usize),
 }
 
-/// List the live members of `pgid`, then accept them only if one of `anchors` (processes already
-/// proven ours, the leader first) still exists in the group afterwards. With no anchor left, a
-/// member that carries `tag` (read AFTER the listing, and still the same process afterwards)
-/// becomes one. Accepted members become anchors and, with `signal`, are each signalled.
+/// List the live members of `pgid` (with `list`), then accept them only if one of `anchors`
+/// (processes already proven ours, the leader first) still exists in the group afterwards. With no
+/// anchor left, a member that carries `tag` (read AFTER the listing, and still the same process
+/// afterwards) becomes one. Accepted members become anchors and are each sent `signal`; SIGTERM
+/// only once per member (`termed`), so a member that joined during the grace still gets one.
+/// One unreadable process or one failed signal does not stop the others from being checked and
+/// signalled (codex #1403 M4); it makes the sweep an error only if nothing else proves the group,
+/// or after every member was tried.
 fn sweep_verified_group(
     pgid: u32,
     anchors: &mut Vec<(u32, String)>,
     tag: Option<&str>,
-    signal: Option<i32>,
+    signal: i32,
+    termed: &mut Vec<(u32, String)>,
+    list: &dyn Fn(u32) -> Result<Vec<(u32, String)>, String>,
 ) -> Result<Sweep, String> {
-    let members = live_group_members(pgid)?;
+    let members = list(pgid)?;
+    let mut unreadable = Vec::new();
     let mut still = Vec::with_capacity(anchors.len());
     for (pid, start) in anchors.drain(..) {
         match proc_state(pid) {
             ProcState::Present { start: now, pgrp, .. } if now == start && (pgrp == pgid || pid == pgid) => {
                 still.push((pid, start));
             }
-            ProcState::Unreadable(error) => return Err(format!("process {pid}: {error}")),
+            ProcState::Unreadable(error) => unreadable.push(format!("process {pid}: {error}")),
             _ => {}
         }
     }
@@ -1031,22 +1053,32 @@ fn sweep_verified_group(
                     ProcState::Present { start: now, pgrp, .. } if now == *start && pgrp == pgid => {
                         anchors.push((*pid, start.clone()));
                     }
-                    ProcState::Unreadable(error) => return Err(format!("process {pid}: {error}")),
+                    ProcState::Unreadable(error) => unreadable.push(format!("process {pid}: {error}")),
                     _ => {}
                 }
             }
         }
         if anchors.is_empty() {
-            return Ok(Sweep::Unanchored(members.len()));
+            // Nothing proved the group ours; an unreadable process might have.
+            return if unreadable.is_empty() { Ok(Sweep::Unanchored(members.len())) } else { Err(unreadable.join("; ")) };
         }
     }
+    let mut failed = Vec::new();
     for (pid, start) in &members {
         if !anchors.iter().any(|(p, s)| p == pid && s == start) {
             anchors.push((*pid, start.clone()));
         }
-        if let Some(sig) = signal {
-            signal_pinned(*pid, start, pgid, sig)?;
+        if signal == SIGTERM && termed.iter().any(|(p, s)| p == pid && s == start) {
+            continue;
         }
+        match signal_pinned(*pid, start, pgid, signal) {
+            Ok(_) if signal == SIGTERM => termed.push((*pid, start.clone())),
+            Ok(_) => {}
+            Err(error) => failed.push(format!("process {pid}: {error}")),
+        }
+    }
+    if !failed.is_empty() {
+        return Err(failed.join("; "));
     }
     Ok(Sweep::Live)
 }
@@ -1063,8 +1095,10 @@ fn tag_in_environ<'a>(entries: impl IntoIterator<Item = &'a [u8]>) -> Option<Str
 
 #[cfg(target_os = "linux")]
 fn proc_state(pid: u32) -> ProcState {
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
+    // Bytes, not UTF-8: `comm` is whatever the process was named (codex #1403 Low), and only the
+    // numeric fields after it are read.
+    let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => String::from_utf8_lossy(&stat).into_owned(),
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => return ProcState::Absent,
         Err(error) => return ProcState::Unreadable(error.to_string()),
     };
@@ -1176,6 +1210,8 @@ fn proc_state(pid: u32) -> ProcState {
     // SAFETY: proc_bsdinfo is plain old data; all-zero is a valid value.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: errno is this thread's; cleared so a failure is not read from an earlier call.
+    unsafe { *libc::__error() = 0 };
     // SAFETY: the buffer is a proc_bsdinfo of exactly `size` bytes, owned by this frame.
     let read = unsafe {
         libc::proc_pidinfo(raw_pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
@@ -1187,11 +1223,16 @@ fn proc_state(pid: u32) -> ProcState {
             zombie: info.pbi_status == MACOS_SZOMB,
         };
     }
+    // A partial record is unreadable whatever errno says (codex #1403 M2); errno only explains a
+    // failure (a return of 0 or less).
+    if read > 0 {
+        return ProcState::Unreadable(format!("proc_pidinfo: short read ({read} of {size} bytes)"));
+    }
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
         // proc_pidinfo does not report exited pids (zombies included): nothing live is there.
         Some(libc::ESRCH) => ProcState::Absent,
-        _ if read > 0 => ProcState::Unreadable(format!("proc_pidinfo: short read ({read} of {size} bytes)")),
+        Some(0) | None => ProcState::Unreadable("proc_pidinfo: no data and no error".into()),
         _ => ProcState::Unreadable(format!("proc_pidinfo: {error}")),
     }
 }
@@ -1254,31 +1295,44 @@ fn procargs2_environ(buf: &[u8]) -> Option<Vec<&[u8]>> {
     Some(strings.take_while(|entry| !entry.is_empty()).collect())
 }
 
-/// The live (non-zombie) processes in group `pgid`, as `(pid, start)`.
+/// The live (non-zombie) processes in group `pgid`, as `(pid, start)`. libproc reports a failure
+/// of `proc_listpgrppids` as 0 with errno set, so errno is cleared first and read on 0 (codex #1403
+/// M2): an error is never an empty group. A full buffer may have cut the list short: it is listed
+/// again into a bigger one. Zero-filled slots are no pid (0 is never in a user group), so the
+/// count's unit (pids or bytes) does not matter.
 #[cfg(target_os = "macos")]
 fn live_group_members(pgid: u32) -> Result<Vec<(u32, String)>, String> {
     let raw_pgid = libc::pid_t::try_from(pgid).map_err(|_| format!("group id {pgid} out of range"))?;
-    // Room for more than the group holds right now; a zero-filled slot is no pid (0 is never in a
-    // user group), so whether the count is in pids or bytes does not matter.
     // SAFETY: a null buffer asks only for the size.
     let estimate = unsafe { libc::proc_listpgrppids(raw_pgid, std::ptr::null_mut(), 0) };
-    let slots = usize::try_from(estimate).unwrap_or(0).max(64) * 2;
-    let mut pids = vec![0 as libc::pid_t; slots];
-    let bytes = libc::c_int::try_from(slots * std::mem::size_of::<libc::pid_t>()).map_err(|_| "too many pids".to_owned())?;
-    // SAFETY: the buffer holds exactly `bytes` bytes of pid_t slots, owned by this frame.
-    let rc = unsafe { libc::proc_listpgrppids(raw_pgid, pids.as_mut_ptr().cast(), bytes) };
-    if rc < 0 {
-        return Err(format!("proc_listpgrppids: {}", std::io::Error::last_os_error()));
-    }
-    let mut members = Vec::new();
-    for pid in pids.into_iter().filter_map(|pid| u32::try_from(pid).ok()).filter(|pid| *pid != 0) {
-        match proc_state(pid) {
-            ProcState::Present { start, pgrp, zombie } if pgrp == pgid && !zombie => members.push((pid, start)),
-            ProcState::Present { .. } | ProcState::Absent => {}
-            ProcState::Unreadable(error) => return Err(format!("process {pid}: {error}")),
+    let mut slots = usize::try_from(estimate).unwrap_or(0).max(64) * 2;
+    for _ in 0..4 {
+        let mut pids = vec![0 as libc::pid_t; slots];
+        let bytes =
+            libc::c_int::try_from(slots * std::mem::size_of::<libc::pid_t>()).map_err(|_| "too many pids".to_owned())?;
+        // SAFETY: errno is this thread's; cleared so a failure is not read from an earlier call.
+        unsafe { *libc::__error() = 0 };
+        // SAFETY: the buffer holds exactly `bytes` bytes of pid_t slots, owned by this frame.
+        let rc = unsafe { libc::proc_listpgrppids(raw_pgid, pids.as_mut_ptr().cast(), bytes) };
+        let error = std::io::Error::last_os_error();
+        if rc < 0 || (rc == 0 && !matches!(error.raw_os_error(), Some(0) | None)) {
+            return Err(format!("proc_listpgrppids: {error}"));
         }
+        if pids.last().is_some_and(|pid| *pid != 0) {
+            slots *= 4;
+            continue;
+        }
+        let mut members = Vec::new();
+        for pid in pids.into_iter().filter_map(|pid| u32::try_from(pid).ok()).filter(|pid| *pid != 0) {
+            match proc_state(pid) {
+                ProcState::Present { start, pgrp, zombie } if pgrp == pgid && !zombie => members.push((pid, start)),
+                ProcState::Present { .. } | ProcState::Absent => {}
+                ProcState::Unreadable(error) => return Err(format!("process {pid}: {error}")),
+            }
+        }
+        return Ok(members);
     }
-    Ok(members)
+    Err(format!("proc_listpgrppids: group {pgid} kept outgrowing the buffer"))
 }
 
 /// Send `sig` to `pid` only while it is still the process `(pid, start)` in group `pgid`. macOS has
@@ -1325,6 +1379,23 @@ fn live_group_members(_pgid: u32) -> Result<Vec<(u32, String)>, String> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn signal_pinned(_pid: u32, _start: &str, _pgid: u32, _sig: i32) -> Result<bool, String> {
     Err("no way to signal a verified process on this host".into())
+}
+
+/// Whether the kernel still has any process (a zombie included) with group id `pgid`: one
+/// `kill(-pgid, 0)`, which checks and delivers nothing. EPERM means one exists that we may not
+/// signal. Ids 0 and 1 are never treated as empty.
+fn group_exists(pgid: u32) -> bool {
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return false;
+    };
+    if pgid <= 1 {
+        return true;
+    }
+    // SAFETY: kill(2) takes two ints and touches no memory of ours; signal 0 is not delivered.
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// `kill(-pgid, sig)`, refusing the widening ids 0 and 1. Errors (ESRCH: the group is gone) are
@@ -1765,6 +1836,80 @@ mod tests {
         assert_eq!(reap_stale_group(pgid, None, Some("job-n/1")), StaleReap::Killed);
         let status = ours.wait().expect("wait");
         assert!(status.code().is_none(), "killed by a signal: {status:?}");
+    }
+
+    /// codex #1403 H3: one empty listing does not end the reap while the kernel still has the group
+    /// (a member forked during the listing, by a process that then exited, is in no listing yet).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_empty_listing_is_not_an_empty_group() {
+        let mut ours = spawn_tagged_group("sleep 30", "job-e/1");
+        let pgid = ours.id();
+        std::thread::sleep(Duration::from_millis(50));
+        let calls = std::cell::Cell::new(0);
+        let missed_once = |pgid: u32| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 { Ok(Vec::new()) } else { live_group_members(pgid) }
+        };
+        assert_eq!(reap_with(pgid, Vec::new(), Some("job-e/1"), &missed_once), StaleReap::Killed);
+        let status = ours.wait().expect("wait");
+        assert!(status.code().is_none(), "the member the first listing missed was stopped: {status:?}");
+    }
+
+    /// The other side of H3: a group whose only process is a zombie (nobody reaped it yet) is over.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_group_of_only_zombies_is_gone() {
+        let mut leader = spawn_tagged_group("exit 0", "job-z/1");
+        let pgid = leader.id();
+        let by = Instant::now() + Duration::from_secs(5);
+        while !live_group_members(pgid).expect("list").is_empty() && Instant::now() < by {
+            std::thread::sleep(POLL);
+        }
+        assert!(group_exists(pgid), "the unreaped leader still holds the group id");
+        assert_eq!(reap_stale_group(pgid, None, Some("job-z/1")), StaleReap::Gone);
+        let _ = leader.wait();
+        assert!(!group_exists(pgid), "reaped: the kernel has no process with that group id");
+    }
+
+    /// codex #1403 M4: a member that joins the group after the first SIGTERM gets its own SIGTERM
+    /// during the grace, not only the SIGKILL at its end.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_member_that_joins_during_the_grace_still_gets_sigterm() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mark = dir.path().join("termed");
+        let script = format!(
+            "trap : TERM; sleep 0.3; (trap 'echo got > {m}; exit 0' TERM; while :; do sleep 0.05; done) & while :; do sleep 0.05; done",
+            m = mark.display()
+        );
+        let mut ours = spawn_group(&script);
+        let pgid = ours.id();
+        let identity = process_identity(pgid).expect("identity");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(reap_stale_group(pgid, Some(&identity), None), StaleReap::Killed);
+        let _ = ours.wait();
+        assert!(mark.exists(), "the member started after the first SIGTERM was sent one too");
+    }
+
+    /// codex #1403 Low: `comm` can hold any bytes; the process is still readable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_with_a_non_utf8_name_is_readable() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("tmp");
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("sleep");
+        let link = dir.path().join(std::ffi::OsStr::from_bytes(b"sl\xffp"));
+        std::os::unix::fs::symlink(sleep, &link).expect("link");
+        let mut child = Command::new(&link).arg("30").spawn().expect("spawn");
+        std::thread::sleep(Duration::from_millis(100));
+        let state = proc_state(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(matches!(state, ProcState::Present { .. }), "{state:?}");
     }
 
     #[test]

@@ -385,13 +385,24 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
   - the leader is alive with the recorded identity ⇒ the group's live members are listed and
     accepted only while a process already proven ours (the leader first) still holds the group
     id after the listing; each accepted member is signalled through a pidfd that pins it
-    (SIGTERM, 2 s, then SIGKILL until none is left). macOS has no pidfd: each member's identity
-    is checked immediately before `kill`;
+    (SIGTERM, 2 s, then SIGKILL until none is left; a member that joins during the 2 s gets its
+    own SIGTERM). macOS has no pidfd: each member's identity (start time and group) is checked
+    immediately before `kill`, so a member that exits in that instant and whose pid is handed
+    to a new process at once would be signalled. macOS assigns pids in sequence, so the freed
+    pid comes back only after the counter wraps; this is accepted rather than leaving every
+    macOS group unresolved;
   - no leader (or no recorded identity) ⇒ gone if no process is left in the group; otherwise a
     member whose environment carries this call's `MAXPLAYER_HOOK_RUN` (read after the listing,
     and still the same process afterwards) proves the group ours, and the group is stopped as
     above. With no such member (a hook that cleared its environment, another attempt's tag, or a
     group from before the tag) it is **unresolved**: nothing is signalled and the job waits.
+
+  "No process left" is decided by the kernel, not by one listing: a listing misses a member
+  forked while it ran by a process that then exited. The group is over when `kill(-pgid, 0)`
+  (which delivers nothing) finds no process with its id, or when a second listing is empty too
+  (only zombies are left). One unreadable process does not stop the others from being checked;
+  it leaves the group unresolved only if nothing else proves it ours. A journal row that cannot
+  name a group (attempt 0, group id 0 or 1, out of range) is an error, never skipped.
 
   Unresolved also covers unreadable process state, a host other than Linux or macOS, a row with
   neither a recorded identity nor a tagged member, and members that outlive SIGKILL. An unresolved group keeps its journal

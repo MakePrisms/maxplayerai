@@ -3934,8 +3934,17 @@ impl SellerStore {
         let mut out = Vec::new();
         for row in rows {
             let (invocation, attempt, pgid, start) = row?;
-            if let (Ok(attempt), Ok(pgid)) = (u32::try_from(attempt), u32::try_from(pgid)) {
-                out.push(JournaledHookGroup { invocation, attempt, pgid, start });
+            // A row that cannot name a group is an error, never skipped: a skipped row would read
+            // as "nothing left running" (codex #1403 store.rs:3838).
+            match (u32::try_from(attempt), u32::try_from(pgid)) {
+                (Ok(attempt), Ok(pgid)) if attempt > 0 && pgid > 1 => {
+                    out.push(JournaledHookGroup { invocation, attempt, pgid, start });
+                }
+                _ => {
+                    return Err(StoreError(format!(
+                        "journaled hook group of {invocation} is invalid (attempt {attempt}, group {pgid})"
+                    )));
+                }
             }
         }
         Ok(out)
@@ -4595,6 +4604,25 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = SellerStore::open(&path).expect("open");
         (store, path)
+    }
+
+    /// codex #1403: a journal row that cannot name a group is an error, never silently skipped.
+    #[test]
+    fn an_invalid_journaled_hook_group_is_an_error_not_skipped() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
+        assert_eq!(store.begin_hook_attempt("inv", "job-h", 1).expect("begin"), Some(1));
+        store.record_hook_group("inv", 42, Some("7"), 2).expect("record");
+        assert_eq!(store.journaled_hook_groups().expect("list").len(), 1);
+        for bad in [
+            "UPDATE hook_runs SET pgid = -5",
+            "UPDATE hook_runs SET pgid = 1",
+            "UPDATE hook_runs SET pgid = 42, attempt = 0",
+            "UPDATE hook_runs SET pgid = 42, attempt = 5000000000",
+        ] {
+            store.lock().expect("lock").execute(bad, []).expect("corrupt");
+            assert!(store.journaled_hook_groups().is_err(), "{bad}");
+        }
     }
 
     #[test]
