@@ -924,6 +924,10 @@ pub fn reap_stale_group(pgid: u32, recorded: Option<&str>, tag: Option<&str>) ->
     if !STALE_REAP_SUPPORTED {
         return Unresolved("this host has no process table to verify a process group with".into());
     }
+    // A group id is a positive pid_t; 0, 1 and anything above i32::MAX would widen or wrap.
+    if pgid <= 1 || libc::pid_t::try_from(pgid).is_err() {
+        return Unresolved(format!("{pgid} is not a usable process group id"));
+    }
     let mut anchors = Vec::new();
     match recorded {
         Some(recorded) => {
@@ -962,24 +966,29 @@ fn reap_with(
     // Members already sent SIGTERM: one that joins the group during the grace gets its own.
     let mut termed = Vec::new();
     let mut signalled = false;
-    // The previous sweep listed no live member while the group still existed.
-    let mut listed_empty = false;
     loop {
         let killing = Instant::now() >= term_until;
         let signal = if killing { SIGKILL } else { SIGTERM };
         match sweep_verified_group(pgid, &mut anchors, tag, signal, &mut termed, list) {
             // An empty LISTING is not an empty group: a member forked while the list was taken, by
-            // a process that then exited, is in neither (codex #1403 H3). The group is over when the
-            // kernel has no process with its id (`kill(-pgid, 0)`, which delivers nothing), or when
-            // a second listing is empty too (only zombies are left, and they run nothing).
-            Ok(Sweep::Empty) if listed_empty || !group_exists(pgid) => {
-                return if signalled { StaleReap::Killed } else { StaleReap::Gone };
+            // a process that then exited, is in neither (codex #1403 H3), and a hook that keeps
+            // forking and exiting can be missed by every listing (codex #1403 r2 High). The group is
+            // over only when the kernel has no process with its id (`kill(-pgid, 0)`, which
+            // delivers nothing). While it still has one that no listing shows, keep looking until
+            // the deadline, then leave it unresolved. A zombie-only group ends once its parent
+            // reaps it: after a daemon crash that parent is init, which reaps at once; when this
+            // process started the group (a re-drive in the same daemon), we are, so our own exited
+            // children in it are reaped first.
+            Ok(Sweep::Empty) => {
+                reap_own_exited_children(pgid);
+                if !group_exists(pgid) {
+                    return if signalled { StaleReap::Killed } else { StaleReap::Gone };
+                }
+                if Instant::now() >= kill_until {
+                    return Unresolved(format!("group {pgid} still exists but no live process of it could be listed"));
+                }
             }
-            Ok(Sweep::Empty) => listed_empty = true,
-            Ok(Sweep::Live) => {
-                listed_empty = false;
-                signalled = true;
-            }
+            Ok(Sweep::Live) => signalled = true,
             Ok(Sweep::Unanchored(left)) if signalled => {
                 return Unresolved(format!(
                     "{left} process(es) remain in group {pgid} but none of ours is left to prove they are ours"
@@ -1385,8 +1394,9 @@ fn signal_pinned(_pid: u32, _start: &str, _pgid: u32, _sig: i32) -> Result<bool,
 /// `kill(-pgid, 0)`, which checks and delivers nothing. EPERM means one exists that we may not
 /// signal. Ids 0 and 1 are never treated as empty.
 fn group_exists(pgid: u32) -> bool {
+    // An id kill(2) cannot take is never reported empty: the caller keeps the group (codex #1403 r2).
     let Ok(pgid) = libc::pid_t::try_from(pgid) else {
-        return false;
+        return true;
     };
     if pgid <= 1 {
         return true;
@@ -1396,6 +1406,22 @@ fn group_exists(pgid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Reap every exited child of THIS process in group `pgid` (`waitpid(-pgid, WNOHANG)`): only our
+/// own children, only once they have exited, so nothing running is touched. Used once a stale
+/// group lists no live member: its leader may be our own unreaped zombie, which still holds the id.
+fn reap_own_exited_children(pgid: u32) {
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    if pgid <= 1 {
+        return;
+    }
+    let mut status = 0;
+    // SAFETY: waitpid writes only `status`, an int owned by this frame. WNOHANG never blocks; it
+    // returns 0 (children left, none exited) or -1 (ECHILD: none of ours in the group) to stop.
+    while unsafe { libc::waitpid(-pgid, &mut status, libc::WNOHANG) } > 0 {}
 }
 
 /// `kill(-pgid, sig)`, refusing the widening ids 0 and 1. Errors (ESRCH: the group is gone) are
@@ -1760,9 +1786,9 @@ mod tests {
         let identity = process_identity(pgid).expect("identity");
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(reap_stale_group(pgid, Some(&identity), None), StaleReap::Killed);
-        let status = ours.wait().expect("wait");
-        assert!(status.code().is_none(), "killed by a signal: {status:?}");
         assert!(!group_alive(pgid), "Killed means nothing live is left in the group");
+        assert!(!group_exists(pgid), "and our own exited leader was reaped: the group id is free");
+        let _ = ours.wait();
     }
 
     #[cfg(target_os = "linux")]
@@ -1834,8 +1860,8 @@ mod tests {
         assert!(matches!(reap_stale_group(pgid, None, Some("job-n/9")), StaleReap::Unresolved(_)));
         assert!(ours.try_wait().expect("try_wait").is_none(), "a wrong tag signals nothing");
         assert_eq!(reap_stale_group(pgid, None, Some("job-n/1")), StaleReap::Killed);
-        let status = ours.wait().expect("wait");
-        assert!(status.code().is_none(), "killed by a signal: {status:?}");
+        assert!(!group_exists(pgid), "nothing is left in the group, our reaped leader included");
+        let _ = ours.wait();
     }
 
     /// codex #1403 H3: one empty listing does not end the reap while the kernel still has the group
@@ -1852,14 +1878,33 @@ mod tests {
             if calls.get() == 1 { Ok(Vec::new()) } else { live_group_members(pgid) }
         };
         assert_eq!(reap_with(pgid, Vec::new(), Some("job-e/1"), &missed_once), StaleReap::Killed);
-        let status = ours.wait().expect("wait");
-        assert!(status.code().is_none(), "the member the first listing missed was stopped: {status:?}");
+        assert!(!group_exists(pgid), "the member the first listing missed was stopped");
+        let _ = ours.wait();
     }
 
-    /// The other side of H3: a group whose only process is a zombie (nobody reaped it yet) is over.
+    /// codex #1403 r2 High: empty listings never end the reap while the kernel still has the group
+    /// (here a live process no listing shows, like a hook that keeps forking past every scan): it
+    /// is kept, unresolved, at the deadline.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_group_of_only_zombies_is_gone() {
+    fn a_group_no_listing_shows_is_kept_while_the_kernel_has_it() {
+        let mut hidden = spawn_tagged_group("sleep 30", "job-h/1");
+        let pgid = hidden.id();
+        let never_listed = |_: u32| Ok(Vec::new());
+        assert!(
+            matches!(reap_with(pgid, Vec::new(), Some("job-h/1"), &never_listed), StaleReap::Unresolved(_)),
+            "the group still exists: kept"
+        );
+        assert!(hidden.try_wait().expect("try_wait").is_none(), "nothing was signalled or reaped");
+        let _ = hidden.kill();
+        let _ = hidden.wait();
+    }
+
+    /// The other side: a group whose only process is our own exited leader (a re-drive in the
+    /// daemon that started it) is reaped and gone, not left unresolved.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_group_of_our_own_exited_leader_is_gone() {
         let mut leader = spawn_tagged_group("exit 0", "job-z/1");
         let pgid = leader.id();
         let by = Instant::now() + Duration::from_secs(5);
@@ -1868,8 +1913,17 @@ mod tests {
         }
         assert!(group_exists(pgid), "the unreaped leader still holds the group id");
         assert_eq!(reap_stale_group(pgid, None, Some("job-z/1")), StaleReap::Gone);
-        let _ = leader.wait();
         assert!(!group_exists(pgid), "reaped: the kernel has no process with that group id");
+        let _ = leader.wait();
+    }
+
+    /// codex #1403 r2 Low: ids kill(2) cannot take are never signalled nor reported empty.
+    #[test]
+    fn an_unusable_group_id_is_unresolved() {
+        for pgid in [0, 1, u32::MAX, (i32::MAX as u32) + 1] {
+            assert!(matches!(reap_stale_group(pgid, None, Some("job-q/1")), StaleReap::Unresolved(_)), "{pgid}");
+        }
+        assert!(group_exists((i32::MAX as u32) + 1), "out of range is never empty");
     }
 
     /// codex #1403 M4: a member that joins the group after the first SIGTERM gets its own SIGTERM
@@ -1879,14 +1933,22 @@ mod tests {
     fn a_member_that_joins_during_the_grace_still_gets_sigterm() {
         let dir = tempfile::tempdir().expect("tmp");
         let mark = dir.path().join("termed");
+        let ready = dir.path().join("ready");
+        // The member is forked by the leader's SIGTERM handler, so it joins strictly after the
+        // first SIGTERM; the leader signals readiness once its handler is installed.
         let script = format!(
-            "trap : TERM; sleep 0.3; (trap 'echo got > {m}; exit 0' TERM; while :; do sleep 0.05; done) & while :; do sleep 0.05; done",
-            m = mark.display()
+            "trap '(trap \"echo got > {m}; exit 0\" TERM; while :; do sleep 0.05; done) &' TERM; touch {r}; while :; do sleep 0.05; done",
+            m = mark.display(),
+            r = ready.display()
         );
         let mut ours = spawn_group(&script);
         let pgid = ours.id();
         let identity = process_identity(pgid).expect("identity");
-        std::thread::sleep(Duration::from_millis(100));
+        let by = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < by {
+            std::thread::sleep(POLL);
+        }
+        assert!(ready.exists(), "the leader installed its SIGTERM handler");
         assert_eq!(reap_stale_group(pgid, Some(&identity), None), StaleReap::Killed);
         let _ = ours.wait();
         assert!(mark.exists(), "the member started after the first SIGTERM was sent one too");

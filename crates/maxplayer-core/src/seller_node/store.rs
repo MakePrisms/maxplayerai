@@ -3922,32 +3922,40 @@ impl SellerStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Every journaled group a previous daemon may have left running.
-    pub fn journaled_hook_groups(&self) -> Result<Vec<JournaledHookGroup>, StoreError> {
+    /// Every journaled group a previous daemon may have left running, or only `only`'s. A row that
+    /// cannot name a group comes back as its own `Err`, never skipped (a skipped row would read as
+    /// "nothing left running", codex #1403) and never failing the other rows (codex #1403 r2): the
+    /// caller keeps it and still reaps the valid ones.
+    pub fn journaled_hook_groups(
+        &self,
+        only: Option<&str>,
+    ) -> Result<Vec<Result<JournaledHookGroup, String>>, StoreError> {
         let conn = self.lock()?;
         let mut statement = conn.prepare(
-            "SELECT invocation, attempt, pgid, pgid_start FROM hook_runs WHERE pgid IS NOT NULL ORDER BY invocation",
+            "SELECT invocation, attempt, pgid, pgid_start FROM hook_runs \
+             WHERE pgid IS NOT NULL AND (?1 IS NULL OR invocation = ?1) ORDER BY invocation",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([only], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<String>>(3)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
             let (invocation, attempt, pgid, start) = row?;
-            // A row that cannot name a group is an error, never skipped: a skipped row would read
-            // as "nothing left running" (codex #1403 store.rs:3838).
-            match (u32::try_from(attempt), u32::try_from(pgid)) {
-                (Ok(attempt), Ok(pgid)) if attempt > 0 && pgid > 1 => {
-                    out.push(JournaledHookGroup { invocation, attempt, pgid, start });
+            // A group id is a positive pid_t above 1 (0 and 1 widen a group signal).
+            out.push(match (u32::try_from(attempt), i32::try_from(pgid)) {
+                (Ok(attempt), Ok(group)) if attempt > 0 && group > 1 => {
+                    Ok(JournaledHookGroup { invocation, attempt, pgid: group.unsigned_abs(), start })
                 }
-                _ => {
-                    return Err(StoreError(format!(
-                        "journaled hook group of {invocation} is invalid (attempt {attempt}, group {pgid})"
-                    )));
-                }
-            }
+                _ => Err(format!("the journaled hook group of {invocation} is invalid (attempt {attempt}, group {pgid})")),
+            });
         }
         Ok(out)
+    }
+
+    /// Run raw SQL on the store (tests that need a row no writer produces).
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(&self, sql: &str) {
+        self.lock().expect("lock").execute(sql, []).expect("execute");
     }
 
     /// The assigned agent for a job, if any. Inspection/tests.
@@ -4606,22 +4614,37 @@ mod tests {
         (store, path)
     }
 
-    /// codex #1403: a journal row that cannot name a group is an error, never silently skipped.
+    /// The valid journaled groups (tests: every row must be valid).
+    fn valid_groups(store: &SellerStore) -> Vec<JournaledHookGroup> {
+        store.journaled_hook_groups(None).expect("list").into_iter().map(|row| row.expect("valid row")).collect()
+    }
+
+    /// codex #1403: a journal row that cannot name a group is an error, never silently skipped;
+    /// r2: it is its own error, so the valid rows still come back, and `only` reads one invocation.
     #[test]
     fn an_invalid_journaled_hook_group_is_an_error_not_skipped() {
         let dir = tempfile::tempdir().expect("tmp");
         let store = SellerStore::open(dir.path().join("seller.sqlite")).expect("open");
         assert_eq!(store.begin_hook_attempt("inv", "job-h", 1).expect("begin"), Some(1));
         store.record_hook_group("inv", 42, Some("7"), 2).expect("record");
-        assert_eq!(store.journaled_hook_groups().expect("list").len(), 1);
+        assert_eq!(store.begin_hook_attempt("ok", "job-k", 1).expect("begin"), Some(1));
+        store.record_hook_group("ok", 43, None, 1).expect("record");
+        assert_eq!(valid_groups(&store).len(), 2);
         for bad in [
-            "UPDATE hook_runs SET pgid = -5",
-            "UPDATE hook_runs SET pgid = 1",
-            "UPDATE hook_runs SET pgid = 42, attempt = 0",
-            "UPDATE hook_runs SET pgid = 42, attempt = 5000000000",
+            "UPDATE hook_runs SET pgid = -5 WHERE invocation = 'inv'",
+            "UPDATE hook_runs SET pgid = 1 WHERE invocation = 'inv'",
+            "UPDATE hook_runs SET pgid = 2147483648 WHERE invocation = 'inv'",
+            "UPDATE hook_runs SET pgid = 42, attempt = 0 WHERE invocation = 'inv'",
+            "UPDATE hook_runs SET pgid = 42, attempt = 5000000000 WHERE invocation = 'inv'",
         ] {
             store.lock().expect("lock").execute(bad, []).expect("corrupt");
-            assert!(store.journaled_hook_groups().is_err(), "{bad}");
+            let rows = store.journaled_hook_groups(None).expect("list");
+            assert_eq!(rows.len(), 2, "{bad}");
+            assert!(rows[0].is_err(), "{bad}: the bad row is an error");
+            assert_eq!(rows[1].as_ref().map(|g| g.pgid), Ok(43), "{bad}: the valid row still comes back");
+            let only = store.journaled_hook_groups(Some("ok")).expect("list");
+            assert_eq!(only.len(), 1, "{bad}: only reads its own invocation");
+            assert!(only[0].is_ok(), "{bad}");
         }
     }
 
@@ -4634,25 +4657,25 @@ mod tests {
         store.record_hook_group("inv", 42, Some("7"), 2).expect("record");
         let journaled =
             vec![JournaledHookGroup { invocation: "inv".to_owned(), attempt: 1, pgid: 42, start: Some("7".to_owned()) }];
-        assert_eq!(store.journaled_hook_groups().expect("list"), journaled);
+        assert_eq!(valid_groups(&store), journaled);
         assert!(store.hook_group_journaled("job-h").expect("read"));
         // codex r2 #2: no next attempt while the previous group is journaled (not yet resolved), and
         // its identity is not overwritten.
         assert_eq!(store.begin_hook_attempt("inv", "job-h", 3).expect("begin"), None);
-        assert_eq!(store.journaled_hook_groups().expect("list"), journaled);
+        assert_eq!(valid_groups(&store), journaled);
         // Once the caller resolved and cleared it, a re-drive is the next attempt.
         store.clear_hook_group("inv").expect("clear");
         assert!(!store.hook_group_journaled("job-h").expect("read"));
         assert_eq!(store.begin_hook_attempt("inv", "job-h", 3).expect("begin"), Some(2));
-        assert!(store.journaled_hook_groups().expect("list").is_empty());
+        assert!(valid_groups(&store).is_empty());
         store.record_hook_group("inv", 43, None, 4).expect("record");
         assert_eq!(
-            store.journaled_hook_groups().expect("list"),
+            valid_groups(&store),
             vec![JournaledHookGroup { invocation: "inv".to_owned(), attempt: 2, pgid: 43, start: None }],
             "the group carries the attempt that started it"
         );
         store.clear_hook_group("inv").expect("clear");
-        assert!(store.journaled_hook_groups().expect("list").is_empty());
+        assert!(valid_groups(&store).is_empty());
         store.clear_hook_outcomes("job-h").expect("clear job");
         assert_eq!(store.begin_hook_attempt("inv", "job-h", 5).expect("begin"), Some(1), "job end drops the run record");
     }
