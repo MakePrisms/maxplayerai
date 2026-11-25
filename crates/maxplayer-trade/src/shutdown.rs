@@ -21,7 +21,7 @@
 //! redacted error text only.
 use std::{
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex, OnceLock},
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
 
@@ -66,7 +66,40 @@ impl std::error::Error for InboxClosed {}
 static PHASE: LazyLock<tokio::sync::watch::Sender<u8>> =
     LazyLock::new(|| tokio::sync::watch::channel(0).0);
 static SIGNALS: Mutex<(Option<&'static str>, Option<&'static str>)> = Mutex::new((None, None));
-static HOME: OnceLock<PathBuf> = OnceLock::new();
+/// The home of the serve session in progress (set by [`announce`]): [`finished`] reports it.
+static HOME: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Where a hosted serve also appends its lifecycle lines ([`log_to`]); `None` for standalone serve.
+static LOG: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// A hosted serve's log is rotated to `<name>.1` past this size.
+pub const LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Also append every lifecycle line to `path` (0600, rotated at [`LOG_MAX_BYTES`]). A daemon
+/// hosting serve may have no stderr at all (the auto-spawned buyer daemon), so its lines would
+/// otherwise be lost. Set only for a home that trades: nothing is written until a line is.
+pub fn log_to(path: Option<PathBuf>) {
+    *LOG.lock().unwrap_or_else(|e| e.into_inner()) = path;
+}
+/// Print a lifecycle line to stderr and, when set, to the [`log_to`] file.
+pub fn emit(line: &str) {
+    eprintln!("{line}");
+    let Some(path) = LOG.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        return;
+    };
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES) {
+        let mut old = path.clone().into_os_string();
+        old.push(".1");
+        let _ = std::fs::rename(&path, old);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
 
 fn signals() -> (Option<&'static str>, Option<&'static str>) {
     *SIGNALS.lock().unwrap_or_else(|e| e.into_inner())
@@ -108,8 +141,15 @@ pub fn bounded<T>(
     }
 }
 
-/// Request a stop as signal `name` would (first call), or force it (second call).
+/// Request a stop as signal `name` would (first call), or force it (second call), and print the
+/// `stopping` / `stop_forced` line.
 pub fn signal(name: &'static str) {
+    let phase = request(name);
+    announce_phase(phase, name);
+}
+/// [`signal`] without the line (a daemon hosting serve prints it only while serve runs). Returns
+/// the phase now in effect: 1 stop requested, 2 forced.
+pub fn request(name: &'static str) -> u8 {
     let phase = {
         let mut s = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
         if s.0.is_none() {
@@ -126,6 +166,28 @@ pub fn signal(name: &'static str) {
         *p = (*p).max(phase);
         changed
     });
+    phase
+}
+/// Request the stop as `name` only if none was requested yet; never escalates to a forced stop
+/// (a daemon leaving on its own must not turn an operator's first signal into the second).
+/// Returns whether this call requested it.
+pub fn request_first(name: &'static str) -> bool {
+    {
+        let mut s = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+        if s.0.is_some() {
+            return false;
+        }
+        s.0 = Some(name);
+    }
+    PHASE.send_if_modified(|p| {
+        let changed = *p < 1;
+        *p = (*p).max(1);
+        changed
+    });
+    true
+}
+/// The `stopping` (phase 1) or `stop_forced` (phase 2) line for a stop requested as `name`.
+pub fn announce_phase(phase: u8, name: &str) {
     let now = crate::clock::now();
     let line = if phase == 1 {
         serde_json::json!({"at":crate::clock::iso(now),"serve":"stopping","signal":name,
@@ -135,24 +197,36 @@ pub fn signal(name: &'static str) {
         serde_json::json!({"at":crate::clock::iso(now),"serve":"stop_forced","by":name,
             "note":"the step in progress is cancelled at its next wait; its journal is intact and the next start resumes it"})
     };
-    eprintln!("{line}");
+    emit(&line.to_string());
 }
 
 /// Print the startup line and install the TERM/INT handlers (replacing their default, which
 /// kills the process without a word). Call once, before binding the socket.
 pub fn start(home: &Path, relays: &[String]) -> anyhow::Result<()> {
+    install_signal_handlers()?;
+    announce(home, relays, None);
+    Ok(())
+}
+/// The startup line of a serve session on `home`, and the home [`finished`] reports. `host`: the
+/// daemon running serve (`buyer daemon`, `seller`); `None` for a standalone `maxplayer trade serve`.
+pub fn announce(home: &Path, relays: &[String], host: Option<&str>) {
+    *HOME.lock().unwrap_or_else(|e| e.into_inner()) = Some(home.to_path_buf());
+    let now = crate::clock::now();
+    let mut line = serde_json::json!({"at":crate::clock::iso(now),"serve":"started",
+        "version":env!("CARGO_PKG_VERSION"),"commit":BUILD_COMMIT,"pid":std::process::id(),
+        "home":home,"relays":relays,"mint_relays":crate::transport::mint_relays(),
+        "stop":format!("SIGTERM/SIGINT: safe stop within {}s, exit {EXIT_STOPPED}", GRACE.as_secs())});
+    if let Some(host) = host {
+        line["host"] = host.into();
+    }
+    emit(&line.to_string());
+}
+/// Standalone serve's TERM/INT handling: the first signal requests the safe stop, a second one
+/// (or [`GRACE`]) forces it.
+fn install_signal_handlers() -> anyhow::Result<()> {
     use tokio::signal::unix::{SignalKind, signal as unix_signal};
     let mut term = unix_signal(SignalKind::terminate())?;
     let mut int = unix_signal(SignalKind::interrupt())?;
-    let _ = HOME.set(home.to_path_buf());
-    let now = crate::clock::now();
-    eprintln!(
-        "{}",
-        serde_json::json!({"at":crate::clock::iso(now),"serve":"started",
-            "version":env!("CARGO_PKG_VERSION"),"commit":BUILD_COMMIT,"pid":std::process::id(),
-            "home":home,"relays":relays,"mint_relays":crate::transport::mint_relays(),
-            "stop":format!("SIGTERM/SIGINT: safe stop within {}s, exit {EXIT_STOPPED}", GRACE.as_secs())})
-    );
     tokio::spawn(async move {
         let first = tokio::select! {
             _ = term.recv() => "SIGTERM",
@@ -170,11 +244,12 @@ pub fn start(home: &Path, relays: &[String]) -> anyhow::Result<()> {
 }
 
 /// The final line: why serve ended, its exit code and what is unfinished. A no-op unless
-/// [`start`] ran in this process. `error` is the returned error, if any.
+/// [`announce`] ran in this process. `error` is the returned error, if any.
 pub fn finished(code: u8, error: Option<&anyhow::Error>) {
-    let Some(home) = HOME.get() else {
+    let Some(home) = HOME.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return;
     };
+    let home = &home;
     let now = crate::clock::now();
     let mut v = serde_json::json!({"at":crate::clock::iso(now),"serve":"exited","exit":code,
         "pid":std::process::id(),"journal":"retained"});
@@ -206,7 +281,7 @@ pub fn finished(code: u8, error: Option<&anyhow::Error>) {
     }) {
         v["socket_removed"] = std::fs::remove_file(&socket).is_ok().into();
     }
-    eprintln!("{v}");
+    emit(&v.to_string());
 }
 
 /// Public ids and states of everything still owed work (read-only snapshot, no lock).
@@ -236,6 +311,7 @@ pub fn unfinished(home: &Path, now: u64) -> serde_json::Value {
     for (id, v, _) in rows("listing") {
         if let Ok(l) = serde_json::from_slice::<Listing>(&v) {
             if !l.cancelled
+                && !l.expired
                 && l.active.is_none()
                 && crate::lifecycle(&l.event, &l.statuses)
                     .is_ok_and(|s| s == crate::Status::Available)
@@ -261,11 +337,41 @@ pub fn unfinished(home: &Path, now: u64) -> serde_json::Value {
     });
     let sends = ids("send", &|v| {
         let a: crate::send::SendAttempt = serde_json::from_slice(v).ok()?;
-        (!a.terminal() || a.manual_recovery()).then_some(a.id)
+        (!a.terminal() || a.manual_recovery() || a.reclaim_retry_pending()).then_some(a.id)
     });
     serde_json::json!({"swaps":swaps,"lots_unserved":lots,"funding":funding,
         "withdrawals":withdrawals,"receives":receives,"sends":sends})
 }
 
+/// Forget every stop request and the reported home: tests that host serve several times in one
+/// process start each from "running". Production never calls it (a stop is final).
+#[doc(hidden)]
+#[cfg(feature = "local-test-mints")]
+pub fn reset() {
+    *SIGNALS.lock().unwrap_or_else(|e| e.into_inner()) = (None, None);
+    PHASE.send_replace(0);
+    *HOME.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *LOG.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// The commit this binary was built from (`build.rs`), or `unknown`.
 pub const BUILD_COMMIT: &str = include_str!(concat!(env!("OUT_DIR"), "/build_commit"));
+
+#[cfg(test)]
+mod tests {
+    /// A daemon leaving on its own (`request_first`) never turns an operator's first signal into
+    /// the forcing second one (review of #1334, L1).
+    #[test]
+    fn request_first_never_escalates() {
+        super::reset();
+        super::request("SIGTERM");
+        assert!(!super::request_first("daemon exiting"));
+        let stop = super::stop().unwrap();
+        assert_eq!(stop.signal, "SIGTERM");
+        assert!(stop.forced.is_none(), "SAFETY: a first stop was forced");
+        super::reset();
+        assert!(super::request_first("daemon exiting"));
+        assert!(super::stop().unwrap().forced.is_none());
+        super::reset();
+    }
+}

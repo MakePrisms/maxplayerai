@@ -31,6 +31,7 @@ on:
         options:
           - ''
           - '@maxplayerai/darwin-arm64'
+          - '@maxplayerai/darwin-x64'
           - '@maxplayerai/linux-x64'
           - '@maxplayerai/linux-arm64'
       npm_probe_version:
@@ -227,8 +228,8 @@ jobs:
           echo "ok: links only against base-OS libraries"
 
       # The archive name is left to `package-release-asset.sh`'s default, `maxplayer`, which is also
-      # the name of the binary inside it and the name it answers to. One asset stem is now the whole
-      # of the release, so naming it here would only add a second place for it to drift.
+      # the name of the binary inside it and the name it answers to. The mint sidecar is packaged
+      # by `build-mint` under its own stem, `maxplayer-mint`.
       - name: Package the asset
         env:
           VERSION: ${{ needs.plan.outputs.version }}
@@ -271,6 +272,120 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  # The mint sidecar (`crates/maxplayer-mint`), released from the same tag at the same version as
+  # `maxplayer` (#merge-binaries, 2026-11-16): its own archive per platform, listed in the same
+  # SHA256SUMS, and no npm packages (`maxplayer mint install` fetches the archive). It is its own
+  # cargo workspace because
+  # cdk's `mint` feature needs `protoc` at BUILD time; this job is therefore the only one in the
+  # release that installs protoc, and users never need it — they get the prebuilt binary.
+  # verify-release-workflow.sh asserts both halves (protoc here, and nowhere else in this file).
+  build-mint:
+    name: Build maxplayer-mint ${{ matrix.platform }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      # Same platform set as `maxplayer`, from the same source (.github/release-platforms.json), so the
+      # mint can never ship to a platform the CLI does not, or the reverse.
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release-mint-${{ matrix.target }}
+          workspaces: crates/maxplayer-mint -> target
+
+      - name: Install the musl toolchain and protoc (linux)
+        if: matrix.kind == 'linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+
+      # GNU tar for the same deterministic-archive reason as the `maxplayer` build above.
+      - name: Install protoc and GNU tar (darwin)
+        if: matrix.kind == 'darwin'
+        run: |
+          brew install protobuf gnu-tar
+          command -v protoc >/dev/null || { echo "protobuf installed but protoc is not on PATH" >&2; exit 1; }
+          command -v gtar >/dev/null || { echo "gnu-tar installed but gtar is not on PATH" >&2; exit 1; }
+          echo "TAR=gtar" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          # `maxplayer-mint --version` -> `maxplayer-mint <v> (<sha> release)`. The word `release` is
+          # the only thing that tells a released mint from a build of a clean checkout (which prints
+          # the bare sha); `maxplayer mint upgrade` replaces only lines carrying it.
+          MINT_SIDECAR_BUILD: ${{ github.sha }} release
+        run: |
+          protoc --version
+          cargo build --manifest-path crates/maxplayer-mint/Cargo.toml --release --locked \
+            --target ${{ matrix.target }}
+
+      # `maxplayer-mint <version> (<commit>)`, the same grammar and the same script as `maxplayer`;
+      # the script also holds crates/maxplayer-mint/Cargo.toml to the release version (lockstep).
+      - name: Verify the version matches the release
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          MINT_RELEASE_MARKER: '1'
+        run: |
+          ./scripts/verify-release-version.sh "$VERSION" \
+            "crates/maxplayer-mint/target/${{ matrix.target }}/release/maxplayer-mint"
+
+      - name: Verify portability (linux)
+        if: matrix.kind == 'linux-musl'
+        run: ./scripts/verify-static-artifact.sh "crates/maxplayer-mint/target/${{ matrix.target }}/release/maxplayer-mint"
+
+      - name: Verify portability (darwin)
+        if: matrix.kind == 'darwin'
+        run: |
+          set -euo pipefail
+          BIN="crates/maxplayer-mint/target/${{ matrix.target }}/release/maxplayer-mint"
+          otool -L "$BIN"
+          if otool -L "$BIN" | grep -Eq '/opt/homebrew|/usr/local'; then
+            echo "the mint links a dylib outside the base OS (Homebrew protobuf?), so it will not start on a clean mac" >&2
+            exit 1
+          fi
+          echo "ok: links only against base-OS libraries"
+
+      # Named `maxplayer-mint`: the archive stem, the directory inside it and the binary all agree.
+      - name: Package the asset
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          ./scripts/package-release-asset.sh \
+            "crates/maxplayer-mint/target/${{ matrix.target }}/release/maxplayer-mint" \
+            '${{ matrix.platform }}' "$VERSION" dist maxplayer-mint
+
+      - name: Verify the archive is deterministic
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          ./scripts/package-release-asset.sh \
+            "crates/maxplayer-mint/target/${{ matrix.target }}/release/maxplayer-mint" \
+            '${{ matrix.platform }}' "$VERSION" dist-recheck maxplayer-mint
+          ASSET="maxplayer-mint-${VERSION}-${{ matrix.platform }}.tar.gz"
+          cmp "dist/$ASSET" "dist-recheck/$ASSET" || {
+            echo "the mint archive is not a function of its contents: two runs over identical inputs differ" >&2
+            od -An -tx1 -N16 "dist/$ASSET" >&2
+            od -An -tx1 -N16 "dist-recheck/$ASSET" >&2
+            exit 1
+          }
+          echo "ok: two runs over identical inputs produced byte-identical archives"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-mint-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
   verify-surface:
     name: Verify release surface
     # The built⊆published guard used to live only in `publish` — tag-gated, and reached only AFTER
@@ -278,7 +393,7 @@ jobs:
     # through every dry run and was first seen on a release that could no longer be un-made. This job
     # runs wherever the build runs, a dry run included, and is deliberately NOT tag-gated. `release`
     # and `publish` both `needs:` it, so a drift here stops them before anything is created.
-    needs: [plan, build]
+    needs: [plan, build, build-mint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -307,7 +422,7 @@ jobs:
     # `publish-images` is a dependency because a GitHub Release is operator-visible guidance: an
     # install line pointing at binaries whose compiled-in sandbox image does not exist sends people to
     # a seat that refuses to boot. See the ordering note on `publish-images`.
-    needs: [plan, build, verify-surface, publish-images]
+    needs: [plan, build, build-mint, verify-surface, publish-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -339,6 +454,9 @@ jobs:
           for platform in $PLATFORMS; do
             asset="maxplayer-$VERSION-$platform.tar.gz"
             [ -f "$asset" ] || { echo "$asset is missing — the release would ship without it" >&2; exit 1; }
+            # The mint sidecar ships from the same tag; its archives share this SHA256SUMS.
+            mint_asset="maxplayer-mint-$VERSION-$platform.tar.gz"
+            [ -f "$mint_asset" ] || { echo "$mint_asset is missing — the release would ship without the mint sidecar for $platform" >&2; exit 1; }
           done
           # `--` rather than `./*.tar.gz`: it stops option parsing without prefixing every path in
           # SHA256SUMS, which keeps `sha256sum -c SHA256SUMS` usable next to the downloaded files.
@@ -589,7 +707,7 @@ jobs:
           # API carries whatever string it likes. The launcher (`maxplayer`) is deliberately absent:
           # it is the package users type, and its dist-tags are how `npx maxplayer` resolves.
           case "$PACKAGE" in
-            '@maxplayerai/darwin-arm64' | '@maxplayerai/linux-x64' | '@maxplayerai/linux-arm64') ;;
+            '@maxplayerai/darwin-arm64' | '@maxplayerai/darwin-x64' | '@maxplayerai/linux-x64' | '@maxplayerai/linux-arm64') ;;
             *) echo "refusing to publish '$PACKAGE': only the @maxplayerai payload packages may be probed" >&2; exit 1 ;;
           esac
 

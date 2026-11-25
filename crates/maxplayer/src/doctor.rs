@@ -277,11 +277,14 @@ fn run_readiness_with_retry(
         if exempt.is_empty() {
             let _ = writeln!(
                 err,
-                "resolve the item(s) above, then re-run `maxplayer seller`. To bypass these checks (NOT recommended), pass --skip-doctor."
+                "resolve the item(s) above, then re-run `maxplayer seller serve`. To bypass these checks (NOT recommended), pass --skip-doctor."
             );
         } else {
             let names = exempt.join(", ");
-            let _ = writeln!(err, "resolve the item(s) above, then re-run `maxplayer seller`.");
+            let _ = writeln!(
+                err,
+                "resolve the item(s) above, then re-run `maxplayer seller serve`."
+            );
             if failures.len() > exempt.len() {
                 let _ = writeln!(
                     err,
@@ -345,7 +348,7 @@ mod checks {
     const NIX_CHECK: &str = "nix";
 
     /// Determinate Systems' documented install one-liner — the fix for a box where nix truly is
-    /// not installed. The same installer `install.sh` chains (#745's shell half).
+    /// not installed. `install.sh` prints it in its seller note when nix is missing.
     const DETERMINATE_NIX_INSTALL: &str =
         "curl -fsSL https://install.determinate.systems/nix | sh -s -- install";
 
@@ -425,6 +428,28 @@ mod checks {
         }
     }
 
+    /// The nix verdict for a home with no `[seller]` section, as `maxplayer doctor` reports it. Nix
+    /// is a seller requirement (#745), so for a home that only buys a missing nix is NOT APPLICABLE:
+    /// a passing probe stays PASS (it is real evidence), and either failing variant becomes SKIP so
+    /// a buyer's doctor run does not exit 1 over something buying never uses. The gate's own detail
+    /// and remedy are kept verbatim, so the PATH-skew case still reads "nix IS installed … do NOT
+    /// reinstall" rather than being flattened into "install nix". Only the doctor report calls this;
+    /// the boot gate keeps the FAIL.
+    pub(super) fn nix_for_buyer_home(check: Check) -> Check {
+        if check.status == super::Status::Pass {
+            return check;
+        }
+        let remedy = check.hint.unwrap_or_default();
+        Check::skip(
+            NIX_CHECK,
+            format!("not needed to buy, and this home has no [seller] section — {}", check.detail),
+            format!(
+                "nix is a seller requirement (#745), and buying never uses it; `maxplayer seller serve` \
+                 refuses to start without it, so before selling: {remedy}"
+            ),
+        )
+    }
+
     /// A runnable nix at a well-known install prefix, probed only after the PATH leg failed. Each
     /// candidate is executed, not merely stat'ed — the point is a nix that would work if PATH
     /// carried it, and a broken shim at a known path proves nothing.
@@ -461,6 +486,125 @@ mod checks {
     // external `git-credential-nostr` helper is not required for delivery push / base fetch.
     // We still report whether it resolves (useful for anyone driving raw `git` by hand) but never
     // fail on its absence.
+    const OBSOLETE_TRADE_CHECK: &str = "obsolete maxplayer-trade";
+    pub(super) const MINT_VERSION_CHECK: &str = "maxplayer-mint version";
+
+    pub(super) const MAXPLAYER_VERSION_CHECK: &str = "maxplayer version";
+
+    /// Advisory, report-only, on every home: whether a newer `maxplayer` is released (GitHub's
+    /// latest release, a few seconds at most; `--offline` skips it; a failed check is shown, never
+    /// an error). About maxplayer itself only — the same line `maxplayer mint` prints, and it never
+    /// mentions the mint: the `maxplayer-mint version` row says when the mint then needs upgrading.
+    pub(super) fn check_maxplayer_version() -> Check {
+        check_maxplayer_version_from(crate::mint_cli::latest_release(
+            super::DOCTOR_OFFLINE.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+
+    pub(super) fn check_maxplayer_version_from(latest: crate::mint_cli::Latest) -> Check {
+        let this = env!("CARGO_PKG_VERSION");
+        match crate::mint_cli::maxplayer_update_notice(&latest) {
+            Some(notice) => Check::warn(MAXPLAYER_VERSION_CHECK, format!("maxplayer {this}"), notice),
+            // Up to date, not checked, or could not check: shown as such, never a warning or a
+            // failure.
+            None => Check::pass(
+                MAXPLAYER_VERSION_CHECK,
+                format!("maxplayer {this}; latest release: {}", latest.describe()),
+            ),
+        }
+    }
+
+    /// Advisory, report-only: whether the installed `maxplayer-mint` matches this maxplayer. The
+    /// mint is version-locked to maxplayer, so an older release means `maxplayer mint upgrade` —
+    /// the same notice `maxplayer mint` prints. Local only (no network); not applicable with no
+    /// mint installed.
+    pub(super) fn check_mint_version() -> Check {
+        check_mint_version_from(crate::mint_cli::version_notice())
+    }
+
+    pub(super) fn check_mint_version_from(notice: Option<crate::mint_cli::VersionNotice>) -> Check {
+        use crate::mint_cli::Relation;
+        let Some(notice) = notice else {
+            return Check::skip(
+                MINT_VERSION_CHECK,
+                "no maxplayer-mint installed",
+                "only a seller running its own credit mint needs one (`maxplayer mint install`)",
+            );
+        };
+        let what = match (&notice.relation, notice.line.as_deref()) {
+            (Relation::Same, Some(line)) => format!("{line} at {}", notice.path.display()),
+            (_, Some(line)) => format!(
+                "{line} at {} (maxplayer is {})",
+                notice.path.display(),
+                env!("CARGO_PKG_VERSION")
+            ),
+            (_, None) => format!("{} did not report a version", notice.path.display()),
+        };
+        if let Some(notice) = notice.notice() {
+            return Check::warn(MINT_VERSION_CHECK, what, notice);
+        }
+        let dir = notice
+            .path
+            .parent()
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| ".".into());
+        match notice.relation {
+            Relation::Same => Check::pass(MINT_VERSION_CHECK, what),
+            // Every mint released before 0.8.0 has no `--version` (it prints usage and exits 2), and
+            // `maxplayer mint upgrade` refuses a binary it cannot classify.
+            _ if notice.line.is_none() => Check::warn(
+                MINT_VERSION_CHECK,
+                what,
+                format!(
+                    "a maxplayer-mint older than 0.8.0 reports no version and `maxplayer mint \
+                     upgrade` cannot replace it; `maxplayer mint install --force --bin-dir {dir}` \
+                     replaces it with {}, keeping <home>/mint/",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            ),
+            _ => Check::warn(
+                MINT_VERSION_CHECK,
+                what,
+                format!(
+                    "it is not this maxplayer's release; `maxplayer mint install --force --bin-dir {dir}` \
+                     replaces it"
+                ),
+            ),
+        }
+    }
+
+    /// Advisory, report-only: the standalone `maxplayer-trade` binary (built from source before
+    /// trading moved into `maxplayer trade`) left on PATH. It shares this home's trade journal, and
+    /// a current journal or serve refuses it, but only deleting it stops someone running it.
+    pub(super) fn check_obsolete_trade_binary() -> Check {
+        check_obsolete_trade_binary_in(std::env::var_os("PATH"))
+    }
+
+    pub(super) fn check_obsolete_trade_binary_in(path: Option<std::ffi::OsString>) -> Check {
+        use std::os::unix::fs::PermissionsExt;
+        let found: Vec<String> = path
+            .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join("maxplayer-trade"))
+            .filter(|f| {
+                std::fs::metadata(f).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+            .map(|f| f.display().to_string())
+            .collect();
+        if found.is_empty() {
+            Check::pass(OBSOLETE_TRADE_CHECK, "no standalone maxplayer-trade binary on PATH")
+        } else {
+            Check::warn(
+                OBSOLETE_TRADE_CHECK,
+                format!("obsolete standalone maxplayer-trade on PATH: {}", found.join(", ")),
+                "trading is `maxplayer trade ...` now; delete the old binary (it is refused by current \
+                 trade journals and serve, but should not be run)",
+            )
+        }
+    }
+
     pub(super) fn check_credential_helper() -> Check {
         match seller_git::resolve_git_credential_nostr() {
             Some(path) => Check::pass(
@@ -820,7 +964,7 @@ mod checks {
             return Check::warn(
                 AGENT_CHECK,
                 "no [seller] section configured",
-                "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
+                "run `maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
             );
         };
         match seller_agents::resolve(&seller, &presets, host) {
@@ -1565,11 +1709,14 @@ mod checks {
     /// `--overlay2=none`; otherwise it fails closed and keeps taking single-turn jobs.
     ///
     /// FAIL when docker ANSWERED and shows the seat cannot keep a session (`runsc` without the flag,
-    /// or no `runsc` registered): the operator turned sessions on, and a seat that silently runs
-    /// without them is a misconfiguration nobody notices (Petar, 2026-11-07). FAIL blocks the seller
-    /// boot until the flag is set or `[sessions]` is turned off. WARN when docker could not confirm
-    /// either way (unreadable, timed out, unparseable): that can be a passing daemon hiccup, so the
-    /// seat starts single-turn and the heartbeat re-probes.
+    /// or no `runsc` registered) AND the operator wrote `[sessions] enabled = true`: they asked for
+    /// sessions, and a seat that silently runs without them is a misconfiguration nobody notices.
+    /// FAIL blocks the seller boot until the flag is set or `[sessions]` is turned off. The same
+    /// verdict on a seat where sessions are on only because `enabled` is unset (the default) is a
+    /// WARN: the operator never chose sessions, so an upgrade must not stop the seat from booting;
+    /// it runs single-turn jobs. WARN too when docker could not confirm either way (unreadable,
+    /// timed out, unparseable): that can be a passing daemon hiccup, so the seat starts single-turn
+    /// and the heartbeat re-probes.
     pub(super) fn check_sandbox_runsc_sessions(
         sandbox: Option<SandboxConfig>,
         sessions: maxplayer_core::home::SessionsConfig,
@@ -1587,13 +1734,18 @@ mod checks {
         use maxplayer_core::session::{
             RunscOverlayGate, runsc_overlay_gate, runsc_overlay_gate_applies,
         };
-        if !runsc_overlay_gate_applies(sandbox.as_ref(), &sessions) {
+        if !runsc_overlay_gate_applies(
+            sandbox.as_ref(),
+            &sessions,
+            maxplayer_core::seller_exec::job_identity().0,
+        ) {
             return Check::pass(
                 SANDBOX_RUNSC_SESSIONS_CHECK,
-                "not a docker + runsc seat with [sessions] enabled; no runsc overlay gate",
+                "not a docker + runsc container-delivery seat with sessions on; no runsc overlay gate",
             );
         }
         let probed = probe();
+        let chosen = sessions.explicitly_enabled();
         match runsc_overlay_gate(true, probed.as_deref().map_err(String::as_str)) {
             RunscOverlayGate::NotApplicable | RunscOverlayGate::Open => Check::pass(
                 SANDBOX_RUNSC_SESSIONS_CHECK,
@@ -1603,11 +1755,24 @@ mod checks {
                 reason,
                 fix,
                 misconfigured: true,
+            } if !chosen => Check::warn(
+                SANDBOX_RUNSC_SESSIONS_CHECK,
+                format!(
+                    "session jobs are NOT advertised on this runsc seat (single-turn jobs continue): \
+                     {reason}. Sessions are on by default; set the flag to offer them, or set \
+                     [sessions] enabled = false to silence this"
+                ),
+                fix,
+            ),
+            RunscOverlayGate::Closed {
+                reason,
+                fix,
+                misconfigured: true,
             } => Check::fail(
                 SANDBOX_RUNSC_SESSIONS_CHECK,
                 format!(
-                    "[sessions] is enabled but this runsc seat cannot keep a session past turn 1: \
-                     {reason}. Set the flag, or turn [sessions] off to run single-turn only"
+                    "[sessions] enabled = true but this runsc seat cannot keep a session past turn 1: \
+                     {reason}. Set the flag, or set [sessions] enabled = false to run single-turn only"
                 ),
                 fix,
             ),
@@ -2205,7 +2370,7 @@ mod checks {
             return Check::skip(
                 HARNESS_CREDS_CHECK,
                 "no [seller] section configured — no harness, so no credential directory to inspect",
-                "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure a harness; the agent preset check reports this same cause",
+                "run `maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n>` once to configure a harness; the agent preset check reports this same cause",
             );
         };
         // ⛔ RESOLVE WITH THE CALLER'S `host`, NEVER A HARDCODED `AdapterHost::Host` (#1015).
@@ -2495,7 +2660,7 @@ mod checks {
 fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (nix, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed\n{}",
+        "Usage:\n  maxplayer doctor [--home <dir>] [--offline]   # seller environment self-check (nix — FAILs only on a home with a [seller] section, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions, maxplayer version, maxplayer-mint version; --offline skips the GitHub latest-release check of the maxplayer version row)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed\n{}",
         crate::skill::docs_pointer_line()
     );
 }
@@ -2539,6 +2704,12 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
     #[cfg(feature = "wallet")]
     {
+        // `--offline` skips the one check that asks a third party (GitHub's latest release, for the
+        // maxplayer version row). Taken out before the strict `--home` parse below.
+        let offline = args.iter().any(|a| a == "--offline");
+        DOCTOR_OFFLINE.store(offline, std::sync::atomic::Ordering::Relaxed);
+        let args: Vec<String> = args.iter().filter(|a| *a != "--offline").cloned().collect();
+        let args = args.as_slice();
         let home_override = match parse_doctor_args(args) {
             Ok(home_override) => home_override,
             Err(message) => {
@@ -2549,6 +2720,10 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         run_doctor(home_override, out, err)
     }
 }
+
+/// `maxplayer doctor --offline`: skip the GitHub latest-release check of the maxplayer version row.
+#[cfg(feature = "wallet")]
+static DOCTOR_OFFLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Parse `maxplayer doctor`'s argv (everything after the `doctor` subcommand). The only accepted
 /// argument is `--home <dir>`; anything else is refused so the operator is told to use `--home` or
@@ -2569,7 +2744,7 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
             }
             other => {
                 return Err(format!(
-                    "unknown doctor option: {other} (doctor accepts only `--home <dir>`; \
+                    "unknown doctor option: {other} (doctor accepts only `--home <dir>` and `--offline`; \
                      the home may also be set via MAXPLAYER_HOME)"
                 ));
             }
@@ -2583,10 +2758,69 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
 /// `maxplayer seller` boot-readiness gate (issue #107) so the two never drift and no check logic is
 /// duplicated. The seller key is read once only to probe NIP-42 relay auth; it is NEVER placed in
 /// any Check detail.
-#[cfg(feature = "wallet")]
+///
+/// This is the GATE's registry: nix is always a blocking environment check here, whatever the
+/// home's role. `maxplayer doctor` reads [`build_report_checks`], which differs only in how it
+/// reports nix on a home with no `[seller]`.
+// Gate-only (plus tests): `maxplayer doctor` reads `build_report_checks`, so a buyer-only build
+// (wallet, no acp) has no caller.
+#[cfg(all(feature = "wallet", any(feature = "acp", test)))]
 fn build_checks(
     home: &maxplayer_core::home::MaxplayerHome,
     unsafe_no_sandbox: bool,
+) -> Vec<Box<dyn FnOnce() -> Check>> {
+    build_checks_with_environment(home, unsafe_no_sandbox, environment_checks_for(home))
+}
+
+/// [`build_environment_checks`], or a SKIP row on a hook-only seat (see [`hook_only_seat`]).
+#[cfg(all(feature = "wallet", any(feature = "acp", test)))]
+fn environment_checks_for(home: &maxplayer_core::home::MaxplayerHome) -> Vec<Box<dyn FnOnce() -> Check>> {
+    if hook_only_seat(home) {
+        vec![Box::new(|| Check::skip("nix", "not applicable", HOOK_ONLY_WHY))]
+    } else {
+        build_environment_checks()
+    }
+}
+
+/// The registry `maxplayer doctor` reports. Nix is a SELLER requirement (#723/#745: "every buyer
+/// path must never require nix"), so on a home with no `[seller]` section a missing nix is reported
+/// as not applicable instead of failing the exit — a buyer running doctor must not be told the box
+/// is broken. A home that has a `[seller]` gets exactly the gate's registry. The boot gate never
+/// reads this: `maxplayer seller` writes `[seller]` before the gate runs, and the gate builds from
+/// [`build_checks`], so a nix-less seat is still refused at boot.
+///
+/// `nix_probe` is the nix verdict as the boot gate would see it ([`checks::check_nix`] in
+/// production). It is a parameter so the doctor path can be tested end to end with a failing probe
+/// on any box, including one where nix works.
+#[cfg(feature = "wallet")]
+fn build_report_checks(
+    home: &maxplayer_core::home::MaxplayerHome,
+    nix_probe: impl FnOnce() -> Check + 'static,
+) -> Vec<Box<dyn FnOnce() -> Check>> {
+    let environment: Vec<Box<dyn FnOnce() -> Check>> = if home.config.seller.is_some() {
+        vec![Box::new(nix_probe)]
+    } else {
+        vec![Box::new(move || checks::nix_for_buyer_home(nix_probe()))]
+    };
+    // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
+    // waive. The containment check is read at its own severity.
+    let mut checks = build_checks_with_environment(home, false, environment);
+    // Report-only (never in the seller boot gate): a leftover standalone maxplayer-trade binary.
+    checks.push(Box::new(checks::check_obsolete_trade_binary));
+    // Report-only: a newer maxplayer release (GitHub; --offline skips it), on every home.
+    checks.push(Box::new(checks::check_maxplayer_version));
+    // Report-only, local: the installed maxplayer-mint against this maxplayer.
+    checks.push(Box::new(checks::check_mint_version));
+    checks
+}
+
+/// [`build_checks`] with the environment head supplied by the caller — the one place the rest of
+/// the registry is assembled, so the gate and the report cannot drift.
+#[cfg(feature = "wallet")]
+fn build_checks_with_environment(
+    home: &maxplayer_core::home::MaxplayerHome,
+    unsafe_no_sandbox: bool,
+    environment: Vec<Box<dyn FnOnce() -> Check>>,
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
     let relay_url = home.config.relay_url.clone();
     let relay_url_for_token_policy = home.config.relay_url.clone();
@@ -2620,6 +2854,7 @@ fn build_checks(
     let sessions_for_runsc = home.config.sessions.clone();
     let sandbox_for_egress = sandbox.clone();
     let sandbox_for_token_policy = sandbox.clone();
+    let hook_only = hook_only_seat(home);
     // The probe runs in the seat's OWN home, because that is where a launcher's config points.
     let home_root = home.root.clone();
     // Reaching this box with stranger-written code is what the containment gate is about, and there
@@ -2659,9 +2894,10 @@ fn build_checks(
     // carried as None — never guessed as a relative `.claude`.
     let user_home = user_home_dir();
 
-    // Environment requirements (#745) head the ONE registry — build_checks stays the single
-    // source both `maxplayer doctor` and the boot gate run, never a second list to keep in sync.
-    let mut checks: Vec<Box<dyn FnOnce() -> Check>> = build_environment_checks();
+    // Environment requirements (#745) head the ONE registry. The boot gate passes
+    // build_environment_checks; `maxplayer doctor` passes the same nix probe, folded to SKIP on a
+    // home with no [seller] (build_report_checks). Everything below is shared, never a second list.
+    let mut checks: Vec<Box<dyn FnOnce() -> Check>> = environment;
     checks.push(Box::new(checks::check_credential_helper));
     checks.push(Box::new(move || checks::check_seller_key(&key_path, key_present)));
     let secret_for_mints = secret.clone();
@@ -2687,6 +2923,28 @@ fn build_checks(
     checks.push(Box::new(move || checks::check_telemetry(telemetry)));
     // The seller boot gate blocks on this (issue #357): a launcher that cannot spawn would let the
     // node advertise and then fail every job. Bypassable, like every check, via --skip-doctor.
+    if hook_only {
+        // hook-agents §9: no job of ours runs here, so none of the sandbox rows describes a
+        // requirement. Reported, not hidden: the seller should know the agent runs uncontained.
+        checks.push(Box::new(|| {
+            Check::warn(
+                "sandbox",
+                "hook-only seat: buyer tasks and input files go to your own agent on this host, uncontained",
+                "run the hook's agent as a separate user if that matters to you",
+            )
+        }));
+        checks.push(Box::new(move || checks::check_seat_reachability(exposure)));
+        checks.push(Box::new(move || {
+            checks::check_home_permissions(perms_home_root, perms_wallet_dir, serves_strangers)
+        }));
+        if let Some(check) = checks::held_sagas_check(held_sagas) {
+            checks.push(Box::new(move || check));
+        }
+        let _ = (sandbox_for_launcher, sandbox_for_creds, sandbox_for_egress, sandbox_for_image,
+            sandbox_for_engine, sandbox_for_runsc_sessions, sessions_for_runsc, sandbox, home_root,
+            unsafe_no_sandbox, seller_for_creds, custom_agents_for_creds, user_home, agent_host);
+        return checks;
+    }
     checks.push(Box::new(move || checks::check_sandbox_launcher(sandbox_for_launcher)));
     // #647 P2: the credential proxy contains every KNOWN model-credential variable. What it cannot
     // recognize is an operator-added forward_env var (which may itself be a credential), so this WARNs
@@ -2713,13 +2971,15 @@ fn build_checks(
         checks::check_sandbox_engine_floor(sandbox_for_engine, serves_strangers)
     }));
     // Session jobs §5.6 (bug 2): the seller's own runsc `--overlay2=none` gate, reported here with
-    // the daemon.json fix. BLOCKING when docker shows the flag missing (sessions are on and cannot
-    // work past turn 1); advisory WARN when docker cannot be read.
-    // Pushed ONLY on a runsc seat with sessions on: every other seat's doctor output is exactly
-    // main's (no new row, no docker read).
+    // the daemon.json fix. BLOCKING when docker shows the flag missing and the operator set
+    // `[sessions] enabled = true`; WARN when `enabled` is unset (on by default: the seat starts and
+    // runs single-turn) or docker cannot be read.
+    // Pushed ONLY on a runsc container-delivery seat with sessions on: every other seat's doctor
+    // output is exactly main's (no new row, no docker read).
     if maxplayer_core::session::runsc_overlay_gate_applies(
         sandbox_for_runsc_sessions.as_ref(),
         &sessions_for_runsc,
+        maxplayer_core::seller_exec::job_identity().0,
     ) {
         checks.push(Box::new(move || {
             checks::check_sandbox_runsc_sessions(sandbox_for_runsc_sessions, sessions_for_runsc)
@@ -2761,17 +3021,37 @@ fn build_checks(
 }
 
 /// The ENVIRONMENT requirements — checks that ask "can this box EVER do the work" rather than "is
-/// it ready right now" — currently just nix (#745). These head [`build_checks`], so `maxplayer
-/// doctor` and the full boot gate run them from the one shared registry; they are ALSO the entire
+/// it ready right now" — currently just nix (#745). These head [`build_checks`], the boot gate's
+/// registry; `maxplayer doctor` runs the same probe through [`build_report_checks`], which reports
+/// it as SKIP on a home with no `[seller]`. They are ALSO the entire
 /// registry the boot gate still runs under `--skip-doctor`, because #745 rules out any escape
 /// hatch for them — the blanket bypass narrows the gate to this subset, it never skips it. A
 /// second gate beside [`sell_readiness_gate`] was the rejected alternative: that is the #728
 /// keep-two-things-in-sync defect, committed prospectively.
-#[cfg(feature = "wallet")]
+#[cfg(all(feature = "wallet", any(feature = "acp", test)))]
 fn build_environment_checks() -> Vec<Box<dyn FnOnce() -> Check>> {
+    vec![Box::new(real_nix_probe())]
+}
+
+/// docs/specs/hook-agents.md §9: every configured `[seller] agents` entry is a `hook` preset, so
+/// nothing of ours runs a job on this box — no sandbox, no nix job environment. Those checks are
+/// then not applicable (an exception to #745 keyed on the resolved roster, not a bypass).
+#[cfg(feature = "wallet")]
+fn hook_only_seat(home: &maxplayer_core::home::MaxplayerHome) -> bool {
+    maxplayer_core::seller_agents::hook_only_home(home)
+}
+
+#[cfg(feature = "wallet")]
+const HOOK_ONLY_WHY: &str =
+    "hook-only seat: every agent is the seller's own program behind a hook, so no job runs in an environment of ours";
+
+/// The production nix probe: the one [`build_environment_checks`] runs for the gate and
+/// [`run_doctor`] hands to [`build_report_checks`], so the two cannot drift.
+#[cfg(feature = "wallet")]
+fn real_nix_probe() -> impl FnOnce() -> Check + 'static {
     // The single-user nix profile lives under the operator $HOME (`~/.nix-profile`).
     let user_home = user_home_dir();
-    vec![Box::new(move || checks::check_nix(user_home))]
+    move || checks::check_nix(user_home)
 }
 
 /// The operator's `$HOME`, or `None` when unset or empty — never guessed as a relative path.
@@ -2808,6 +3088,19 @@ fn run_doctor(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
+    run_doctor_with_nix_probe(home_override, real_nix_probe(), out, err)
+}
+
+/// [`run_doctor`] with the nix probe injected: the whole doctor path (home resolution, the registry
+/// it picks, rendering, exit code) with only the nix verdict replaced, so a test can prove which
+/// registry `maxplayer doctor` actually runs.
+#[cfg(feature = "wallet")]
+fn run_doctor_with_nix_probe(
+    home_override: Option<std::path::PathBuf>,
+    nix_probe: impl FnOnce() -> Check + 'static,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
     let home = match resolve_doctor_home(home_override) {
         Ok(home) => home,
         Err(error) => {
@@ -2818,9 +3111,7 @@ fn run_doctor(
 
     let _ = write!(out, "{}", report_preamble(&home.root));
 
-    // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
-    // waive. The containment check is read at its own severity.
-    let results = run_checks(build_checks(&home, false));
+    let results = run_checks(build_report_checks(&home, nix_probe));
     for result in &results {
         let _ = writeln!(out, "{}", result.render());
     }
@@ -2837,7 +3128,8 @@ fn run_doctor(
 }
 
 /// `maxplayer seller` startup readiness gate (issue #107 — auto-doctor, NOT a first-run wizard). Runs the
-/// SAME registry as `maxplayer doctor` via [`build_checks`] and REFUSES to boot when any BLOCKING check
+/// same registry as `maxplayer doctor` via [`build_checks`] (doctor differs only in reporting a
+/// missing nix as SKIP on a home with no `[seller]`, see [`build_report_checks`]) and REFUSES to boot when any BLOCKING check
 /// (`Status::Fail`) fails, echoing each failure's one-line fix hint. WARN checks are advisory: they
 /// print but never block. Returns `Ok(())` when the box can sell, `Err(())` when it must not start.
 ///
@@ -2881,7 +3173,7 @@ pub fn sell_readiness_gate(
              whether it is ready right now, and #745 rules out any bypass for it"
         );
         return run_readiness_with_retry(
-            || run_checks(build_environment_checks()),
+            || run_checks(environment_checks_for(home)),
             READINESS_MAX_ATTEMPTS,
             readiness_backoff,
             std::thread::sleep,
@@ -4850,12 +5142,13 @@ mod tests {
         use checks::check_sandbox_runsc_sessions_with;
         use maxplayer_core::home::{SandboxConfig, SandboxMode, SessionsConfig};
         let on = SessionsConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         };
         let runsc = SandboxConfig {
             mode: SandboxMode::Docker,
             runtime: Some("runsc".into()),
+            container_delivery: Some(true),
             ..Default::default()
         };
         let reported = |json: &'static str| {
@@ -4880,7 +5173,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("turn [sessions] off"),
+            rendered.contains("set [sessions] enabled = false to run single-turn only"),
             "names the other way out: {rendered}"
         );
         assert!(
@@ -4910,6 +5203,48 @@ mod tests {
             let check = reported(json);
             assert_eq!(check.status, Status::Fail, "{json}: {}", check.render());
         }
+
+        // Sessions on only because `enabled` is unset (the default): the same misconfigured verdicts
+        // WARN instead of FAIL, so upgrading a runsc seat without the flag never blocks its boot. It
+        // still probes, still names the fix, and still advertises no session.
+        for json in [
+            r#"{"runsc":{"path":"/usr/bin/runsc"}}"#,
+            r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=root:memory"]}}"#,
+            r#"{"runc":{"path":"runc"}}"#,
+        ] {
+            let mut probed = false;
+            let check = check_sandbox_runsc_sessions_with(
+                Some(runsc.clone()),
+                SessionsConfig::default(),
+                || {
+                    probed = true;
+                    Ok(json.to_owned())
+                },
+            );
+            assert!(probed, "{json}: unset enabled still probes docker");
+            assert_eq!(check.status, Status::Warn, "{json}: {}", check.render());
+            let rendered = check.render();
+            assert!(rendered.contains("single-turn jobs continue"), "{rendered}");
+            assert!(
+                rendered.contains("[sessions] enabled = false"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("--overlay2=none"),
+                "names the fix: {rendered}"
+            );
+        }
+        let unset_open = check_sandbox_runsc_sessions_with(
+            Some(runsc.clone()),
+            SessionsConfig::default(),
+            || {
+                Ok(
+                    r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=none"]}}"#
+                        .into(),
+                )
+            },
+        );
+        assert_eq!(unset_open.status, Status::Pass, "{}", unset_open.render());
         // Docker could not confirm either way: a possible hiccup, so WARN (boot continues
         // single-turn and the heartbeat re-probes), never PASS.
         let unreadable = check_sandbox_runsc_sessions_with(Some(runsc.clone()), on.clone(), || {
@@ -4939,7 +5274,13 @@ mod tests {
         for (sandbox, sessions) in [
             (Some(runc), on.clone()),
             (None, on.clone()),
-            (Some(runsc.clone()), SessionsConfig::default()),
+            (
+                Some(runsc.clone()),
+                SessionsConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            ),
         ] {
             let mut probed = false;
             let check = check_sandbox_runsc_sessions_with(sandbox.clone(), sessions, || {
@@ -4975,9 +5316,10 @@ mod tests {
             mode: SandboxMode::Docker,
             image: Some("maxplayer-sandbox:test".into()),
             runtime: Some("runsc".into()),
+            container_delivery: Some(true),
             ..Default::default()
         });
-        home.config.sessions.enabled = true;
+        home.config.sessions.enabled = Some(true);
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
         let results = run_checks(build_checks(&home, false));
@@ -4987,6 +5329,15 @@ mod tests {
                 .any(|check| check.name == "sandbox runsc sessions"),
             "build_checks must run the runsc sessions check; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
+        );
+        // Sessions on by default (`enabled` unset) run it too.
+        home.config.sessions.enabled = None;
+        let results = run_checks(build_checks(&home, false));
+        assert!(
+            results
+                .iter()
+                .any(|check| check.name == "sandbox runsc sessions"),
+            "enabled unset must run the runsc sessions check too"
         );
 
         // Non-runsc seats (Petar, 15:33): the row is ABSENT — no new WARN/FAIL/PASS line, no docker
@@ -5027,10 +5378,18 @@ mod tests {
                 true,
             ),
             ("no sandbox", None, true),
+            (
+                "runsc, host delivery",
+                Some(SandboxConfig {
+                    container_delivery: Some(false),
+                    ..docker.clone()
+                }),
+                true,
+            ),
             ("runsc, sessions off", Some(docker.clone()), false),
         ] {
             home.config.sandbox = sandbox;
-            home.config.sessions.enabled = sessions;
+            home.config.sessions.enabled = Some(sessions);
             let results = run_checks(build_checks(&home, false));
             assert!(
                 !results
@@ -5290,9 +5649,7 @@ mod tests {
         let mut presets = BTreeMap::new();
         presets.insert(
             "myabsent".to_owned(),
-            AgentPresetConfig {
-                argv: vec!["maxplayer-doctor-absent-adapter-x7q".to_owned()],
-            },
+            AgentPresetConfig::acp(vec!["maxplayer-doctor-absent-adapter-x7q".to_owned()]),
         );
 
         let seller = SellerConfig {
@@ -5544,9 +5901,7 @@ mod tests {
         let mut presets = std::collections::BTreeMap::new();
         presets.insert(
             "claude".to_owned(),
-            maxplayer_core::home::AgentPresetConfig {
-                argv: vec![existing],
-            },
+            maxplayer_core::home::AgentPresetConfig::acp(vec![existing]),
         );
         presets
     }
@@ -5577,9 +5932,7 @@ mod tests {
         let mut presets = std::collections::BTreeMap::new();
         presets.insert(
             "cursor".to_owned(),
-            maxplayer_core::home::AgentPresetConfig {
-                argv: vec![existing],
-            },
+            maxplayer_core::home::AgentPresetConfig::acp(vec![existing]),
         );
         let seller = seller_for_agents(vec!["cursor".into()], vec!["ignored".into()]);
         let check = checks::check_harness_credential_permissions(
@@ -5638,9 +5991,7 @@ mod tests {
         let mut presets = std::collections::BTreeMap::new();
         presets.insert(
             "cursor".to_owned(),
-            maxplayer_core::home::AgentPresetConfig {
-                argv: vec![existing],
-            },
+            maxplayer_core::home::AgentPresetConfig::acp(vec![existing]),
         );
         let seller = seller_for_agents(vec!["cursor".into()], vec!["ignored".into()]);
         let check = checks::check_harness_credential_permissions(
@@ -5726,9 +6077,7 @@ mod tests {
         let mut presets = std::collections::BTreeMap::new();
         presets.insert(
             "grok".to_owned(),
-            maxplayer_core::home::AgentPresetConfig {
-                argv: vec![existing],
-            },
+            maxplayer_core::home::AgentPresetConfig::acp(vec![existing]),
         );
         let seller = seller_for_agents(vec!["grok".into()], vec!["ignored".into()]);
         let check = checks::check_harness_credential_permissions(
@@ -6512,6 +6861,216 @@ mod tests {
             vec!["nix"],
             "the --skip-doctor gate runs the environment subset of the one registry — only nix today"
         );
+    }
+
+    // A leftover standalone `maxplayer-trade` on PATH is a WARN naming the file (never a FAIL: it
+    // does not change the exit); a non-executable file of that name, or none, passes.
+    #[test]
+    fn obsolete_maxplayer_trade_on_path_is_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-obsolete-trade-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (with, without) = (dir.join("with"), dir.join("without"));
+        std::fs::create_dir_all(&with).unwrap();
+        std::fs::create_dir_all(&without).unwrap();
+        let path = |dirs: &[&std::path::Path]| Some(std::env::join_paths(dirs).unwrap());
+
+        let none = checks::check_obsolete_trade_binary_in(path(&[&without]));
+        assert_eq!(none.status, Status::Pass, "{}", none.render());
+
+        let bin = with.join("maxplayer-trade");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let not_exec = checks::check_obsolete_trade_binary_in(path(&[&without, &with]));
+        assert_eq!(not_exec.status, Status::Pass, "{}", not_exec.render());
+
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let found = checks::check_obsolete_trade_binary_in(path(&[&without, &with]));
+        assert_eq!(found.status, Status::Warn, "{}", found.render());
+        let rendered = found.render();
+        assert!(rendered.contains(&bin.display().to_string()), "{rendered}");
+        assert!(rendered.contains("maxplayer trade"), "{rendered}");
+        assert_eq!(exit_code(&[found]), SUCCESS, "a leftover binary must not fail doctor");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Nix is a seller requirement: on a home with no [seller] the doctor REPORT shows a missing nix
+    // as SKIP (both failure variants), never FAIL, and a working nix keeps its PASS. Pure, so it is
+    // red-provable on any box — drop the fold and the two failures stay FAIL.
+    #[test]
+    fn nix_for_buyer_home_skips_a_missing_nix_and_keeps_a_pass() {
+        let pass = checks::nix_for_buyer_home(checks::fold_nix(true, None));
+        assert_eq!(pass.status, Status::Pass, "{}", pass.render());
+
+        let skewed = std::path::PathBuf::from("/nix/var/nix/profiles/default/bin/nix");
+        for (failed, skew) in [(checks::fold_nix(false, None), false), (checks::fold_nix(false, Some(skewed)), true)] {
+            assert_eq!(failed.status, Status::Fail, "precondition: the gate's verdict is FAIL");
+            let reported = checks::nix_for_buyer_home(failed);
+            assert_eq!(reported.status, Status::Skip, "{}", reported.render());
+            assert_eq!(reported.name, "nix");
+            let rendered = reported.render();
+            assert!(rendered.contains("no [seller] section"), "{rendered}");
+            // The PATH-skew diagnosis survives the fold: an installed-but-off-PATH nix is never
+            // reported to a buyer as "install it" (advisor r1, #1312).
+            assert_eq!(rendered.contains("do NOT reinstall"), skew, "{rendered}");
+            assert_eq!(rendered.contains("nix IS installed"), skew, "{rendered}");
+            assert!(
+                rendered.contains("`maxplayer seller serve`"),
+                "names what needs nix: {rendered}"
+            );
+            assert!(
+                rendered.contains("curl -fsSL https://install.determinate.systems/nix | sh -s -- install"),
+                "says how to install it before selling: {rendered}"
+            );
+            assert_eq!(exit_code(&[reported]), SUCCESS, "a buyer's missing nix must not fail the exit");
+        }
+    }
+
+    // Wiring, end to end through the doctor path: `run_doctor_with_nix_probe` is everything
+    // `maxplayer doctor` runs (home load from disk, registry choice, render, exit) with only the
+    // nix probe replaced by a real FAIL verdict, so this holds on a box where nix works. A buyer
+    // home must render nix as SKIP; a home with [seller] must render it as FAIL and exit 1.
+    // Red-proof: point the doctor path back at `build_checks`, or make `build_report_checks` skip
+    // the fold for buyer homes, and the buyer assertions fail.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn doctor_report_scopes_the_nix_failure_to_seller_homes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-nix-buyer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        // Network-free, as in nix_check_is_wired_into_the_shared_registry, but on disk: the doctor
+        // path reloads the home from config.toml.
+        maxplayer_core::home::save_config(&mut home, |config| {
+            config.relay_url = "not-a-relay-url".into();
+            config.accepted_mints = Vec::new();
+        })
+        .expect("write a network-free config");
+        assert!(home.config.seller.is_none(), "precondition: a fresh home has no [seller]");
+
+        let doctor = |root: &std::path::Path| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run_doctor_with_nix_probe(
+                Some(root.to_path_buf()),
+                || checks::fold_nix(false, None),
+                &mut out,
+                &mut err,
+            );
+            (code, String::from_utf8(out).unwrap())
+        };
+        let nix_line = |report: &str| {
+            report
+                .lines()
+                .find(|line| line.split_whitespace().nth(1) == Some("nix"))
+                .map(str::to_owned)
+                .unwrap_or_else(|| panic!("the report carries a nix line: {report}"))
+        };
+
+        let (_, buyer) = doctor(&tmp);
+        let buyer_nix = nix_line(&buyer);
+        assert!(buyer_nix.starts_with("SKIP nix"), "buyer home: {buyer_nix}");
+        assert!(buyer_nix.contains("no [seller] section"), "buyer home: {buyer_nix}");
+        // The report (and only the report) carries the leftover-maxplayer-trade row.
+        assert!(buyer.contains("obsolete maxplayer-trade"), "doctor report: {buyer}");
+        // ...and the two version rows: maxplayer itself (on every home) and the installed mint.
+        assert!(buyer.contains("maxplayer version"), "doctor report: {buyer}");
+        assert!(buyer.contains("maxplayer-mint version"), "doctor report: {buyer}");
+
+        maxplayer_core::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_for_agents(vec!["claude".into()], vec!["claude-agent-acp".into()]));
+        })
+        .expect("write a [seller] section");
+        let (code, seller) = doctor(&tmp);
+        let seller_nix = nix_line(&seller);
+        assert!(seller_nix.starts_with("FAIL nix"), "seller home: {seller_nix}");
+        assert_eq!(code, FAILURE, "a seller home without nix must fail doctor: {seller}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn doctor_version_rows_keep_the_mint_upgrade_and_the_maxplayer_update_apart() {
+        use crate::mint_cli::{Latest, Relation, VersionNotice};
+        let this = env!("CARGO_PKG_VERSION");
+        let notice = |relation: Relation| VersionNotice {
+            path: std::path::PathBuf::from("/b/maxplayer-mint"),
+            line: Some("maxplayer-mint x (y)".into()),
+            relation,
+        };
+        // (a) the mint row: local only.
+        let none = checks::check_mint_version_from(None);
+        assert_eq!(none.status, Status::Skip, "{}", none.render());
+        let current = checks::check_mint_version_from(Some(notice(Relation::Same)));
+        assert_eq!(current.status, Status::Pass, "{}", current.render());
+        let older = checks::check_mint_version_from(Some(notice(Relation::Older("0.0.1".into()))));
+        assert_eq!(older.status, Status::Warn, "{}", older.render());
+        assert!(older.render().contains("maxplayer mint upgrade --bin-dir /b"), "{}", older.render());
+        // A pre-0.8.0 mint answers no `--version`: `upgrade` refuses it, so the fix is install --force.
+        let silent = checks::check_mint_version_from(Some(VersionNotice {
+            line: None,
+            ..notice(Relation::Unknown)
+        }));
+        assert_eq!(silent.status, Status::Warn, "{}", silent.render());
+        let text = silent.render();
+        assert!(
+            text.contains("/b/maxplayer-mint did not report a version"),
+            "{text}"
+        );
+        assert!(text.contains("older than 0.8.0"), "{text}");
+        assert!(
+            text.contains("`maxplayer mint install --force --bin-dir /b`"),
+            "{text}"
+        );
+        assert!(!text.contains("maxplayer mint upgrade --bin-dir"), "{text}");
+
+        // (b) the maxplayer row: no mint involved at all.
+        let up_to_date = checks::check_maxplayer_version_from(Latest::Found(this.into()));
+        // Ahead of the latest stable: a pass. A pre-release (an rc) says what it is, never "is
+        // newer", which read like an update notice in rc-testing.
+        let ahead = checks::check_maxplayer_version_from(Latest::Found("0.0.1".into()));
+        assert_eq!(ahead.status, Status::Pass, "{}", ahead.render());
+        let text = ahead.render();
+        if this.contains('-') {
+            assert!(
+                text.contains(&format!(
+                    "maxplayer 0.0.1 (latest stable; this is {this}, a pre-release)"
+                )),
+                "{text}"
+            );
+            assert!(!text.contains("is newer"), "{text}");
+        } else {
+            assert!(
+                text.contains(&format!("(this maxplayer, {this}, is newer)")),
+                "{text}"
+            );
+        }
+        assert_eq!(up_to_date.status, Status::Pass, "{}", up_to_date.render());
+        // A failed check is shown, never a failure; --offline is shown as not checked.
+        let failed = checks::check_maxplayer_version_from(Latest::Failed("timed out".into()));
+        assert_eq!(failed.status, Status::Pass, "{}", failed.render());
+        assert!(failed.render().contains("could not check (timed out)"), "{}", failed.render());
+        let offline = checks::check_maxplayer_version_from(Latest::NotChecked("--offline".into()));
+        assert_eq!(offline.status, Status::Pass, "{}", offline.render());
+        assert!(offline.render().contains("not checked (--offline)"), "{}", offline.render());
+        let newer = checks::check_maxplayer_version_from(Latest::Found("999.0.0".into()));
+        assert_eq!(newer.status, Status::Warn, "{}", newer.render());
+        let text = newer.render();
+        assert!(text.contains(&format!("maxplayer 999.0.0 is available (you have {this})")), "{text}");
+        assert!(text.contains("install.sh | sh") && text.contains("npm install -g maxplayer@latest"), "{text}");
+        assert!(!text.to_lowercase().contains("mint"), "the maxplayer update names no mint: {text}");
+        assert_eq!(exit_code(&[older, newer]), SUCCESS, "advisory only");
     }
 
     // #745's ruled-out bypass, pinned: the refusal for an environment failure must NOT advertise

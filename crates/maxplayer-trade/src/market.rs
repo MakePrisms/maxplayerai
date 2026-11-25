@@ -101,7 +101,7 @@ impl Market {
         let mut clients = vec![];
         for url in urls {
             check_market_relay(url)?;
-            let c = Client::new(keys.clone());
+            let c = maxplayer_core::relay_transport::client(keys.clone());
             c.automatic_authentication(sign_in);
             c.add_relay(url).await?;
             let mut rx = c.notifications();
@@ -140,7 +140,7 @@ impl Market {
                 for relay in c.relays().await.into_values() {
                     maxplayer_core::relay_auth::resubscribe_on_auth(
                         relay,
-                        "maxplayer-trade market",
+                        "maxplayer trade market",
                     );
                 }
             }

@@ -6,7 +6,6 @@ import net from 'node:net';
 import { schnorr } from '@noble/curves/secp256k1';
 import { RelayReader, ChallengeReader, parseChallengeQuorum, DEFAULT_CHALLENGE_QUORUM } from '../src/challenge/shared/relay.mjs';
 import { EventStore } from '../src/challenge/shared/model.mjs';
-import { connectionText } from '../src/challenge/live.ts';
 import { relayReady } from '../../../scripts/challenges/coordinator.mjs';
 const buyer=Buffer.from(schnorr.getPublicKey('01'.padStart(64,'0'))).toString('hex');
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
@@ -38,12 +37,9 @@ test('quorum met: 2 of 3 challenge relays complete is ready and degraded, with a
   assert.deepEqual(s.quorum,{required:2,complete:2,total:3});assert.deepEqual(s.missingRelays,['ws://c']);
   assert.ok(s.warnings.includes('Degraded: 2 of 3 challenge relays complete (quorum 2); missing: ws://c'),s.warnings.join('; '));
   assert.equal(relayReady(snap(reader)),true,'the runner posts while degraded');
-  // The page says so on its status line.
-  assert.equal(connectionText(s,'Live'),'Live · Degraded: 2 of 3 challenge relays complete (quorum 2); missing: ws://c');
   // The third relay catches up: no longer degraded, warning gone.
   finish(reader.challenges[2]);
   assert.equal(reader.status.degraded,false);assert.ok(!reader.status.warnings.some(w=>w.startsWith('Degraded')));
-  assert.equal(connectionText(reader.status,'Live'),'Live');
 });
 
 test('our trade relay is required even when the quorum is met',t=>{
@@ -125,6 +121,8 @@ test('real WebSocket: stop while the TCP connection never completes the handshak
 
 // Advisor r1 H1: a routine multi-filter poll of a relay that already finished its round must not
 // count that relay as missing. All three up: degraded never set. One relay down: aggregate
+// The old runner's quorum reader (scripts/challenges, retired in PR 6 of docs/specs/swarm.md); the
+// /swarm board reads our relay only (src/swarm/shared/relay.mjs).
 // historyComplete (and relayReady) never drops while the two live relays are polled.
 async function pollRounds(t,{down}) {
   const seen=[];

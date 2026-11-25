@@ -1,0 +1,16 @@
+{
+  "name": "@maxplayerai/darwin-x64",
+  "version": "0.8.2-rc1",
+  "description": "maxplayer binary for darwin-x64 — payload package, install `maxplayer` instead",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MakePrisms/maxplayerai.git"
+  },
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "bin": {
+    "maxplayer-darwin-x64": "bin/maxplayer"
+  },
+  "files": ["bin/maxplayer", "LICENSE-MIT", "LICENSE-APACHE"]
+}

@@ -286,8 +286,10 @@ pub fn connector(mint: &str) -> Result<NostrMintConnector> {
         Some((home, false)) => Some(crate::wallet::identity(&home)?),
         None => None,
     };
+    // One signed-in connection per mint-relay list for the whole process (serve, or one CLI
+    // command's several mint requests) instead of a new connection and sign-in per request.
     let c = match identity {
-        Some(keys) => c.with_identity(keys),
+        Some(keys) => c.with_identity(keys).with_persistent_connections(),
         None => c,
     };
     Ok(match lab_window(mint) {

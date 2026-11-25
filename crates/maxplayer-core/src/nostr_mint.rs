@@ -11,15 +11,22 @@
 //! proofs instead of compensating them away. The mint rebuilds the original reply for a replayed
 //! swap (spec §3.3), so a re-send after a lost reply completes normally.
 //!
-//! Each request uses its own short-lived relay connection, so the connector holds no state tied to
-//! one tokio runtime (the payment worker runs its own runtime). Product wallets sign requests and
+//! A request goes out as soon as ONE relay is connected; a relay that is slow or unreachable gets
+//! the same request when it connects or on the next re-send, and never delays it. By default each
+//! request uses its own short-lived relay connection, so the connector holds no state tied to one
+//! tokio runtime (the payment worker runs its own runtime). A long-running process opts in to one
+//! shared connection per signer and relay list ([`NostrMintConnector::with_persistent_connections`]):
+//! it is kept per tokio runtime, dropped with that runtime, and logs each relay that becomes
+//! unreachable or reachable again (it keeps retrying; nothing is skipped). Product wallets sign requests and
 //! sign in to the relay with the home's registered key ([`NostrMintConnector::with_identity`]):
 //! relay.maxplayer.ai only accepts writes from registered keys (email signup spec v2.12 §2.1,
 //! option C, Bob 2026-10-22). The mint therefore sees which npub made each request. Without an
 //! identity (tests, diagnostics) every request uses a fresh throwaway key, as before.
 
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -41,8 +48,9 @@ use cdk::{
 };
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::{
-    Client, ClientMessage, Event, EventBuilder, EventId, Filter, Keys, Kind, PublicKey,
-    RelayMessage, RelayNotification, RelayPoolNotification, SubscriptionId, Tag, Timestamp,
+    Client, ClientMessage, Event, EventBuilder, EventId, Filter, Keys, Kind, PublicKey, Relay,
+    RelayMessage, RelayNotification, RelayPoolNotification, RelayUrl, SubscriptionId, Tag,
+    Timestamp,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -225,6 +233,13 @@ pub struct RelayEvidence {
     pub eose: bool,
     pub closed: bool,
     pub notice: bool,
+    /// Sign-ins this request observed on the relay (any socket); a new one re-sends its REQ.
+    #[serde(skip)]
+    pub sign_ins_seen: u32,
+    /// Times this request's lifecycle receiver for the relay lagged: a socket or sign-in may have
+    /// gone unseen, so its REQ is re-sent.
+    #[serde(skip)]
+    pub lifecycle_lags: u32,
 }
 impl Default for RelayEvidence {
     fn default() -> Self {
@@ -244,6 +259,8 @@ impl Default for RelayEvidence {
             eose: false,
             closed: false,
             notice: false,
+            sign_ins_seen: 0,
+            lifecycle_lags: 0,
         }
     }
 }
@@ -355,6 +372,7 @@ fn collect_lifecycle(
     receivers: &mut [(String, tokio::sync::broadcast::Receiver<RelayNotification>)],
     observation: &mut RequestObservation,
 ) {
+    let mut lost = false;
     for (url, receiver) in receivers {
         for _ in 0..1024 {
             let evidence = observation.relays.entry(url.clone()).or_default();
@@ -362,6 +380,7 @@ fn collect_lifecycle(
                 Ok(RelayNotification::Authenticated) => {
                     evidence.auth = "authenticated";
                     evidence.auth_generation = Some(evidence.connection_generation);
+                    evidence.sign_ins_seen = evidence.sign_ins_seen.saturating_add(1);
                 }
                 Ok(RelayNotification::AuthenticationFailed) => {
                     evidence.auth = "failed";
@@ -388,13 +407,26 @@ fn collect_lifecycle(
                     }
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                    observation.evidence_lost = true
+                    evidence.lifecycle_lags = evidence.lifecycle_lags.saturating_add(1);
+                    lost = true;
                 }
                 Err(_) => break,
                 _ => {}
             }
         }
     }
+    if lost {
+        observation.evidence_lost = true;
+    }
+}
+
+/// What a request's reply subscription on a relay was last sent for: the socket (connection
+/// generation), the sign-ins and the receiver lags this request has seen there. Taken from the
+/// request's own ordered notifications, so a change always shows up as a different value.
+fn subscribed_for(observation: &RequestObservation, url: &str) -> (u32, u32, u32) {
+    observation.relays.get(url).map_or((0, 0, 0), |r| {
+        (r.connection_generation, r.sign_ins_seen, r.lifecycle_lags)
+    })
 }
 
 /// A cdk mint connector that talks to a `nostr://<npub>` mint over Nostr relays.
@@ -409,6 +441,8 @@ pub struct NostrMintConnector {
     /// Signs every request and the relay sign-in. `None`: a fresh throwaway key per request.
     /// (`Keys`' `Debug` prints only the public key.)
     identity: Option<Keys>,
+    /// Share one long-lived relay connection ([`Self::with_persistent_connections`]).
+    persistent: bool,
     last_observation: Arc<std::sync::Mutex<Option<RequestObservation>>>,
 }
 
@@ -425,6 +459,19 @@ impl NostrMintConnector {
                 "no relays configured for nostr:// mint".into(),
             ));
         }
+        // An unusable URL would otherwise be skipped silently and leave the connector waiting.
+        // Stored as the SDK spells them, once each, so evidence keys and the shared-connection
+        // key match what the relay pool reports for equivalent spellings.
+        let mut normalized: Vec<String> = Vec::with_capacity(relays.len());
+        for relay in &relays {
+            let parsed = RelayUrl::parse(relay)
+                .map_err(|error| Error::Custom(format!("invalid mint relay {relay}: {error}")))?;
+            let key = relay_key(&parsed);
+            if !normalized.contains(&key) {
+                normalized.push(key);
+            }
+        }
+        let relays = normalized;
         Ok(Self {
             mint_url: mint_url.clone(),
             mint_pk,
@@ -433,8 +480,21 @@ impl NostrMintConnector {
             resend_every: DEFAULT_RESEND_EVERY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             identity: None,
+            persistent: false,
             last_observation: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Keep one relay connection open, signed in, for every request with this identity and relay
+    /// list on the current tokio runtime (any connector built the same way shares it), instead of
+    /// opening and signing in per request. For long-running processes (`maxplayer-trade serve`).
+    /// Applies only with [`Self::with_identity`]: a throwaway key signs one request and never
+    /// shares a connection. The connection is dropped with its runtime; when none of its relays
+    /// is connected and none is still connecting, the next request opens a fresh one instead of
+    /// waiting for the SDK's reconnect backoff.
+    pub fn with_persistent_connections(mut self) -> Self {
+        self.persistent = true;
+        self
     }
 
     /// Sign every request, and sign in to the relays, with `keys` (the home's registered key)
@@ -553,6 +613,7 @@ impl NostrMintConnector {
         observation: &mut RequestObservation,
         start: Instant,
     ) -> Result<Value, Error> {
+        use nostr_sdk::prelude::RelayStatus;
         let started_unix_ms = unix_now_ms();
         let deadline = Instant::now() + self.window;
         let request = Request {
@@ -585,41 +646,85 @@ impl NostrMintConnector {
             .map_err(|error| Error::Custom(format!("sign {operation} request: {error}")))?;
 
         observation.request_event = Some(event.id.to_hex());
-        let client = Client::new(keys.clone());
-        client.automatic_authentication(true);
-        for relay in &self.relays {
-            let _ = client.add_relay(relay.as_str()).await;
-        }
+        let pooled = match &self.identity {
+            Some(identity) if self.persistent => Some(self.pooled(identity).await),
+            _ => None,
+        };
+        let client = match &pooled {
+            Some(pooled) => pooled.client.clone(),
+            None => {
+                let client = crate::relay_transport::client(keys.clone());
+                client.automatic_authentication(true);
+                for relay in &self.relays {
+                    let _ = client.add_relay(relay.as_str()).await;
+                }
+                client
+            }
+        };
         // Subscribe to lifecycle notifications before connection/auth starts. Receivers are
         // drained without spawning tasks, so cancellation cannot leak collectors.
         let mut lifecycle = Vec::new();
         for (url, relay) in client.relays().await {
-            lifecycle.push((
-                url.to_string().trim_end_matches('/').to_owned(),
-                relay.notifications(),
-            ));
+            lifecycle.push((relay_key(&url), relay.notifications()));
+        }
+        // A shared connection is already up, maybe signed in, and no notification will say so
+        // again: seed this request's evidence from its current state. What the receivers above
+        // caught before that read is older than it, so it is discarded instead of counted twice.
+        // Only evidence is seeded: every relay still gets this request's subscription on its
+        // current socket, and again after any sign-in this request sees (below).
+        if let Some(pooled) = &pooled {
+            use tokio::sync::broadcast::error::TryRecvError;
+            for (_, receiver) in &mut lifecycle {
+                while !matches!(
+                    receiver.try_recv(),
+                    Err(TryRecvError::Empty | TryRecvError::Closed)
+                ) {}
+            }
+            for (url, relay) in client.relays().await {
+                if !relay.is_connected() {
+                    continue;
+                }
+                let url = relay_key(&url);
+                let auth = pooled.auth(&url);
+                let evidence = observation.relays.entry(url).or_default();
+                evidence.connected = true;
+                evidence.ever_connected = true;
+                evidence.connection_generation = 1;
+                match auth {
+                    LinkAuth::Unknown => {}
+                    LinkAuth::Challenged => evidence.challenged = true,
+                    LinkAuth::Authenticated | LinkAuth::Failed => {
+                        evidence.challenged = true;
+                        evidence.auth = if auth == LinkAuth::Authenticated {
+                            "authenticated"
+                        } else {
+                            "failed"
+                        };
+                        evidence.auth_generation = Some(1);
+                    }
+                }
+            }
         }
         let mut notifications = client.notifications();
-        client.connect().await;
-        client
-            .wait_for_connection(self.connect_timeout.min(remaining(deadline)))
-            .await;
-        let connected = client
+        if pooled.is_none() {
+            client.connect().await;
+        }
+        // Send as soon as ONE relay is connected. `Client::wait_for_connection` waits for EVERY
+        // relay (or the timeout), so one unreachable relay cost the full connect timeout on every
+        // request (field report 2026-11-16: 5.3 s per request, a maker lock missed its deadline).
+        // A relay that connects later gets this request as soon as it does (below).
+        let relays: Vec<(String, Relay)> = client
             .relays()
             .await
-            .values()
-            .any(|relay| relay.is_connected());
-        for (url, relay) in client.relays().await {
-            let evidence = observation
-                .relays
-                .entry(url.to_string().trim_end_matches('/').to_owned())
-                .or_default();
-            evidence.connected = relay.is_connected();
-            evidence.ever_connected |= evidence.connected;
-        }
+            .into_iter()
+            .map(|(url, relay)| (relay_key(&url), relay))
+            .collect();
+        wait_for_first_connection(&relays, self.connect_timeout.min(remaining(deadline))).await;
         collect_lifecycle(&mut lifecycle, observation);
-        if !connected {
-            disconnect(&client).await;
+        if !relays.iter().any(|(_, relay)| relay.is_connected()) {
+            if pooled.is_none() {
+                disconnect(&client).await;
+            }
             // Same class as an unreachable HTTPS mint today (connection refused): ambiguous.
             return Err(Error::HttpError(
                 None,
@@ -630,36 +735,31 @@ impl NostrMintConnector {
             ));
         }
 
-        let relays: Vec<(String, nostr_sdk::prelude::Relay)> = client
-            .relays()
-            .await
-            .into_iter()
-            .map(|(url, relay)| (url.to_string().trim_end_matches('/').to_owned(), relay))
-            .collect();
-
-        // Subscribe BEFORE publishing, so a fast reply isn't missed.
+        // This request's reply subscription. Only replies to this request event match it.
         let subscription = SubscriptionId::generate();
         let filter = Filter::new()
             .kind(Kind::Custom(RESPONSE_KIND))
             .pubkey(keys.public_key())
             .author(self.mint_pk)
+            .event(event.id)
             .since(Timestamp::now() - Duration::from_secs(10));
-        let _ = tokio::time::timeout(
-            remaining(deadline),
-            client.subscribe_with_id(subscription.clone(), filter.clone(), None),
-        )
-        .await;
-        // A relay that requires sign-in (relay.maxplayer.ai) refuses an EVENT sent before sign-in
-        // (`auth-required:`) and never delivers live events to a REQ it saw before sign-in;
-        // nostr-sdk does not re-send that REQ. So after each sign-in on a relay this call re-sends
-        // its REQ and THEN its EVENT to that relay, in that order on the one socket, so the reply
-        // cannot beat the subscription. The EVENT goes out raw (no SDK auth retry that could race
-        // the REQ). Relays that never ask for sign-in see exactly the old REQ-then-EVENT, no wait.
-        let mut signed_in_under: std::collections::HashMap<String, Option<u32>> =
-            relays.iter().map(|(url, _)| (url.clone(), None)).collect();
-        let send_event = |relay: &nostr_sdk::prelude::Relay| {
-            relay.send_msg(ClientMessage::event(event.clone())).is_ok()
+        // The subscription goes out raw on each relay once it is connected, never registered with
+        // the SDK, and is closed when this call ends or is cancelled ([`CallGuard`]). It is sent
+        // again on every new socket and after every sign-in this call sees: a relay that requires
+        // sign-in (relay.maxplayer.ai) refuses an EVENT sent before sign-in (`auth-required:`) and
+        // never delivers live events to a REQ it saw before sign-in. Each REQ is followed by this
+        // request's EVENT (once the first send is due) on the same socket, so the reply cannot
+        // beat the subscription. Nothing is queued for a relay that is not connected: the SDK
+        // would send it whenever that relay connects, maybe after `exp` and after this call
+        // returned. Relays that never ask for sign-in see exactly REQ-then-EVENT, no wait.
+        let mut guard = CallGuard {
+            pooled: pooled.clone(),
+            relays: relays.clone(),
+            subscription: subscription.clone(),
+            req_sent: HashMap::new(),
         };
+        let send_event =
+            |relay: &Relay| relay.send_msg(ClientMessage::event(event.clone())).is_ok();
         let count_send = |observation: &mut RequestObservation, url: &str, queued: bool| {
             if queued {
                 observation.wire_sends = Some(observation.wire_sends.unwrap_or(0) + 1);
@@ -671,6 +771,23 @@ impl NostrMintConnector {
                     .publish_failed = true;
             }
         };
+        let accept_reply = |reply: &Event,
+                            relay_url: &RelayUrl,
+                            observation: &mut RequestObservation|
+         -> Option<Result<Value, Error>> {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let result = self.accept(
+                reply,
+                &event.id,
+                &keys,
+                &request.id,
+                observation,
+                elapsed_ms,
+            )?;
+            observation.reply_ms = Some(start.elapsed().as_millis() as u64);
+            observation.reply_relay = Some(relay_url.to_string());
+            Some(result)
+        };
         // One pool notification: a usable reply ends the call; relay messages are evidence.
         let handle = |notification: RelayPoolNotification,
                       observation: &mut RequestObservation|
@@ -680,20 +797,14 @@ impl NostrMintConnector {
                     event: reply,
                     relay_url,
                     ..
-                } => {
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    let result = self.accept(
-                        &reply,
-                        &event.id,
-                        &keys,
-                        &request.id,
-                        observation,
-                        elapsed_ms,
-                    )?;
-                    observation.reply_ms = Some(start.elapsed().as_millis() as u64);
-                    observation.reply_relay = Some(relay_url.to_string());
-                    Some(result)
-                }
+                } => accept_reply(&reply, &relay_url, observation),
+                // The pool reports an event id as `Event` once, from the first relay; the same
+                // reply from another relay comes only as a raw message. Read both, so a receiver
+                // that lagged over the first copy still gets the answer.
+                RelayPoolNotification::Message {
+                    relay_url,
+                    message: RelayMessage::Event { event: reply, .. },
+                } => accept_reply(&reply, &relay_url, observation),
                 RelayPoolNotification::Message { relay_url, message } => {
                     let r = observation
                         .relays
@@ -771,27 +882,6 @@ impl NostrMintConnector {
                     }
                 }
             }
-            for (url, relay) in &relays {
-                let Some(r) = observation.relays.get(url) else {
-                    continue;
-                };
-                let generation = r.auth_generation.filter(|_| r.auth == "authenticated");
-                if generation.is_some() && signed_in_under.get(url) != Some(&generation) {
-                    signed_in_under.insert(url.clone(), generation);
-                    let _ =
-                        relay.send_msg(ClientMessage::req(subscription.clone(), filter.clone()));
-                    // The re-sent REQ reopens a subscription the relay CLOSEd before sign-in.
-                    if let Some(r) = observation.relays.get_mut(url) {
-                        r.closed = false;
-                        r.closed_category = None;
-                        r.eose = false;
-                    }
-                    if observation.attempts > 0 {
-                        let queued = send_event(relay);
-                        count_send(observation, url, queued);
-                    }
-                }
-            }
             // Every relay we reached refused this request for lack of sign-in AND rejected
             // sign-in, both on its current socket: no path can carry a reply, so say so now
             // instead of waiting out the window. A failed sign-in alone proves nothing (many
@@ -814,14 +904,56 @@ impl NostrMintConnector {
                     )),
                 ));
             }
+            // Nothing new goes out once the window has passed: the request may already be
+            // past its `exp`, and nobody would wait for the reply.
             if Instant::now() >= deadline {
                 break Err(Error::Timeout);
+            }
+            // Every relay was shut down (a shared connection retired by another request): none
+            // can reconnect or carry a reply, so don't wait out the window. Ambiguous.
+            if relays
+                .iter()
+                .all(|(_, r)| matches!(r.status(), RelayStatus::Terminated | RelayStatus::Banned))
+            {
+                break Err(Error::HttpError(
+                    None,
+                    format!("all relays closed for mint {}", self.mint_url),
+                ));
+            }
+            // (Re)send the subscription on each connected relay whose socket, or sign-in, is new
+            // since it was last sent; then the request, once sending has started.
+            for (url, relay) in &relays {
+                if !relay.is_connected() {
+                    continue;
+                }
+                let sent_for = subscribed_for(observation, url);
+                if guard.req_sent.get(url) == Some(&sent_for) {
+                    continue;
+                }
+                guard.req_sent.insert(url.clone(), sent_for);
+                let _ = relay.send_msg(ClientMessage::req(subscription.clone(), filter.clone()));
+                // The re-sent REQ reopens a subscription the relay CLOSEd before sign-in.
+                if let Some(r) = observation.relays.get_mut(url) {
+                    r.closed = false;
+                    r.closed_category = None;
+                    r.eose = false;
+                }
+                if observation.attempts > 0 {
+                    let queued = send_event(relay);
+                    count_send(observation, url, queued);
+                }
             }
             if Instant::now() >= next_send {
                 observation.attempts += 1;
                 for (url, relay) in &relays {
-                    let queued = send_event(relay);
-                    count_send(observation, url, queued);
+                    // Only on the socket that already has the subscription; a relay that
+                    // connected since gets both from the loop above on the next pass.
+                    let subscribed = relay.is_connected()
+                        && guard.req_sent.get(url) == Some(&subscribed_for(observation, url));
+                    if subscribed {
+                        let queued = send_event(relay);
+                        count_send(observation, url, queued);
+                    }
                 }
                 next_send = Instant::now() + self.resend_every;
             }
@@ -846,8 +978,93 @@ impl NostrMintConnector {
                 }
             }
         }
-        disconnect(&client).await;
+        // Closes this request's subscription; on a shared connection, also makes sure nothing it
+        // queued can go out later.
+        drop(guard);
+        if pooled.is_none() {
+            disconnect(&client).await;
+        }
         outcome
+    }
+
+    /// The shared connection for `identity` and this connector's relays on the current runtime,
+    /// opened on first use by one request while concurrent ones wait for it. Replaced by a fresh
+    /// one when none of its relays is connected and none is still connecting (or it has had a
+    /// whole connect timeout): the SDK would otherwise wait out its reconnect backoff (10 s and
+    /// more) while a new socket connects at once.
+    async fn pooled(&self, identity: &Keys) -> Arc<Pooled> {
+        let runtime = tokio::runtime::Handle::current();
+        let key = PoolKey {
+            runtime: runtime.id(),
+            signer: identity.public_key().to_hex(),
+            relays: self.relays.clone(),
+        };
+        let (current, opening, created) = {
+            let mut pool = lock(&POOL);
+            let created = !pool.contains_key(&key);
+            let slot = pool.entry(key.clone()).or_default();
+            (slot.conn.clone(), slot.opening.clone(), created)
+        };
+        if created {
+            // Forget this runtime's connection when the runtime goes away: its tasks die with it,
+            // so a later runtime must never reuse the client. Spawned with POOL unlocked: on a
+            // runtime that is shutting down, `spawn` drops the task, running `Evict`, right here.
+            let evict = Evict(key.clone());
+            drop(runtime.spawn(async move {
+                let _evict = evict;
+                std::future::pending::<()>().await;
+            }));
+        }
+        if let Some(current) = current
+            && current.usable(self.connect_timeout).await
+        {
+            return current;
+        }
+        let _opening = opening.lock().await;
+        // Another request may have opened one while this one waited.
+        let latest = lock(&POOL).get(&key).and_then(|slot| slot.conn.clone());
+        if let Some(latest) = latest
+            && latest.usable(self.connect_timeout).await
+        {
+            return latest;
+        }
+        let fresh = self.open_pooled(identity, runtime).await;
+        // Not stored when the runtime is already gone (its slot evicted). The replaced connection
+        // is dropped with POOL unlocked.
+        let replaced = lock(&POOL)
+            .get_mut(&key)
+            .and_then(|slot| slot.conn.replace(fresh.clone()));
+        drop(replaced);
+        fresh
+    }
+
+    async fn open_pooled(&self, identity: &Keys, runtime: tokio::runtime::Handle) -> Arc<Pooled> {
+        let client = crate::relay_transport::client(identity.clone());
+        client.automatic_authentication(true);
+        for relay in &self.relays {
+            let _ = client.add_relay(relay.as_str()).await;
+        }
+        let retired = Arc::new(AtomicBool::new(false));
+        let mut links = HashMap::new();
+        for (url, relay) in client.relays().await {
+            let url = relay_key(&url);
+            // Both receivers are taken before connecting, so the first status change is seen.
+            let link = Arc::new(Mutex::new(RelayLink::new(
+                url.clone(),
+                relay.clone(),
+                retired.clone(),
+            )));
+            tokio::spawn(watch_link(relay.notifications(), link.clone()));
+            links.insert(url, link);
+        }
+        client.connect().await;
+        Arc::new(Pooled {
+            client,
+            links,
+            created: Instant::now(),
+            runtime,
+            retired,
+        })
     }
 
     /// A valid reply to THIS request, or `None` (ignored: wrong kind, signer, request, version,
@@ -977,6 +1194,334 @@ fn remaining(deadline: Instant) -> Duration {
 
 async fn disconnect(client: &Client) {
     let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, client.disconnect()).await;
+}
+
+/// A relay's URL as an evidence and link key: without a trailing slash, as configured.
+fn relay_key(url: &RelayUrl) -> String {
+    url.to_string().trim_end_matches('/').to_owned()
+}
+
+/// Return once any of `relays` is connected, none can connect any more (all terminated or banned,
+/// or none configured), or after `timeout`. Woken by status changes, not by polling.
+async fn wait_for_first_connection(relays: &[(String, Relay)], timeout: Duration) {
+    use nostr_sdk::prelude::RelayStatus;
+    use std::future::Future;
+    use std::task::Poll;
+    // Receivers first, so a change between the check and the wait still wakes it.
+    let mut receivers: Vec<_> = relays.iter().map(|(_, r)| r.notifications()).collect();
+    let done = || {
+        relays.iter().any(|(_, r)| r.is_connected())
+            || relays
+                .iter()
+                .all(|(_, r)| matches!(r.status(), RelayStatus::Terminated | RelayStatus::Banned))
+    };
+    let _ = tokio::time::timeout(timeout, async {
+        while !done() {
+            let mut changes: Vec<_> = receivers.iter_mut().map(|r| Box::pin(r.recv())).collect();
+            std::future::poll_fn(|cx| {
+                if changes.iter_mut().any(|c| c.as_mut().poll(cx).is_ready()) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+    })
+    .await;
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What one request leaves on the relays, undone when the request ends or is cancelled (its
+/// future dropped): its reply subscription is closed on every socket that has it, so a shared
+/// connection does not collect one subscription per cancelled request. A shared relay that is
+/// down with messages still queued (maybe this request's) is shut down and its connection
+/// retired: the SDK would otherwise send them whenever that relay comes back, after `exp`.
+struct CallGuard {
+    pooled: Option<Arc<Pooled>>,
+    relays: Vec<(String, Relay)>,
+    subscription: SubscriptionId,
+    /// Per relay: what the subscription was last sent for ([`subscribed_for`]).
+    req_sent: HashMap<String, (u32, u32, u32)>,
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        // A short-lived connection is disconnected as a whole right after.
+        let Some(pooled) = &self.pooled else {
+            return;
+        };
+        for (url, relay) in &self.relays {
+            if !relay.is_connected() {
+                if relay.queue() > 0 {
+                    relay.disconnect();
+                    pooled.retired.store(true, Ordering::SeqCst);
+                }
+                continue;
+            }
+            if self.req_sent.contains_key(url) {
+                let _ = relay.send_msg(ClientMessage::close(self.subscription.clone()));
+            }
+        }
+    }
+}
+
+/// One shared connection: same runtime, signer and relay list (in order).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PoolKey {
+    runtime: tokio::runtime::Id,
+    signer: String,
+    relays: Vec<String>,
+}
+
+#[derive(Default)]
+struct PoolSlot {
+    conn: Option<Arc<Pooled>>,
+    /// Held by the one request opening a connection; concurrent requests wait for it instead of
+    /// each opening (and logging) their own.
+    opening: Arc<tokio::sync::Mutex<()>>,
+}
+
+static POOL: LazyLock<Mutex<HashMap<PoolKey, PoolSlot>>> = LazyLock::new(Default::default);
+
+/// A shared relay connection ([`NostrMintConnector::with_persistent_connections`]).
+struct Pooled {
+    client: Client,
+    /// Per relay (URL without trailing slash): link state, see [`RelayLink`].
+    links: HashMap<String, Arc<Mutex<RelayLink>>>,
+    created: Instant,
+    runtime: tokio::runtime::Handle,
+    /// Not reused by later requests ([`CallGuard`], [`RelayLink::drain`]).
+    retired: Arc<AtomicBool>,
+}
+
+impl Pooled {
+    /// Sign-in state of the relay's CURRENT socket, read now (not when a background task last
+    /// ran): `Unknown` unless known to belong to that socket.
+    fn auth(&self, url: &str) -> LinkAuth {
+        let Some(link) = self.links.get(url) else {
+            return LinkAuth::Unknown;
+        };
+        let (auth, lines) = {
+            let mut link = lock(link);
+            let lines = link.drain();
+            (link.current(), lines)
+        };
+        for line in lines {
+            eprintln!("{line}");
+        }
+        auth
+    }
+
+    /// Not retired, and some relay is connected or one is still connecting within the first
+    /// connect timeout.
+    async fn usable(&self, connect_timeout: Duration) -> bool {
+        use nostr_sdk::prelude::RelayStatus;
+        if self.retired.load(Ordering::SeqCst) {
+            return false;
+        }
+        let statuses: Vec<RelayStatus> = self
+            .client
+            .relays()
+            .await
+            .values()
+            .map(|r| r.status())
+            .collect();
+        statuses.contains(&RelayStatus::Connected)
+            || (self.created.elapsed() < connect_timeout
+                && statuses.iter().any(|s| {
+                    matches!(
+                        s,
+                        RelayStatus::Initialized | RelayStatus::Pending | RelayStatus::Connecting
+                    )
+                }))
+    }
+}
+
+impl Drop for Pooled {
+    // Requests hold their own reference, so this runs after the last one finishes. On a runtime
+    // that is shutting down the task is dropped instead (its sockets go with the runtime).
+    fn drop(&mut self) {
+        let client = self.client.clone();
+        drop(self.runtime.spawn(async move { client.shutdown().await }));
+    }
+}
+
+/// Removes a runtime's shared connection when the runtime drops its tasks.
+struct Evict(PoolKey);
+
+impl Drop for Evict {
+    fn drop(&mut self) {
+        // Dropped after POOL is unlocked (end of statement).
+        let removed = lock(&POOL).remove(&self.0);
+        drop(removed);
+    }
+}
+
+/// Sign-in state of one shared relay's socket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LinkAuth {
+    #[default]
+    Unknown,
+    Challenged,
+    Authenticated,
+    Failed,
+}
+
+/// One shared relay: its sign-in and reachability state, fed from its own notification receiver
+/// whenever read ([`Pooled::auth`]) and by [`watch_link`] in the background.
+struct RelayLink {
+    url: String,
+    relay: Relay,
+    notifications: tokio::sync::broadcast::Receiver<RelayNotification>,
+    /// The shared connection's retirement flag.
+    retired: Arc<AtomicBool>,
+    auth: LinkAuth,
+    /// The socket (`stats().success()`) `auth` was observed on.
+    socket: usize,
+    state: LinkState,
+}
+
+impl RelayLink {
+    /// Call before connecting, so the first status change is seen.
+    fn new(url: String, relay: Relay, retired: Arc<AtomicBool>) -> Self {
+        Self {
+            url,
+            notifications: relay.notifications(),
+            retired,
+            relay,
+            auth: LinkAuth::Unknown,
+            socket: 0,
+            state: LinkState::New,
+        }
+    }
+
+    /// Apply every notification since the last drain; returns the reachability lines to log.
+    fn drain(&mut self) -> Vec<String> {
+        use tokio::sync::broadcast::error::TryRecvError;
+        // Read before draining. A sign-in notification drained now came from this socket or an
+        // earlier one; for an earlier one, the later socket's status change follows it in the
+        // queue (the SDK counts a socket right after announcing it) and resets the state.
+        let socket = self.relay.stats().success();
+        let mut lines = Vec::new();
+        loop {
+            match self.notifications.try_recv() {
+                Ok(RelayNotification::RelayStatus { status }) => {
+                    // Sign-in belongs to one socket: any status change ends it.
+                    self.auth = LinkAuth::Unknown;
+                    let (state, line) = link_log(self.state, status, &self.url);
+                    self.state = state;
+                    lines.extend(line);
+                }
+                Ok(RelayNotification::Message {
+                    message: RelayMessage::Auth { .. },
+                }) if self.auth == LinkAuth::Unknown => {
+                    (self.auth, self.socket) = (LinkAuth::Challenged, socket)
+                }
+                Ok(RelayNotification::Authenticated) => {
+                    (self.auth, self.socket) = (LinkAuth::Authenticated, socket)
+                }
+                Ok(RelayNotification::AuthenticationFailed) => {
+                    (self.auth, self.socket) = (LinkAuth::Failed, socket)
+                }
+                Ok(_) => {}
+                // Lost notifications may have ended the socket the state belongs to.
+                Err(TryRecvError::Lagged(_)) => self.auth = LinkAuth::Unknown,
+                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+            }
+        }
+        // A socket that ended with messages still queued (its writer stalled or closing while
+        // the relay still read as connected) would send them on the next socket, after the
+        // requests that queued them returned and maybe after their `exp`. The SDK announces the
+        // drop and then waits at least 7 s before reconnecting; this runs on that announcement
+        // (via `watch_link`), so the relay is shut down first and the connection retired.
+        if !self.relay.is_connected() && self.relay.queue() > 0 {
+            self.relay.disconnect();
+            self.retired.store(true, Ordering::SeqCst);
+        }
+        lines
+    }
+
+    fn current(&self) -> LinkAuth {
+        if self.relay.is_connected() && self.socket == self.relay.stats().success() {
+            self.auth
+        } else {
+            LinkAuth::Unknown
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LinkState {
+    #[default]
+    New,
+    Up,
+    Down,
+    Unreachable,
+}
+
+/// The next link state after `status`, and the line to log for it: once when a relay first fails
+/// to connect or drops, once when it connects again; never per retry. The connection is shared
+/// by every mint on these relays, so the line names the relay only.
+fn link_log(
+    state: LinkState,
+    status: nostr_sdk::prelude::RelayStatus,
+    relay: &str,
+) -> (LinkState, Option<String>) {
+    use nostr_sdk::prelude::RelayStatus;
+    const MEANWHILE: &str = "retrying in the background; mint requests go out on the other \
+                             connected relays meanwhile";
+    match (status, state) {
+        (RelayStatus::Connected, LinkState::Down | LinkState::Unreachable) => (
+            LinkState::Up,
+            Some(format!("mint relay {relay} is reachable again")),
+        ),
+        (RelayStatus::Connected, _) => (LinkState::Up, None),
+        (RelayStatus::Disconnected, LinkState::Up) => (
+            LinkState::Down,
+            Some(format!("mint relay {relay} disconnected; {MEANWHILE}")),
+        ),
+        (RelayStatus::Disconnected, LinkState::New) => (
+            LinkState::Unreachable,
+            Some(format!("mint relay {relay} unreachable; {MEANWHILE}")),
+        ),
+        (_, state) => (state, None),
+    }
+}
+
+/// Keep one shared relay's link state current and log its reachability changes to stderr.
+/// `wake` is a second receiver on the same relay: it only says when to drain.
+async fn watch_link(
+    mut wake: tokio::sync::broadcast::Receiver<RelayNotification>,
+    link: Arc<Mutex<RelayLink>>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        let ended = matches!(
+            wake.recv().await,
+            Ok(RelayNotification::Shutdown) | Err(RecvError::Closed)
+        );
+        let (lines, terminated) = {
+            let mut link = lock(&link);
+            let lines = link.drain();
+            // `Shutdown` can be lost to a lagged receiver; the status set before it cannot.
+            let terminated = matches!(
+                link.relay.status(),
+                nostr_sdk::prelude::RelayStatus::Terminated
+                    | nostr_sdk::prelude::RelayStatus::Banned
+            );
+            (lines, terminated)
+        };
+        for line in lines {
+            eprintln!("{line}");
+        }
+        if ended || terminated {
+            return;
+        }
+    }
 }
 
 /// A fresh request id. An OS RNG failure is an ambiguous error before anything is published, never
@@ -1330,6 +1875,50 @@ mod tests {
         assert!(!pending.is_definitive_failure());
     }
 
+    /// Field report 2026-11-16 (option 3, logging only): a relay that never connects is logged
+    /// once, not per retry; a drop and a recovery are each logged once; nothing is skipped.
+    #[test]
+    fn mint_relay_reachability_is_logged_once_per_change() {
+        use nostr_sdk::prelude::RelayStatus::*;
+        let r = "wss://dead.example";
+        let mut state = LinkState::New;
+        let mut lines = Vec::new();
+        for status in [
+            Pending,
+            Connecting,
+            Disconnected,
+            Connecting,
+            Disconnected,
+            Connecting,
+            Connected,
+            Disconnected,
+            Connecting,
+            Disconnected,
+            Connected,
+            Connected,
+        ] {
+            let (next, line) = link_log(state, status, r);
+            state = next;
+            lines.extend(line);
+        }
+        assert_eq!(
+            lines,
+            [
+                format!(
+                    "mint relay {r} unreachable; retrying in the background; mint requests go out on the other connected relays meanwhile"
+                ),
+                format!("mint relay {r} is reachable again"),
+                format!(
+                    "mint relay {r} disconnected; retrying in the background; mint requests go out on the other connected relays meanwhile"
+                ),
+                format!("mint relay {r} is reachable again"),
+            ]
+        );
+        // A relay that connects at once is never logged.
+        let (state, line) = link_log(LinkState::New, Connected, r);
+        assert_eq!((state, line), (LinkState::Up, None));
+    }
+
     #[tokio::test]
     async fn nostr_oversized_request_is_a_definitive_413_before_any_relay() {
         let connector = NostrMintConnector::new(
@@ -1394,6 +1983,204 @@ mod tests {
         collect_lifecycle(&mut receivers, &mut observation);
         assert_eq!(observation.relays[&url].connection_generation, 2);
         assert_eq!(reason_category("blocked: secret\u{001b}[31m"), "policy");
+    }
+
+    /// Review r1 H5: on a runtime that is shutting down, `spawn` drops the task (and runs its
+    /// destructor) before returning. Registering a shared connection there must neither deadlock
+    /// on the pool lock nor leave the dead runtime's connection behind.
+    #[test]
+    fn shared_connection_on_a_shutting_down_runtime_neither_deadlocks_nor_leaks() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let id = handle.id();
+        runtime.shutdown_background();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let connector = NostrMintConnector::new(
+                &MintUrl::from_str(&format!("nostr://{G_NPUB}")).unwrap(),
+                vec!["ws://127.0.0.1:1".into()],
+            )
+            .unwrap()
+            .with_identity(Keys::generate())
+            .with_persistent_connections();
+            // Timers on a shut-down runtime panic; only returning at all matters here.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(connector.call_observed(op::INFO, Value::Null))
+            }));
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deadlocked registering a shared connection");
+        assert!(!lock(&POOL).keys().any(|key| key.runtime == id));
+    }
+
+    /// A relay that accepts TCP and never answers the websocket handshake, so the SDK stays
+    /// `Connecting` until `close` is sent; then every held socket closes and the handshake fails.
+    async fn closable_black_hole() -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (close, closed) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            tokio::select! {
+                _ = async {
+                    while let Ok((socket, _)) = listener.accept().await {
+                        held.push(socket);
+                    }
+                } => {}
+                _ = closed => {}
+            }
+        });
+        (url, close)
+    }
+
+    /// One relay with its own [`RelayLink`] and [`watch_link`], as a shared connection has.
+    async fn watched(url: &str) -> (Client, Relay, Arc<AtomicBool>) {
+        let client = Client::new(Keys::generate());
+        client.add_relay(url).await.unwrap();
+        let relay = client.relays().await.into_values().next().unwrap();
+        let retired = Arc::new(AtomicBool::new(false));
+        let link = Arc::new(Mutex::new(RelayLink::new(
+            url.to_owned(),
+            relay.clone(),
+            retired.clone(),
+        )));
+        tokio::spawn(watch_link(relay.notifications(), link));
+        (client, relay, retired)
+    }
+
+    /// Review r2 H1: a shared relay that leaves `Connected` with messages still queued would send
+    /// them on its next socket, after the requests that queued them returned and maybe after
+    /// their `exp`. [`watch_link`] shuts it down on the status change, well before the SDK's
+    /// >= 7 s reconnect, and retires the connection. A relay that drops with nothing queued is
+    /// left to reconnect: a request still waiting on it needs the next socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_relay_down_with_queued_messages_is_shut_down_and_retires_the_connection() {
+        use nostr_sdk::prelude::RelayStatus;
+        let (url, close) = closable_black_hole().await;
+        let (_queued_client, queued, queued_retired) = watched(&url).await;
+        let (_idle_client, idle, idle_retired) = watched(&url).await;
+        queued.connect();
+        idle.connect();
+        let started = Instant::now();
+        while queued.status() != RelayStatus::Connecting || idle.status() != RelayStatus::Connecting
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "never connecting"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Queued and never written: the socket's writer only runs once the handshake completes.
+        queued
+            .send_msg(ClientMessage::close(SubscriptionId::generate()))
+            .unwrap();
+        assert_eq!(queued.queue(), 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = close.send(());
+
+        let dropped = Instant::now();
+        while queued.status() != RelayStatus::Terminated || !queued_retired.load(Ordering::SeqCst) {
+            assert!(
+                dropped.elapsed() < Duration::from_secs(3),
+                "a relay down with {} queued message(s) was left to reconnect: {:?}",
+                queued.queue(),
+                queued.status()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while idle.status() == RelayStatus::Connecting {
+            assert!(
+                dropped.elapsed() < Duration::from_secs(3),
+                "idle relay never dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !idle_retired.load(Ordering::SeqCst),
+            "a relay down with nothing queued retired its connection"
+        );
+        assert_ne!(idle.status(), RelayStatus::Terminated);
+    }
+
+    /// Review r2 M2: once every relay of a shared connection is shut down (another request
+    /// retired it), none can reconnect or carry a reply, so a request waiting on it ends at once,
+    /// ambiguously, instead of waiting out its window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_ends_at_once_when_every_shared_relay_is_shut_down() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let local = LocalRelay::new(RelayBuilder::default());
+        local.run().await.expect("relay run");
+        let identity = Keys::generate();
+        // No mint listens for G_NPUB: only the shutdown can end the request before its window.
+        let connector = NostrMintConnector::new(
+            &MintUrl::from_str(&format!("nostr://{G_NPUB}")).unwrap(),
+            vec![local.url().await.to_string()],
+        )
+        .unwrap()
+        .with_timing(
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(3),
+        )
+        .with_identity(identity.clone())
+        .with_persistent_connections();
+        let call = tokio::spawn({
+            let connector = connector.clone();
+            async move { connector.call_observed(op::INFO, Value::Null).await }
+        });
+
+        let signer = identity.public_key().to_hex();
+        let started = Instant::now();
+        let pooled = loop {
+            let found = lock(&POOL)
+                .iter()
+                .find(|(key, _)| key.signer == signer)
+                .and_then(|(_, slot)| slot.conn.clone());
+            if let Some(pooled) = found {
+                break pooled;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "no shared connection"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let relays = pooled.client.relays().await;
+        while !relays.values().all(|r| r.is_connected()) {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "never connected"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The request is out and waiting for its reply.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!call.is_finished());
+
+        let shut = Instant::now();
+        for relay in relays.values() {
+            relay.disconnect();
+        }
+        let (result, obs) = call.await.unwrap();
+        let error = result.expect_err("nobody answers");
+        assert!(
+            matches!(&error, Error::HttpError(None, m) if m.contains("all relays closed")),
+            "{error:?} {obs:?}"
+        );
+        assert!(!error.is_definitive_failure(), "{error:?}");
+        assert!(
+            shut.elapsed() < Duration::from_secs(2),
+            "waited {:?} after every relay was shut down: {obs:?}",
+            shut.elapsed()
+        );
+        drop(pooled);
     }
 
     #[test]

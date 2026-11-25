@@ -196,7 +196,7 @@ impl PaymentSend for NostrPaymentSend {
         &mut self,
         payload: PaymentPayload,
     ) -> Result<PaymentSent, PaymentSendError> {
-        use nostr_sdk::prelude::{Client, PublicKey};
+        use nostr_sdk::prelude::PublicKey;
 
         let receiver = PublicKey::parse(&payload.seller_pubkey).map_err(|error| {
             PaymentSendError::Transport(format!(
@@ -204,7 +204,7 @@ impl PaymentSend for NostrPaymentSend {
             ))
         })?;
         let gift_wrap = payment_send_gift_wrap(&self.keys, receiver, payload.wire_json()?).await?;
-        let client = Client::new(self.keys.clone());
+        let client = crate::relay_transport::client(self.keys.clone());
         client.add_relay(&self.relay).await.map_err(|error| {
             PaymentSendError::Transport(format!("failed to add relay: {error}"))
         })?;

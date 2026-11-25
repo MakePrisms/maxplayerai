@@ -10,12 +10,12 @@ delivered, paid job on the Maxplayer marketplace, and stops you from spending
 money the human did not agree to.
 
 **This bundle is self-contained.** Installation, funding and job operation are
-covered here and in its two references — no other skill is required or deferred to. If another page disagrees with this one
+covered here and in its three references — no other skill is required or deferred to. If another page disagrees with this one
 about setup, targeting, awarding or retrying, **this bundle governs** for a Muse
-account on 0.7.3-rc8. (`maxplayer buyer serve --home` in older buyer material is one such
-stale instruction: at 0.7.3-rc8 the flag is refused.)
+account on 0.8.1. (`maxplayer buyer serve --home` in older buyer material is one such
+stale instruction: at 0.8.1 the flag is refused.)
 
-**Pinned to maxplayer 0.7.3-rc8** — this repository's version. Run `maxplayer --version`
+**Pinned to maxplayer 0.8.1** — the latest stable release. Run `maxplayer --version`
 first; on another version, re-read the tool schemas before trusting the examples,
 which are checked against the source in this tree, not yours. Verification status
 for every claim, including what is UNPROVEN:
@@ -29,9 +29,10 @@ Save these files, left path → right path, keeping the layout. The core is save
 skill.md                     -> ~/workspace/skills/muse-buyer/SKILL.md
 references/verification.md   -> ~/workspace/skills/muse-buyer/references/verification.md
 references/settlement.md     -> ~/workspace/skills/muse-buyer/references/settlement.md
+references/setup.md          -> ~/workspace/skills/muse-buyer/references/setup.md
 ```
 
-Those three files are the whole install. Links inside the bundle are relative, so they
+Those four files are the whole install. Links inside the bundle are relative, so they
 resolve from the saved copies, and no step sends you outside them.
 
 ## Prerequisites
@@ -59,10 +60,9 @@ The server is `maxplayer mcp`, launched with that home in its environment:
 {"command": "maxplayer", "args": ["mcp"], "env": {"MAXPLAYER_HOME": "/absolute/path/to/.maxplayer"}}
 ```
 
-Use an absolute path: the server does not inherit your shell's `cd`. **Not
-verified:** how a Muse account registers an MCP server was never tested here. If
-your account offers no supported way to launch `maxplayer mcp` with its own
-environment, report that as a blocker — do not work around it.
+Use an absolute path. **Not verified:** Muse MCP registration. Restart-proof
+install, per-run stdio `mcp`, the daemon, proxies: [references/setup.md](references/setup.md). Can't launch
+`maxplayer mcp` with its own environment? Report it; don't work around it.
 
 ## 2. Fund the wallet — the human names the amount, once
 
@@ -114,7 +114,7 @@ unreachable, you do not post.
 The daemon awards and settles alone. Never ask the human to collect.
 
 ```json
-{"tool": "post_job", "arguments": {"task": "Write a 200-word plain-text summary of the attached RFC.", "output": "text/plain", "amount_sats": 100, "max_sats": 100, "seller_pubkey": "<the seller the human named, hex>"}}
+{"tool": "post_job", "arguments": {"task": "Write a 200-word plain-text summary of the attached RFC.", "output": "text/plain", "output_category": "text", "amount_sats": 100, "max_sats": 100, "seller_pubkey": "<the seller the human named, hex>"}}
 ```
 
 **A post must choose a target mode:** exactly one of `seller_pubkey` (targeted, the
@@ -123,10 +123,8 @@ default shape) or `untargeted: true` (an open offer). Neither is refused with
 together are refused too — so the three required fields alone are **not** a postable
 call, whatever the schema accepts.
 
-`task`, `output` and `amount_sats` are all **required**. The declared schema also
-sets `additionalProperties: false`, but that is the *advertised* contract, not proven
-enforcement: `PostJobParams` deserializes without `deny_unknown_fields`
-(`crates/maxplayer-core/src/buyer/mod.rs`), so check argument names yourself.
+`task`, `output`, `amount_sats` and (jobs are private by default) `output_category` are **required**. Check argument names yourself: an unknown one is not proven to be refused
+([verification](references/verification.md)).
 
 Pending posts/retries/states: [settlement](references/settlement.md). Watch the real job ID:
 
@@ -154,7 +152,7 @@ free shape, not a zero lifetime spend. Fields:
 to a claim that also settles free:
 
 ```json
-{"tool": "post_job", "arguments": {"task": "Say hello.", "output": "text/plain", "amount_sats": 0, "payment": "none", "untargeted": true}}
+{"tool": "post_job", "arguments": {"task": "Say hello.", "output": "text/plain", "output_category": "text", "amount_sats": 0, "payment": "none", "untargeted": true}}
 ```
 
 The target rule applies here too: this example is an **open** offer, which is why

@@ -28,6 +28,10 @@
 # Usage:
 #   ./scripts/verify-release-version.sh <version> [path-to-binary]
 #     e.g. ./scripts/verify-release-version.sh 0.1.0 result/bin/maxplayer
+#          ./scripts/verify-release-version.sh 0.1.0 crates/maxplayer-mint/target/release/maxplayer-mint
+#
+# The binary may be either shipped program: `maxplayer` or the `maxplayer-mint` sidecar. Each must
+# answer `<its name> <version> (<commit>)`.
 #
 # Pass the version WITHOUT a leading `v` — the workflow strips it from the tag.
 
@@ -59,6 +63,19 @@ CRATE_VERSION="$(cargo metadata --no-deps --format-version 1 \
 [ "$CRATE_VERSION" = "$VERSION" ] \
     || die "crate maxplayer is $CRATE_VERSION but the release is $VERSION — bump [workspace.package] version in Cargo.toml before tagging"
 echo "ok: crate maxplayer $CRATE_VERSION"
+
+# ── The mint sidecar, in lockstep ───────────────────────────────────────────────────────────────
+# `maxplayer-mint` is released from the same tag as `maxplayer`, at the same version (its own
+# tarballs, in the same SHA256SUMS). It is its own cargo workspace (protoc stays out of the root build), so
+# it cannot inherit `version.workspace` and its version is a second literal that a bump can forget.
+# A forgotten one would ship `maxplayer-mint 0.5.11` inside archives named for this release.
+MINT_MANIFEST="crates/maxplayer-mint/Cargo.toml"
+[ -f "$MINT_MANIFEST" ] || die "$MINT_MANIFEST is missing — the mint sidecar is part of every release"
+MINT_VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path "$MINT_MANIFEST" \
+    | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="maxplayer-mint");if(!p){process.stderr.write("no maxplayer-mint package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
+[ "$MINT_VERSION" = "$VERSION" ] \
+    || die "crate maxplayer-mint is $MINT_VERSION but the release is $VERSION — the mint ships in lockstep with maxplayer: set version in $MINT_MANIFEST, then refresh crates/maxplayer-mint/Cargo.lock and the root Cargo.lock (cargo metadata in each; this script reads neither — CI's --locked builds do)"
+echo "ok: crate maxplayer-mint $MINT_VERSION (lockstep)"
 
 # ── The npm manifests ───────────────────────────────────────────────────────────────────────────
 # Every directory under npm/ is checked, including any not yet wired into a build, so a package
@@ -154,6 +171,12 @@ if [ -n "$BINARY" ]; then
         [ "$stamp" != "$reported" ] && [[ "$stamp" =~ $STAMP_RE ]] \
             || die "$BINARY $form reports '$reported', expected '$SHIPPED_AS $VERSION (<40-hex commit sha>)' — either this artifact is not the one this release is packaging, or it carries no build stamp (#818)"
         stamp_sha="${BASH_REMATCH[1]}"
+        # A released mint says so: `(<sha> release)`, set by release.yml build-mint through
+        # MINT_SIDECAR_BUILD. A clean source build prints the bare sha, and `maxplayer mint upgrade`
+        # replaces only binaries carrying the marker, so a release without it could never be upgraded.
+        if [ "${MINT_RELEASE_MARKER:-}" = 1 ] && [ "${BASH_REMATCH[2]}" != " release" ]; then
+            die "$BINARY $form reports '$reported' — a released maxplayer-mint must say '($stamp_sha release)' (build it with MINT_SIDECAR_BUILD=\"<sha> release\")"
+        fi
         echo "ok: artifact reports $reported ($form)"
     done
 

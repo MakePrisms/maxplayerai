@@ -14,8 +14,6 @@
  * to cache. The files themselves keep their names; the query string is the
  * only difference.
  */
-import { parseChallengeRelays, parseChallengeQuorum } from "../src/challenge/shared/relay.mjs";
-import { withSwarmBuyer } from "./swarm-buyer.mjs";
 import { build, context } from "esbuild";
 import { createHash } from "node:crypto";
 import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -26,27 +24,24 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "dist");
 const SITE_ORIGIN = "https://www.maxplayer.ai";
 
-const buyer = process.env.CHALLENGE_BUYER_PUBKEY ?? "94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5";
-if (!/^[0-9a-f]{64}$/.test(buyer)) throw Error("CHALLENGE_BUYER_PUBKEY must be lowercase hex");
 const relay = process.env.RELAY_URL ?? "wss://relay.maxplayer.ai";
 if (!["ws:", "wss:"].includes(new URL(relay).protocol)) throw Error("Invalid RELAY_URL");
-const challengeRelays = parseChallengeRelays(process.env.CHALLENGE_RELAYS);
-// Challenge relay quorum (run 2 #13): default 2; must be a majority of CHALLENGE_RELAYS.
-const challengeQuorum = parseChallengeQuorum(process.env.CHALLENGE_QUORUM, challengeRelays.length);
 const watch = process.argv.includes("--watch");
 // Legal pages are served one level deep, so they load assets from "/" rather than "./".
-// Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date.
-const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "skill-preview.html"];
+// Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date; older dates stay live at their URLs.
+// Stylesheets of the pages in the new look (/, /market and the legal pages). The other pages use styles.css.
+const SITE_CSS = ["site.css", "market.css", "nojs.css", "legal.css", "join.css"];
+const PAGES = ["index.html", "market.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "terms-20261123.html", "privacy-20261123.html", "skill-preview.html", "join-preview.html", "join-invite.html"];
 
 const options = {
-  // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,
-  // so the token-trade reader never ships in (or changes) the jobs bundle.
-  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts") },
+  // teams.js serves / and market.js serves /market (the two pages in the new look).
+  // join.js serves the team invite page a browser gets for /join/<token> (its copy line);
+  // legal.js serves the legal pages (their menu); terminal.js serves the pages that keep
+  // the earlier look (chat, mint); tokens.js serves /tokens only, so the token-trade reader never ships
+  // in (or changes) another bundle.
+  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts"), teams: join(root, "src/teams.ts"), market: join(root, "src/market-page.ts"), legal: join(root, "src/legal.ts"), join: join(root, "src/join.ts") },
   bundle: true,
   define: {
-    CHALLENGE_BUYER_PUBKEY: JSON.stringify(buyer),
-    CHALLENGE_RELAYS: JSON.stringify(challengeRelays),
-    CHALLENGE_QUORUM: JSON.stringify(challengeQuorum),
     CONFIGURED_RELAY_URL: JSON.stringify(relay),
     WEB_ANALYTICS_ENABLED: String(process.env.VERCEL_ENV === "production"),
   },
@@ -62,7 +57,6 @@ if (watch) {
   // Dev loop: unstamped copies, rebuild on save. Stamping is a deploy concern.
   mkdirSync(dist, { recursive: true });
   cpSync(join(root, "public"), dist, { recursive: true });
-  writeFileSync(join(dist, "swarm.html"), withSwarmBuyer(readFileSync(join(root, "public/swarm.html"), "utf8"), "html", buyer));
   const ctx = await context(options);
   await ctx.watch();
   console.log("watching src/ …");
@@ -73,14 +67,16 @@ if (watch) {
   await build(options);
 
   // One stamp derived from every shipped byte the HTML/CSS reference.
-  const fontNames = readdirSync(join(root, "public/fonts"));
+  const fontNames = readdirSync(join(root, "public/fonts")).sort();
+  // The pictures of the new pages (agent marks, the sheet of soft marks), referenced from site.css and preloaded
+  // by index.html.
+  const assetNames = readdirSync(join(root, "public/assets"), { recursive: true })
+    .filter((f) => statSync(join(root, "public/assets", f)).isFile()).sort();
   const hash = createHash("sha256");
-  for (const rel of [...PAGES, "styles.css", "fonts.css", "swarm.css", ...fontNames.map((f) => join("fonts", f))]) {
+  for (const rel of [...PAGES, "styles.css", "fonts.css", "swarm.css", ...SITE_CSS, ...fontNames.map((f) => join("fonts", f)), ...assetNames.map((f) => join("assets", f))]) {
     hash.update(readFileSync(join(root, "public", rel)));
   }
-  hash.update(readFileSync(join(dist, "terminal.js")));
-  hash.update(readFileSync(join(dist, "tokens.js")));
-  hash.update(readFileSync(join(dist, "swarm.js")));
+  for (const bundle of ["terminal.js", "tokens.js", "swarm.js", "teams.js", "market.js", "legal.js", "join.js"]) hash.update(readFileSync(join(dist, bundle)));
   const STAMP = hash.digest("hex").slice(0, 12);
 
   // Stamp the specifiers, not the files: fonts.css's url()s and every asset
@@ -91,22 +87,27 @@ if (watch) {
     readFileSync(join(root, "public/fonts.css"), "utf8")
       .replace(/url\((['"])(\.\/fonts\/[^'"?]+)\1\)/g, `url($1$2?v=${STAMP}$1)`),
   );
-  // Every page: the buyer homepage (/), the seller page (/sell), the live
-  // market (/market), the chat page (/chat), the mint page (/mint), the token-trade page (/tokens) and the community swarm (/swarm) — cleanUrls serves them.
+  // The new pages' stylesheets point at pictures in assets/: stamp those url()s the same way, so an index.html
+  // preload of a picture matches the stylesheet's URL byte-for-byte.
+  for (const css of SITE_CSS) {
+    writeFileSync(
+      join(dist, css),
+      readFileSync(join(root, "public", css), "utf8")
+        .replace(/url\((['"])(\.\/assets\/[^'"?]+)\1\)/g, `url($1$2?v=${STAMP}$1)`),
+    );
+  }
+  // Every page: the Teams homepage (/), the
+  // market (/market), the mint page (/mint), the token-trade page (/tokens) and the swarms (/swarm and /swarm/<naddr>) — cleanUrls serves them.
   for (const page of PAGES) {
     writeFileSync(
       join(dist, page),
-      withSwarmBuyer(readFileSync(join(root, "public", page), "utf8"), page === "swarm.html" ? "html" : null, buyer)
-        .replace(/(href|src)="(\.?\/)(styles\.css|fonts\.css|terminal\.js|tokens\.js|swarm\.js|swarm\.css|fonts\/[^"?]+)"/g, `$1="$2$3?v=${STAMP}"`),
+      readFileSync(join(root, "public", page), "utf8")
+        .replace(/(href|src)="(\.?\/)(styles\.css|fonts\.css|site\.css|market\.css|nojs\.css|legal\.css|legal\.js|join\.css|join\.js|terminal\.js|tokens\.js|swarm\.js|teams\.js|market\.js|swarm\.css|fonts\/[^"?]+|assets\/[^"?]+)"/g, `$1="$2$3?v=${STAMP}"`),
     );
   }
 
   // The agent-facing surface: skills, discovery index, /skill.md alias.
   cpSync(join(root, ".well-known"), join(dist, ".well-known"), { recursive: true });
-  // The join skill names the swarm buyer's key in its text, written at build time like the page's,
-  // so an agent following the one-line join finds it without running the page's script.
-  const joinSkill = join(".well-known", "skills", "swarm-join", "skill.md");
-  writeFileSync(join(dist, joinSkill), withSwarmBuyer(readFileSync(join(root, joinSkill), "utf8"), "skill", buyer));
 
   // The legacy index remains the inventory for the skill URLs we already
   // publish. Discovery v0.2.0 adds integrity metadata, so derive every digest
@@ -118,7 +119,7 @@ if (watch) {
   const discoveryIndex = {
     $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
     skills: legacySkillIndex.skills.map(({ name, description, path }) => {
-      // The SHIPPED bytes: the join skill is rewritten above, so its source file is not what is served.
+      // The SHIPPED bytes, as served.
       const artifact = readFileSync(join(dist, path.slice(1)));
       return {
         name,
@@ -142,5 +143,5 @@ if (watch) {
   writeFileSync(join(dist, ".buildstamp"), JSON.stringify({ flat: true, stamp: STAMP }, null, 2) + "\n");
 
   const kb = (f) => (statSync(join(dist, f)).size / 1024).toFixed(1);
-  console.log(`dist/terminal.js ${kb("terminal.js")} KB · dist/tokens.js ${kb("tokens.js")} KB · stamp ${STAMP}`);
+  console.log(`dist/teams.js ${kb("teams.js")} KB · dist/market.js ${kb("market.js")} KB · dist/terminal.js ${kb("terminal.js")} KB · dist/tokens.js ${kb("tokens.js")} KB · stamp ${STAMP}`);
 }

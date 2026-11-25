@@ -3,15 +3,16 @@ declare const WEB_ANALYTICS_ENABLED: boolean;
  * /tokens — the token-trade market, read-only and unlisted (team link only:
  * no nav, footer or llms.txt entry, and served noindex).
  *
- * Its own bundle (tokens.js): the jobs board's terminal.js is untouched and
- * this page never opens the production relay. It reads listings and status
- * chains from the trade CLI's public relays (trade/relays.ts), validates every
+ * Its own bundle (tokens.js): the jobs board's terminal.js is untouched. It
+ * reads listings and status chains from the trade CLI's relays, ours first
+ * (trade/relays.ts), without signing in, validates every
  * event with the CLI's rules (trade/validate.ts), and renders the book
  * (trade/book.ts). No wallet, no keys, no trading: nothing here can sign.
  */
 import { startAnalytics } from "./analytics.js";
-import { WINDOWS, completedStats, createBook, type BookView, type LotRow } from "./trade/book.js";
+import { CLOSED_ROW_CAP, WINDOWS, closedMeta, closedRows, completedStats, createBook, type BookView, type LotRow } from "./trade/book.js";
 import { dockSide, mintLabel, rate, seller, timeLeft } from "./trade/format.js";
+import { SETTLE_MS, boardSettled, relaySummary } from "./trade/conn.js";
 import { DEFAULT_TRADE_RELAYS, createTradeReader, type RelayState } from "./trade/relays.js";
 import { ago, duration, esc, nf, now, stamp } from "./ui/format.js";
 import { reconcileList, type KeyedItem } from "./ui/reconcile.js";
@@ -67,8 +68,6 @@ function closedItem(r: LotRow, t: number): KeyedItem {
 }
 
 let windowKey = "24h";
-/** After the first relay answers, wait at most this long for the others before painting. */
-const SETTLE_MS = 2500;
 
 /** The buttons are static HTML (painted before JS); this only wires them. */
 function wireWindows(onChange: () => void): void {
@@ -83,8 +82,10 @@ function wireWindows(onChange: () => void): void {
 }
 
 /** Fills the static stat cells in place: labels never re-render, so nothing moves. */
+const currentWindow = () => WINDOWS.find((x) => x.key === windowKey) ?? WINDOWS[0]!;
+
 function renderStats(v: BookView, t: number): void {
-  const w = WINDOWS.find((x) => x.key === windowKey) ?? WINDOWS[0]!;
+  const w = currentWindow();
   const c = completedStats(v, t, w.seconds);
   const values: Record<string, string> = {
     trades: nf.format(c.trades),
@@ -132,13 +133,16 @@ function render(v: BookView, answered: boolean, settled: boolean): void {
   // lands reshuffled the rows two or three times in the first second.
   if (!settled) return;
   renderStats(v, t);
-  const recent = v.closed.filter((r) => r.updated_at >= t - 2 * 86400);
+  // The closed-lots list follows the period buttons, like the stats: All
+  // time lists every trade the Trades stat counts.
+  const w = currentWindow();
+  const recent = closedRows(v, t, w);
   el("lots-meta").textContent = `${v.open.length} open`;
-  el("recent-meta").textContent = `${recent.length} in 48h`;
+  el("recent-meta").textContent = closedMeta(recent.length, w);
   if (v.open.length) reconcileList(el("lots"), v.open.map((r) => openItem(r, t)));
   else if (answered) reconcileList(el("lots"), [{ key: "-empty", className: "empty", html: "No open lots right now." }]);
-  if (recent.length) reconcileList(el("recent"), recent.slice(0, 120).map((r) => closedItem(r, t)));
-  else if (answered) reconcileList(el("recent"), [{ key: "-empty", className: "empty", html: "Nothing sold, cancelled or expired in the last 48 hours." }]);
+  if (recent.length) reconcileList(el("recent"), recent.slice(0, CLOSED_ROW_CAP).map((r) => closedItem(r, t)));
+  else if (answered) reconcileList(el("recent"), [{ key: "-empty", className: "empty", html: esc(w.empty) }]);
   renderDetail();
 }
 
@@ -151,7 +155,7 @@ function boot(): void {
   /** Relays that have finished (or failed) their first read. */
   const firstRead = new Set<string>();
   let graceOver = false;
-  const settled = () => answered && (firstRead.size >= DEFAULT_TRADE_RELAYS.length || graceOver);
+  const settled = () => boardSettled(answered, firstRead.size, DEFAULT_TRADE_RELAYS.length, graceOver);
   const live = () => [...states].filter(([, s]) => s === "live").map(([u]) => u);
   const paint = () => render(book.view(now(), live()), answered, settled());
   wireWindows(() => paint());
@@ -159,12 +163,9 @@ function boot(): void {
   const conn = el("conn");
   const connText = el("conn-text");
   const showConn = () => {
-    const n = live().length;
-    const total = DEFAULT_TRADE_RELAYS.length;
-    const any = (s: RelayState) => [...states.values()].includes(s);
-    const state = n > 0 ? "live" : any("syncing") || any("connecting") || states.size < total ? "connecting" : "failed";
+    const { state, text } = relaySummary(states, DEFAULT_TRADE_RELAYS.length);
     conn.dataset.state = state;
-    connText.textContent = n > 0 ? `live · ${n}/${total} relays` : state === "failed" ? "relays unreachable" : "syncing";
+    connText.textContent = text;
     conn.title = [...states].map(([u, s]) => `${u.replace("wss://", "")}: ${s}`).join("\n");
   };
 

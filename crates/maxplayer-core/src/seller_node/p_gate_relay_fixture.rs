@@ -108,6 +108,9 @@ pub(crate) enum ScriptedFrame {
     /// client's id-keyed verification cache, so a same-id twin that follows on the REQ's own
     /// subscription is admitted without re-verification and reaches the app (the RC3-02 hole).
     Elsewhere(String, Value),
+    /// Send no `EOSE` for this answer: the read stays open until the client gives up. Scripts one
+    /// unanswered read (a recheck that times out) without withholding a whole kind.
+    WithholdEose,
 }
 
 impl ScriptedFrame {
@@ -687,14 +690,21 @@ async fn serve_connection(
 
                 match verdict {
                     Verdict::Eose => {
+                        let mut eose = true;
                         for frame in controls.scripted_answer(&filters) {
                             let (sub, event) = match frame {
                                 ScriptedFrame::Event(event) => (subscription_id.clone(), event),
                                 ScriptedFrame::Elsewhere(sub, event) => (sub, event),
+                                ScriptedFrame::WithholdEose => {
+                                    eose = false;
+                                    continue;
+                                }
                             };
                             send(&writer, json!(["EVENT", sub, event])).await?;
                         }
-                        send(&writer, json!(["EOSE", subscription_id])).await?;
+                        if eose {
+                            send(&writer, json!(["EOSE", subscription_id])).await?;
+                        }
                     }
                     Verdict::Closed(reason) => {
                         send(&writer, json!(["CLOSED", subscription_id, reason])).await?;

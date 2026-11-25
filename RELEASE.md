@@ -3,11 +3,21 @@
 `maxplayer` ships two ways from one tag: downloadable archives on a GitHub Release, and `npx maxplayer` from
 npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v*` tag.
 
+The same tag also ships the mint sidecar, `maxplayer-mint` (`crates/maxplayer-mint`), as a separate
+binary at the same version: `maxplayer-mint-<version>-<platform>.tar.gz` archives listed in the same
+`SHA256SUMS`, on the GitHub Release only — there is no npm package for it. A released mint reports
+`maxplayer-mint <version> (<commit> release)` (build-mint sets `MINT_SIDECAR_BUILD`); a source build
+prints the bare commit, and `maxplayer mint upgrade` replaces only the former. Users install it with
+`maxplayer mint install` (and later `maxplayer mint upgrade`), which downloads the archive for
+`maxplayer`'s own version and checks it against `SHA256SUMS`. It is built by the `build-mint` job, the
+only release job that installs `protoc` (cdk's mint signatory needs it at build time); users never
+need it.
+
 ## Before the first release
 
 One setup step, done once **per package**, and it is the only thing standing between a tag and a
-publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`
-and `@maxplayerai/darwin-arm64`:
+publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`,
+`@maxplayerai/darwin-arm64` and `@maxplayerai/darwin-x64`:
 
 - Settings → **Trusted publishing** → add a GitHub Actions publisher: organization `MakePrisms`,
   repository `maxplayerai`, workflow `release.yml`.
@@ -21,13 +31,14 @@ Releases as normal, and `npm publish` fails loudly for that package. There is no
 unconfigured package fails the job rather than producing a release that looks published.
 
 The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
-the `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64` and `@maxplayerai/darwin-arm64` packages, in
-the npm organization `maxplayerai`. All four need their own trusted publisher entry — the setting is
-per package, not per account or per org. The GitHub side of that entry is the same for all four, and
+the `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`, `@maxplayerai/darwin-arm64` and
+`@maxplayerai/darwin-x64` packages, in the npm organization `maxplayerai`. All five need their own
+trusted publisher entry — the setting is per package, not per account or per org. The GitHub side of
+that entry is the same for all five, and
 is unaffected by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
 
-⚠ `@maxplayerai/darwin-arm64` is new (#446) and needs its entry before the tag that first publishes
-it. The setting lives on npmjs.com and needs an org admin — but whether it is really there is a
+⚠ `@maxplayerai/darwin-x64` is new (Intel macs) and needs its entry before the tag that first
+publishes it, exactly as `@maxplayerai/darwin-arm64` did (#446). The setting lives on npmjs.com and needs an org admin — but whether it is really there is a
 question this repo CAN answer, by publishing something worthless through the same path. See below.
 
 ### Proving an entry exists, before the tag
@@ -51,8 +62,8 @@ Three things about it are load-bearing:
   nothing about the launcher or the linux payloads — those are proven by something else, not by this
   run: `maxplayer`, `@maxplayerai/linux-x64` and `@maxplayerai/linux-arm64` published through this
   same workflow file, tokenless, in the rc.1 and rc.2 releases. Production runs are the strongest
-  evidence an entry exists. `@maxplayerai/darwin-arm64` is the only one with no such run behind it,
-  which is why it is the one to probe.
+  evidence an entry exists. A payload with no release behind it yet — `@maxplayerai/darwin-x64` until
+  its first tag — is the one to probe.
 - **Bump the version every run.** npm never allows reusing a version, probe or not.
 
 A red has three causes that look identical — npm answers a trusted-publishing mismatch with a 404 or
@@ -74,9 +85,12 @@ fails outright.
 1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, the workspace crate
    entries in `Cargo.lock` (refreshed by any `cargo` invocation — e.g. `cargo build` — since the
    release build passes `--locked` and fails on a stale lockfile), and `version` in every
-   `npm/*/package.json`, and the `optionalDependencies` pins in `npm/maxplayer/package.json`. All of
+   `npm/*/package.json`, the `optionalDependencies` pins in `npm/maxplayer/package.json`, and
+   `version` in `crates/maxplayer-mint/Cargo.toml` (its own
+   workspace, so it cannot inherit the root version; refresh `crates/maxplayer-mint/Cargo.lock` too). All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
-   asserts this and stops if anything disagrees.
+   asserts this and stops if anything disagrees. The website moves only on a **stable** bump: see
+   [Website version pins](#website-version-pins-stable-releases-only).
 2. **Open a PR from the bump branch to `main` and squash-merge it.** `main` rejects direct pushes, so
    the bump reaches `main` through a PR, and pr-feedback gates the merge:
 
@@ -129,6 +143,27 @@ A genuine pre-release, once a stable exists, works as it always did: a semver su
 and the tree — tag `v0.3.0-rc1` against a tree that says `0.3.0-rc1`. The suffix marks the GitHub
 Release a pre-release and publishes under the `rc` dist-tag, leaving `latest` where it was.
 
+## Website version pins: stable releases only
+
+The website (`web/app`: `public/`, `.well-known/`, `src/`) names stable releases only. It never
+mentions or relies on a release candidate: no `maxplayer@rc` or `--tag rc` install line, no
+`-rcN` version, no pre-release guidance. Release candidates are announced in `RELEASE_NOTES.md`
+and on GitHub Releases, and testers install them from there.
+
+- **An RC bump (`X.Y.Z-rcN`) leaves `web/app` alone.** The version pins on
+  `.well-known/skills/seller-tool-onboarding/skill.md` (version sentence, `git checkout` tag,
+  default sandbox image tag) and every file under `.well-known/skills/muse-buyer/` stay on the
+  latest stable release.
+- **A stable bump (`X.Y.Z`) moves them** to the new version, together with any install line or
+  "from X.Y.Z" claim that should now point at it.
+
+`web/app/test/site-version.mjs` decides the expected pin: `Cargo.toml`'s version when it is stable,
+otherwise the newest stable `## vX.Y.Z` section in `RELEASE_NOTES.md` (which must be older than the
+version the RC builds toward). `seller-tool-onboarding-skill.test.mjs` and `muse-buyer-skill.test.mjs`
+assert the pages against it, and `stable-only-site.test.mjs` fails on any release-candidate mention
+under `public/`, `.well-known/` or `src/`. `scripts/verify-release-version.sh` and
+`scripts/verify-release-surface.sh` do not read `web/app`.
+
 ## What the tag does
 
 - Builds `maxplayer` once per platform, on a runner of that architecture, with
@@ -136,9 +171,13 @@ Release a pre-release and publishes under the `rc` dist-tag, leaving `latest` wh
 - Verifies each artifact: the version matches the tag, `acp` and `sell` are compiled in
   (`scripts/verify-seller-surface.sh`), and on Linux that it runs inside alpine and debian with no
   toolchain present.
-- Attaches the three `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
+- Attaches every platform's `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
   Each is required by name before the release is created: a count cannot tell a complete release
   from one missing a platform.
+- Builds `maxplayer-mint` on the same platforms (`build-mint`, with `protoc`), verifies its version line
+  and portability the same way, and attaches `maxplayer-mint-<version>-<platform>.tar.gz` to the same
+  Release and `SHA256SUMS` (required by name, like `maxplayer`'s archives). The mint is not published to
+  npm.
 - Publishes the npm packages: every payload package first, then the `maxplayer` launcher.
 
 The publish order matters. The launcher pins its payload by exact version, so publishing it first
@@ -184,8 +223,11 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 | linux-x64 | `ubuntu-latest` | archive + `@maxplayerai/linux-x64` |
 | linux-arm64 | `ubuntu-24.04-arm` | archive + `@maxplayerai/linux-arm64` |
 | darwin-arm64 | `macos-15` | archive + `@maxplayerai/darwin-arm64` |
+| darwin-x64 | `macos-15-intel` | archive + `@maxplayerai/darwin-x64` |
 
-**darwin-x64 and Windows are out of scope.**
+**Windows is out of scope.** darwin-x64 builds natively on GitHub's Intel mac runner so every
+verify step runs the binary on real x86_64 hardware; when GitHub retires that label, move to the
+next `macos-*-intel` label, or cross-compile from the arm64 runner and run the checks under Rosetta.
 
 Adding a platform means: a matrix entry in `release.yml`, a package under `npm/`, an entry in
 `PLATFORM_PACKAGES` in `npm/maxplayer/bin/maxplayer.js`, an `optionalDependencies` pin, the platform in
@@ -270,8 +312,10 @@ make it load-bearing.
 
 - **The tag produced no run at all.** The tagged commit has no `release.yml` — see the warning under
   Dry run. Delete the tag, then tag a `main` that contains `release.yml` and push it again.
-- **Publish failed, Release exists.** Fix the cause and re-run just the publish job. The build is
-  reproducible from the tag.
+- **Publish failed, Release exists.** Fix the cause and re-run just the publish job, but only if no
+  package was published yet: npm does not allow republishing a version, so a re-run after a partial
+  publish fails on the first package already there (see the trusted-publisher note above); cut the
+  next patch version instead. The build is reproducible from the tag.
 - **A version disagreed with the tag.** Nothing was published — the check runs before any upload.
   Delete the tag, fix the versions, tag again.
 - **A bad version reached npm.** npm does not allow republishing a version. Bump and release again;

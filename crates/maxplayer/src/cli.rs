@@ -80,10 +80,20 @@ where
         #[cfg(feature = "acp")]
         Some("sandbox-reap") => crate::sandbox_reap::run(&args[2..], out, err),
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
+        // `trade` is dispatched in main.rs, before this function, on the raw OS arguments.
         Some("profile") => crate::profile_cli::run(&args[2..], out, err),
         Some("whoami") => crate::whoami::run(&args[2..], out, err),
         // Email registration (spec v2.12): link this key to an email so the relay accepts its writes.
         Some("account") => crate::account_cli::run(&args[2..], out, err),
+        // The credit mint: `mint` shows it (read-only), `mint install` fetches the released
+        // `maxplayer-mint` at this version and sets up <home>/mint/, `mint upgrade` replaces an
+        // older released one, `mint uninstall` removes the binary (never <home>/mint/).
+        Some("mint") => crate::mint_cli::run(&args[2..], out, err),
+        // Swarms on the home's relay (docs/specs/swarm.md §6): list, join, create, decide, ….
+        Some("swarm") => crate::swarm_cli::run(&args[2..], out, err),
+        // Teams on the home's relay (docs/specs/maxplayer-team.md): chat, follows and a shared repo.
+        #[cfg(feature = "wallet")]
+        Some("team") => crate::team_cli::run(&args[2..], out, err),
         // Where the agent documentation lives. Pure print — no home, key, wallet or network — so
         // it works on a box that has installed nothing but the binary.
         Some("skill") => crate::skill::run(&args[2..], out, err),
@@ -93,6 +103,53 @@ where
         Some("mock") => run_mock(&args[2..], out, err),
         Some("run") => run_agent(&args[2..], out, err),
         _ => usage(err),
+    }
+}
+
+/// The first stderr lines a daemon prints when it starts (`buyer serve`, `seller serve`), once its
+/// home is resolved and before anything that can fail. Every daemon start goes through here, so the
+/// order is decided in ONE place: the version start line ([`crate::build_stamp::start_line`], #1354)
+/// is always FIRST, and the deprecation line of a verbless start comes right after it — it never
+/// becomes the daemon's first line.
+#[cfg(feature = "wallet")]
+pub(crate) fn daemon_preamble(
+    err: &mut dyn Write,
+    role: &str,
+    place: &str,
+    deprecated: Option<DeprecatedStart>,
+) {
+    let _ = writeln!(err, "{}", crate::build_stamp::start_line(role, place));
+    if let Some(alias) = deprecated {
+        let _ = writeln!(err, "{}", alias.line());
+    }
+    local_proxy_warning(err);
+}
+
+/// A process started from an agent's shell can inherit that agent's credentialed egress proxy,
+/// whose token dies with the agent's run; every later request then fails with 407. Warns once on
+/// `err` (stderr: `mcp`'s stdout is its JSON-RPC stream).
+pub(crate) fn local_proxy_warning(err: &mut dyn Write) {
+    if let Some(warning) = maxplayer_core::error_chain::local_proxy_warning(std::env::vars_os()) {
+        let _ = writeln!(err, "{warning}");
+    }
+}
+
+/// A verbless daemon start form that still works but is deprecated: `serve` is the start verb for
+/// every daemon (`buyer serve`, `seller serve`, `reviewer serve`, `maxplayer-mint serve`).
+#[derive(Clone, Copy)]
+pub(crate) struct DeprecatedStart {
+    pub old: &'static str,
+    pub new: &'static str,
+}
+
+impl DeprecatedStart {
+    /// One line naming the new command, so a supervisor log shows the fix while the daemon keeps
+    /// serving exactly as before.
+    pub(crate) fn line(self) -> String {
+        format!(
+            "maxplayer: `{}` without `serve` is deprecated and still works; use `{}`",
+            self.old, self.new
+        )
     }
 }
 
@@ -343,7 +400,17 @@ fn usage(err: &mut dyn Write) -> i32 {
 fn write_usage(out: &mut dyn Write) {
     let _ = write!(
         out,
-        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer skill    # print where the agent documentation lives (orientation URL + skill index); no wallet, key or network\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n  maxplayer account <link|status|marketing on|off>   # link this agent's key to your email (required to write to the relay)\n"
+        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer skill    # print where the agent documentation lives (orientation URL + skill index); no wallet, key or network\n  maxplayer mcp\n  maxplayer buyer serve   # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n  maxplayer account <link|status|marketing on|off>   # link this agent's key to your email (required to write to the relay)\n  maxplayer mint [install|upgrade|uninstall|init|name|serve|issue|restore|version]   # this home's credit mint: show it, install/upgrade the released maxplayer-mint at this version, uninstall the binary, or run a maxplayer-mint command for this home\n  maxplayer swarm <list|show|join|leave|create|job|decide|members> ...   # swarms: groups of sellers a buyer gives goals to\n"
+    );
+    #[cfg(feature = "wallet")]
+    let _ = writeln!(
+        out,
+        "  maxplayer team <whoami|create|invite|invites|join|list|send|inbox|log|watch|clone|pull|push|…> ...   # teams: group chat and a shared private repo with other agents (`maxplayer team --help`)"
+    );
+    #[cfg(feature = "wallet")]
+    let _ = writeln!(
+        out,
+        "  maxplayer trade <discover|list|take|cancel|status|balance|recover|preflight|doctor|serve|send> ...   # trade tokens between mints on this home's key and wallet (`maxplayer trade --help`)"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(
@@ -356,7 +423,7 @@ fn write_usage(out: &mut dyn Write) {
     #[cfg(feature = "acp")]
     let _ = write!(
         out,
-        "  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer sandbox-reap --seat <64-hex> [--dry-run]   # remove a RETIRED seat's leftover containment holders\n"
+        "  maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted]\n  maxplayer seller serve   # zero-prompt relaunch from config.toml\n  maxplayer sandbox-reap --seat <64-hex> [--dry-run]   # remove a RETIRED seat's leftover containment holders\n"
     );
     let _ = writeln!(
         out,
@@ -707,6 +774,11 @@ mod tests {
             out.contains("maxplayer skill"),
             "`maxplayer --help` must list the skill subcommand:\n{out}"
         );
+        #[cfg(feature = "wallet")]
+        assert!(
+            out.contains("\n  maxplayer team <") && out.contains("`maxplayer team --help`"),
+            "`maxplayer --help` must list the team subcommand:\n{out}"
+        );
 
         // A wrong invocation prints the same usage to stderr — a stranger who typed the wrong thing
         // is exactly the reader who needs the pointer.
@@ -781,9 +853,15 @@ mod tests {
         #[cfg(feature = "acp")]
         cases.push(("seller --help", "maxplayer seller"));
         #[cfg(feature = "acp")]
+        cases.push(("seller serve --help", "maxplayer seller serve"));
+        #[cfg(feature = "acp")]
         cases.push(("sandbox-reap --help", "maxplayer sandbox-reap"));
         #[cfg(feature = "wallet")]
         cases.push(("sandbox-probe --help", "maxplayer sandbox-probe"));
+        #[cfg(feature = "wallet")]
+        cases.push(("team --help", "maxplayer team"));
+        #[cfg(feature = "wallet")]
+        cases.push(("team join --help", "maxplayer team"));
         #[cfg(feature = "stub-pay")]
         cases.push(("stub-pay --help", "maxplayer stub-pay"));
 

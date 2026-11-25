@@ -134,6 +134,27 @@ struct SlotGate {
     /// Configured ceiling, clamped as `new` clamps it. Held so a report can carry its denominator: a
     /// count of resumed jobs means nothing without the capacity they are being bounded to.
     capacity: usize,
+    /// #1299: execution tasks spawned by [`spawn_bounded_execution`] that have not returned yet,
+    /// INCLUDING ones still waiting for a permit (which hold no slot). A drain waits for this to
+    /// reach zero; a store row count could not serve, because a resumed row skipped as already
+    /// settled can keep its non-terminal state and would hold a drain open forever.
+    executions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// #1299: decrements [`SlotGate::executions`] when an execution task ends, unwind included.
+struct ExecutionGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ExecutionGuard {
+    fn enter(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// A reserved slot held for a claim that is awaiting its award. `reserved_at` bounds how long the
@@ -166,6 +187,7 @@ impl SlotGate {
             parked: Mutex::new(HashMap::new()),
             lapse_after,
             capacity: capacity.max(1),
+            executions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -265,9 +287,21 @@ impl SlotGate {
         lapsed
     }
 
-    /// Permits currently free. For logging and tests.
+    /// Permits currently free — the number [`Self::try_reserve`] tests, so the beat's `free_slots`.
     fn available(&self) -> usize {
         self.permits.available_permits()
+    }
+
+    /// The beat's `["slots",n]` / `["free_slots",m]` pair, from ONE read of the gate. `free` is
+    /// exactly what the claim decision tests: capacity minus executing jobs, session turns and
+    /// claim-time reservations (`parked`) alike, because each holds a permit.
+    fn advertised(&self) -> crate::heartbeat::SeatSlots {
+        crate::heartbeat::SeatSlots::new(self.capacity, self.available())
+    }
+
+    /// #1299: execution tasks not yet returned (running or waiting for a permit).
+    fn executions(&self) -> usize {
+        self.executions.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -324,7 +358,11 @@ where
         );
     }
     let slots = Arc::clone(slots);
+    // Counted from BEFORE the spawn, so a drain tick can never see the gap between the award and the
+    // task's first poll as "nothing in flight".
+    let running = ExecutionGuard::enter(&slots.executions);
     tokio::task::spawn_local(async move {
+        let _running = running;
         let slot = match parked {
             Some(permit) => Some(permit),
             None => {
@@ -436,6 +474,9 @@ enum SkipReason {
     AgentUnavailable,
     /// The live roster cannot satisfy the signed model/family/capability request.
     CapabilityUnavailable,
+    /// docs/specs/hook-agents.md §3: no serving entry is eligible for this offer's SHAPE with its
+    /// own capability (e.g. only a hook entry, and the offer is git-only or a contribution).
+    NoEligibleAgent,
     /// §2.1: the offer states `payment=none` and this seat has not opted in to free work
     /// (`[seller] takes_no_payment = false`, the default).
     ///
@@ -484,6 +525,9 @@ impl SkipReason {
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::CapabilityUnavailable => "requested model, family or capabilities unavailable on this node",
             Self::AgentUnavailable => "requested agent harness not available on this node",
+            Self::NoEligibleAgent => {
+                "no configured agent can serve this offer's shape (a hook entry serves inline, non-contribution offers only)"
+            }
             Self::FreeNotOffered => {
                 "free offer (payment=none) and this seat does not work for free (set [seller] \
                  takes_no_payment=true, which also requires rate_sats=0, to opt in)"
@@ -757,6 +801,74 @@ impl FedUnderRateOffersInner {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.seen.len()
+    }
+}
+
+/// Whether a lapsed/aged offer skip is worth a default-output line rather than a count.
+///
+/// Only an offer AIMED AT THIS SEAT and authored within the admit window
+/// ([`MAX_OFFER_ADMIT_AGE_SECS`]): a buyer who sent us a job that was already expired, a private
+/// offer whose inputs took longer to stage than its deadline allowed, or a host clock running ahead.
+/// Everything older is history the boot replay (the targeted subscription has no `since`) and the
+/// periodic backfill re-read on every pass, which is the flood this quieting exists for. The caller
+/// also drops offers this seat already recorded (our own finished jobs) and repeats within a boot.
+fn stale_skip_is_news(targeted_here: bool, authored_secs_ago: u64) -> bool {
+    targeted_here && authored_secs_ago <= MAX_OFFER_ADMIT_AGE_SECS
+}
+
+/// Routine no-ops the seat counts instead of printing one line each.
+///
+/// After a reconnect the backfill replays the relay's recent history, and an open-pool seat sees
+/// every other seller's awards, acceptances and lapsed offers in it: hundreds of lines in one
+/// second, none of which needs an operator. Each still prints in full under `MAXPLAYER_VERBOSE`;
+/// by default they are only counted, and the status tick prints one summary line so the operator
+/// can still see that they happened. Nothing that reports a state change of OUR work or a failure
+/// goes through here.
+#[derive(Default)]
+struct QuietTally {
+    /// An award or acceptance for an offer this seat never recorded (another seller's job).
+    not_ours: std::sync::atomic::AtomicU64,
+    /// An acceptance (pay-bind) for a job whose award already bound it here.
+    already_awarded: std::sync::atomic::AtomicU64,
+    /// An offer skipped because its deadline passed or it was authored too long ago.
+    stale_offers: std::sync::atomic::AtomicU64,
+    /// A relay CLOSED for a subscription id this seat never registered.
+    unknown_closes: std::sync::atomic::AtomicU64,
+    /// A follow-up for a session that already ended.
+    ended_followups: std::sync::atomic::AtomicU64,
+}
+
+impl QuietTally {
+    fn bump(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The summary of everything counted since the last call, resetting the counts. `None` when
+    /// nothing was counted, so an idle seat prints nothing extra.
+    fn take_summary(&self) -> Option<String> {
+        let take = |counter: &std::sync::atomic::AtomicU64| {
+            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+        };
+        // `label: count` so the wording reads right for 1 and for many.
+        let parts: Vec<String> = [
+            ("other sellers' awards/acceptances", take(&self.not_ours)),
+            ("pay-binds for jobs already awarded here", take(&self.already_awarded)),
+            ("lapsed or aged offers skipped", take(&self.stale_offers)),
+            ("relay CLOSEDs for subscriptions not ours", take(&self.unknown_closes)),
+            ("follow-ups to ended sessions", take(&self.ended_followups)),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(what, count)| format!("{what}: {count}"))
+        .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "seller node routine (since last status): {} — set {}=1 to print each",
+            parts.join(", "),
+            crate::oplog::VERBOSE_ENV
+        ))
     }
 }
 
@@ -1361,13 +1473,14 @@ fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter 
 /// Bound on the §5.6 `docker info` read. A daemon that does not answer in time closes the gate.
 const RUNSC_GATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The §5.6 runsc overlay gate for this config. A seat it does not apply to (not docker + runsc +
-/// `[sessions] enabled`) runs NO docker command ([`crate::session::resolve_runsc_gate`] awaits the
+/// The §5.6 runsc overlay gate for this config. A seat it does not apply to (not a docker
+/// container-delivery seat on runsc with sessions on) runs NO docker command ([`crate::session::resolve_runsc_gate`] awaits the
 /// read only when it applies); otherwise one bounded `docker info --format '{{json .Runtimes}}'`.
 async fn probe_runsc_gate(
     config: &crate::home::MaxplayerConfig,
 ) -> crate::session::RunscOverlayGate {
-    crate::session::resolve_runsc_gate(config.sandbox.as_ref(), &config.sessions, || {
+    let uid = crate::seller_exec::job_identity().0;
+    crate::session::resolve_runsc_gate(config.sandbox.as_ref(), &config.sessions, uid, || {
         bounded_runtimes_read(RUNSC_GATE_PROBE_TIMEOUT, || {
             use crate::seller_exec::DockerCli as _;
             crate::seller_exec::RealDockerCli
@@ -4434,6 +4547,17 @@ pub async fn probe_configured_harnesses(
     home: &MaxplayerHome,
 ) -> Result<Vec<HarnessProbeVerdict>, NodeError> {
     let registry = boot_agent_registry(home)?;
+    // hook-agents §9: a hook-only seat runs nothing of ours, so NONE of the sandbox-side gates below
+    // apply (sandbox policy, token-mode gate, forward_env/mcp lines, holder reap) — any of them could
+    // refuse a host with no docker at all. Decided by the one shared predicate the doctor also uses.
+    if crate::seller_agents::hook_only_home(home) {
+        opline!("seller node: hook-only seat — no sandbox, token-mode gate or containment holders apply; each hook proves itself with a boot ping");
+        let mut verdicts = Vec::with_capacity(registry.entries().len());
+        for (index, entry) in registry.entries().iter().enumerate() {
+            verdicts.push(hook_boot_verdict(index, entry, home).await);
+        }
+        return Ok(verdicts);
+    }
     // A `[sandbox]` that does not resolve into an executor refuses the boot gate outright: probing
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
@@ -4516,6 +4640,12 @@ pub async fn probe_configured_harnesses(
     let mut verdicts = Vec::with_capacity(registry.entries().len());
     for (index, entry) in registry.entries().iter().enumerate() {
         let label = entry.name.clone().unwrap_or_else(|| "<unlabelled>".to_owned());
+        // hook-agents §9: a hook entry proves itself with a `boot` ping, run on the host as the
+        // seller's own program — no sandbox, no sentinel turn. Its model is self-reported config.
+        if entry.kind.is_hook() {
+            verdicts.push(hook_boot_verdict(index, entry, home).await);
+            continue;
+        }
         let result = probe_one_harness(index, &entry.argv, &label, &sandbox, &identity, home).await;
         verdicts.push(HarnessProbeVerdict {
             index,
@@ -4524,6 +4654,23 @@ pub async fn probe_configured_harnesses(
         });
     }
     Ok(verdicts)
+}
+
+/// A hook entry's boot verdict: one `boot` ping on the host, as the seller's own program (§9).
+async fn hook_boot_verdict(
+    index: usize,
+    entry: &crate::seller_agents::RegisteredAgent,
+    home: &MaxplayerHome,
+) -> HarnessProbeVerdict {
+    let (argv, cwd) = (entry.argv.clone(), home.root.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        crate::hook::ping(&argv, &cwd, crate::hook::PingReason::Boot)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("ping task failed: {error}")))
+    .map(|()| None)
+    .map_err(|reason| (reason, Fault::Unproven));
+    HarnessProbeVerdict { index, name: entry.name.clone(), result }
 }
 
 /// The pure decision the pre-advertise gate turns on: the registry indices that PROVED they can
@@ -4626,6 +4773,13 @@ pub async fn boot_advertising_only_proven(
     // the kind-0 publish, rather than advertising a silently shorter set: a buyer commits sats on this
     // field, so "we could not check" must never look like "checked, and no". The proven set is recorded
     // into the roster below, before the first heartbeat or claim can read it.
+    // hook-agents §9: a hook-only seat runs nothing of ours, so there is no job environment to
+    // measure: it advertises no capability tokens and skips the probe (and its sandbox gate).
+    let hook_only = crate::seller_agents::hook_only_home(&home);
+    let (capabilities, job_nix) = if hook_only {
+        opline!("seller node: hook-only seat — no job environment of ours to probe; advertising no capability tokens");
+        (Vec::new(), false)
+    } else {
     let sandbox = crate::seller_exec::SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(format!("capability probe policy: {error}")))?;
     let probe_dir = crate::seller_exec::ProbeWorkdir::create(&home)
@@ -4647,6 +4801,8 @@ pub async fn boot_advertising_only_proven(
         }
     };
     drop(probe_dir);
+    (capabilities, job_nix)
+    };
     opline!("seller node capability probe proved: [{}]", capabilities.join(", "));
     opline!(
         "seller node job environment nix: {}",
@@ -4723,6 +4879,69 @@ const RETRACTION_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cadence of the outbox drain / housekeeping tick.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Minimum spacing between two beats fired by a `free_slots` change. A change is noticed on the
+/// drain tick (every [`DRAIN_INTERVAL`]); the first change after a quiet spell republishes on that
+/// tick, and a seat whose seats churn faster than this republishes at most once per window, the
+/// last value winning. The periodic beat is unaffected.
+const SEAT_CHANGE_BEAT_DEBOUNCE: Duration = Duration::from_secs(15);
+
+/// #1299: how long a drain waits once ONLY unsent private-content copies hold it. They are durable
+/// (`private-content.sqlite`) and re-sent by the next boot, and a copy the relay keeps refusing is
+/// retried indefinitely, so this bounds the wait instead of letting one copy pin the seat.
+const DRAIN_PRIVATE_GRACE: Duration = Duration::from_secs(600);
+
+/// #1299: what a drain is still waiting for. See [`SellerNodeRunner::drain_remaining`].
+#[derive(Debug)]
+struct DrainLeft {
+    held: usize,
+    executions: usize,
+    turns: usize,
+    lane_busy: bool,
+    queued: usize,
+    outbox: Result<usize, String>,
+    private: Result<usize, String>,
+}
+
+impl DrainLeft {
+    /// Everything but private-content copies is done.
+    fn only_private(&self) -> bool {
+        self.held == 0
+            && self.executions == 0
+            && self.turns == 0
+            && !self.lane_busy
+            && self.queued == 0
+            && matches!(self.outbox, Ok(0))
+    }
+
+    /// Nothing at all is owed: the node may leave.
+    fn idle(&self) -> bool {
+        self.only_private() && matches!(self.private, Ok(0))
+    }
+}
+
+impl std::fmt::Display for DrainLeft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = |value: &Result<usize, String>| match value {
+            Ok(n) => n.to_string(),
+            Err(error) => format!("unknown ({error})"),
+        };
+        write!(
+            f,
+            "{} slot(s) held, {} job execution(s) running or queued, {} session turn(s), {} \
+             unpublished event(s), {} private copy(ies) unsent",
+            self.held,
+            self.executions,
+            self.turns,
+            count(&self.outbox),
+            count(&self.private)
+        )?;
+        if self.lane_busy || self.queued > 0 {
+            write!(f, ", work lane busy={} queued={}", self.lane_busy, self.queued)?;
+        }
+        Ok(())
+    }
+}
+
 /// A booted seller node with its live relay surface.
 pub struct SellerNodeRunner {
     node: SellerNode,
@@ -4750,10 +4969,19 @@ pub struct SellerNodeRunner {
     /// seconds. Recorded on every publish ATTEMPT: a relay that refuses the beat is the watchdog's
     /// business, and retrying it every drain tick would turn the interval into five seconds.
     announced_serving_generation: std::sync::atomic::AtomicU64,
+    /// The `free_slots` the last kind-30340 beat was built from. The drain tick compares it with the
+    /// slot gate and, on a difference, fires the heartbeat supervision now (debounced by
+    /// [`SEAT_CHANGE_BEAT_DEBOUNCE`]) rather than an interval later, so a buyer reading the beat
+    /// sees a seat free up or fill within seconds. `u32::MAX` until the first beat. Recorded on every
+    /// publish ATTEMPT, like `announced_serving_generation`.
+    announced_free_slots: std::sync::atomic::AtomicU32,
     /// Whether `nix` works in the JOB environment, measured once at boot alongside the capability
     /// probe ([`crate::capability::probe_seat_nix`]). Read into every job prompt. `false` until
     /// measured, so a node booted without the probe keeps the generic install advice.
     job_nix: std::sync::atomic::AtomicBool,
+    /// hook-agents §9: per hook entry, when its last interval ping started, whether one is in
+    /// flight, and its consecutive interval-ping failures.
+    hook_pings: Arc<std::sync::Mutex<std::collections::HashMap<usize, hook_run::PingTrack>>>,
     /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
     /// the off-loop execution tasks; see [`SlotGate`].
     /// The seat's held tools (the Holder route, `[[sandbox.held_tools]]`): one holder container per
@@ -4819,9 +5047,19 @@ pub struct SellerNodeRunner {
     /// every pass. Feedback-only wire-noise dedup — never consulted on the claim/money path. See
     /// [`FedUnderRateOffers`].
     fed_under_rate_offers: FedUnderRateOffers,
+    /// Routine no-ops counted instead of printed (see [`QuietTally`]).
+    quiet: QuietTally,
+    /// Offer ids whose stale skip was already printed this boot (see [`stale_skip_is_news`]), so
+    /// the periodic backfill re-reading the same offer does not repeat the line. Same bounded
+    /// first-sight set as [`Self::fed_under_rate_offers`].
+    announced_stale_offers: FedUnderRateOffers,
     /// #747: how this node is asked to leave the selling role, so it can publish its terminal
     /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
     shutdown: shutdown::ShutdownChannel,
+    /// #1299: the drain latch (SIGUSR1). Once set the node claims nothing new, advertises
+    /// `accepting=n`, still executes awards for claims it already published, and leaves through the
+    /// ordinary exit path when no slot is held and no awarded/executing row remains.
+    drain: shutdown::DrainSignal,
     /// Backfill cadence, resolved once at boot (tests shorten it per runner, never via the env).
     wrap_backfill_interval_secs: u64,
     /// Mint redeems between the intent-to-receive breadcrumb and the receipt write. Graceful
@@ -5082,17 +5320,26 @@ impl SellerNodeRunner {
         // and narrows from there as harnesses prove they cannot deliver.
         let agents = Arc::new(LiveRoster::new(boot_agent_registry(node.home())?));
 
+        // hook-agents §5.1: a hook group a killed daemon left running is stopped before anything
+        // can re-drive its job (each verified against its journaled start time).
+        hook_run::reap_journaled_groups(node.store(), None);
+        hook_run::reconcile_terminal_hook_state(node.store(), node.home());
+
         // The Holder route: start the seat's holder containers BEFORE anything goes on the wire, so
         // a REQUIRED tool that cannot start refuses the boot rather than a seat that advertises and
         // fails every job. An optional tool that cannot start is logged, and the seat serves without
         // it — the posture a vendor outage would give. Several tools start concurrently: each start
         // waits on its own vendor's enrolment.
         let held_tools = {
+            // A hook-only seat runs no container, so it starts no holder (a REQUIRED one that cannot
+            // start would otherwise refuse a seat that never uses it). Same predicate as the doctor.
+            let hook_only = crate::seller_agents::hook_only_home(node.home());
             let cfgs: Vec<&crate::home::HeldToolConfig> = node
                 .home()
                 .config
                 .sandbox
                 .as_ref()
+                .filter(|_| !hook_only)
                 .map(|sandbox| sandbox.held_tools.iter().collect())
                 .unwrap_or_default();
             let (uid, gid) = job_identity();
@@ -5195,7 +5442,7 @@ impl SellerNodeRunner {
         }
 
         let seller_pubkey = keys.public_key();
-        let client = Client::new(keys);
+        let client = crate::relay_transport::client(keys);
         // Seller receive depends on NIP-42; keep auto-auth ON so a relay that challenges on the REQ
         // (not just connect) still authenticates.
         client.automatic_authentication(true);
@@ -5282,7 +5529,9 @@ impl SellerNodeRunner {
             sign_in,
             agents,
             announced_serving_generation: std::sync::atomic::AtomicU64::new(0),
+            announced_free_slots: std::sync::atomic::AtomicU32::new(u32::MAX),
             job_nix: std::sync::atomic::AtomicBool::new(false),
+            hook_pings: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             held_tools,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
@@ -5302,7 +5551,10 @@ impl SellerNodeRunner {
             runsc_gate: std::sync::Mutex::new(runsc_gate),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
+            quiet: QuietTally::default(),
+            announced_stale_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
+            drain: shutdown::DrainSignal::new(),
             wrap_backfill_interval_secs: resolve_wrap_backfill_interval_secs(),
             redeems_in_flight: std::sync::atomic::AtomicUsize::new(0),
             remit_flight: crate::fee_remit::RemitFlight::new(),
@@ -5453,13 +5705,11 @@ impl SellerNodeRunner {
     }
 
     fn session_gc(&self) -> Option<super::session_gc::SessionGc> {
-        let config = &self.node.home().config.sessions;
-        config.enabled.then(|| super::session_gc::SessionGc {
-            store: self.node.store().clone(),
-            home_root: self.node.home().root.clone(),
-            lifetime_secs: config.lifetime_secs,
-            disk_budget_bytes: config.disk_budget_bytes,
-        })
+        super::session_gc::SessionGc::for_config(
+            &self.node.home().config.sessions,
+            self.node.store().clone(),
+            self.node.home().root.clone(),
+        )
     }
 
     pub fn seller_pubkey(&self) -> String {
@@ -5625,6 +5875,79 @@ impl SellerNodeRunner {
         self.shutdown.handle()
     }
 
+    /// #1299: a handle asking this node to DRAIN — stop claiming, finish in-flight work, then leave
+    /// through the same exit path as a shutdown (terminal `accepting=n`, [`Self::run`] returns
+    /// `Ok(())`). The daemon wires it to SIGUSR1 via [`shutdown::spawn_drain_signal_listener`]. A
+    /// shutdown request during a drain still stops the node immediately.
+    pub fn drain_handle(&self) -> shutdown::DrainSignal {
+        self.drain.clone()
+    }
+
+    /// #1299: make this node findable by `maxplayer seller drain` (its pid goes into the home
+    /// lock). Call ONLY after SIGUSR1 is handled as a drain ([`shutdown::spawn_drain_signal_listener`]
+    /// returned `Some`): before that, SIGUSR1's default disposition would kill a node the command
+    /// meant to drain. A failure is logged; the seat keeps selling, only the command cannot find it.
+    pub fn enable_drain_command(&self) {
+        if let Err(error) = self.node.record_drain_pid() {
+            opline!(
+                "seller node WARN: could not record the pid for `maxplayer seller drain` ({error}); \
+                 drain this seat with SIGUSR1 directly"
+            );
+        }
+    }
+
+    /// #1299: what a drain is still waiting for. Counts held slots (executing jobs, running
+    /// follow-up turns, and claims parked for an award we promised to honour), live execution tasks
+    /// (an award whose task is still waiting for a permit holds no slot), session turns in flight (a
+    /// turn task holds no slot until it acquires one), the work lane (`lane_busy`: an award mid-
+    /// handler; `queued`: events not yet handled, e.g. a late award), the unexpired outbox (a
+    /// delivery enqueued but not yet on the wire), and unsent private-content copies (a private
+    /// result's encrypted copies go out after its carrier). Durable job rows are deliberately NOT
+    /// counted: a resumed row skipped as settled elsewhere keeps its state, and would hold a drain
+    /// open forever. A store read failure is never "idle".
+    fn drain_remaining(&self, lane_busy: bool, queued: usize) -> DrainLeft {
+        DrainLeft {
+            held: self.slots.capacity.saturating_sub(self.slots.available()),
+            executions: self.slots.executions(),
+            turns: self.session_rt.in_flight_turns(),
+            lane_busy,
+            queued,
+            outbox: self
+                .node
+                .store()
+                .pending_outbox(now_unix())
+                .map(|items| items.len())
+                .map_err(|error| error.to_string()),
+            private: self.private_content_unsent(),
+        }
+    }
+
+    /// #1299: the run loop's drain check, reading the work lane and event queue the loop owns (an
+    /// award mid-handler, a late award not yet handled). The loop's exit decision and its status
+    /// line both come from here, so neither can read idle while the lane still holds work.
+    fn drain_check(
+        &self,
+        lane: &Option<LaneFuture>,
+        queue: &schedule::WorkQueue<Box<nostr_sdk::Event>>,
+    ) -> DrainLeft {
+        self.drain_remaining(lane.is_some(), queue.queued_events())
+    }
+
+    /// #1299: unsent private-content copies and carriers (capped count), for the drain.
+    fn private_content_unsent(&self) -> Result<usize, String> {
+        if !self.node.home().config.privacy.private_content_v2 {
+            return Ok(0);
+        }
+        let path = self.node.home().root.join("private-content.sqlite");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let me = self.seller_pubkey.to_hex();
+        crate::private_content::store::ContentStore::open(&path)
+            .and_then(|db| Ok(db.pending(&me, 256)?.len() + db.pending_carriers(&me, 256)?.len()))
+            .map_err(|error| error.to_string())
+    }
+
     /// Subscribe (or re-subscribe) the offer REQ. `open_pool` false forces the targeted-only shape —
     /// used by the boot/recovery path when the seller has not opted into the open pool, and by the
     /// `CLOSED` degrade, which keeps targeted claiming alive after the relay refuses the grouped REQ.
@@ -5727,6 +6050,11 @@ impl SellerNodeRunner {
     /// ticket stays queued and the tick armed, and the decline line is logged once per offer and
     /// condition ([`Self::log_offer_deferred`]).
     async fn reconsider_capacity_skips(&self) -> usize {
+        // #1299: a draining node re-drives nothing. Returning before the ticket loop also keeps every
+        // #1057 `review retry` ticket on disk for the restarted seller.
+        if self.drain.is_requested() {
+            return 0;
+        }
         self.sweep_review_state_if_due();
         let retries = self.terminal_review_retries();
         if !retries.is_empty() {
@@ -5926,7 +6254,7 @@ impl SellerNodeRunner {
             AWARD_SUB_ID => award_filter_with(
                 self.seller_pubkey,
                 self.claim_open_pool(),
-                self.node.home().config.sessions.enabled,
+                self.node.home().config.sessions.enabled(),
             ),
             WRAP_SUB_ID => Filter::new()
                 .kind(Kind::GiftWrap)
@@ -6264,6 +6592,18 @@ impl SellerNodeRunner {
         // [`shutdown::spawn_os_signal_listener`], or an embedder's handle). Taken once — a second
         // loop on the same node would get `None` and simply never see a request.
         let mut shutdown_rx = self.shutdown.take_receiver();
+        // #1299: the drain has been logged; its `accepting=n` beat has been fired (re-tried each tick
+        // while a heartbeat supervision is in flight, which may have built an `accepting=y` draft);
+        // and since when only private-content copies have held it (see DRAIN_PRIVATE_GRACE).
+        let mut drain_noticed = false;
+        let mut drain_beat_fired = false;
+        // When a `free_slots` change last fired a beat (debounce, see SEAT_CHANGE_BEAT_DEBOUNCE).
+        let mut last_seat_change_beat: Option<tokio::time::Instant> = None;
+        // How long the seat announcement has gone unconfirmed, and when the in-flight supervision
+        // started: an announcement that falls behind is logged even if a supervision never returns.
+        let mut announcement_gap = schedule::AnnouncementGap::new(tokio::time::Instant::now());
+        let mut supervision_started: Option<tokio::time::Instant> = None;
+        let mut drain_private_only_since: Option<tokio::time::Instant> = None;
         // The serialized work lane and what feeds it. Events queue (bounded: when full, relay reads
         // pause until it drains); ticks and backfills coalesce to one pending pass each and take
         // turns with events.
@@ -6326,6 +6666,9 @@ impl SellerNodeRunner {
                 // an unlistened SIGTERM used to be.
                 reason = shutdown::next_request(&mut shutdown_rx) => {
                     opline!("seller node: shutdown requested ({reason}); retracting the seat and ending the loop");
+                    // hook-agents §5.1: running hook groups get SIGTERM, the grace, then SIGKILL.
+                    // Their journal entries stay, so a boot after an unclean exit still reaps.
+                    let _ = tokio::task::spawn_blocking(crate::hook::terminate_all).await;
                     break;
                 }
                 // Expired-container sweep. SPAWNED, never awaited here: the pass is bounded by
@@ -6340,7 +6683,56 @@ impl SellerNodeRunner {
                 // Housekeeping runs on the lane; the loop only asks for it, and reports a lane that
                 // has stayed busy (30s, then 60s, 120s, ...).
                 _ = drain_tick.tick() => {
+                    // #1299: a requested drain. First tick: say so and re-announce now
+                    // (`accepting=n`) rather than an interval later. Every tick: leave through the
+                    // ordinary exit path once nothing is held — same retraction, same lane settle,
+                    // same remittance drain as a SIGTERM, minus the interrupted jobs.
+                    if self.drain.is_requested() {
+                        if !drain_noticed {
+                            drain_noticed = true;
+                            opline!(
+                                "seller node: drain requested ({}); claiming nothing new, finishing \
+                                 in-flight work",
+                                self.drain.reason().unwrap_or("unknown")
+                            );
+                        }
+                        if !drain_beat_fired && (!heartbeat_enabled || supervision.is_none()) {
+                            drain_beat_fired = true;
+                            if heartbeat_enabled {
+                                heartbeat_tick.reset_immediately();
+                            }
+                        }
+                        let left = self.drain_check(&lane, &queue);
+                        if left.idle() {
+                            opline!("seller node: drain complete (nothing in flight); retracting the seat and ending the loop");
+                            break;
+                        }
+                        if left.only_private() {
+                            let since = *drain_private_only_since
+                                .get_or_insert_with(tokio::time::Instant::now);
+                            if since.elapsed() >= DRAIN_PRIVATE_GRACE {
+                                opline!(
+                                    "seller node: drain leaving with private content still unsent \
+                                     ({left}) after {}s; it is stored and re-sent after the restart",
+                                    DRAIN_PRIVATE_GRACE.as_secs()
+                                );
+                                break;
+                            }
+                        } else {
+                            drain_private_only_since = None;
+                        }
+                        opline_verbose!("seller node draining: {left}");
+                    }
                     queue.request_tick();
+                    if heartbeat_enabled
+                        && let Some(line) = announcement_gap.check(
+                            tokio::time::Instant::now(),
+                            heartbeat_interval,
+                            supervision_started.map(|at| at.elapsed()),
+                        )
+                    {
+                        opline!("{line}");
+                    }
                     // R3-2: a harness dropped or came back since the last beat. Fire the heartbeat
                     // supervision NOW (its single-flight arm below) rather than an interval later, so
                     // buyers stop targeting a seat that cannot work within seconds, and resume as
@@ -6356,6 +6748,22 @@ impl SellerNodeRunner {
                              republishing kind-30340 now",
                             ad.harnesses.available,
                             ad.harnesses.configured
+                        );
+                        heartbeat_tick.reset_immediately();
+                    } else if heartbeat_enabled
+                        && supervision.is_none()
+                        && self.seats_changed_since_last_beat()
+                        && last_seat_change_beat
+                            .is_none_or(|at| at.elapsed() >= SEAT_CHANGE_BEAT_DEBOUNCE)
+                    {
+                        // A seat freed or filled since the last beat: republish now, so a buyer
+                        // choosing by `free_slots` does not wait out the interval. Debounced.
+                        last_seat_change_beat = Some(tokio::time::Instant::now());
+                        let seats = self.slots.advertised();
+                        opline_verbose!(
+                            "seller node seats changed: {}/{} free — republishing kind-30340 now",
+                            seats.free,
+                            seats.total
                         );
                         heartbeat_tick.reset_immediately();
                     }
@@ -6440,10 +6848,25 @@ impl SellerNodeRunner {
                         Some((label, busy)) => format!("work BUSY {}s on {label}", busy.as_secs()),
                     };
                     let queued = queue.queued_events();
-                    self.report_status(&format!(
-                        " · {relay_state} · {work_state}{}",
-                        if queued > 0 { format!(" ({queued} event(s) queued)") } else { String::new() }
-                    ));
+                    let drain_left = self
+                        .drain
+                        .is_requested()
+                        .then(|| self.drain_check(&lane, &queue));
+                    self.report_status(
+                        &format!(
+                            " · {relay_state} · {work_state}{}",
+                            if queued > 0 { format!(" ({queued} event(s) queued)") } else { String::new() }
+                        ),
+                        drain_left,
+                    );
+                    // Always drained so a verbose run does not carry counts over; printed only
+                    // when the individual lines were hidden (under MAXPLAYER_VERBOSE each one
+                    // already printed, and the summary's "set it to see each" would be wrong).
+                    if let Some(summary) = self.quiet.take_summary()
+                        && !crate::oplog::verbose_enabled()
+                    {
+                        opline!("{summary}");
+                    }
                     // Wraps then offers (#560), on the lane, on this owned cadence — a recovery leg
                     // must not depend on a tick config can disable.
                     queue.request_backfill();
@@ -6491,6 +6914,7 @@ impl SellerNodeRunner {
                         threshold: stall_threshold_duration,
                         interval: heartbeat_interval,
                     };
+                    supervision_started = Some(tokio::time::Instant::now());
                     supervision = Some(Box::pin(Arc::clone(&self).supervise(
                         relay.clone(),
                         input,
@@ -6501,6 +6925,12 @@ impl SellerNodeRunner {
                 report = async { supervision.as_mut().expect("polled only while armed").await },
                     if supervision.is_some() => {
                     supervision = None;
+                    supervision_started = None;
+                    if let Some(line) =
+                        announcement_gap.on_publish(report.publish_ok, tokio::time::Instant::now())
+                    {
+                        opline!("{line}");
+                    }
                     if report.probe_ok && stalled_since_recovery {
                         if manual_recovery_succeeded {
                             opline!(
@@ -6649,10 +7079,17 @@ impl SellerNodeRunner {
                         }) => {
                             let id = subscription_id.to_string();
                             let label = subscription_label(&id);
-                            opline!(
-                                "seller node RELAY-CLOSED: relay closed the {label} subscription \
-                                 (id={id}): {reason}"
-                            );
+                            if is_our_subscription(&id) {
+                                opline!(
+                                    "seller node RELAY-CLOSED: relay closed the {label} subscription \
+                                     (id={id}): {reason}"
+                                );
+                            } else {
+                                opline_verbose!(
+                                    "seller node RELAY-CLOSED: relay closed the {label} subscription \
+                                     (id={id}): {reason}"
+                                );
+                            }
 
                             // An id we never registered cannot be a leg of ours going deaf, so it
                             // must not cost a reconnect — and escalating it did exactly that. Field
@@ -6668,7 +7105,11 @@ impl SellerNodeRunner {
                             // re-challenge sweep closing auth-scoped subs from the pre-expiry
                             // generation.
                             if !is_our_subscription(&id) {
-                                opline!(
+                                // Not a leg of ours, so nothing for the operator to do: counted
+                                // for the status summary, printed in full under MAXPLAYER_VERBOSE
+                                // for the relay owner who needs the two ages.
+                                QuietTally::bump(&self.quiet.unknown_closes);
+                                opline_verbose!(
                                     "{}",
                                     unknown_close_diagnostic(
                                         &id,
@@ -6903,7 +7344,9 @@ impl SellerNodeRunner {
     /// through the signer actor and sent on the shared client; a failure is logged, never wedges the
     /// loop. Used for both the targeted under-rate refusal and an execution failure.
     ///
-    /// Returns whether the feedback reached the relay (`send_event_to` resolved `Ok`). The under-rate
+    /// Returns whether the feedback reached the relay (`send_event_to` resolved `Ok`), or, for a
+    /// private job, whether its copy is durably persisted (the private flush sends it again, so a
+    /// deduping caller must not sign a second copy). The under-rate
     /// dedup (#582) records an offer as fed ONLY on a `true`, so a transient publish failure is retried
     /// by the next backfill re-ingest rather than being permanently suppressed. Callers that do not
     /// dedup (execution/delivery failure) ignore the return.
@@ -7013,13 +7456,13 @@ impl SellerNodeRunner {
                                     ))
                                 }
                             );
-                            false
+                            private
                         }
                         Ok(Err(error)) => {
                             opline!(
                                 "seller node WARN: buyer feedback publish failed offer={offer_id} ({error})"
                             );
-                            false
+                            private
                         }
                         Err(_) => {
                             opline!(
@@ -7027,7 +7470,7 @@ impl SellerNodeRunner {
                                  offer={offer_id} (continuing)",
                                 FEEDBACK_PUBLISH_BUDGET.as_secs()
                             );
-                            false
+                            private
                         }
                     }
                     },
@@ -7073,7 +7516,7 @@ impl SellerNodeRunner {
     /// `serving` is the authority on whether the seat can take work — NOT whether `names` is empty,
     /// which is also true for an unlabelled `--agent-argv` hatch that is serving perfectly well.
     /// Both come from ONE `advertisement()` snapshot, as that method requires.
-    fn report_status(&self, loop_health: &str) {
+    fn report_status(&self, loop_health: &str, drain_left: Option<DrainLeft>) {
         let roster = self.agents.advertisement();
         let busy = self.slots.capacity.saturating_sub(self.slots.available());
         let harnesses = if roster.names.is_empty() {
@@ -7081,9 +7524,21 @@ impl SellerNodeRunner {
         } else {
             roster.names.join(", ")
         };
+        // #1299: a draining seat says so first — it is not advertising, and the operator waiting to
+        // upgrade wants to know what it is still waiting for.
+        // `drain_left` is the loop's own check (lane and queue included), so "idle" here is the
+        // same verdict the loop exits on.
+        let state = if let Some(left) = drain_left.filter(|_| self.drain.is_requested()) {
+            if left.idle() {
+                "DRAINING — idle, exiting".to_owned()
+            } else {
+                format!("DRAINING — {left}")
+            }
+        } else {
+            advertising_state(self.sign_in.refusal().is_some(), roster.serving).to_owned()
+        };
         opline!(
-            "seller node status: {} · harness: {harnesses} · {busy}/{} job slot(s) busy{loop_health}",
-            advertising_state(self.sign_in.refusal().is_some(), roster.serving),
+            "seller node status: {state} · harness: {harnesses} · {busy}/{} job slot(s) busy{loop_health}",
             self.slots.capacity
         );
     }
@@ -7270,6 +7725,10 @@ impl SellerNodeRunner {
             return true;
         };
         let in_flight = self.live_in_flight("heartbeat");
+        // ONE gate read for both seat tags; recorded so the drain tick can republish on a change.
+        let seats = self.slots.advertised();
+        self.announced_free_slots
+            .store(seats.free, std::sync::atomic::Ordering::SeqCst);
         // R3-2: the generation is read BEFORE the snapshot, so a transition landing between the two
         // leaves the recorded value behind the roster — one extra beat, never a missed one.
         let generation = self.agents.generation();
@@ -7287,7 +7746,10 @@ impl SellerNodeRunner {
         // snapshot, both reads.
         let draft = crate::heartbeat::heartbeat_for_state(
             in_flight,
-            roster.serving,
+            // #1299: a draining seat advertises `accepting=n` from the first beat after the request,
+            // so buyers stop targeting it while it finishes. The serving count is unchanged (the
+            // harnesses still work), which is how a reader tells a drain from a broken seat.
+            roster.serving && !self.drain.is_requested(),
             seller.rate_sats,
             // §4.1 — derived from the SAME `SellerConfig` `classify_offer` reads, in the same call,
             // for the same reason the admission policy below is: the ad cannot drift from its gate.
@@ -7303,10 +7765,23 @@ impl SellerNodeRunner {
         // R3-2 — the count from the SAME snapshot as `accepting`, so `serving=0/n` and
         // `accepting=n` cannot describe two different moments.
         .with_serving(roster.harnesses)
+        // `slots` / `free_slots`: the claim gate's own numbers.
+        .with_slots(seats)
         .to_event_draft();
         self.announced_serving_generation
             .store(generation, std::sync::atomic::Ordering::SeqCst);
         self.publish_seat_announcement(draft, "heartbeat").await
+    }
+
+    /// Has the slot gate's free count moved since the last beat was built? `false` before the first
+    /// beat: the boot beat announces the seats, and counting "no beat yet" as a change would fire a
+    /// redundant beat AND start the debounce window, delaying the first real change by up to
+    /// [`SEAT_CHANGE_BEAT_DEBOUNCE`].
+    fn seats_changed_since_last_beat(&self) -> bool {
+        let announced = self
+            .announced_free_slots
+            .load(std::sync::atomic::Ordering::SeqCst);
+        announced != u32::MAX && self.slots.advertised().free != announced
     }
 
     /// R3-2: has the roster's serving state changed since the last beat was built?
@@ -7367,6 +7842,8 @@ impl SellerNodeRunner {
         // working harnesses says `serving=1/1` beside `accepting=n`, which is how a reader tells a
         // retraction from a seat that cannot work.
         .with_serving(roster.harnesses)
+        // The seats ride it too, so the terminal beat carries the same tag set as a live one.
+        .with_slots(self.slots.advertised())
         .to_event_draft();
 
         opline!("seller node: publishing terminal kind-30340 (accepting=n) — retracting this seat");
@@ -7402,13 +7879,13 @@ impl SellerNodeRunner {
             Err(error) => {
                 // Fall back to publishing ZERO DEPTH, as this path always has, but say so: a silent
                 // read failure that inflated the count would be the same invisible shape as #313
-                // itself. The fallback moves `queue_depth` and nothing else — `accepting` comes from
+                // itself. The fallback moves `in_flight`/`queue_depth` and nothing else — `accepting` comes from
                 // `anything_serving` on the live beat, and on the retraction path that beat says
                 // `accepting=n` whatever the count is (`retraction_for_state` passes
                 // `anything_serving = false` as a literal).
                 opline!(
                     "seller node {what}: in-flight count unavailable ({error}); \
-                     publishing queue_depth=0 this tick"
+                     publishing in_flight=0 this tick"
                 );
                 0
             }
@@ -7609,6 +8086,12 @@ impl SellerNodeRunner {
     }
 
     async fn on_offer(&self, event: &nostr_sdk::Event) {
+        // #1299: a draining node takes no new work, so it does none of the pre-claim work either
+        // (recording, input staging, buyer feedback). `claim_offer` checks again for its other callers.
+        if self.drain.is_requested() {
+            opline_verbose!("seller node offer skip id={}: draining (no new claims)", event.id);
+            return;
+        }
         // RC3-02: offer BACKFILL (`run_offer_backfill` -> `read_stored`), the preflight redrive and the
         // private-content path all call this directly, NOT through `dispatch_event`, and
         // `read_stored` reads the raw Message stream where relay-pool 0.44.3 re-emits a same-id,
@@ -7772,6 +8255,30 @@ impl SellerNodeRunner {
                         skip.reason(),
                         buyer_pubkey
                     ),
+                    // Backfill (and the boot replay of the targeted subscription) re-reads every
+                    // expired offer on the relay; those are counted, not printed (see
+                    // `QuietTally`). The exception is news to this operator: a recent offer aimed
+                    // at this seat that we never saw before it lapsed (see `stale_skip_is_news`).
+                    SkipReason::Lapsed | SkipReason::TooOld => {
+                        let job_id = event.id.to_hex();
+                        let news = stale_skip_is_news(
+                            offer.seller_pubkey.as_deref() == Some(seller_pubkey.as_str()),
+                            (now as u64).saturating_sub(event.created_at.as_secs()),
+                        ) && !self.announced_stale_offers.contains(&job_id)
+                            && matches!(self.node.store().offer_facts(&job_id), Ok(None));
+                        if news {
+                            self.announced_stale_offers.record(&job_id);
+                            opline!(
+                                "seller node offer skip id={}: {} — a recent offer aimed at this \
+                                 seat; check the buyer's deadline and this host's clock",
+                                event.id,
+                                skip.reason()
+                            );
+                        } else {
+                            QuietTally::bump(&self.quiet.stale_offers);
+                            opline_verbose!("seller node offer skip id={}: {}", event.id, skip.reason());
+                        }
+                    }
                     _ => opline!("seller node offer skip id={}: {}", event.id, skip.reason()),
                 }
                 // Buyer-visibility: a TARGETED-to-self under-rate refusal also emits a feedback-kind
@@ -8114,6 +8621,16 @@ impl SellerNodeRunner {
         #[cfg(test)]
         self.claim_offer_entries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // #1299: a draining node takes no new work. Every claim goes through this function (the wire
+        // path, backfill, the preflight re-drive and the capacity-skip re-drive), so this is the
+        // backstop; `on_offer` and `reconsider_capacity_skips` also stop earlier. `Deferred`, not
+        // `Declined`: a drain is a condition that clears (on the restarted seller), so a #1057
+        // review-retry ticket must survive it. Awards for claims already published do not come
+        // through here, so they are still honoured.
+        if self.drain.is_requested() {
+            opline_verbose!("seller node offer skip id={job_id}: draining (no new claims)");
+            return ClaimOutcome::Deferred;
+        }
         // #541/#814: refuse an offer that is no longer ours to claim, before any work. Two
         // buyer-authenticated signals land here (see [`Suppression`]): a co-signed kind-3400 receipt
         // means the offer was awarded + settled (to us or another seat) and is terminal; a kind-3405
@@ -8175,6 +8692,40 @@ impl SellerNodeRunner {
                 return ClaimOutcome::Deferred;
             }
         }
+
+        // docs/specs/hook-agents.md §3 — ONE selection per claim: the first serving entry whose kind
+        // admits this offer's shape and whose OWN capability meets the request. It drives the
+        // claim's tags, the private dispatch block and the pin; nothing re-derives it later.
+        // A contribution pin that cannot be read is not an absent one: a capacity re-drive of a
+        // contribution offer could otherwise be admitted to an entry that cannot take it (a hook).
+        let contribution_pinned = if contribution.is_some() {
+            true
+        } else {
+            match self.node.store().contribution_pin(job_id) {
+                Ok(pin) => pin.is_some(),
+                Err(error) => {
+                    self.log_offer_deferred(
+                        job_id,
+                        format!("seller node offer skip id={job_id}: contribution pin unreadable ({error})"),
+                    );
+                    return ClaimOutcome::Deferred;
+                }
+            }
+        };
+        let shape = crate::seller_roster::OfferShape { inline: offer.accepts_inline_delivery(), contribution: contribution_pinned };
+        let request = offer_capability_request(offer);
+        // `selected_capability` is the snapshot the request was judged on; the claim tags and the
+        // private dispatch block below carry exactly it (never a later re-read of the roster).
+        let Some((selected_entry, selected_capability)) = self
+            .agents
+            .select(offer.requested_agent.as_deref(), shape, |cap| {
+                crate::buyer::lifecycle::capability_meets_request(cap, &request).is_ok()
+            })
+            .map(|(s, capability)| (s.agent.clone(), capability))
+        else {
+            opline!("seller node offer skip id={job_id}: {}", SkipReason::NoEligibleAgent.reason());
+            return ClaimOutcome::Declined;
+        };
 
         // #591: persist the contribution pin BEFORE record_offer. execute_job only runs on an awarded
         // claim, which requires the recorded offer — so writing the pin first makes pin ≤ offer ≤
@@ -8272,7 +8823,9 @@ impl SellerNodeRunner {
         // names came from one moment and whose models came from another would attribute a model to a
         // harness the seat was not offering when it said so — and nothing downstream could detect it,
         // because both halves parse.
-        let roster = self.agents.advertisement();
+        // The claim describes the SELECTED entry only (§4): the buyer's award filter reads the claim,
+        // so it judges exactly what will run. The beat stays seat-wide.
+        let selected_names: Vec<String> = selected_entry.name.clone().into_iter().collect();
         let claim = claim_draft(
             job_id,
             buyer_pubkey,
@@ -8283,17 +8836,15 @@ impl SellerNodeRunner {
                 Some(creq) => gateway::ClaimPayment::Sat(&creq),
                 None => gateway::ClaimPayment::None,
             },
-            &roster.names,
-            // The claim holds the declared colour and emits none of it: `claim_draft` asks only for
-            // the filterable tags. Passing it is not a leak, and passing a stub here instead would
-            // make this the one site whose capability came from somewhere other than the config.
-            &roster.capability(&self.node.home().config.seat),
+            &selected_names,
+            &selected_capability,
         );
         // Session jobs (docs/specs/session-jobs.md §2.2): `["session","1"]` only when
         // `[sessions] enabled` AND this is a docker seat on the container-delivery path. With the
         // flag off `advertise_on_claim` is a no-op, so the claim bytes are today's.
         let mut claim = claim;
-        {
+        // A hook entry advertises no session in this build (hook sessions are the next stage).
+        if !selected_entry.kind.is_hook() {
             let config = &self.node.home().config;
             let docker_container_seat = config.sandbox.as_ref().is_some_and(|sandbox| {
                 sandbox.mode == crate::home::SandboxMode::Docker
@@ -8307,19 +8858,19 @@ impl SellerNodeRunner {
                 &runsc_gate,
             );
         }
-        let chosen = offer.requested_agent.as_ref().or_else(|| roster.names.first()).cloned();
-        let capability = roster.capability(&self.node.home().config.seat);
-        let family = chosen.as_deref().and_then(crate::agent_presets::harness_family_for_preset).map(str::to_owned);
-        let model = family.as_ref().and_then(|f| capability.models.iter().find(|m| &m.family == f)).map(|m| m.model.clone());
+        let chosen = selected_entry.name.clone();
+        let family = selected_entry.family();
+        let model = selected_capability.models.first().map(|m| m.model.clone());
+        let capability = selected_capability.clone();
         let dispatch = crate::private_content::Dispatch { agent: chosen, harness_family: family,
             harness_model: model, capabilities: (!capability.capabilities.is_empty()).then_some(capability.capabilities) };
-        let claim = match super::privacy::project(self.node.home(), seller_pubkey, job_id, claim, Some(dispatch)) {
-            Ok(claim) => claim,
-            Err(e) => { opline!("seller private claim refused job_id={job_id}: {e}"); return ClaimOutcome::ReachedReview; }
-        };
         // Reserve-at-claim: a fully loaded node has no free slot and simply does not claim, which is
         // how it stays invisible to the market. The gate is consulted only here on the event loop,
         // never concurrently with itself, so two offers can never both take the last slot.
+        //
+        // Reserved BEFORE the private claim intent is prepared (hook-agents §3): a capacity skip must
+        // leave no prepared intent behind, or a later re-drive with a different selection would
+        // contradict it.
         let reserved = self.slots.try_reserve(job_id);
         if reserved == Reserve::Full {
             opline!("seller node offer skip id={job_id}: {}", SkipReason::SlotsBusy.reason());
@@ -8337,7 +8888,20 @@ impl SellerNodeRunner {
                 runner.slots.release(job_id);
             }
         };
-        match self.node.store().claim_and_enqueue(
+        let claim = match super::privacy::project(self.node.home(), seller_pubkey, job_id, claim, Some(dispatch)) {
+            Ok(claim) => claim,
+            Err(e) => {
+                opline!("seller private claim refused job_id={job_id}: {e}");
+                release_on_no_claim(self);
+                return ClaimOutcome::ReachedReview;
+            }
+        };
+        let pin = selected_entry.name.clone().map(|label| super::store::ClaimPin {
+            label,
+            kind: selected_entry.kind.as_str().to_owned(),
+            fingerprint: selected_entry.fingerprint(),
+        });
+        match self.node.store().claim_and_enqueue_pinned(
             job_id,
             job_id,
             creq.as_deref(),
@@ -8345,6 +8909,7 @@ impl SellerNodeRunner {
             now,
             now + CLAIM_PUBLISH_WINDOW_SECS,
             now,
+            pin.as_ref(),
         ) {
             Ok(super::store::Claimed::New) => {
                 opline!(
@@ -8417,7 +8982,8 @@ impl SellerNodeRunner {
         let buyer = match self.node.store().offer_facts(&job_id) {
             Ok(Some((buyer, _, _))) => buyer,
             Ok(None) => {
-                opline!("seller node accept ignore job_id={job_id}: no offer of ours recorded");
+                QuietTally::bump(&self.quiet.not_ours);
+                opline_verbose!("seller node accept ignore job_id={job_id}: no offer of ours recorded");
                 return;
             }
             Err(error) => {
@@ -8454,7 +9020,8 @@ impl SellerNodeRunner {
             // The overwhelmingly common case: the AWARD already bound this job. The ACCEPT is
             // information, not instruction — record nothing, run nothing.
             Ok(Some(_)) => {
-                opline!(
+                QuietTally::bump(&self.quiet.already_awarded);
+                opline_verbose!(
                     "seller node accept job_id={job_id} buyer={buyer}: pay-bind observed (already awarded — no action)"
                 );
             }
@@ -8707,7 +9274,8 @@ impl SellerNodeRunner {
         let buyer = match self.node.store().offer_facts(&job_id) {
             Ok(Some((buyer, _, _))) => buyer,
             Ok(None) => {
-                opline!("seller node award ignore job_id={job_id}: no offer of ours recorded");
+                QuietTally::bump(&self.quiet.not_ours);
+                opline_verbose!("seller node award ignore job_id={job_id}: no offer of ours recorded");
                 return;
             }
             Err(error) => {
@@ -8741,9 +9309,9 @@ impl SellerNodeRunner {
         };
         match match_award(&award.claim_id, our_claim_id.as_deref(), &award_author, &buyer) {
             AwardMatch::Execute => {
-                let private = async {
+                let private: Result<(), crate::private_content::hosting::SendError> = async {
                     let Some((mut ctx, offer)) = super::privacy::known(self.node.home(), &self.seller_pubkey.to_hex(), &job_id)? else {
-                        if super::privacy::is_private(&draft) { return Err(crate::private_content::Error("private award context missing")); }
+                        if super::privacy::is_private(&draft) { return Err(crate::private_content::Error("private award context missing").into()); }
                         if let Some((mut public,offer)) = crate::private_content::public_v2::known(self.node.home(),&job_id)? {
                             let claim=public.store.event(&award.claim_id)?.ok_or(crate::private_content::Error("public awarded claim missing"))?;
                             public.select(&offer,&claim,event)?;
@@ -8873,6 +9441,10 @@ impl SellerNodeRunner {
                 continue;
             };
             let roster = Arc::clone(&self.agents);
+            if self.agents.entry(harness).is_some_and(|e| e.kind.is_hook()) {
+                self.start_hook_restore_ping(harness, argv, roster);
+                continue;
+            }
             // A `[sandbox]` that does not resolve grounds the harness rather than restoring it under
             // a pass-through: a probe that ran unsandboxed would prove nothing about the executor an
             // awarded job actually gets.
@@ -9346,16 +9918,55 @@ impl SellerNodeRunner {
         // ⛔ This is a LABEL, not a guard. It changes nothing about whether the job is paid: under
         // award-is-payment the sats were committed at award, upstream of this arm. Never read this
         // code as protecting money (see `ReasonCode::CapabilityMissing`).
+        // hook-agents §7.1: a staged hook answer is re-delivered, never re-run, and BEFORE the current
+        // roster is consulted: the answer may already be bound, and a hook removed or edited since
+        // the claim must not strand it. Only a NEW execution faces the pin check below. A staged row
+        // that cannot be read is not an absent one: defer rather than run the hook again.
+        match self.node.store().hook_outcome(job_id) {
+            Ok(Some(row)) => {
+                self.redeliver_staged_hook_outcome(job_id, &offer, &stored_creq, row).await;
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                opline!(
+                    "seller node execute defer job_id={job_id}: staged hook outcome unreadable ({error}); retried on the next re-drive"
+                );
+                return;
+            }
+        }
         let requested_agent = offer.requested_agent.clone();
-        let Some(selected) = self.agents.dispatch(requested_agent.as_deref()) else {
+        // hook-agents §3: a pinned claim runs on exactly the entry it described (label + fingerprint);
+        // an unpinned one (an older build's claim, or the unlabelled hatch) dispatches as before but
+        // over ACP entries only, so a hook added later never picks up work that never admitted hooks.
+        // A pin READ error is not an unpinned claim: retrying beats running unrelated ACP work.
+        let pin = match self.node.store().claim_pin(job_id) {
+            Ok(pin) => pin,
+            Err(error) => {
+                opline!("seller node execute defer job_id={job_id}: claim pin unreadable ({error}); retried on the next re-drive");
+                return;
+            }
+        };
+        let selected = self.agents.for_execution(
+            pin.as_ref().map(|p| (p.label.as_str(), p.kind.as_str(), p.fingerprint.as_str())),
+            requested_agent.as_deref(),
+            true,
+        );
+        let Some(selected) = selected else {
             opline!(
-                "seller node execute fail job_id={job_id}: requested agent {:?} is not available on \
-                 this node (never substituted)",
-                requested_agent.as_deref().unwrap_or("<any>")
+                "seller node execute fail job_id={job_id}: {} (never substituted)",
+                match &pin {
+                    Some(pin) => format!("pinned agent {:?} changed or is gone since the claim", pin.label),
+                    None => format!(
+                        "requested agent {:?} is not available on this node",
+                        requested_agent.as_deref().unwrap_or("<any>")
+                    ),
+                }
             );
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, UNDISPATCHABLE_REASON_CODE, CAPABILITY_MISSING_FEEDBACK, None).await;
             return;
         };
+        let agent_kind = selected.agent.kind.clone();
         let agent_command = selected.agent.argv.clone();
         let agent_label = selected.agent.name.clone();
         // The registry index travels with the run: reporting a fault happens long after dispatch, and
@@ -9375,6 +9986,21 @@ impl SellerNodeRunner {
         // Move awarded -> executing (idempotent). A failed mark is logged, never fatal.
         if let Err(error) = self.node.store().mark_executing(job_id, now_unix()) {
             opline!("seller node execute job_id={job_id}: mark_executing failed (continuing): {error}");
+        }
+        // hook-agents §7: a hook entry runs the seller's own agent behind its command; nothing below
+        // (container, workdir git, ACP) applies.
+        if agent_kind.is_hook() {
+            self.execute_hook_job(
+                job_id,
+                &offer,
+                &stored_creq,
+                harness,
+                &agent_command,
+                agent_label.as_deref().unwrap_or("<hook>"),
+                &agent_kind,
+            )
+            .await;
+            return;
         }
 
         let seller_pubkey = self.seller_pubkey.to_hex();
@@ -10212,14 +10838,17 @@ impl SellerNodeRunner {
         // seat's claim carried `["session","1"]`. Otherwise `None`, and the inputs file is today's.
         let sessions_config = &self.node.home().config.sessions;
         // §5.6: a gate that closed after the claim (the daemon lost `--overlay2=none`) runs the
-        // job single-turn rather than parking a container whose rootfs would not survive.
-        let session_job = crate::session::runs_as_session(
+        // job single-turn rather than parking a container whose rootfs would not survive. §4: so
+        // does a job with too little time left for the wrap-up (its cancel would fire at once).
+        let session_job = crate::session::runs_turn_one_as_session(
             sessions_config,
             &self.runsc_gate(),
             self.node
                 .store()
                 .claim_advertised_session(job_id)
                 .unwrap_or(false),
+            now_unix().max(0) as u64,
+            deadline,
         );
         let prompt = if session_job {
             format!("{prompt}\n\n{}", crate::session::prompt_session_section())
@@ -11560,6 +12189,9 @@ impl SellerNodeRunner {
                 opline!("seller node job_id={job_id}: fail_job write error (continuing): {error}")
             }
         }
+        // hook-agents §6/§7.1: a failed hook job's state (staged answer, run record, directory) goes
+        // with it, whichever path failed it. A job with no hook state is not touched.
+        hook_run::clear_terminal_hook_state(self.node.store(), self.node.home(), job_id);
     }
 
     /// The job row's state, for a LOG that must name why a write moved nothing. Never fails the
@@ -11717,6 +12349,7 @@ impl SellerNodeRunner {
                 self.redrive_followups().await;
                 self.reconsider_capacity_skips().await;
                 self.start_due_harness_probes();
+                self.start_hook_interval_pings();
             }
             schedule::Work::Backfill => {
                 let wraps = self.run_wrap_backfill().await;
@@ -11785,7 +12418,7 @@ impl SellerNodeRunner {
         let stalled =
             !confirmed && schedule::watchdog_tripped(unconfirmed, input.threshold, input.interval);
         if !stalled && input.forced.is_none() {
-            return SupervisionDone { clock, probe_ok, recovered: None };
+            return SupervisionDone { clock, probe_ok, publish_ok, recovered: None };
         }
         let overlap_since = nostr_sdk::Timestamp::from(
             clock
@@ -11825,6 +12458,7 @@ impl SellerNodeRunner {
         let result = self.recover_stall(&relay, overlap_since).await;
         drop(guard);
         let took = recovery_started.elapsed().as_secs();
+        let mut republished = false;
         let recovered = match result {
             Ok(attempts) => {
                 let outage = now_unix().saturating_sub(clock.confirmed_unix());
@@ -11837,7 +12471,7 @@ impl SellerNodeRunner {
                     overlap_since.as_secs()
                 );
                 // Announce the seat on the new socket now, not an interval later.
-                self.publish_heartbeat_bounded().await;
+                republished = self.publish_heartbeat_bounded().await;
                 true
             }
             Err(error) => {
@@ -11848,18 +12482,29 @@ impl SellerNodeRunner {
                 false
             }
         };
-        SupervisionDone { clock, probe_ok, recovered: Some(recovered) }
+        SupervisionDone { clock, probe_ok, publish_ok: publish_ok || republished, recovered: Some(recovered) }
     }
 
     async fn publish_heartbeat_bounded(&self) -> bool {
-        tokio::time::timeout(HEARTBEAT_PUBLISH_BUDGET, self.publish_heartbeat())
-            .await
-            .unwrap_or(false)
+        match tokio::time::timeout(HEARTBEAT_PUBLISH_BUDGET, self.publish_heartbeat()).await {
+            Ok(confirmed) => confirmed,
+            // Every other failure inside the publish logs its own line; a cut-off one did not.
+            Err(_) => {
+                opline!(
+                    "seller node heartbeat publish did not finish within {}s (continuing; counts as \
+                     unconfirmed)",
+                    HEARTBEAT_PUBLISH_BUDGET.as_secs()
+                );
+                false
+            }
+        }
     }
 }
 
 #[path = "session_run.rs"]
 mod session_run;
+#[path = "hook_run.rs"]
+mod hook_run;
 
 /// The relay event kinds the lane has a handler for; anything else is never queued.
 fn handled_event_kind(kind: Kind) -> bool {
@@ -11896,6 +12541,8 @@ struct SupervisionInput {
 struct SupervisionDone {
     clock: schedule::LivenessClock,
     probe_ok: bool,
+    /// Whether the relay confirmed a seat announcement this supervision published.
+    publish_ok: bool,
     /// `Some(ok)` when a recovery ran.
     recovered: Option<bool>,
 }
@@ -11995,6 +12642,36 @@ mod slot_gate_tests {
     use std::time::{Duration, Instant};
 
     const LONG: Duration = Duration::from_secs(3600);
+
+    /// #1299 advisor r1 — an execution is counted from BEFORE its task first runs, while it waits for
+    /// a permit (holding no slot), and uncounted once it returns.
+    /// RED ON REVERT: drop the `ExecutionGuard` and `executions()` reads 0 while the task waits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue_1299_an_execution_waiting_for_a_permit_is_counted() {
+        let gate = Arc::new(SlotGate::new(1, LONG));
+        assert_eq!(gate.try_reserve("busy"), super::Reserve::Reserved);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = Arc::clone(&ran);
+                spawn_bounded_execution(&gate, "late-award".into(), move |_, _| async move {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                assert_eq!(gate.executions(), 1, "counted before the task's first poll");
+                tokio::task::yield_now().await;
+                assert_eq!(gate.executions(), 1, "still counted while it waits for a permit");
+                assert_eq!(gate.available(), 0, "and it holds no slot of its own");
+                gate.release("busy");
+                for _ in 0..100 {
+                    if gate.executions() == 0 { break; }
+                    tokio::task::yield_now().await;
+                }
+                assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+                assert_eq!(gate.executions(), 0, "uncounted once it returns");
+            })
+            .await;
+    }
 
     #[test]
     fn one_slot_is_serial_admits_one_then_blocks() {
@@ -12556,11 +13233,13 @@ mod tests {
         );
         assert_eq!(
             production
-                .matches("crate::session::runs_as_session(")
+                .matches("crate::session::runs_turn_one_as_session(")
                 .count(),
             1
         );
-        let execute = production.find("crate::session::runs_as_session(").unwrap();
+        let execute = production
+            .find("crate::session::runs_turn_one_as_session(")
+            .unwrap();
         assert!(
             production[execute..]
                 .chars()
@@ -12713,6 +13392,7 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
         ]))
     }
@@ -14098,10 +14778,12 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
             crate::seller_agents::RegisteredAgent {
                 name: Some("codex".to_owned()),
                 argv: vec!["codex-acp".to_owned()],
+                kind: Default::default(),
             },
         ]));
         assert_eq!(
@@ -14128,6 +14810,7 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
         ]));
         let untargeted = offer(5, Some(SELLER), NOW + 600);
@@ -14514,10 +15197,12 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                kind: Default::default(),
             },
             crate::seller_agents::RegisteredAgent {
                 name: Some("codex".to_owned()),
                 argv: vec!["codex-acp".to_owned()],
+                kind: Default::default(),
             },
         ]);
         let dispatched = registry
@@ -16263,6 +16948,42 @@ mod tests {
         id
     }
 
+    /// Wait until the relay has answered EOSE for every subscription id in `ids` on this seat's
+    /// notification stream; returns the ids that never did (empty = all live).
+    ///
+    /// `subscribe_offers`/`subscribe_all` return once the REQ is QUEUED for the socket, not once the
+    /// relay holds it, while `post_offer` returns only after the relay's OK on the buyer's own
+    /// connection. At boot the open-pool filter is live-only (`since(now).limit(0)`), so an offer
+    /// stored before the relay registers the seller's REQ is broadcast to an empty subscription map,
+    /// and the REQ that lands afterwards returns nothing (`limit 0`): the seat never sees it.
+    /// The fixture relay inserts the subscription BEFORE it sends EOSE, so EOSE is the "REQ is live"
+    /// signal. Tests that publish an untargeted offer right after subscribing must wait on it, or
+    /// they race under load (`the winner must claim the open-pool offer`, CI run 44093112869).
+    async fn await_subscriptions_live(
+        notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+        ids: &[&str],
+        wait: Duration,
+    ) -> Vec<String> {
+        let mut pending: std::collections::BTreeSet<String> =
+            ids.iter().map(|id| id.to_string()).collect();
+        let _ = tokio::time::timeout(wait, async {
+            while !pending.is_empty() {
+                match notifications.recv().await {
+                    Ok(RelayPoolNotification::Message {
+                        message: nostr_sdk::RelayMessage::EndOfStoredEvents(id),
+                        ..
+                    }) => {
+                        pending.remove(&id.to_string());
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+        .await;
+        pending.into_iter().collect()
+    }
+
     /// Feed JOB_OFFER events off the seller's live notification stream into `on_offer` — exactly what
     /// the run loop's select arm does — until `done` holds or the deadline passes. Returns whether
     /// `done` held.
@@ -16990,7 +17711,7 @@ mod tests {
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
         home.config.relay_url = relay_url;
         home.config.review.seller_offer = false;
-        home.config.sessions.enabled = true;
+        home.config.sessions.enabled = Some(true);
         let mut seller = seller_cfg(1, true);
         seller.claim_award_timeout_secs = Some(3_600);
         home.config.seller = Some(seller);
@@ -17507,6 +18228,13 @@ mod tests {
                     .subscribe_offers(None, open_pool)
                     .await
                     .expect("establish the offer subscription");
+                let not_live = await_subscriptions_live(
+                    &mut notifications,
+                    &[OFFER_SUB_ID],
+                    Duration::from_secs(5),
+                )
+                .await;
+                assert!(not_live.is_empty(), "the relay never served these REQs: {not_live:?}");
 
                 let deadline_unix = now_unix() as u64 + 3_600;
                 let target = to_seller.as_deref();
@@ -17805,6 +18533,23 @@ mod tests {
                     .subscribe_all(None)
                     .await
                     .expect("loser offer + award subscriptions");
+                // Both offer REQs (and the loser's award REQ) must be LIVE at the relay before the
+                // untargeted offer is posted.
+                for (label, notifs, ids) in [
+                    ("winner", &mut winner_notifs, &[OFFER_SUB_ID][..]),
+                    (
+                        "loser",
+                        &mut loser_notifs,
+                        &[OFFER_SUB_ID, AWARD_SUB_ID][..],
+                    ),
+                ] {
+                    let not_live =
+                        await_subscriptions_live(notifs, ids, Duration::from_secs(5)).await;
+                    assert!(
+                        not_live.is_empty(),
+                        "the relay never served the {label}'s REQs: {not_live:?}"
+                    );
+                }
 
                 let deadline_unix = now_unix() as u64 + 3_600;
                 let job_id = post_offer(
@@ -18010,6 +18755,22 @@ mod tests {
                 // Both seats need the offer REQ (to claim) and the award/accept REQ (to see it).
                 winner.subscribe_all(None).await.expect("winner subscriptions");
                 loser.subscribe_all(None).await.expect("loser subscriptions");
+                // Both seats' offer and award/accept REQs must be LIVE at the relay before the
+                // untargeted offer is posted.
+                for (label, notifs) in
+                    [("winner", &mut winner_notifs), ("loser", &mut loser_notifs)]
+                {
+                    let not_live = await_subscriptions_live(
+                        notifs,
+                        &[OFFER_SUB_ID, AWARD_SUB_ID],
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                    assert!(
+                        not_live.is_empty(),
+                        "the relay never served the {label}'s REQs: {not_live:?}"
+                    );
+                }
 
                 let deadline_unix = now_unix() as u64 + 3_600;
                 let job_id = post_offer(
@@ -18298,6 +19059,339 @@ mod tests {
         store
             .record_award(&"a".repeat(64), job_id, buyer_hex, now)
             .expect("award");
+    }
+
+    // ── hook agents (docs/specs/hook-agents.md), codex r1 #11: claim pin → award → hook → result ──
+    //
+    // These drive the REAL execute_job against a local relay with a hook entry whose program is a
+    // shell script. What they pin: the hook runs once; the result carries exactly its decoded answer;
+    // the seller's co-signature verifies over the receipt preimage built from that answer's digest; a
+    // staged answer is re-delivered without re-running; a delivered job never re-runs; a claim whose
+    // pin does not match (or carries none) never reaches a hook.
+
+    const HOOK_ANSWER: &str = "héllo\nbuyer — exact bytes";
+
+    /// Boot a 1-slot hook-only seller. The hook appends a line to <root>/runs per call and answers
+    /// [HOOK_ANSWER].
+    async fn boot_hook_seller(label: &str, relay_url: &str) -> (SellerNodeRunner, Keys, std::path::PathBuf) {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay_url.to_string();
+        let mut seller = seller_cfg(1, false);
+        seller.claim_award_timeout_secs = Some(0);
+        seller.offer_backfill_secs = 0;
+        seller.agents = vec!["my-hook".to_owned()];
+        home.config.seller = Some(seller);
+        // No reviewer on the fixture relay: the seller's own offer review is switched off.
+        home.config.review.seller_offer = false;
+        let runs = root.join("runs");
+        let script = format!(
+            r#"cat >/dev/null; echo run >> '{}'; printf '%s' '{{"status":"done","answer":"héllo\nbuyer — exact bytes"}}'"#,
+            runs.display()
+        );
+        let mut preset = crate::home::AgentPresetConfig::hook(vec!["sh".into(), "-c".into(), script]);
+        preset.family = Some("claude-code".into());
+        preset.model = Some("my-model".into());
+        home.config.agents.insert("my-hook".to_owned(), preset);
+        let secret = crate::home::read_secret_key_hex(&home).expect("read seller secret");
+        let keys = Keys::parse(&secret).expect("parse seller keys");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot the hook seller");
+        (runner, keys, root)
+    }
+
+    fn hook_runs(root: &std::path::Path) -> usize {
+        std::fs::read_to_string(root.join("runs")).map(|s| s.lines().count()).unwrap_or(0)
+    }
+
+    /// An awarded inline job, claimed with `pin`.
+    fn seed_awarded_inline_job(runner: &SellerNodeRunner, job_id: &str, buyer_hex: &str, pin: Option<&crate::seller_node::store::ClaimPin>) {
+        let now = now_unix();
+        let store = runner.node.store();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    accepts_delivery: vec![gateway::DELIVERY_MODE_INLINE.to_owned()],
+                    payment_mode: crate::gateway::PaymentMode::Sat,
+                    offer_id: job_id.to_owned(),
+                    buyer_pubkey: buyer_hex.to_owned(),
+                    amount_sats: 100,
+                    unit: "sat".to_owned(),
+                    task: "answer me".to_owned(),
+                    deadline_unix: now + 3_600,
+                    targeted: true,
+                    capability_request: Some(Default::default()),
+                    requested_agent: None,
+                    output: Some("text/plain".to_owned()),
+                },
+                now,
+            )
+            .expect("record offer");
+        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), crate::gateway::ClaimPayment::Sat("creq"), &[], &Default::default());
+        store
+            .claim_and_enqueue_pinned(job_id, job_id, Some("creq"), &draft, now, now + 3_600, now, pin)
+            .expect("claim");
+        // A distinct award event per job (award ids are unique).
+        store.record_award(&Keys::generate().public_key().to_hex(), job_id, buyer_hex, now).expect("award");
+    }
+
+    fn hook_pin(runner: &SellerNodeRunner) -> crate::seller_node::store::ClaimPin {
+        let entry = runner.agents.entry(0).expect("hook entry");
+        crate::seller_node::store::ClaimPin { label: "my-hook".into(), kind: "hook".into(), fingerprint: entry.fingerprint() }
+    }
+
+    async fn fetch_results(observer: &Client, job_id: &str) -> Vec<nostr_sdk::Event> {
+        observer
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(crate::kinds::JOB_RESULT_KIND))
+                    .event(nostr_sdk::EventId::from_hex(job_id).expect("job id")),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fetch results")
+            .into_iter()
+            .collect()
+    }
+
+    fn tag_value(event: &nostr_sdk::Event, name: &str, index: usize) -> Option<String> {
+        event.tags.iter().map(|t| t.as_slice()).find(|t| t.first().map(String::as_str) == Some(name)).and_then(|t| t.get(index).cloned())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_job_runs_once_and_its_exact_answer_is_the_signed_result() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, seller_keys, root) = boot_hook_seller("hook-e2e", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "7".repeat(64);
+        let pin = hook_pin(&runner);
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&pin));
+
+        runner.execute_job(&job_id, None, false).await;
+
+        let store = runner.node.store();
+        assert_eq!(hook_runs(&root), 1, "the hook runs exactly once");
+        assert!(store.has_delivery(&job_id).expect("has_delivery"), "the answer was journaled as the delivery");
+        assert!(store.hook_job_ids().expect("ids").is_empty(), "terminal: staged answer and run record cleared");
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        assert_eq!(results.len(), 1, "one result");
+        let result = &results[0];
+        assert_eq!(result.content, HOOK_ANSWER, "the result carries the hook's decoded answer byte-for-byte");
+        assert_eq!(tag_value(result, "harness", 1).as_deref(), Some("my-hook"), "names the pinned entry");
+        assert_eq!(tag_value(result, "usage_transport", 1).as_deref(), Some("hook"));
+        assert_eq!(tag_value(result, "model", 1).as_deref(), Some("my-model"));
+        // The co-signature binds THIS answer: rebuild the preimage from its digest and verify.
+        let preimage = delivery_receipt_preimage(
+            &job_id,
+            "answer me",
+            100,
+            &buyer_hex,
+            &seller_keys.public_key().to_hex(),
+            &crate::receipt::result_content_hash_hex(HOOK_ANSWER),
+            crate::receipt::DeliveryKind::Inline.as_str(),
+            Some("creq"),
+        );
+        let sig_hex = tag_value(result, "sig", 2).expect("sig seller tag");
+        let sig = nostr_sdk::secp256k1::schnorr::Signature::from_slice(&hex::decode(&sig_hex).expect("sig hex"))
+            .expect("sig bytes");
+        let message = nostr_sdk::secp256k1::Message::from_digest(preimage.digest_bytes());
+        nostr_sdk::secp256k1::Secp256k1::verification_only()
+            .verify_schnorr(&sig, &message, &seller_keys.public_key().xonly().expect("xonly"))
+            .expect("the seller co-signed the receipt preimage of exactly this answer");
+
+        // A redundant re-drive of the delivered job never runs the hook again nor emits a second result.
+        runner.execute_job(&job_id, None, true).await;
+        assert_eq!(hook_runs(&root), 1);
+        assert_eq!(fetch_results(&observer, &job_id).await.len(), 1);
+
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_hook_answer_is_redelivered_without_rerunning_the_hook() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-staged", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "8".repeat(64);
+        let pin = hook_pin(&runner);
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&pin));
+        // The crash: the hook ran and its answer was staged, but the daemon died before delivery.
+        runner
+            .node
+            .store()
+            .stage_hook_outcome(
+                &crate::seller_node::store::HookOutcomeRow {
+                    invocation: job_id.clone(),
+                    job_id: job_id.clone(),
+                    turn: 1,
+                    status: "done".into(),
+                    answer: "the staged answer".into(),
+                    wall_time_ms: 5,
+                },
+                now_unix(),
+            )
+            .expect("stage");
+
+        runner.execute_job(&job_id, None, true).await;
+
+        assert_eq!(hook_runs(&root), 0, "a staged answer is re-delivered, never re-run");
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "the staged answer");
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex r2 #8: a job failed on a path outside the hook runner (here: the hook was edited since
+    /// the claim) still loses the hook state an earlier attempt left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_job_failed_before_dispatch_still_loses_its_hook_state() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-fail-cleanup", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "3".repeat(64);
+        let changed = crate::seller_node::store::ClaimPin { fingerprint: "the-entry-at-claim-time".into(), ..hook_pin(&runner) };
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&changed));
+        let store = runner.node.store();
+        assert_eq!(store.begin_hook_attempt(&job_id, &job_id, now_unix()).expect("begin"), Some(1));
+        let workdir = job_workdir(runner.node.home(), &job_id);
+        std::fs::create_dir_all(&workdir).expect("dir");
+
+        runner.execute_job(&job_id, None, true).await;
+
+        assert_eq!(store.job_state(&job_id).expect("state"), Some(crate::seller_node::store::JobState::Failed));
+        assert!(store.hook_job_ids().expect("ids").is_empty(), "the run record went with the failure");
+        assert!(!workdir.exists(), "and so did the directory");
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex r2 #6: a partly written claim pin is neither the pinned entry nor "unpinned": the job is
+    /// deferred (left awarded for the next re-drive), not failed and not dispatched anywhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_claim_pin_defers_the_job() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-partial-pin", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "4".repeat(64);
+        let pin = hook_pin(&runner);
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&pin));
+        runner.node.store().exec_sql_for_test("UPDATE claims SET agent_kind = NULL");
+
+        runner.execute_job(&job_id, None, false).await;
+
+        assert_eq!(hook_runs(&root), 0, "nothing runs on a partial pin");
+        let store = runner.node.store();
+        assert_eq!(
+            store.job_state(&job_id).expect("state"),
+            Some(crate::seller_node::store::JobState::Awarded),
+            "deferred, not failed"
+        );
+        let observer = connect_observer(&relay_url).await;
+        assert!(fetch_results(&observer, &job_id).await.is_empty());
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// codex r2 #3: the hook was edited after the claim (its fingerprint no longer matches the pin)
+    /// while a staged answer waited for delivery. The staged answer is still delivered, naming the
+    /// pinned entry, and the edited hook is not run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_hook_answer_is_delivered_even_after_the_hook_changed() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-staged-changed", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "5".repeat(64);
+        let then = crate::seller_node::store::ClaimPin { fingerprint: "the-entry-at-claim-time".into(), ..hook_pin(&runner) };
+        seed_awarded_inline_job(&runner, &job_id, &buyer_hex, Some(&then));
+        runner
+            .node
+            .store()
+            .stage_hook_outcome(
+                &crate::seller_node::store::HookOutcomeRow {
+                    invocation: job_id.clone(),
+                    job_id: job_id.clone(),
+                    turn: 1,
+                    status: "done".into(),
+                    answer: "staged before the edit".into(),
+                    wall_time_ms: 5,
+                },
+                now_unix(),
+            )
+            .expect("stage");
+
+        runner.execute_job(&job_id, None, true).await;
+
+        assert_eq!(hook_runs(&root), 0, "the edited hook is never run for it");
+        let store = runner.node.store();
+        assert!(store.has_delivery(&job_id).expect("has_delivery"));
+        assert!(store.hook_job_ids().expect("ids").is_empty(), "delivered: hook state cleared");
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "staged before the edit");
+        assert_eq!(tag_value(&results[0], "harness", 1).as_deref(), Some("my-hook"), "names the pinned entry");
+        assert_eq!(tag_value(&results[0], "model", 1), None, "the edited entry's model is not claimed for it");
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_whose_pin_does_not_match_or_is_absent_never_reaches_the_hook() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, _keys, root) = boot_hook_seller("hook-pin", &relay_url).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let changed = crate::seller_node::store::ClaimPin { fingerprint: "not-the-configured-entry".into(), ..hook_pin(&runner) };
+        let (mismatch, unpinned) = ("9".repeat(64), "6".repeat(64));
+        seed_awarded_inline_job(&runner, &mismatch, &buyer_hex, Some(&changed));
+        seed_awarded_inline_job(&runner, &unpinned, &buyer_hex, None);
+
+        runner.execute_job(&mismatch, None, false).await;
+        runner.execute_job(&unpinned, None, false).await;
+
+        assert_eq!(hook_runs(&root), 0, "neither claim may run the hook");
+        let store = runner.node.store();
+        for job in [&mismatch, &unpinned] {
+            assert_eq!(store.job_state(job).expect("state"), Some(crate::seller_node::store::JobState::Failed), "{job}");
+            assert!(!store.has_delivery(job).expect("has_delivery"));
+        }
+        let observer = connect_observer(&relay_url).await;
+        assert!(fetch_results(&observer, &mismatch).await.is_empty());
+        assert!(fetch_results(&observer, &unpinned).await.is_empty());
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Compose the resume decision exactly as `execute_job` does on resume: read every durable marker
@@ -18707,6 +19801,173 @@ mod tests {
         f.record("offerX");
         assert_eq!(f.len(), 1, "one id however many re-ingests");
         assert!(f.contains("offerX"));
+    }
+
+    /// An idle seat prints no summary; a busy one prints one line naming only the non-zero counts,
+    /// and the counts reset so the next status tick reports only what happened since.
+    #[test]
+    fn quiet_tally_summarises_then_resets() {
+        let tally = QuietTally::default();
+        assert_eq!(tally.take_summary(), None, "nothing counted, nothing printed");
+
+        for _ in 0..3 {
+            QuietTally::bump(&tally.not_ours);
+        }
+        QuietTally::bump(&tally.stale_offers);
+        let summary = tally.take_summary().expect("counted events produce a summary");
+        assert!(summary.starts_with("seller node routine (since last status): "), "{summary}");
+        assert!(summary.contains("other sellers' awards/acceptances: 3"), "{summary}");
+        assert!(summary.contains("lapsed or aged offers skipped: 1"), "{summary}");
+        assert!(!summary.contains("pay-bind"), "zero counts stay out of the line: {summary}");
+        assert!(summary.contains("MAXPLAYER_VERBOSE=1"), "names the knob: {summary}");
+
+        assert_eq!(tally.take_summary(), None, "counts reset after each summary");
+
+        // Every counter has a label in the line, so none is counted and then silently dropped.
+        for (i, counter) in [
+            &tally.not_ours,
+            &tally.already_awarded,
+            &tally.stale_offers,
+            &tally.unknown_closes,
+            &tally.ended_followups,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for _ in 0..=i {
+                QuietTally::bump(counter);
+            }
+        }
+        let summary = tally.take_summary().expect("summary");
+        for expected in [
+            "other sellers' awards/acceptances: 1",
+            "pay-binds for jobs already awarded here: 2",
+            "lapsed or aged offers skipped: 3",
+            "relay CLOSEDs for subscriptions not ours: 4",
+            "follow-ups to ended sessions: 5",
+        ] {
+            assert!(summary.contains(expected), "missing {expected:?} in {summary}");
+        }
+    }
+
+    /// nostr-relay-builder 0.44.1 probes a free port, releases it, then binds it again, so a
+    /// parallel test can take it in between: retry only that AddrInUse, with a fresh relay (the same
+    /// recovery as `profile.rs`'s `start_relay`).
+    async fn start_quiet_test_relay() -> nostr_relay_builder::prelude::LocalRelay {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        for attempt in 1..=8 {
+            let relay = LocalRelay::new(RelayBuilder::default());
+            match relay.run().await {
+                Ok(()) => return relay,
+                Err(nostr_relay_builder::Error::IO(error))
+                    if error.kind() == std::io::ErrorKind::AddrInUse && attempt < 8 => {}
+                Err(error) => panic!("relay run: {error}"),
+            }
+        }
+        unreachable!("the last attempt returns or panics")
+    }
+
+    /// Only a recent offer aimed at this seat is worth a default-output line when it lapses.
+    #[test]
+    fn a_stale_skip_is_news_only_when_recent_and_aimed_here() {
+        assert!(stale_skip_is_news(true, 0), "aimed here, just authored");
+        assert!(stale_skip_is_news(true, MAX_OFFER_ADMIT_AGE_SECS), "edge of the admit window");
+        assert!(!stale_skip_is_news(true, MAX_OFFER_ADMIT_AGE_SECS + 1), "history replay");
+        assert!(!stale_skip_is_news(false, 0), "open-pool offer for anyone");
+    }
+
+    /// The on_offer hookup: open-pool and historical stale offers are counted; a recent offer aimed
+    /// at this seat is announced (not counted) the first time only.
+    ///
+    /// RED ON REVERT: drop the `stale_skip_is_news` branch in `on_offer` and the targeted offer is
+    /// counted too (stale_offers 4, not 3); drop the `announced_stale_offers` check and the repeat
+    /// is announced again (stale_offers 2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_offers_are_counted_unless_recent_and_aimed_here() {
+        let relay = start_quiet_test_relay().await;
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_capacity_skip_seller("quiet-stale", &relay_url, true, 0, None).await;
+        let runner = Arc::new(runner);
+        let buyer = Keys::generate();
+        let now = now_unix() as u64;
+        let lapsed = now - 10;
+        let offer = |task: &str, to_us: bool, authored: u64| {
+            let mut draft = crate::gateway::OfferDraft::untargeted(task, "", 100, lapsed);
+            if to_us {
+                draft.seller_pubkey = Some(runner.seller_pubkey.to_hex());
+            }
+            crate::gateway::nostr::event_builder(&draft.to_event_draft())
+                .expect("offer builder")
+                .custom_created_at(nostr_sdk::Timestamp::from(authored))
+                .sign_with_keys(&buyer)
+                .expect("sign offer")
+        };
+        let open_pool = offer("open pool, lapsed", false, now);
+        let aimed_here = offer("aimed here, lapsed", true, now);
+        let aimed_here_old = offer("aimed here, history", true, now - MAX_OFFER_ADMIT_AGE_SECS - 60);
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.on_offer(&open_pool).await;
+                runner.on_offer(&aimed_here).await;
+                runner.on_offer(&aimed_here).await; // the backfill re-reading it
+                runner.on_offer(&aimed_here_old).await;
+            })
+            .await;
+
+        assert!(
+            runner.announced_stale_offers.contains(&aimed_here.id.to_hex()),
+            "the recent offer aimed here was announced"
+        );
+        assert!(!runner.announced_stale_offers.contains(&aimed_here_old.id.to_hex()));
+        assert_eq!(
+            runner.quiet.stale_offers.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "open-pool + repeat + history are counted; the first sight of the recent one is not"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An award or acceptance for an offer this seat never recorded (another seller's job, replayed
+    /// by backfill) is counted for the summary. (That it is not printed by default rests on the
+    /// call site using `opline_verbose!`; nothing here captures stderr.)
+    ///
+    /// RED ON REVERT: drop either `QuietTally::bump(&self.quiet.not_ours)` in `on_accept` /
+    /// `on_award` and the count stays short.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn other_sellers_awards_and_accepts_are_counted() {
+        let relay = start_quiet_test_relay().await;
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_capacity_skip_seller("quiet-not-ours", &relay_url, true, 0, None).await;
+        let runner = Arc::new(runner);
+
+        let buyer = Keys::generate();
+        let other_seller = Keys::generate().public_key().to_hex();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for offer in ["0".repeat(64), "1".repeat(64)] {
+                    runner
+                        .on_award(&award_event(&offer, "their-claim", &buyer, &other_seller, &buyer))
+                        .await;
+                    runner
+                        .on_accept(&accept_event(&offer, "their-claim", &buyer, &other_seller, &buyer))
+                        .await;
+                }
+            })
+            .await;
+
+        assert_eq!(
+            runner.quiet.not_ours.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "two awards and two acceptances for offers we never recorded"
+        );
+        let summary = runner.quiet.take_summary().expect("summary");
+        assert!(summary.contains("other sellers' awards/acceptances: 4"), "{summary}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A targeted (non-open-pool) seller wired to `relay_url` with a controllable `rate_sats`, so a
@@ -21003,6 +22264,746 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // BEGIN #1299 drain tests
+    /// Boot a 1-slot seller against the fixture with a 1 s heartbeat, for the drain teeth.
+    async fn drain_runner(label: &str, fixture: &PGateRelay) -> (SellerNodeRunner, std::path::PathBuf) {
+        let root = throwaway_root(label);
+        let mut home = lane_home(&root, fixture);
+        // An hour: the only beats after the boot one are the drain's own, so a prompt `accepting=n`
+        // proves the drain fired it (advisor r1: a 1 s interval masked a missing reset).
+        home.config.seller_heartbeat.interval_secs = 3600;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        (runner, root)
+    }
+
+    /// #1299 advisor r1 — the drain's exit condition counts the work lane (an award mid-handler) and
+    /// queued events (a late award not yet handled), session turns in flight, and private copies;
+    /// private copies alone are the only thing the grace bound may leave behind.
+    /// RED ON REVERT: drop any term from `only_private` and its case reads idle.
+    #[test]
+    fn issue_1299_drain_left_counts_every_kind_of_owed_work() {
+        let idle = || DrainLeft { held: 0, executions: 0, turns: 0, lane_busy: false, queued: 0, outbox: Ok(0), private: Ok(0) };
+        assert!(idle().idle());
+        for (what, left) in [
+            ("held slot", DrainLeft { held: 1, ..idle() }),
+            ("execution", DrainLeft { executions: 1, ..idle() }),
+            ("session turn", DrainLeft { turns: 1, ..idle() }),
+            ("lane busy", DrainLeft { lane_busy: true, ..idle() }),
+            ("queued event", DrainLeft { queued: 1, ..idle() }),
+            ("outbox", DrainLeft { outbox: Ok(1), ..idle() }),
+            ("outbox unreadable", DrainLeft { outbox: Err("x".into()), ..idle() }),
+        ] {
+            assert!(!left.idle() && !left.only_private(), "{what} must hold the drain");
+        }
+        for left in [DrainLeft { private: Ok(2), ..idle() }, DrainLeft { private: Err("x".into()), ..idle() }] {
+            assert!(!left.idle() && left.only_private(), "{left}");
+        }
+    }
+
+    /// #1299 advisor r1 — a session turn task holds no slot until it acquires one; the drain must
+    /// count it from the moment it is admitted.
+    /// RED ON REVERT: drop `turns` from `drain_remaining` and the runner reads idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_session_turn_in_flight_holds_the_drain() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-turn", &fixture).await;
+        assert!(runner.drain_remaining(false, 0).idle(), "harness check: idle at rest");
+        runner.session_rt.insert_in_flight_for_test(&"1".repeat(64));
+        let left = runner.drain_remaining(false, 0);
+        assert!(!left.idle(), "{left}");
+        assert_eq!(left.turns, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 advisor r1 (Medium) — a drain must not consume a #1057 `review retry` ticket: the
+    /// restarted seller serves it. RED ON REVERT: drop the early return in
+    /// `reconsider_capacity_skips` AND return `Declined` from `claim_offer` and the ticket is deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_drain_keeps_review_retry_tickets() {
+        let (_relay, runner, root, buyer) = review_1057_seller("review-1299-drain").await;
+        let review_root = runner.node.home().root.clone();
+        let (id, offer) = offer_1057(&buyer, "#1299 drain ticket", 300, now_unix() as u64 + 600);
+        settle_1057(&runner, &id, R1057_PERMANENT);
+        block_1057(&runner, &buyer, &id, &offer).await;
+        crate::review::state::retry(&review_root, &id).unwrap();
+        assert!(runner.drain_handle().request("test drain"));
+        assert_eq!(runner.reconsider_capacity_skips().await, 0);
+        assert!(ticket_1057(&runner, &id), "the ticket survives the drain");
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #1299 — a draining node claims nothing new, on the shared choke point both claim paths use.
+    ///
+    /// RED ON REVERT: drop the drain check at the top of `claim_offer` and the offer goes on to its
+    /// review gate (`ReachedReview`) instead of being declined.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_draining_node_declines_new_offers() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-declines", &fixture).await;
+        let buyer = Keys::generate();
+        let (id, offer) = offer_1057(&buyer, "#1299 drain", 300, now_unix() as u64 + 600);
+        assert!(runner.drain_handle().request("test drain"));
+        let outcome = runner
+            .claim_offer(
+                &id,
+                &buyer.public_key().to_hex(),
+                &offer,
+                &runner.seller_pubkey.to_hex(),
+                offer.deadline_unix,
+                now_unix(),
+                None,
+            )
+            .await;
+        assert_eq!(outcome, ClaimOutcome::Deferred, "a draining node must not claim (and keeps #1057 tickets)");
+        assert!(runner.node.store().claim_row_state(&id).unwrap().is_none());
+        assert_eq!(runner.slots.available(), 1, "nothing was reserved");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 — a drain advertises `accepting=n` while it waits, does NOT leave while a slot is held
+    /// (an executing job, or a claim whose award it promised to honour), and leaves through the
+    /// ordinary exit path — clean return, terminal `accepting=n` — once the slot is released.
+    ///
+    /// RED ON REVERT: drop the drain arm on the drain tick and the loop never returns; make
+    /// `drain_remaining` ignore held slots and the loop returns while the slot is still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_1299_a_drain_waits_for_held_work_then_leaves_cleanly() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-waits", &fixture).await;
+        let slots = Arc::clone(&runner.slots);
+        assert_eq!(slots.try_reserve("job-in-flight"), Reserve::Reserved);
+        let drain = runner.drain_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let joined = local
+            .run_until(async {
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| seat_announcements(events)
+                            .iter()
+                            .any(|beat| beat.tag_value("accepting") == Some("y")))
+                        .await,
+                    "harness check: the seat advertises itself open first"
+                );
+                let before = seat_announcements(&fixture.events().await).len();
+                assert!(drain.request("test drain"));
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| {
+                            let beats = seat_announcements(events);
+                            beats.len() > before
+                                && beats.last().unwrap().tag_value("accepting") == Some("n")
+                        })
+                        .await,
+                    "a draining seat must advertise accepting=n while it finishes"
+                );
+                // Two drain ticks (5 s each) with the slot still held: the loop must stay up.
+                tokio::time::sleep(DRAIN_INTERVAL * 2 + Duration::from_millis(500)).await;
+                assert!(
+                    !loop_handle.is_finished(),
+                    "a drain must not leave while a slot is still held"
+                );
+                slots.release("job-in-flight");
+                tokio::time::timeout(FIXTURE_WAIT, loop_handle).await
+            })
+            .await;
+        let outcome = joined
+            .expect("an idle drain must RETURN, not have to be killed")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "a completed drain is a clean exit: {outcome:?}");
+        let events = fixture.events().await;
+        let terminal = *seat_announcements(&events).last().expect("a beat");
+        assert_eq!(terminal.tag_value("accepting"), Some("n"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 — SIGTERM during a drain still means stop now: the loop returns although a slot is
+    /// held, exactly as an ordinary shutdown leaves in-flight rows to the boot resume path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_1299_a_shutdown_aborts_a_drain() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-abort", &fixture).await;
+        assert_eq!(runner.slots.try_reserve("job-in-flight"), Reserve::Reserved);
+        let drain = runner.drain_handle();
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let joined = local
+            .run_until(async {
+                assert!(drain.request("test drain"));
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(shutdown.request("SIGTERM"));
+                tokio::time::timeout(FIXTURE_WAIT, loop_handle).await
+            })
+            .await;
+        let outcome = joined
+            .expect("a shutdown during a drain must return promptly")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// #1299 follow-up: a seller home for the session drain tests, on the default `[sessions]`
+    /// (sessions on because `enabled` is unset).
+    fn drain_session_home(root: &std::path::Path, fixture: &PGateRelay) -> crate::home::MaxplayerHome {
+        let mut home = lane_home(root, fixture);
+        home.config.seller_heartbeat.interval_secs = 3600;
+        home
+    }
+
+    /// A default home (`[sessions] enabled` unset) puts kind-3412 follow-ups on the award REQ it
+    /// actually sends. RED ON REVERT: read `explicitly_enabled()` for the award filter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_home_award_subscription_carries_followups() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("default-award-3412");
+        let home = drain_session_home(&root, &fixture);
+        assert_eq!(home.config.sessions.enabled, None, "default [sessions]");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot");
+        runner
+            .subscribe_one(AWARD_SUB_ID, None)
+            .await
+            .expect("award REQ");
+        let filters = runner
+            .client
+            .subscription(&nostr_sdk::SubscriptionId::new(AWARD_SUB_ID))
+            .await;
+        let followup = Kind::Custom(crate::kinds::SESSION_FOLLOWUP_KIND);
+        assert!(
+            filters
+                .values()
+                .flatten()
+                .any(|f| f.kinds.as_ref().is_some_and(|k| k.contains(&followup))),
+            "{filters:?}"
+        );
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 follow-up: a priced session job parked after turn 1 (turn 1 unpaid): offer row, our
+    /// claim journaled with `["session","1"]` (already expired, so the outbox holds no drain), the
+    /// buyer's award, and the parked session record. Returns the job id.
+    fn park_session_1299(runner: &SellerNodeRunner, buyer: &Keys) -> String {
+        let store = runner.node.store();
+        let job_id = "a".repeat(64);
+        let buyer_hex = buyer.public_key().to_hex();
+        let now = now_unix();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    offer_id: job_id.clone(),
+                    buyer_pubkey: buyer_hex.clone(),
+                    amount_sats: 100,
+                    unit: "sat".to_owned(),
+                    task: "#1299 session".to_owned(),
+                    deadline_unix: now + 3_600,
+                    targeted: true,
+                    requested_agent: None,
+                    capability_request: None,
+                    output: Some("text/plain".to_owned()),
+                    payment_mode: crate::gateway::PaymentMode::Sat,
+                    accepts_delivery: Vec::new(),
+                },
+                now,
+            )
+            .expect("record offer");
+        let claim = crate::gateway::EventDraft::new(
+            crate::kinds::JOB_CLAIM_KIND,
+            vec![crate::gateway::TagSpec::new(["session", "1"])],
+            "",
+        );
+        store
+            .claim_and_enqueue(&job_id, &job_id, Some(""), &claim, now, now - 1, now)
+            .expect("claim");
+        store
+            .record_award(&"b".repeat(64), &job_id, &buyer_hex, now)
+            .expect("award");
+        store
+            .put_session(&crate::seller_node::store::SessionRecord {
+                job_id: job_id.clone(),
+                buyer_pubkey: buyer_hex,
+                container: "maxplayer-1299-test-absent".to_owned(),
+                holder: None,
+                holder_started_at: None,
+                image_id: String::new(),
+                orchestrator_version: String::new(),
+                acp_session_id: None,
+                harness: "claude".to_owned(),
+                model: None,
+                turn: 1,
+                last_turn_at: now as u64,
+                disk_bytes: 0,
+                state: crate::session::SessionState::Parked,
+                proxy_host: None,
+                base_oid: None,
+                holder_egress_dev: None,
+                holder_classifier: None,
+                holder_proxy_ports: None,
+            })
+            .expect("park session");
+        job_id
+    }
+
+    /// #1299 follow-up: the buyer's signed kind-3412 for `job_id` (turn 2, or a close).
+    fn followup_1299(
+        runner: &SellerNodeRunner,
+        buyer: &Keys,
+        job_id: &str,
+        status: crate::session::FollowUpStatus,
+    ) -> nostr_sdk::Event {
+        let turn = status == crate::session::FollowUpStatus::Turn;
+        let draft = crate::session::followup_draft(&crate::session::FollowUp {
+            offer_id: job_id.to_owned(),
+            seller_pubkey: runner.seller_pubkey.to_hex(),
+            status,
+            prev_result_id: turn.then(|| "c".repeat(64)),
+            turn: turn.then_some(2),
+            deadline_unix: turn.then(|| now_unix() as u64 + 3_600),
+            text: turn.then(|| "#1299 turn two".to_owned()),
+        })
+        .expect("follow-up draft");
+        crate::gateway::nostr::event_builder(&draft)
+            .expect("builder")
+            .sign_with_keys(buyer)
+            .expect("sign follow-up")
+    }
+
+    /// Wait (bounded) until `check` holds.
+    async fn eventually_1299(within: Duration, mut check: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        check()
+    }
+
+    /// #1299 N1(a) — unsent private-content copies hold the drain (only the grace bound may leave
+    /// them behind): `drain_remaining` really reads `private-content.sqlite`.
+    /// RED ON REVERT: `private: Ok(0)` in `drain_remaining` and the runner reads idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_unsent_private_copies_hold_the_drain() {
+        use crate::private_content::{Binding, ContentBody, ContentType, PreparedContent, BODY_SCHEMA};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-private", &fixture).await;
+        assert!(runner.node.home().config.privacy.private_content_v2, "harness check: v2 on");
+        assert!(runner.drain_remaining(false, 0).idle(), "harness check: idle at rest");
+        let seller = runner.seller_pubkey.to_hex();
+        let buyer = Keys::generate().public_key().to_hex();
+        let service = Keys::generate().public_key().to_hex();
+        let mut recipients = vec![seller.clone(), buyer.clone(), service.clone()];
+        recipients.sort();
+        let (job, offer, message) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+        let content = PreparedContent::new(ContentBody {
+            schema: BODY_SCHEMA.into(),
+            job_id: job.clone(),
+            offer_id: Some(offer.clone()),
+            award_id: None,
+            message_id: message.clone(),
+            kind: ContentType::Progress,
+            revision: 0,
+            supersedes: None,
+            author: seller.clone(),
+            recipients,
+            text: "#1299 progress".into(),
+            requested_output: None,
+            dispatch: None,
+            attachments: vec![],
+            contribution: None,
+        })
+        .expect("content");
+        let mut db = crate::private_content::store::ContentStore::open(
+            &runner.node.home().root.join("private-content.sqlite"),
+        )
+        .expect("open content store");
+        db.enqueue(
+            &content,
+            &Binding {
+                buyer: &buyer,
+                seller: &seller,
+                service: &service,
+                author: &seller,
+                job_id: &job,
+                offer_id: Some(&offer),
+                award_id: None,
+                message_id: &message,
+                commitment: content.commitment(),
+                kind: ContentType::Progress,
+            },
+        )
+        .expect("enqueue copies");
+        drop(db);
+        let left = runner.drain_remaining(false, 0);
+        assert!(matches!(left.private, Ok(n) if n > 0), "{left}");
+        assert!(!left.idle(), "unsent private copies must hold the drain: {left}");
+        assert!(left.only_private(), "and only the grace bound may leave them: {left}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 N1(c) — the loop's drain check counts the work lane (an award mid-handler) and the
+    /// event queue (a late award not yet handled); the loop exits and reports on this helper alone.
+    /// RED ON REVERT: make `drain_check` call `drain_remaining(false, 0)` and both cases read idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_the_loop_drain_check_counts_the_lane_and_the_queue() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-lane", &fixture).await;
+        let mut queue: schedule::WorkQueue<Box<nostr_sdk::Event>> = schedule::WorkQueue::new(8);
+        let mut lane: Option<LaneFuture> = None;
+        assert!(runner.drain_check(&lane, &queue).idle(), "harness check: idle at rest");
+        let award = crate::gateway::nostr::event_builder(&crate::gateway::EventDraft::new(
+            crate::kinds::JOB_AWARD_KIND,
+            Vec::new(),
+            "",
+        ))
+        .expect("builder")
+        .sign_with_keys(&Keys::generate())
+        .expect("sign");
+        queue.push_event(Box::new(award));
+        let left = runner.drain_check(&lane, &queue);
+        assert!(!left.idle() && left.queued == 1, "a queued award must hold the drain: {left}");
+        let mut empty: schedule::WorkQueue<Box<nostr_sdk::Event>> = schedule::WorkQueue::new(8);
+        lane = Some(Box::pin(async { LaneDone { backfill_complete: None, drain: None } }));
+        let left = runner.drain_check(&lane, &empty);
+        assert!(!left.idle() && left.lane_busy, "a busy lane must hold the drain: {left}");
+        lane = None;
+        empty.request_tick();
+        assert!(runner.drain_check(&lane, &empty).idle(), "a periodic tick is not owed work");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 N1(b) + N3 — a draining node starts no new session turn: an admitted follow-up is
+    /// journaled `received` (with its text) but not spawned, so it holds no drain; a close during
+    /// the drain still closes the session.
+    /// RED ON REVERT: drop the drain check after the turn is journaled and the turn task starts
+    /// (`in_flight_turns() == 1`); move it back before `record_turn` and no row is journaled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_draining_node_journals_a_follow_up_without_starting_it() {
+        use crate::session::{FollowUpStatus, SessionState, TurnState};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("1299-followup-defer");
+        let runner = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture)).await.expect("boot"),
+        );
+        let buyer = Keys::generate();
+        let job_id = park_session_1299(&runner, &buyer);
+        let turn = followup_1299(&runner, &buyer, &job_id, FollowUpStatus::Turn);
+        let fid = turn.id.to_hex();
+        assert!(runner.drain_handle().request("test drain"));
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.on_followup(&turn).await;
+                assert_eq!(runner.session_rt.in_flight_turns(), 0, "no turn task while draining");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let store = runner.node.store();
+                let row = store.turn(&fid).expect("turn read").expect("the turn is journaled");
+                assert_eq!(row.state, TurnState::Received, "journaled, never started");
+                assert_eq!(store.turn_texts(&job_id, 2).expect("texts"), vec!["#1299 turn two".to_owned()]);
+                assert_eq!(runner.session_rt.in_flight_turns(), 0);
+                assert!(runner.drain_remaining(false, 0).idle(), "a journaled turn holds no drain");
+                // A close during the drain is still honoured.
+                let close = followup_1299(&runner, &buyer, &job_id, FollowUpStatus::Close);
+                runner.on_followup(&close).await;
+                assert_eq!(
+                    store.session(&job_id).expect("session read").expect("row").state,
+                    SessionState::Closed
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 N3 — a follow-up deferred by a drain survives the restart off the store alone (no
+    /// relay history): the fresh runner's `recover_sessions` re-drives it.
+    /// RED ON REVERT: return before `record_turn` while draining (the pre-fix shape) and the
+    /// restarted seller finds nothing to run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_deferred_follow_up_runs_on_the_restarted_seller() {
+        use crate::session::{FollowUpStatus, TurnState};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("1299-followup-restart");
+        let runner = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture)).await.expect("boot"),
+        );
+        let buyer = Keys::generate();
+        let job_id = park_session_1299(&runner, &buyer);
+        let turn = followup_1299(&runner, &buyer, &job_id, FollowUpStatus::Turn);
+        let fid = turn.id.to_hex();
+        assert!(runner.drain_handle().request("test drain"));
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async { runner.on_followup(&turn).await }).await;
+        assert_eq!(runner.session_rt.in_flight_turns(), 0);
+        drop(local);
+        drop(runner);
+
+        // ---- restart: a fresh runner over the SAME home, nothing replayed from the relay --------
+        let restarted = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture))
+                .await
+                .expect("boot the restarted seller"),
+        );
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                restarted.recover_sessions().await;
+                assert_eq!(restarted.session_rt.in_flight_turns(), 1, "the journaled turn is re-driven");
+                // It runs: turn 1 is unpaid, so it reaches the payment gate and says so.
+                let store = restarted.node.store().clone();
+                assert!(
+                    eventually_1299(Duration::from_secs(5), || matches!(
+                        store.turn(&fid),
+                        Ok(Some(row)) if row.state == TurnState::WaitingPayment
+                    ))
+                    .await,
+                    "the restarted seller must run the deferred turn"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1203 — two stale follow-ups for one turn of an ENDED session are answered once each, ever:
+    /// replaying both (on the same seller, and on a restarted one over the same home) publishes no
+    /// new refusal, while a refusal whose publish was not confirmed is retried by the next replay.
+    /// RED ON REVERT: put back the `record_turn(.., Refused, ..)` dedup in the ended-session branch
+    /// and every replay of the pair publishes more kind-3404s (each evicts the other's row); mark
+    /// before publishing and the unconfirmed refusal of `a` is never sent again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1203_an_ended_session_refuses_each_follow_up_once_across_replays() {
+        use crate::session::{FollowUpStatus, SessionState};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("1203-ended-replay");
+        let runner = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture)).await.expect("boot"),
+        );
+        let buyer = Keys::generate();
+        let job_id = park_session_1299(&runner, &buyer);
+        assert!(runner
+            .node
+            .store()
+            .set_session_state(&job_id, SessionState::Closed, now_unix() as u64)
+            .expect("close"));
+        // Two distinct follow-ups for the same turn 2 (different text, so different ids).
+        let stale = |text: &str| {
+            let draft = crate::session::followup_draft(&crate::session::FollowUp {
+                offer_id: job_id.clone(),
+                seller_pubkey: runner.seller_pubkey.to_hex(),
+                status: FollowUpStatus::Turn,
+                prev_result_id: Some("c".repeat(64)),
+                turn: Some(2),
+                deadline_unix: Some(now_unix() as u64 + 3_600),
+                text: Some(text.to_owned()),
+            })
+            .expect("follow-up draft");
+            crate::gateway::nostr::event_builder(&draft)
+                .expect("builder")
+                .sign_with_keys(&buyer)
+                .expect("sign follow-up")
+        };
+        let (a, b) = (stale("#1203 first try"), stale("#1203 second try"));
+        assert_ne!(a.id, b.id);
+        let feedback = crate::kinds::JOB_FEEDBACK_KIND as u64;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // The relay never confirms `a`'s first refusal: it is not marked as answered.
+                fixture.withhold_ok_for(&[feedback]);
+                runner.on_followup(&a).await;
+                assert_eq!(fixture.event_kind_count(feedback).await, 1);
+                fixture.withhold_ok_for(&[]);
+                // The next replay sends it again (confirmed this time); `b` gets its one answer.
+                runner.on_followup(&a).await;
+                runner.on_followup(&b).await;
+                assert_eq!(
+                    fixture.event_kind_count(feedback).await,
+                    3,
+                    "an unconfirmed refusal is retried, a confirmed one is not"
+                );
+                // Replays, in both orders, as a backfill would deliver them.
+                for _ in 0..3 {
+                    runner.on_followup(&a).await;
+                    runner.on_followup(&b).await;
+                    runner.on_followup(&b).await;
+                    runner.on_followup(&a).await;
+                }
+                assert_eq!(
+                    fixture.event_kind_count(feedback).await,
+                    3,
+                    "replays of an ended session's follow-ups must publish nothing new"
+                );
+            })
+            .await;
+        drop(local);
+        drop(runner);
+
+        // ---- restart: a fresh runner over the SAME home replays both again -----------------------
+        let restarted = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture))
+                .await
+                .expect("boot the restarted seller"),
+        );
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                restarted.on_followup(&b).await;
+                restarted.on_followup(&a).await;
+            })
+            .await;
+        let refusals: Vec<_> = fixture
+            .events()
+            .await
+            .into_iter()
+            .filter(|event| event.kind == feedback)
+            .collect();
+        assert_eq!(refusals.len(), 3, "a restart must publish nothing new");
+        let has = |event: &crate::seller_node::p_gate_relay_fixture::PublishedEvent, tag: &[&str]| {
+            event.tags.iter().any(|t| t.iter().map(String::as_str).eq(tag.iter().copied()))
+        };
+        for (fid, n) in [(a.id.to_hex(), 2), (b.id.to_hex(), 1)] {
+            let answers: Vec<_> = refusals
+                .iter()
+                .filter(|event| has(event, &["e", fid.as_str(), "", "reply"]))
+                .collect();
+            assert_eq!(answers.len(), n, "refusals replying to {fid}");
+            for event in answers {
+                assert!(has(event, &["status", "refusal"]), "{:?}", event.tags);
+                assert!(has(event, &["reason_code", "session_expired"]), "{:?}", event.tags);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1203 field shape — a follow-up refused while the session was live, then a second one for
+    /// the same turn after the session closed, then both replayed (and a `close`): the live-refused
+    /// one (an old refused row, as an upgraded seat holds it) is not answered again, the late one is
+    /// answered once, the close publishes nothing.
+    /// RED ON REVERT: drop the own-row check (`followup_id = ?3`) from `ended_refusal_due` and the
+    /// live-refused follow-up gets a second (session_expired) answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1203_a_live_refusal_then_a_late_follow_up_are_each_answered_once() {
+        use crate::session::{FollowUpStatus, SessionState, TurnState};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("1203-field-shape");
+        let runner = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture)).await.expect("boot"),
+        );
+        let buyer = Keys::generate();
+        let job_id = park_session_1299(&runner, &buyer);
+        let sign = |text: &str| {
+            let draft = crate::session::followup_draft(&crate::session::FollowUp {
+                offer_id: job_id.clone(),
+                seller_pubkey: runner.seller_pubkey.to_hex(),
+                status: FollowUpStatus::Turn,
+                prev_result_id: Some("c".repeat(64)),
+                turn: Some(2),
+                deadline_unix: Some(now_unix() as u64 + 3_600),
+                text: Some(text.to_owned()),
+            })
+            .expect("follow-up draft");
+            crate::gateway::nostr::event_builder(&draft)
+                .expect("builder")
+                .sign_with_keys(&buyer)
+                .expect("sign follow-up")
+        };
+        let (live, late) = (sign("#1203 refused live"), sign("#1203 sent after close"));
+        // `live` was refused (and answered) while the session was parked, by a seller from before
+        // this fix: a refused row and no `turn-refused:` marker (the shape an upgraded seat holds).
+        let store = runner.node.store();
+        let now = now_unix() as u64;
+        assert!(store
+            .record_turn(&live.id.to_hex(), &job_id, 2, now + 3_600, TurnState::Refused, now)
+            .expect("record"));
+        assert!(store
+            .set_session_state(&job_id, SessionState::Closed, now)
+            .expect("close"));
+        let close = followup_1299(&runner, &buyer, &job_id, FollowUpStatus::Close);
+        let feedback = crate::kinds::JOB_FEEDBACK_KIND as u64;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for _ in 0..3 {
+                    runner.on_followup(&live).await;
+                    runner.on_followup(&late).await;
+                    runner.on_followup(&close).await;
+                }
+            })
+            .await;
+        let refusals: Vec<_> = fixture
+            .events()
+            .await
+            .into_iter()
+            .filter(|event| event.kind == feedback)
+            .collect();
+        let replies_to = |fid: String| {
+            refusals
+                .iter()
+                .filter(|event| {
+                    event.tags.iter().any(|t| {
+                        t.iter().map(String::as_str).eq(["e", fid.as_str(), "", "reply"])
+                    })
+                })
+                .count()
+        };
+        assert_eq!(replies_to(live.id.to_hex()), 0, "the live refusal is not answered again");
+        assert_eq!(replies_to(late.id.to_hex()), 1, "the late follow-up is answered once");
+        assert_eq!(refusals.len(), 1, "a close to an ended session publishes nothing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 N4 — a turn waiting for the previous turn's payment does not hold a drain until its
+    /// deadline: it returns, left `waiting_payment` for the restarted seller to re-drive.
+    /// RED ON REVERT: drop the drain check in the `PaymentGate::Wait` branch and the turn task keeps
+    /// polling (`in_flight_turns() == 1`) until the turn deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_turn_waiting_for_payment_releases_the_drain() {
+        use crate::session::{FollowUpStatus, TurnState};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("1299-followup-payment");
+        let runner = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture)).await.expect("boot"),
+        );
+        let buyer = Keys::generate();
+        let job_id = park_session_1299(&runner, &buyer);
+        let turn = followup_1299(&runner, &buyer, &job_id, FollowUpStatus::Turn);
+        let fid = turn.id.to_hex();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.on_followup(&turn).await;
+                let store = runner.node.store().clone();
+                assert!(
+                    eventually_1299(Duration::from_secs(5), || matches!(
+                        store.turn(&fid),
+                        Ok(Some(row)) if row.state == TurnState::WaitingPayment
+                    ))
+                    .await,
+                    "harness check: the turn waits for turn 1's payment"
+                );
+                assert_eq!(runner.session_rt.in_flight_turns(), 1, "harness check: it holds the drain");
+                assert!(runner.drain_handle().request("test drain"));
+                let rt = Arc::clone(&runner);
+                assert!(
+                    eventually_1299(super::session_run::PAYMENT_WAIT_POLL + Duration::from_secs(3), || {
+                        rt.session_rt.in_flight_turns() == 0
+                    })
+                    .await,
+                    "a draining node must not wait out an unpaid previous turn"
+                );
+                let row = store.turn(&fid).expect("turn read").expect("row");
+                assert_eq!(row.state, TurnState::WaitingPayment, "left for the restarted seller");
+                assert!(
+                    store.unfinished_turns().expect("unfinished").iter().any(|t| t.followup_id == fid),
+                    "recover_sessions re-drives it at boot"
+                );
+                assert!(runner.drain_remaining(false, 0).idle());
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // END #1299 drain tests
+
     // BEGIN R3-2 run-loop tests
     /// R3-2 — a seat whose harness drops republishes its beat promptly with `serving=0/1` and
     /// `status=not_serving`, and promptly again with `serving=1/1` once it is restored. The heartbeat
@@ -21072,6 +23073,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     // END R3-2 run-loop tests
+
+    // BEGIN free-seats run-loop tests
+    /// The beat the relay RECEIVES states the slot gate's own numbers — `slots`, `free_slots`, and
+    /// `in_flight` beside the deprecated `queue_depth` — and a seat change (a claim-time reservation
+    /// taken, then released) republishes it promptly in both directions, not an interval later.
+    /// The heartbeat interval is an hour, so every beat after the boot one is change-driven.
+    ///
+    /// RED ON REVERT: drop the `seats_changed_since_last_beat` arm on the drain tick and no second
+    /// beat arrives; drop `.with_slots(seats)` in `publish_heartbeat` and the boot beat lacks the tags.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_seat_change_republishes_the_beat_with_free_slots_in_both_directions() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("free-seats-change");
+        let mut home = lane_home(&root, &fixture);
+        home.config.seller_heartbeat.interval_secs = 3600;
+        if let Some(seller) = home.config.seller.as_mut() {
+            seller.slots = 2;
+        }
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let slots = Arc::clone(&runner.slots);
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let beat_with_free = |free: &'static str| {
+            move |events: &[PublishedEvent]| {
+                seat_announcements(events).last().is_some_and(|e| {
+                    e.tag_value(crate::heartbeat::SLOTS_TAG) == Some("2")
+                        && e.tag_value(crate::heartbeat::FREE_SLOTS_TAG) == Some(free)
+                })
+            }
+        };
+        local
+            .run_until(async {
+                assert!(
+                    fixture.wait_until_published(FIXTURE_WAIT, beat_with_free("2")).await,
+                    "the boot beat states slots=2 free_slots=2"
+                );
+                let boot = fixture.events().await;
+                let first = *seat_announcements(&boot).last().expect("a beat");
+                assert_eq!(first.tag_value(crate::heartbeat::IN_FLIGHT_TAG), Some("0"));
+                assert_eq!(
+                    first.tag_value(crate::heartbeat::QUEUE_DEPTH_TAG),
+                    Some("0"),
+                    "the deprecated tag still rides the beat"
+                );
+
+                // A claim-time reservation: no job row, so in_flight stays 0 — the case
+                // queue_depth could never show — while one seat is gone.
+                assert_eq!(slots.try_reserve("held-by-a-claim"), Reserve::Reserved);
+                // Bounded by the debounce window plus a tick, never the hour-long interval.
+                assert!(
+                    fixture
+                        .wait_until_published(
+                            SEAT_CHANGE_BEAT_DEBOUNCE + FIXTURE_WAIT,
+                            beat_with_free("1")
+                        )
+                        .await,
+                    "a reserved seat must be re-announced now (free_slots=1), not an interval later"
+                );
+                let held = fixture.events().await;
+                let last = *seat_announcements(&held).last().expect("a beat");
+                assert_eq!(last.tag_value(crate::heartbeat::IN_FLIGHT_TAG), Some("0"));
+
+                // Released: the seat frees again. Debounced, so allow the window plus a tick.
+                slots.release("held-by-a-claim");
+                assert!(
+                    fixture
+                        .wait_until_published(
+                            SEAT_CHANGE_BEAT_DEBOUNCE + FIXTURE_WAIT,
+                            beat_with_free("2")
+                        )
+                        .await,
+                    "a freed seat must be re-announced (free_slots=2) within the debounce window"
+                );
+                assert!(shutdown.request("free-seats stop"));
+                let _ = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `advertised()` is the claim gate's own number: a reservation and an execution permit both
+    /// take a seat, and `free` reaches 0 exactly when `try_reserve` answers `Full`.
+    #[tokio::test]
+    async fn the_advertised_free_seats_are_the_claim_gates_number() {
+        let gate = Arc::new(SlotGate::new(2, Duration::from_secs(3600)));
+        assert_eq!(gate.advertised(), crate::heartbeat::SeatSlots { total: 2, free: 2 });
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(gate.advertised().free, 1, "a claim-time reservation holds a seat");
+        let executing = gate.take_for_execution("a").expect("parked permit");
+        assert_eq!(gate.advertised().free, 1, "an executing job still holds its seat");
+        let unreserved = gate.acquire_unreserved().await.expect("permit");
+        assert_eq!(gate.advertised().free, 0);
+        assert_eq!(gate.try_reserve("b"), Reserve::Full, "free_slots=0 ⇔ the gate refuses");
+        drop(executing);
+        drop(unreserved);
+        assert_eq!(gate.advertised().free, 2);
+        // `slots = 0` is clamped to one seat, as the gate itself clamps it.
+        assert_eq!(
+            SlotGate::new(0, Duration::from_secs(1)).advertised(),
+            crate::heartbeat::SeatSlots { total: 1, free: 1 }
+        );
+    }
+    // END free-seats run-loop tests
 
     // BEGIN #1228 tests
     /// #1228: a seat whose sign-in the relay refuses must not report ADVERTISING, and only a
@@ -22609,6 +24714,50 @@ mod tests {
     // at spawn with ENOENT (no process created), and the healthy case injects a passing verdict so
     // no agent is ever spawned.
 
+    /// hook-agents §9 / codex r1 #9: a hook-only seat must not reach ANY sandbox-side boot gate. The
+    /// `[sandbox]` here cannot even resolve into an executor; before the fix the probe refused the
+    /// boot on it (`NodeError::Sandbox`) although no job of this seat ever runs in a sandbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_only_seat_boots_past_an_unresolvable_sandbox_on_its_ping() {
+        use crate::home::SandboxConfig;
+        let root = throwaway_root("hookonly-boot");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        // Harness session settings are docker-only: on a launcher they refuse to resolve.
+        let mut sandbox: SandboxConfig = crate::home::parse_config_toml(
+            "[sandbox]\nmode='docker'\n[sandbox.harnesses.codex]\nmodel='gpt-5.6-sol'\nreasoning_effort='high'\n",
+        )
+        .expect("parse")
+        .sandbox
+        .expect("sandbox");
+        sandbox.mode = crate::home::SandboxMode::Launcher;
+        assert!(
+            crate::seller_exec::SandboxPolicy::from_config(Some(&sandbox)).is_err(),
+            "precondition: this [sandbox] refuses to resolve"
+        );
+        crate::home::save_config(&mut home, |config| {
+            let mut seller = seller_cfg(1, false);
+            seller.agents = vec!["my-hook".to_owned()];
+            config.seller = Some(seller);
+            config.agents.insert(
+                "my-hook".to_owned(),
+                crate::home::AgentPresetConfig::hook(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "cat >/dev/null; exit 0".to_owned(),
+                ]),
+            );
+            config.sandbox = Some(sandbox);
+        })
+        .expect("persist config");
+        assert!(crate::seller_agents::hook_only_home(&home));
+        let verdicts = probe_configured_harnesses(&home)
+            .await
+            .expect("a hook-only seat never reaches the sandbox gate");
+        assert_eq!(verdicts.len(), 1);
+        assert!(verdicts[0].result.is_ok(), "{:?}", verdicts[0].result);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A seat whose every configured harness FAILS its pre-advertise probe must publish nothing: no
     /// kind-0 identity and no kind-30340 announcement. The `[sandbox]` launcher is unresolvable, so
     /// the probe's spawn fails ENOENT before any agent runs.
@@ -23020,9 +25169,7 @@ mod tests {
             // real ACP adapter would make this a test of the CI image rather than of the wiring.
             config.agents.insert(
                 "claude".to_owned(),
-                crate::home::AgentPresetConfig {
-                    argv: vec!["true".to_owned()],
-                },
+                crate::home::AgentPresetConfig::acp(vec!["true".to_owned()]),
             );
             config.relay_url = fixture.url();
         })
@@ -23317,9 +25464,7 @@ mod tests {
             config.seller = Some(seller);
             config.agents.insert(
                 "claude".to_owned(),
-                crate::home::AgentPresetConfig {
-                    argv: stub_argv(&script),
-                },
+                crate::home::AgentPresetConfig::acp(stub_argv(&script)),
             );
             config.relay_url = fixture.url();
         })
@@ -23650,6 +25795,7 @@ mod supervised_probe_tests {
         let roster = Arc::new(LiveRoster::new(AgentRegistry::new(vec![RegisteredAgent {
             name: Some("claude".to_owned()),
             argv: vec!["claude-acp".to_owned()],
+            kind: Default::default(),
         }])));
         roster.fault(0, Fault::Unproven, now);
         let due = now + Duration::from_secs(24 * 60 * 60);
@@ -23769,6 +25915,7 @@ mod supervised_probe_tests {
         let roster = Arc::new(LiveRoster::new(AgentRegistry::new(vec![RegisteredAgent {
             name: Some("claude".to_owned()),
             argv: vec!["claude-acp".to_owned()],
+            kind: Default::default(),
         }])));
         let now = Instant::now();
         roster.fault(0, Fault::Unproven, now);

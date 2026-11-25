@@ -81,6 +81,14 @@ const KIND_MAXPLAYER_TRADE_STATUS: u32 = 3411;
 // session) on an awarded job (docs/specs/session-jobs.md §2.1).
 const KIND_MAXPLAYER_SESSION_FOLLOWUP: u32 = 3412;
 const KIND_MOBEE_SELLER_HEARTBEAT: u32 = 30340;
+// Maxplayer swarm (docs/specs/swarm.md §4): addressable buyer-authored SWARM JOB
+// and DECISION, seller-authored MEMBERSHIP, and buyer-authored SWARM. Stored like
+// the heartbeat; author/tag rules are enforced by maxplayer-core's validators,
+// not here. Writes stay member-gated like every other kind.
+const KIND_MAXPLAYER_SWARM_JOB: u32 = 30341;
+const KIND_MAXPLAYER_SWARM_MEMBERSHIP: u32 = 30342;
+const KIND_MAXPLAYER_SWARM_DECISION: u32 = 30343;
+const KIND_MAXPLAYER_SWARM: u32 = 30344;
 const KIND_MOBEE_NIP89_HANDLER: u32 = 31990;
 // NIP-17 DM-relay list (standard kind 10050). Pre-allowed by mobee for future
 // DM-inbox discovery; size-bounded like the gift wrap below, but with no `p`-tag
@@ -679,7 +687,11 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MAXPLAYER_SESSION_FOLLOWUP
         | KIND_MAXPLAYER_TRADE_LOT
         | KIND_MAXPLAYER_TRADE_STATUS
-        | KIND_MOBEE_SELLER_HEARTBEAT => Ok(Scope::MessagesWrite),
+        | KIND_MOBEE_SELLER_HEARTBEAT
+        | KIND_MAXPLAYER_SWARM_JOB
+        | KIND_MAXPLAYER_SWARM_MEMBERSHIP
+        | KIND_MAXPLAYER_SWARM_DECISION
+        | KIND_MAXPLAYER_SWARM => Ok(Scope::MessagesWrite),
         // Mobee self-describing discovery/config kinds — the NIP-89 handler
         // advertisement and the NIP-17 DM-relay list. Grouped with kind-0's
         // UsersWrite (identity/discovery) class per keeper:mobee, so an
@@ -4594,6 +4606,26 @@ mod postgres_tests {
             Scope::MessagesWrite
         );
         assert!(!requires_h_channel_scope(3412));
+    }
+
+    #[test]
+    fn swarm_kinds_are_admitted_without_channel_scope() {
+        let dummy = make_dummy_event();
+        assert!(
+            !open_ingest_enabled(),
+            "run admission tests with BUZZ_OPEN_INGEST unset"
+        );
+        // Literal wire numbers: maxplayer-core swarm kinds (docs/specs/swarm.md §4).
+        for kind in [30341, 30342, 30343, 30344] {
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy).unwrap(),
+                Scope::MessagesWrite,
+                "swarm kind {kind} should require MessagesWrite scope"
+            );
+            assert!(!requires_h_channel_scope(kind));
+        }
+        // The block is closed: the next number stays unknown.
+        assert!(required_scope_for_kind(30345, &dummy).is_err());
     }
 
     #[test]

@@ -409,7 +409,7 @@ async fn connect_metadata_client(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
 ) -> Result<Kind0Session, ProfileError> {
-    let client = nostr_sdk::Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     client
         .add_relay(&home.config.relay_url)
         .await
@@ -1041,7 +1041,7 @@ pub async fn fetch_names_async(
     home: &MaxplayerHome,
     pubkeys: &HashSet<String>,
 ) -> Result<HashMap<String, Option<String>>, ProfileError> {
-    use nostr_sdk::prelude::{Client, Filter, Kind, PublicKey};
+    use nostr_sdk::prelude::{Filter, Kind, PublicKey};
 
     let keys = buyer_keys(home)?;
     let authors: Result<Vec<PublicKey>, ProfileError> = pubkeys
@@ -1053,7 +1053,7 @@ pub async fn fetch_names_async(
         .collect();
     let authors = authors?;
 
-    let client = Client::new(keys);
+    let client = crate::relay_transport::client(keys);
     client
         .add_relay(&home.config.relay_url)
         .await

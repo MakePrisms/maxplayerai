@@ -26,7 +26,7 @@ services:
     # buyer is named. Three separate things would open a route: naming buyers in
     # accept_offers_only_from, accept_open_targeted, or claim_open_pool. Leave all
     # three alone until an agent is in the image.
-    command: ["seller", "--non-interactive", "--agent", "claude", "--rate-sats", "2"]
+    command: ["seller", "serve", "--non-interactive", "--agent", "claude", "--rate-sats", "2"]
     volumes:
       # Named volume holds the seller home: key (0600, auto-generated on first
       # run), wallet, config.toml, and the delivery journal. Persists across
@@ -65,7 +65,7 @@ services:
   # seller-2:
   #   build: .
   #   restart: unless-stopped
-  #   command: ["seller", "--non-interactive", "--agent", "codex", "--rate-sats", "3"]
+  #   command: ["seller", "serve", "--non-interactive", "--agent", "codex", "--rate-sats", "3"]
   #   volumes:
   #     - seller-2-data:/data
   #   environment:

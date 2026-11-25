@@ -18,7 +18,8 @@ npm run bake      # refresh snapshot.json from the live relay (Node 22+, or 20 w
 
 Vercel Web Analytics uses the framework-independent `@vercel/analytics`
 integration (`Other` in Vercel's setup guide), not the Next.js component.
-The shared entry point covers `/`, `/sell`, and `/market`. Tracking is compiled
+Every bundle's entry starts it (`src/teams.ts` for `/`, `src/market-page.ts` for `/market`, `src/main.ts`
+for the pages in the earlier look). Tracking is compiled
 in only when `VERCEL_ENV=production`; local and preview builds do not collect.
 Only page views are enabled. The `beforeSend` hook removes query strings and
 fragments and rejects custom events; no form content or browser storage is read.
@@ -29,6 +30,55 @@ does not need to be loosened. After production deployment, visit each page and
 verify the script and collection requests succeed and page views appear in
 the Vercel dashboard. Dashboard enablement and live collection cannot be
 proven by a local build or a preview deployment.
+
+## Pages
+
+| Route | Files | Look |
+|---|---|---|
+| `/` Teams | `public/index.html`, `site.css`, `src/teams.ts` → `src/site/teams.js` | new |
+| `/market` (what were Buy, Sell and Market) | `public/market.html`, `site.css` + `market.css`, `src/market-page.ts` → `src/site/market.js` on `src/site/market-data.ts` | new |
+| `/chat`, `/mint`, `/tokens`, `/swarm`, legal pages | their own HTML, `styles.css`, `src/main.ts` (`tokens.ts`, `swarm.ts`) | earlier |
+
+`/sell` redirects to `/market#sell`. The top nav is Teams and Market on every page.
+
+Legal pages are one file per effective date (`public/terms-<YYYYMMDD>.html`, served at `/terms/<date>` by a
+`vercel.json` rewrite; `/terms` and `/privacy` redirect to the current date). `public/legal/versions.json` lists
+every published terms and privacy date plus `current`. The registration service accepts a version it lists, and
+`maxplayer account link` offers `current`, so a new version needs no service deploy or CLI release: add the page,
+its rewrite, its `PAGES` entry in `scripts/build.mjs`, its date in the manifest, and move the redirect and
+`current` together. Merge it on the effective date. `test/legal-versions.test.mjs` checks the manifest against the
+pages, rewrites and redirects.
+
+The two new pages share `site.css` (colours, type, nav, buttons, the phone mock-up and its chat) and `fonts.css`.
+`/` is a scripted presentation: it opens no relay and makes no request. `/market` reads the live market. Both hide
+what the script positions until it has run; `nojs.css`, linked inside `<noscript>`, shows it when there is no script.
+The CSP is `style-src 'self'; script-src 'self'`: no `style=""` in markup or in strings a script writes as HTML,
+no `<style>`, no inline script. Styles set through `element.style` are fine. `test/build.test.mjs` checks it.
+
+`src/site/teams.js` and `src/site/market.js` are plain JavaScript, ported as they were built and not yet typed;
+`tsc` does not check them. `market-data.ts` is typed and tested (`test/market-page.test.ts`).
+
+### How `/market` loads
+
+`market-data.ts` drives the reader below (source, store, engine) and decides WHEN the engine computes and WHEN the
+page is told. The rule (bob, 2026-11-20): placeholders until what is shown is whole, then all of it at once, nothing
+moves, under three seconds.
+
+- No recompute while history is read: events go into the engine's cache, and the engine computes once when there is
+  something whole to show. A first visit costs two computes, not one per request.
+- The first screen needs a week, not the whole past. The source reads newest first, so an event older than a week
+  means the week is all in (four requests). A period's numbers come from that period's events only, so the week's
+  board does not change when the older history arrives.
+- Names are asked for on every visit, on a small request of the page's own, and nothing is shown before they are
+  in: the source reads profiles last, and the browser's store is not trusted for them.
+- All time and an expert's profile need the whole history: the page shows placeholders for those until it is in.
+- The browser's store is trusted only if this code marked it (`localStorage` `maxplayer-market-store`), and it is
+  marked only after what was read has been written.
+- The activity list carries the event only (who posted, bid, hired, delivered, paid, and the price). The task text
+  is never passed to the page.
+
+The old board (`src/ui/board.ts`, `docks.ts`, the board half of `main.ts`) is no longer reached by any page and is
+left in place for a later clean-up, as are the deploy-baked `snapshot.json` and `public/media/`, which no page loads.
 
 ## Architecture
 
@@ -53,7 +103,7 @@ relay ──(WebSocket: poll today, stream after the relay upgrade)──▶ sou
 | `src/trade/`, `src/tokens.ts` | `/tokens`: the token-trade order book — unlisted (no nav/footer/llms.txt link, `noindex`) for the team for now. Its own bundle (`tokens.js`). Reads kinds 3410/3411 from the trade CLI's public relays, never the production relay, and validates every event with a 1:1 port of `crates/maxplayer-trade` `parse_lot`/`lifecycle`, checked against Rust-signed golden cases in `test/fixtures/trade-rust.json` (generator: `test/fixtures/trade-rust.rs`). Read-only: no keys, no wallet. |
 | `src/ui/` | Presentation: keyed row reconciler (unchanged rows are never touched), docks, ticker, streaks. The market modules never touch the DOM. |
 
-**Instant paint contract**: the static chrome is plain HTML painted before a
+**Instant paint contract** (the earlier board; for `/market` see "How `/market` loads" above): the static chrome is plain HTML painted before a
 byte of JS runs; returning visitors boot from IndexedDB; first-time visitors
 boot from a deploy-baked `snapshot.json`; skeletons appear only when both are
 empty, and empty-state text renders only after the relay has actually

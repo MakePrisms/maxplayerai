@@ -15,6 +15,12 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         if action != "serve" {
             return Err(USAGE.into());
         }
+        // First line of the reviewer's log: which build is serving (before the config is read).
+        let _ = writeln!(
+            err,
+            "{}",
+            crate::build_stamp::start_line("reviewer", &format!("config {config}"))
+        );
         let config: maxplayer_core::reviewer::ServiceConfig = serde_json::from_slice(
             &std::fs::read(config).map_err(|_| "cannot read reviewer config")?,
         )

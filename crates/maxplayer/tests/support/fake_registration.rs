@@ -25,6 +25,8 @@ use serde_json::{Value, json};
 
 pub const MAX_ATTEMPTS: u32 = 5;
 pub const CODE_TTL_SECS: u64 = 600;
+/// The service's default `legal.terms_versions`/`privacy_versions` (maxplayer-registration config.rs).
+pub const OFFERED_VERSIONS: [&str; 2] = ["20261029", "20261123"];
 
 #[derive(Debug, Clone)]
 pub struct Pending {
@@ -34,6 +36,8 @@ pub struct Pending {
     pub attempts: u32,
     pub expires_at: u64,
     pub created_at: u64,
+    pub terms_version: String,
+    pub privacy_version: String,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +76,10 @@ struct State {
     requests: Vec<Recorded>,
     /// What confirm and status report as `relay_member` (`added` unless a test changes it).
     relay_member: String,
+    /// What `GET /legal/versions.json` serves (the website's manifest); `None` = 404. Like the
+    /// real service, link requests also accept the versions it lists.
+    legal_manifest: Option<Value>,
+    legal_fetches: usize,
 }
 
 pub struct FakeRegistration {
@@ -135,6 +143,8 @@ impl FakeRegistration {
             confirm_calls: 0,
             requests: Vec::new(),
             relay_member: "added".into(),
+            legal_manifest: None,
+            legal_fetches: 0,
         }));
         let shared = state.clone();
         std::thread::spawn(move || {
@@ -149,6 +159,15 @@ impl FakeRegistration {
     /// What `registration_url` must be set to.
     pub fn base_url(&self) -> String {
         self.base.clone()
+    }
+
+    /// Served at `/legal/versions.json`, where the CLI tests point `MAXPLAYER_LEGAL_VERSIONS_URL`.
+    pub fn set_legal_manifest(&self, manifest: Value) {
+        self.state.lock().unwrap().legal_manifest = Some(manifest);
+    }
+
+    pub fn legal_fetches(&self) -> usize {
+        self.state.lock().unwrap().legal_fetches
     }
 
     /// The code the next `link/request` "emails".
@@ -252,6 +271,18 @@ fn serve(stream: TcpStream, state: &Mutex<State>) {
     if reader.read_exact(&mut body).is_err() {
         return;
     }
+    if method == "GET" && path == "/legal/versions.json" {
+        // The website, not the service: unsigned, and not one of the recorded requests.
+        let answer = {
+            let mut state = state.lock().unwrap();
+            state.legal_fetches += 1;
+            match &state.legal_manifest {
+                Some(manifest) => ok(200, manifest.clone()),
+                None => fail(404, "not_found", "no such page"),
+            }
+        };
+        return write_answer(stream, answer);
+    }
     let answer = {
         let mut state = state.lock().unwrap();
         let (answer, event) = handle(&mut state, &method, &path, auth.as_deref(), &body);
@@ -264,6 +295,10 @@ fn serve(stream: TcpStream, state: &Mutex<State>) {
         });
         answer
     };
+    write_answer(stream, answer);
+}
+
+fn write_answer(stream: TcpStream, answer: Answer) {
     let text = answer.body.to_string();
     let reason = match answer.status {
         200 => "OK",
@@ -431,10 +466,20 @@ fn link_request(state: &mut State, pk: &str, body: &Value) -> Answer {
             "label must be 1-64 letters, digits, spaces, '.', '_' or '-'",
         );
     }
-    if terms != "20261029" {
+    let offered = |doc: &str, version: &str| {
+        OFFERED_VERSIONS.contains(&version)
+            || (version.len() == 8
+                && state.legal_manifest.as_ref().is_some_and(|m| {
+                    m[doc]
+                        .as_array()
+                        .is_some_and(|list| list.iter().any(|v| v == version))
+                }))
+    };
+    let (terms_offered, privacy_offered) = (offered("terms", &terms), offered("privacy", &privacy));
+    if !terms_offered {
         return fail(400, "unknown_terms_version", "terms version is not offered");
     }
-    if privacy != "20261029" {
+    if !privacy_offered {
         return fail(
             400,
             "unknown_privacy_version",
@@ -478,16 +523,19 @@ fn link_request(state: &mut State, pk: &str, body: &Value) -> Answer {
             attempts: 0,
             expires_at: t + CODE_TTL_SECS,
             created_at: t,
+            terms_version: terms.clone(),
+            privacy_version: privacy.clone(),
         },
     );
+    let (terms_url, privacy_url) = (terms, privacy);
     ok(
         202,
         json!({
             "status": "code_sent",
             "expires_in_secs": CODE_TTL_SECS,
             "max_attempts": MAX_ATTEMPTS,
-            "terms_url": "https://www.maxplayer.ai/terms/20261029",
-            "privacy_url": "https://www.maxplayer.ai/privacy/20261029",
+            "terms_url": format!("https://www.maxplayer.ai/terms/{terms_url}"),
+            "privacy_url": format!("https://www.maxplayer.ai/privacy/{privacy_url}"),
         }),
     )
 }
@@ -559,8 +607,8 @@ fn link_confirm(state: &mut State, pk: &str, body: &Value) -> Answer {
             email: pending.email.clone(),
             label: pending.label.clone(),
             entered_by: entered_by.to_owned(),
-            terms_version: "20261029".into(),
-            privacy_version: "20261029".into(),
+            terms_version: pending.terms_version.clone(),
+            privacy_version: pending.privacy_version.clone(),
             notice_version: "v1".into(),
         },
     );
@@ -572,8 +620,8 @@ fn link_confirm(state: &mut State, pk: &str, body: &Value) -> Answer {
             "first_link": first_link,
             "email": pending.email,
             "label": pending.label,
-            "terms_version": "20261029",
-            "privacy_version": "20261029",
+            "terms_version": pending.terms_version,
+            "privacy_version": pending.privacy_version,
             "relay_member": state.relay_member,
             "marketing": if subscribed { "subscribed" } else { "unsubscribed" },
         }),

@@ -1,31 +1,38 @@
 #!/usr/bin/env bash
-# The maxplayer-trade binary users install has no plain-HTTP mint and no ws:// mint relay, on
-# loopback or anywhere (Petar, 2026-11-06). Loopback fixtures exist only in builds with the
-# test-only `local-test-mints` feature, which every `cargo test` gets through a self
-# dev-dependency. This check is the one place that runs the binary built WITHOUT it.
+# The `maxplayer` binary users install has no plain-HTTP mint and no ws:// mint relay in
+# `maxplayer trade`, on loopback or anywhere (Petar, 2026-11-06). Loopback fixtures exist only in
+# builds with the test-only `local-test-mints` feature of crates/maxplayer-trade, which every
+# `cargo test` of that crate gets through a self dev-dependency. This check is the one place that
+# runs the user binary, built WITHOUT it.
 #
-# Usage (repo root): scripts/check-user-build-mint-fence.sh [path/to/maxplayer-trade]
-# Without an argument it builds the binary the way a user does: no features, `--locked`, no
-# dev-dependencies (`cargo install --locked --path crates/maxplayer-trade` resolves the same
-# features; this uses the debug profile to stay cheap in CI).
+# Usage (repo root): scripts/check-user-build-mint-fence.sh [path/to/maxplayer]
+# Without an argument it builds `maxplayer` the way a user does: default features, `--locked`, no
+# dev-dependencies (the release build adds `acp`, which does not touch trading); debug profile to
+# stay cheap in CI.
+#
+# `maxplayer mint install --from <url>` and `maxplayer mint upgrade --from <url>` are fenced the same
+# way: their download source (the released `maxplayer-mint`) is https:// or file:// only, so a
+# plain-HTTP source on loopback is refused before it is contacted and before --home or --bin-dir is
+# created. So is a plain-HTTP latest-release source for `maxplayer mint` (MAXPLAYER_RELEASES_LATEST_URL):
+# it is reported as "could not check", never contacted, and `maxplayer mint` still creates nothing.
 #
 # Every refusal must happen before any mint or relay is contacted (a local listener counts
 # connections) and before the --home directory is created. https:// and nostr:// mints must
 # still pass the fence (checked through `balance` on an absent home: no network, prints 0).
 set -euo pipefail
 
-MANIFEST=crates/maxplayer-trade/Cargo.toml
 HTTP_REFUSED='http:// mints are not supported; use https:// or nostr://'
+HTTP_SOURCE_REFUSED='http:// download sources are not supported; use https:// (or file:// for a local mirror)'
 WS_REFUSED='ws:// mint relays are not supported; use wss://'
 NPUB=npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d
 
 if [ $# -ge 1 ]; then
   BIN=$1
 else
-  cargo build --manifest-path "$MANIFEST" --locked --bin maxplayer-trade
-  target=$(cargo metadata --manifest-path "$MANIFEST" --format-version 1 --no-deps |
+  cargo build -p maxplayer --locked --bin maxplayer
+  target=$(cargo metadata --format-version 1 --no-deps |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-  BIN=$target/debug/maxplayer-trade
+  BIN=$target/debug/maxplayer
 fi
 [ -x "$BIN" ] || { echo "FAIL: no binary at $BIN"; exit 1; }
 
@@ -59,27 +66,24 @@ run() {
   shift 2
   n=$((n + 1))
   local home=$work/home-$n code=0
-  env -u MAXPLAYER_HOME "$BIN" --home "$home" "$@" >"$work/out" 2>"$work/err" || code=$?
+  env -u MAXPLAYER_HOME "$BIN" trade --home "$home" "$@" >"$work/out" 2>"$work/err" || code=$?
   local all
   all=$(cat "$work/out" "$work/err")
   if [ "$code" != "$want_code" ]; then
-    echo "FAIL: maxplayer-trade $*: exit $code, expected $want_code"; echo "$all"; fail=1; return
+    echo "FAIL: maxplayer trade $*: exit $code, expected $want_code"; echo "$all"; fail=1; return
   fi
   if [ -n "$want_text" ] && ! grep -qF -- "$want_text" <<<"$all"; then
-    echo "FAIL: maxplayer-trade $*: output lacks '$want_text'"; echo "$all"; fail=1; return
+    echo "FAIL: maxplayer trade $*: output lacks '$want_text'"; echo "$all"; fail=1; return
   fi
   if [ -e "$home" ]; then
-    echo "FAIL: maxplayer-trade $*: created --home $home"; fail=1; return
+    echo "FAIL: maxplayer trade $*: created --home $home"; fail=1; return
   fi
-  echo "ok: maxplayer-trade $* -> exit $code: $(grep -F -- "${want_text:-\"balance\"}" <<<"$all" | head -1)"
+  echo "ok: maxplayer trade $* -> exit $code: $(grep -F -- "${want_text:-\"balance\"}" <<<"$all" | head -1)"
 }
 
 # Refused: plain HTTP mints on loopback, in every command that takes a mint.
 run 1 "$HTTP_REFUSED" preflight "$HTTP_MINT"
 run 1 "$HTTP_REFUSED" balance "$HTTP_MINT"
-run 1 "$HTTP_REFUSED" fund "$HTTP_MINT" --amount 1
-run 1 "$HTTP_REFUSED" withdraw "$HTTP_MINT" --invoice lnbc1
-run 1 "$HTTP_REFUSED" receive "$HTTP_MINT" --token-file /dev/null
 run 1 "$HTTP_REFUSED" send "$HTTP_MINT" --amount 1 --out "$work/token"
 run 1 "$HTTP_REFUSED" list --give-mint "$HTTP_MINT" --give 1 --want-mint https://testnut.cashudevkit.org --want 1
 run 1 "$HTTP_REFUSED" list --give-mint https://testnut.cashudevkit.org --give 1 --want-mint "$HTTP_MINT" --want 1 --dry-run
@@ -96,13 +100,52 @@ run 0 '"balance":0' balance https://testnut.cashudevkit.org
 run 0 '"balance":0' balance "nostr://$NPUB"
 run 0 '"balance":0' --mint-relay wss://relay.maxplayer.ai balance "nostr://$NPUB"
 
+# `maxplayer mint install|upgrade`: a plain-HTTP release source is refused (usage error, exit 1)
+# with nothing contacted and neither the home nor the bin dir created.
+run_mint_install() {
+  local from=$1 sub=${2:-install}
+  n=$((n + 1))
+  local home=$work/home-$n bin=$work/bin-$n code=0
+  env -u MAXPLAYER_HOME "$BIN" mint "$sub" --from "$from" --home "$home" --bin-dir "$bin" \
+    >"$work/out" 2>"$work/err" || code=$?
+  local all
+  all=$(cat "$work/out" "$work/err")
+  if [ "$code" != 1 ]; then
+    echo "FAIL: maxplayer mint $sub --from $from: exit $code, expected 1"; echo "$all"; fail=1; return
+  fi
+  if ! grep -qF -- "$HTTP_SOURCE_REFUSED" <<<"$all"; then
+    echo "FAIL: maxplayer mint $sub --from $from: output lacks '$HTTP_SOURCE_REFUSED'"; echo "$all"; fail=1; return
+  fi
+  if [ -e "$home" ] || [ -e "$bin" ]; then
+    echo "FAIL: maxplayer mint $sub --from $from: created --home or --bin-dir"; fail=1; return
+  fi
+  echo "ok: maxplayer mint $sub --from $from -> exit 1: $HTTP_SOURCE_REFUSED"
+}
+run_mint_install "http://127.0.0.1:$PORT/release"
+run_mint_install "http://localhost:$PORT/release"
+run_mint_install "http://[::1]:$PORT/release"
+run_mint_install "http://127.0.0.1:$PORT/release" upgrade
+run_mint_install "http://localhost:$PORT/release" upgrade
+
+# `maxplayer mint` (status): a plain-HTTP latest-release source is not contacted; the check reads
+# "could not check", the exit is 0, and the absent home is not created.
+n=$((n + 1))
+home=$work/home-$n code=0
+env -u MAXPLAYER_HOME MAXPLAYER_RELEASES_LATEST_URL="http://127.0.0.1:$PORT/releases/latest" \
+  "$BIN" mint --home "$home" --bin-dir "$work/bin-$n" >"$work/out" 2>"$work/err" || code=$?
+if [ "$code" != 0 ] || ! grep -qF 'latest:    could not check (http:// is not supported' "$work/out" || [ -e "$home" ]; then
+  echo "FAIL: maxplayer mint with an http:// latest-release source: exit $code"; cat "$work/out" "$work/err"; fail=1
+else
+  echo "ok: maxplayer mint with an http:// latest-release source -> could not check, nothing created"
+fi
+
 connections=$(wc -l <"$work/connections")
 if [ "$connections" != 0 ]; then
   echo "FAIL: $connections connection(s) reached the loopback mint/relay listener"
   fail=1
 fi
 if [ "$fail" != 0 ]; then
-  echo "FAIL: the user build of maxplayer-trade must refuse http:// mints and ws:// mint relays"
+  echo "FAIL: the user build must refuse http:// mints, ws:// mint relays and http:// mint downloads"
   exit 1
 fi
-echo "PASS: user build refuses http:// mints and ws:// mint relays ($n commands, 0 connections)"
+echo "PASS: user build refuses http:// mints, ws:// mint relays, http:// mint downloads and http:// release checks ($n commands, 0 connections)"

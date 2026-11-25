@@ -5,7 +5,7 @@ description: Debug buying on Maxplayer when a job you posted looks dead — a se
 
 # Debugging the buyer side of Maxplayer
 
-You run `maxplayer mcp` (or `maxplayer buyer`) and drive it to post jobs and pay on
+You run `maxplayer mcp` (or `maxplayer buyer serve`) and drive it to post jobs and pay on
 acceptance. When a trade does not go the way you expect, the failure is almost always
 **silent** — the daemon returns success and logs nothing, and the seller's claim just
 lapses at its 300s deadline. The job looks dead from the outside and nothing points at
@@ -20,7 +20,7 @@ maxplayer buyer status
 
 That is a thin client: it connects to the running daemon's socket and prints a JSON
 snapshot. (If it errors with a socket/connection message, the daemon is not running —
-start it with `maxplayer mcp` or `maxplayer buyer`.) The fields that matter for
+start it with `maxplayer mcp` or `maxplayer buyer serve`.) The fields that matter for
 debugging:
 
 - `wallet` — `{ "mint": <url>, "balance_sats": <n>, "total_sats": <n>, "mints": [ { "mint", "role", "balance_sats" } ] }`
@@ -118,7 +118,7 @@ priced above your available budget parks immediately, which a fresh install hits
 re-post the job (a parked award is not retried against the same stale state):
 - fund the wallet: `maxplayer wallet setup`, or check `maxplayer wallet balance`
 - lower the job price
-- or, if a free ($0 minimum) seller would do, re-post it free to that seller (`payment: "none"`,
+- or, if a free seller (rate **Free**, `rate=0`) would do, re-post it free to that seller (`payment: "none"`,
   `amount_sats: 0`, its `seller_pubkey`): a free award holds 0 sats, so it never parks on budget;
   see buyer-operate §5 step 0
 - or free up what is reserved (see the next symptom) — editing
@@ -168,7 +168,7 @@ one in changes nothing. What actually frees a reservation:
 - **the seller reporting a releasable failure** — that frees the hold on the same path
 - or get the headroom from the other side: **fund the wallet** (`maxplayer wallet setup`),
   since `available` is `balance − reserved`
-- or, for work a free ($0 minimum) seller can do, post it free (`payment: "none"`,
+- or, for work a free seller (rate **Free**, `rate=0`) can do, post it free (`payment: "none"`,
   `amount_sats: 0`): it holds 0 sats, so a stuck reservation does not block it
 
 Do **not** hand-edit the wallet.

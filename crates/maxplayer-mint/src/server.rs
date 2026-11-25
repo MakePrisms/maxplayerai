@@ -51,7 +51,7 @@ impl Server {
         relays: &[String],
         rate_limit: u32,
     ) -> Result<Self> {
-        let client = Client::new(keys.clone());
+        let client = maxplayer_core::relay_transport::client(keys.clone());
         client.automatic_authentication(true);
         for relay in relays {
             client
@@ -256,7 +256,7 @@ impl Server {
                         "maxplayer-mint: swap {:?}: inputs are pending (11002), left executing. \
                          Either another swap holding them is still in flight (it settles by itself), \
                          or an interrupted swap was not compensated at startup: only then does the \
-                         startup log show a recovery error, and restarting `run` retries it",
+                         startup log show a recovery error, and restarting `serve` retries it",
                         request.id
                     );
                 }

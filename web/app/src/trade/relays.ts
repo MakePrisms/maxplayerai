@@ -1,11 +1,14 @@
 /**
  * Read-only reader for the token-trade market: listings (TRADE_LOT) and their
- * hash-chained statuses (TRADE_STATUS), from the public relays the trade CLI publishes to.
+ * hash-chained statuses (TRADE_STATUS), from the relays the trade CLI publishes to:
+ * ours first, then the public ones.
  *
  * Mirrors `Market::discover` in crates/maxplayer-trade/src/market.rs, plus one
  * read the CLI does not need: every status under the protocol tag, because a
  * `sold` status carries its listing after relays have deleted the listing
  * itself (24h NIP-40 expiry), and that is the only record of an older trade.
+ * relay.maxplayer.ai keeps listings past their expiry, so it is the source of
+ * truth for history; the public relays add reach and redundancy.
  *
  *   - every configured relay is queried and the results are UNIONED by id;
  *   - listings: `{kinds:[TRADE_LOT], #t:[maxplayer], since}`;
@@ -23,25 +26,26 @@
  * silently stops forwarding.
  *
  * Never signs, never holds a key, never sends EVENT or AUTH, and never asks
- * for trade negotiation (private, NIP-44 encrypted). The production relay is
- * not read here: by default the CLI also publishes every lot to the public
- * relays below, and this page never signs in.
+ * for trade negotiation (private, NIP-44 encrypted). relay.maxplayer.ai
+ * answers trade reads without sign-in (#1251), so its AUTH challenge is
+ * ignored like every other relay's.
  *
  * The socket and clock are injectable so the whole loop runs in tests.
  */
 import { MAXPLAYER_TAG, TRADE_LOT, TRADE_STATUS } from "../model/kinds.js";
 import type { NostrEvent } from "./validate.js";
 
-/** market.rs DEFAULT_RELAYS without relay.maxplayer.ai (see above). */
+/** market.rs DEFAULT_RELAYS, same order: our relay first. */
 export const DEFAULT_TRADE_RELAYS: readonly string[] = Object.freeze([
+  "wss://relay.maxplayer.ai",
   "wss://nos.lol",
   "wss://relay.primal.net",
   "wss://offchain.pub",
 ]);
 
 /**
- * Listings live 24h, but completed trades are shown all time, so the first
- * round walks every listing the relays still hold (paged, see drain). Later
+ * Listings expire after 24h, but completed trades are shown all time, so the
+ * first round walks every listing the relays still hold (paged, see drain). Later
  * rounds read only from the previous round, less the overlap.
  */
 export const HISTORY_FLOOR = 0;
@@ -87,7 +91,6 @@ export interface TradeReaderOptions {
 export function allowedRelay(url: string): boolean {
   try {
     const u = new URL(url);
-    if (u.hostname === "relay.maxplayer.ai") return false;
     return u.protocol === "wss:" || (u.protocol === "ws:" && (u.hostname === "127.0.0.1" || u.hostname === "localhost"));
   } catch {
     return false;

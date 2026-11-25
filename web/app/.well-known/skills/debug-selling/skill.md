@@ -1,11 +1,11 @@
 ---
 name: maxplayer-debug-selling
-description: Debug selling on Maxplayer when your seller won't start, isn't earning, or looks dead. Covers `maxplayer seller` refusing to boot (the startup doctor / readiness gate), a fresh seller bricking at the relay-git seed with a 404, health-checks that show nothing on a perfectly healthy daemon (which log line actually proves liveness), a seat that buyers can't discover, and a seller that quietly stops claiming new jobs. Says exactly which command to run, which log line to grep, and where to report a dead end.
+description: Debug selling on Maxplayer when your seller won't start, isn't earning, or looks dead. Covers `maxplayer seller serve` refusing to boot (the startup doctor / readiness gate), a fresh seller bricking at the relay-git seed with a 404, health-checks that show nothing on a perfectly healthy daemon (which log line actually proves liveness), a seat that buyers can't discover, and a seller that quietly stops claiming new jobs. Says exactly which command to run, which log line to grep, and where to report a dead end.
 ---
 
 # Debugging the seller side of Maxplayer
 
-The seller is `maxplayer seller` — the same binary a buyer installs, run in its other mode. It watches
+The seller is `maxplayer seller serve` — the same binary a buyer installs, run in its other mode. It watches
 the relay for open jobs, claims what it can do, delivers, and collects.
 
 **The first move for almost everything here is the doctor:**
@@ -14,20 +14,22 @@ the relay for open jobs, claims what it can do, delivers, and collects.
 maxplayer doctor
 ```
 
-It runs the same checks `maxplayer seller` runs at startup: `nix`, `credential helper`,
+It runs the same checks `maxplayer seller serve` runs at startup: `nix`, `credential helper`,
 `seller key`, `relay reachability`, `relay token policy`, `mint reachability`, `agent preset`,
 `telemetry`, the sandbox checks (`sandbox launcher`, `sandbox credential containment`,
 `sandbox egress`, `sandbox image`, `sandbox engine floor`, `sandbox containment`),
 `seat reachability`, `home permissions` and `harness credential permissions`. Each prints `PASS`/`WARN`/`FAIL` and, when not PASS,
-a one-line `(fix: …)` hint. Exit is `0` unless something `FAIL`ed; a `WARN` never fails.
+a one-line `(fix: …)` hint. Exit is `0` unless something `FAIL`ed; a `WARN` never fails. One
+difference: until the first `maxplayer seller serve` run writes a `[seller]` section, `doctor` reports a
+missing `nix` as `SKIP`, while `maxplayer seller serve` itself still refuses to start without it.
 Every check runs even after one fails, so one run shows the whole picture. Add
 `--home <dir>` to diagnose a specific seat.
 
 ---
 
-## Symptom: `maxplayer seller` refuses to start
+## Symptom: `maxplayer seller serve` refuses to start
 
-On startup, `maxplayer seller` runs the doctor as a readiness gate and **refuses to boot if any
+On startup, `maxplayer seller serve` runs the doctor as a readiness gate and **refuses to boot if any
 blocking check FAILs** — this is by design, so a seat never advertises work it cannot do.
 You will see:
 
@@ -40,7 +42,7 @@ followed by the check lines, and on failure:
 ```
 ... REFUSING to start: N blocking readiness check(s) failed —
   FAIL <check> — <detail> (fix: <hint>)
-resolve the item(s) above, then re-run `maxplayer seller`. To bypass these checks (NOT
+resolve the item(s) above, then re-run `maxplayer seller serve`. To bypass these checks (NOT
 recommended), pass --skip-doctor.
 ```
 
@@ -66,7 +68,7 @@ For a seat strangers can reach (`--claim-open-pool` or `--accept-open-targeted`)
 on a seat only named buyers reach they are WARNs. A `WARN` (e.g. one of several mints down,
 or `no [seller] section configured`) prints but does **not** block boot.
 
-**Fix:** resolve the FAILed item using its hint, then re-run `maxplayer seller`. Re-running
+**Fix:** resolve the FAILed item using its hint, then re-run `maxplayer seller serve`. Re-running
 `maxplayer doctor` confirms it before you retry. `--skip-doctor` bypasses every check except
 `nix`, and is not recommended — a bad launcher or unresolvable agent means every awarded job dies at
 spawn and you lose the award.
@@ -206,7 +208,7 @@ so the `ls-remote` 404s and the seller refuses to boot. It fails closed: no mone
 **Fix / workaround — bring your own delivery host (the tool's own recommended fix):**
 
 ```
-maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> --git-remote <https-url>
+maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> --git-remote <https-url>
 ```
 
 `--git-remote <https-url>` points delivery at a git host you control (e.g. an HTTPS repo
@@ -261,9 +263,15 @@ builds, the `wrap backfill (periodic): fetching` line). Do not grep for `online`
 `heartbeat published` — no such success line exists. The **absence** of heartbeat-failure lines
 is normal and healthy.
 
-**Quieter or noisier:** routine no-ops (a re-seen offer already claimed, a duplicate award) are
-hidden by default and print only with `MAXPLAYER_VERBOSE=1` in the daemon's environment. Nothing
-that reports a state change or a failure is behind that flag.
+**Quieter or noisier:** routine no-ops are hidden by default and print only with
+`MAXPLAYER_VERBOSE=1` in the daemon's environment: a re-seen offer already claimed, a duplicate
+award, awards and acceptances for other sellers' jobs, pay-binds for jobs already awarded here,
+lapsed or aged offers re-read from relay history, a relay `CLOSED` for a subscription that is not
+ours, and follow-ups to ended sessions. After a reconnect these can be hundreds of lines, so instead
+the status tick prints one `seller node routine (since last status): …` line counting them; it is
+informational, not a problem. A lapsed offer aimed at this seat and authored within the last hour
+still prints its `offer skip` line (check the buyer's deadline and this host's clock). Nothing that
+reports a state change or a failure is behind that flag.
 
 **Dead end → report it:** if you see `seller node live:` but the periodic `seller node status:`
 line never repeats, the loop may be wedged — file on **MakePrisms/maxplayerai** with the last few
@@ -286,7 +294,8 @@ There is **no periodic re-publish** of the profile. So if the relay was unreacha
 started, or a relay outage wiped the replaceable event, your profile is gone and does **not**
 come back on its own.
 
-Your **capability** — `rate`, `accepting`, `queue_depth`, `accepted_mints`, `agents` — rides the
+Your **capability** — `rate`, `accepting`, `in_flight` (and its deprecated twin `queue_depth`),
+`slots`/`free_slots`, `accepted_mints`, `agents` — rides the
 **kind-30340 heartbeat** (`d=maxplayer-seller`), republished every ~5 min. Do not grep for a
 kind-31990 / NIP-89 handler: #645 retired it and nothing publishes one any more. Any 31990 still on
 a relay is pre-#645 residue, not live capability. The heartbeat *does* self-heal — one interval
@@ -297,12 +306,12 @@ seller node heartbeat+watchdog enabled: kind-30340 every <n>s; …
 ```
 
 A successful beat is silent; only failures print (`seller node heartbeat publish failed
-(continuing): …`).
+(continuing): …`, and `seat announcement OVERDUE …` once no beat has landed for 1.5 intervals).
 
 **Check:** confirm the `seller node discoverable …` line appeared at your last startup, and that
 the relay was up at that moment. Then read your latest kind-30340 — resolve it by `(pubkey, d)`,
 never by event id, since each beat supersedes the last in place. If it says `accepting=n`, you are
-published but declining: the seat is busy (`queue_depth` > 0), has dropped every harness (the beat
+published but declining: the seat is draining, has dropped every harness (the beat
 then also says `serving=0/<n>` and `status=not_serving`; the daemon re-probes it after 1 minute,
 doubling to 10, and republishes as soon as one passes), or is the
 **retraction** a cleanly-stopped daemon publishes on its way out — check `created_at` against your
@@ -313,7 +322,7 @@ Note the converse, and do not read it as good news: an `accepting=y` beat left b
 replaceable and a dead seat publishes nothing to supersede it. A seat announcement is only worth what
 its `created_at` says — a stale `accepting=y` means nothing.
 
-**Fix:** **restart the seller** (`maxplayer seller`). Boot re-publishes the kind-0 profile and
+**Fix:** **restart the seller** (`maxplayer seller serve`). Boot re-publishes the kind-0 profile and
 resumes the heartbeat, and you are listed again. This is the correct response after any relay outage
 that happened while your seat was already running — though if only capability looked stale, waiting
 one heartbeat interval would have fixed that much on its own.
@@ -391,14 +400,16 @@ backlog full (cap 32)` line and a count of `claimed` rows past their deadline
 
 ## Symptom: sessions DISABLED on a runsc seat
 
-Only a seat with `[sandbox] mode = "docker"`, `runtime = "runsc"` and `[sessions] enabled` can see
+Only a seat with `[sandbox] mode = "docker"`, `runtime = "runsc"` and sessions on (the default) can see
 this. Any other seat (no runtime set, runc, any other runtime name, launcher mode) never runs this
 check and never logs this line.
 
-**At startup, a missing flag stops the seller.** When docker shows the runtime named `runsc` without
-`--overlay2=none` (or no `runsc` at all), `maxplayer doctor` reports `FAIL sandbox runsc sessions`,
-and the seller refuses to start with that row and the fix below. Either set the flag (below) or turn
-`[sessions]` off to run single-turn only. If docker cannot be read at startup (timeout, bad output),
+**At startup, a missing flag stops the seller if you set `[sessions] enabled = true`.** When docker
+shows the runtime named `runsc` without `--overlay2=none` (or no `runsc` at all), `maxplayer doctor`
+reports `FAIL sandbox runsc sessions`, and the seller refuses to start with that row and the fix
+below. Either set the flag (below) or turn `[sessions]` off to run single-turn only. With `enabled`
+unset (sessions on by default) the same row is a WARN: the seller starts, logs the line below and
+takes single-turn jobs. If docker cannot be read at startup (timeout, bad output),
 the row is a WARN instead: the seller starts without offering sessions and re-checks on each
 heartbeat. While running, the seller logs this line when the verdict changes (for example if the flag
 disappears after a docker reconfigure); it then stops offering sessions but keeps running:
@@ -407,8 +418,8 @@ disappears after a docker reconfigure); it then stops offering sessions but keep
 seller node sessions DISABLED on this runsc seat (single-turn jobs continue): the docker runtime "runsc" runs without --overlay2=none (runtimeArgs []); ...
 ```
 
-`maxplayer doctor` reports the same verdict as `sandbox runsc sessions` (FAIL for a missing flag,
-WARN when docker could not be read), with the same fix.
+`maxplayer doctor` reports the same verdict as `sandbox runsc sessions` (FAIL for a missing flag
+with `enabled = true`, WARN with `enabled` unset or when docker could not be read), with the same fix.
 
 **Read it:** a session job's container is stopped between turns and started again for the next one.
 gVisor's default (`--overlay2=root:self`) keeps every file the agent writes outside the job's work
@@ -416,7 +427,8 @@ folder in a sandbox-private layer that is thrown away when the container stops. 
 agent's own conversation under `~/.claude` or `~/.codex`, so turn 2 would start with nothing. The
 seat therefore offers session jobs only when docker's runtime named `runsc` has `--overlay2=none`.
 A seller that is already running when this happens keeps taking single-turn jobs; a seller that
-starts with sessions on and no flag refuses to start until the flag is set or `[sessions]` is off.
+starts with `[sessions] enabled = true` and no flag refuses to start until the flag is set or
+`[sessions]` is off; one with `enabled` unset starts single-turn.
 
 **Fix:**
 

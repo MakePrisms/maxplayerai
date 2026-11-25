@@ -4,12 +4,14 @@
 //!
 //! - [`home`]: `<home>/mint/` (Nostr key, seed, `mint.sqlite`, `mint.toml`).
 //! - [`backend`]: the cdk mint behind the transport.
+//! - [`backup`]: automatic online snapshots of `mint.sqlite`, and `restore`.
 //! - [`dispatch`]: one envelope `op` → one cdk mint call.
 //! - [`issue`]: local issue into a token file.
 //! - [`replay`]: the durable request log (replay and reconcile).
 //! - [`server`]: the relay listener (kind 23410 in, 23411 out).
 
 pub mod backend;
+pub mod backup;
 pub mod dispatch;
 pub mod home;
 pub mod issue;

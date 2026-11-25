@@ -1,4 +1,5 @@
-//! `maxplayer seller` — seller daemon with good defaults.
+//! `maxplayer seller serve` — seller daemon with good defaults (the verbless `maxplayer seller` is its
+//! deprecated alias).
 //!
 //! Required user choices: `--agent` (or `--agent-argv`) and `--rate-sats` on first run.
 //! Everything else defaults (relay, mint, key 0600, relay-git delivery) and persists to
@@ -89,6 +90,15 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     if args.first().map(String::as_str) == Some("fees") {
         return crate::seller_fees::run(&args[1..], out, err);
     }
+    // `maxplayer seller drain` (#1299): asks the RUNNING seller on this home to drain, then waits for
+    // it to exit. Dispatched before the option parser for the same reason as `fees`: it boots nothing.
+    if args.first().map(String::as_str) == Some("drain") {
+        return crate::seller_drain::run(&args[1..], out, err);
+    }
+    // `maxplayer seller serve [flags]` is the start verb; the verbless `maxplayer seller [flags]` is
+    // its deprecated alias. Only the FIRST token selects the verb, so a flag value spelled `serve`
+    // (`--name serve`) stays a value, and `fees`/`drain` are dispatched above before this is read.
+    let (args, deprecated) = split_serve_verb(args);
     let options = match SellOptions::parse(args) {
         Ok(options) => options,
         Err(message) => {
@@ -100,7 +110,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
     #[cfg(not(feature = "wallet"))]
     {
-        let _ = (options, out);
+        let _ = (options, out, deprecated);
         let _ = writeln!(
             err,
             "maxplayer seller requires the wallet feature (rebuild with default features)"
@@ -110,15 +120,36 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
     #[cfg(feature = "wallet")]
     {
-        match run_sell(options, out, err) {
+        match run_sell(options, deprecated, out, err) {
             Ok(()) => SUCCESS,
             Err(code) => code,
         }
     }
 }
 
+/// The verbless `maxplayer seller [flags]`: still starts the seller, deprecated for `seller serve`.
+const SELLER_VERBLESS: crate::cli::DeprecatedStart = crate::cli::DeprecatedStart {
+    old: "maxplayer seller",
+    new: "maxplayer seller serve",
+};
+
+/// Split a leading `serve` off the seller arguments. Returns the remaining flags and whether the
+/// verb was MISSING (the deprecated verbless form). Only position 0 is a verb: anywhere else
+/// `serve` is a flag value or an unknown option, and the option parser decides which.
+fn split_serve_verb(args: &[String]) -> (&[String], bool) {
+    match args.first().map(String::as_str) {
+        Some("serve") => (&args[1..], false),
+        _ => (args, true),
+    }
+}
+
 #[cfg(feature = "wallet")]
-fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> Result<(), i32> {
+fn run_sell(
+    options: SellOptions,
+    deprecated: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<(), i32> {
     let root = match options.home.clone() {
         Some(path) => path,
         None => home::default_home_dir().map_err(|error| {
@@ -126,6 +157,14 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
             RUNTIME_ERROR
         })?,
     };
+    // First lines of the seller's log: which build is serving (before anything that can fail), then
+    // the deprecation of the verbless form right after it.
+    crate::cli::daemon_preamble(
+        err,
+        "seller",
+        &format!("home {}", root.display()),
+        deprecated.then_some(SELLER_VERBLESS),
+    );
     let mut home = home::bootstrap(&root).map_err(|error| {
         let _ = writeln!(err, "{error}");
         RUNTIME_ERROR
@@ -267,6 +306,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     // award-is-payment a buyer commits the sats at award. The probe is local compute only (no
     // sats/mint); the gate + roster narrowing live in maxplayer-core so the kind-30340 heartbeat is
     // honest for free.
+    let trade_home = home.clone();
     let runner = runtime
         .block_on(async {
             let verdicts = maxplayer_core::seller_node::run::probe_configured_harnesses(&home).await?;
@@ -305,7 +345,26 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
             maxplayer_core::seller_node::shutdown::spawn_os_signal_listener(
                 runner.shutdown_handle(),
             );
-            runner.run().await
+            // #1299: SIGUSR1 drains instead — no new claims, finish in-flight work, then exit 0
+            // through the same retraction path. SIGTERM/SIGINT above still stop immediately. The
+            // pid goes into seller.lock only once the handler is registered: until then SIGUSR1
+            // would kill this node, so `maxplayer seller drain` must not be able to find it.
+            if maxplayer_core::seller_node::shutdown::spawn_drain_signal_listener(
+                runner.drain_handle(),
+            )
+            .is_some()
+            {
+                runner.enable_drain_command();
+            }
+            // Trade's serve for this home, now that this seller holds its home lock (a second seller
+            // refused at the lock never gets here). Stopped safely after the node leaves: the step
+            // in progress finishes or is cancelled at its next wait with its journal intact.
+            let trade = crate::trade_host::start(&trade_home, "seller");
+            let result = runner.run().await;
+            if let Some(trade) = trade {
+                trade.shutdown("seller exiting").await;
+            }
+            result
         })
         .map_err(|error| {
             let _ = writeln!(err, "{error}");
@@ -385,7 +444,8 @@ fn ensure_seller_config(
     let interactive = !options.non_interactive && !steady_state && atty_stderr();
     if options.non_interactive || steady_state {
         let mut missing = Vec::new();
-        if agent_command.is_empty() {
+        // A resolved label (a preset, possibly a hook with no ACP fallback) is an agent too.
+        if agent_command.is_empty() && agent_label.is_none() {
             missing.push("agent (--agent claude|cursor|codex, or --agent-argv)");
         }
         if rate_sats.is_none() {
@@ -407,7 +467,7 @@ fn ensure_seller_config(
             return Err(USAGE_ERROR);
         }
     } else if interactive {
-        if agent_command.is_empty() {
+        if agent_command.is_empty() && agent_label.is_none() {
             let available = agent_presets::detect_available_agents(&custom_agents);
             let suggestion = available.first().map(String::as_str).unwrap_or("claude");
             let detected = if available.is_empty() {
@@ -426,9 +486,14 @@ fn ensure_seller_config(
                     let _ = writeln!(err, "{message}");
                     USAGE_ERROR
                 })?;
-            agent_command = argv;
+            report_agent_preset(err, &label, &argv[0], &custom_agents);
+            agent_command = maxplayer_core::seller_agents::fallback_command_for(
+                &label,
+                argv,
+                &custom_agents,
+                existing.as_ref().map(|seller| seller.agent_command.as_slice()),
+            );
             agent_label = Some(label.clone());
-            report_agent_preset(err, &label, &agent_command[0], &custom_agents);
         }
         if rate_sats.is_none() {
             rate_sats = Some(prompt_u64(
@@ -438,7 +503,7 @@ fn ensure_seller_config(
                 DEFAULT_RATE_SATS,
             )?);
         }
-    } else if agent_command.is_empty() || rate_sats.is_none() {
+    } else if (agent_command.is_empty() && agent_label.is_none()) || rate_sats.is_none() {
         // Non-TTY first run without flags.
         let _ = writeln!(
             err,
@@ -579,7 +644,14 @@ fn resolve_agent(
                 USAGE_ERROR
             })?;
         report_agent_preset(err, &label, &argv[0], custom_agents);
-        return Ok((Some(label), argv));
+        // A hook preset's argv never becomes the ACP fallback: the previous fallback (if any) stays.
+        let command = maxplayer_core::seller_agents::fallback_command_for(
+            &label,
+            argv,
+            custom_agents,
+            existing.map(|seller| seller.agent_command.as_slice()),
+        );
+        return Ok((Some(label), command));
     }
     if let Some(seller) = existing {
         return Ok((seller.agents.first().cloned(), seller.agent_command.clone()));
@@ -794,13 +866,38 @@ impl SellOptions {
 fn sell_usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n  maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted\n  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)\n  - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named\n  - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)\n{}",
+        "Usage:\n  maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller serve   # zero-prompt relaunch from config.toml\n  maxplayer seller serve --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n  maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted\n  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm\n  maxplayer seller drain [--home <dir>] [--no-wait | --timeout <secs>]   # finish in-flight jobs, then exit 0 (upgrade without interrupting a job)\n  maxplayer seller [flags]   # deprecated alias for `maxplayer seller serve [flags]` (still works)\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)\n  - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named\n  - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)\n{}",
         crate::skill::docs_pointer_line()
     );
 }
 
 #[cfg(test)]
 mod tests {
+    /// The seller hosts trade serve (`[trade] serve`) only after its home lock is held and the node
+    /// has booted (a second seller refused at the lock never reaches it), and stops it through trade's
+    /// safe stop after the node leaves. A seller cannot boot hermetically (doctor gate, harness probe),
+    /// so the wiring is pinned on the source; the behaviour is tested in maxplayer-trade
+    /// `tests/hosted_serve.rs` and through the buyer daemon in `tests/trade_hosted.rs`.
+    #[test]
+    fn the_seller_hosts_trade_serve_after_boot_and_stops_it_safely() {
+        let src = include_str!("sell.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let boot = body
+            .find("boot_advertising_only_proven(home, verdicts)")
+            .unwrap();
+        let start = body
+            .find("crate::trade_host::start(&trade_home, \"seller\")")
+            .expect("seller hosts trade serve");
+        let run = body.find("let result = runner.run().await;").unwrap();
+        let stop = body
+            .find("trade.shutdown(\"seller exiting\").await")
+            .expect("safe stop after the node");
+        assert!(
+            boot < start && start < run && run < stop,
+            "order: boot (lock held), host, run, safe stop"
+        );
+    }
+
     use super::*;
 
     // #595 (mints-are-mints): the seller `--help` names the shipped default mint but must not fork
@@ -941,9 +1038,7 @@ mod tests {
         let mut custom = std::collections::BTreeMap::new();
         custom.insert(
             "codex".to_owned(),
-            home::AgentPresetConfig {
-                argv: vec!["/opt/not-codex".to_owned()],
-            },
+            home::AgentPresetConfig::acp(vec!["/opt/not-codex".to_owned()]),
         );
 
         let mut err = Vec::new();
@@ -969,9 +1064,7 @@ mod tests {
         let mut custom = std::collections::BTreeMap::new();
         custom.insert(
             "mine".to_owned(),
-            home::AgentPresetConfig {
-                argv: vec![argv0.clone()],
-            },
+            home::AgentPresetConfig::acp(vec![argv0.clone()]),
         );
 
         let options = SellOptions::parse(&["--agent".into(), "mine".into()]).expect("parse");
@@ -1106,6 +1199,50 @@ mod tests {
     // boot, before the seller node read it. The assertion is on the PERSISTED (reloaded-from-disk)
     // config because that disk value is exactly what the next boot reads for capacity
     // (`maxplayer_core::seller_node::run` derives it from `config.seller.slots` with no ceiling clamp).
+    /// codex r1 #9: `--agent <hook>` on a first run must not store the hook's argv as the ACP
+    /// `agent_command` fallback, and the seat it writes must pass the readiness check and relaunch.
+    #[test]
+    fn a_hook_first_run_stores_no_acp_fallback_and_relaunches() {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-hook-first-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap temp home");
+        home::save_config(&mut home, |config| {
+            config.agents.insert(
+                "my-hook".to_owned(),
+                home::AgentPresetConfig::hook(vec!["/bin/sh".to_owned(), "-c".to_owned(), "true".to_owned()]),
+            );
+        })
+        .expect("seed hook preset");
+        let options = SellOptions {
+            non_interactive: true,
+            agent: Some("my-hook".to_owned()),
+            agents: vec!["my-hook".to_owned()],
+            rate_sats: Some(100),
+            ..SellOptions::default()
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        ensure_seller_config(&mut home, &options, &mut out, &mut err).unwrap_or_else(|code| {
+            panic!("first run failed code={code} err={}", String::from_utf8_lossy(&err))
+        });
+        let mut home = home::bootstrap(&root).expect("reload persisted config");
+        let seller = home.config.seller.clone().expect("[seller] written");
+        assert_eq!(seller.agents, vec!["my-hook".to_owned()]);
+        assert!(seller.agent_command.is_empty(), "hook argv must not be the ACP fallback: {:?}", seller.agent_command);
+        maxplayer_core::seller::require_seller_config(&home).expect("a named roster satisfies readiness");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        ensure_seller_config(&mut home, &SellOptions::default(), &mut out, &mut err).unwrap_or_else(|code| {
+            panic!("bare relaunch failed code={code} err={}", String::from_utf8_lossy(&err))
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn sell_writeback_preserves_operator_multi_harness_agents() {
         // #369-class (seller-orch comment 5173135097): a bare relaunch must carry a multi-harness
@@ -1435,5 +1572,155 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- `seller serve` is the start verb; the verbless form is a deprecated alias ----
+
+    fn argv(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|t| (*t).to_owned()).collect()
+    }
+
+    fn run_seller(tokens: &[&str]) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(&argv(tokens), &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    /// Only position 0 is the verb. A flag VALUE spelled `serve` stays a value, and the verbless
+    /// form is the one reported as deprecated.
+    #[test]
+    fn serve_is_a_verb_only_in_first_position() {
+        let with = argv(&["serve", "--rate-sats", "5"]);
+        let (rest, deprecated) = split_serve_verb(&with);
+        assert_eq!(rest, &with[1..]);
+        assert!(!deprecated);
+
+        let bare = argv(&["--rate-sats", "5"]);
+        let (rest, deprecated) = split_serve_verb(&bare);
+        assert_eq!(rest, &bare[..]);
+        assert!(deprecated);
+
+        assert!(
+            split_serve_verb(&[]).1,
+            "a bare `seller` relaunch is the deprecated form"
+        );
+
+        // `--name serve` / `--agent-argv serve`: the value reaches the parser as a value, in both forms.
+        for prefix in [&[][..], &["serve"][..]] {
+            let mut tokens = prefix.to_vec();
+            tokens.extend([
+                "--name",
+                "serve",
+                "--agent-argv",
+                "serve",
+                "--rate-sats",
+                "5",
+            ]);
+            let tokens = argv(&tokens);
+            let (rest, _) = split_serve_verb(&tokens);
+            let options = SellOptions::parse(rest).expect("a flag value `serve` is a value");
+            assert_eq!(options.name.as_deref(), Some("serve"));
+            assert_eq!(options.agent_argv, vec!["serve".to_owned()]);
+            assert_eq!(options.rate_sats, Some(5));
+        }
+    }
+
+    /// No ambiguity with the existing subcommands: `fees` and `drain` keep their own parsers, and
+    /// `serve` does not turn them into seller options (or the reverse).
+    #[test]
+    fn serve_does_not_collide_with_fees_drain_or_options() {
+        // `seller drain` is still drain: its own parser names the bad option.
+        let (code, _out, err) = run_seller(&["drain", "--bogus"]);
+        assert_eq!(code, USAGE_ERROR);
+        assert!(
+            err.contains("unknown option for `seller drain`: --bogus"),
+            "{err}"
+        );
+        // `seller fees` is still fees: its own usage, not the seller parser.
+        let (code, _out, err) = run_seller(&["fees", "--bogus"]);
+        assert_ne!(code, SUCCESS);
+        assert!(
+            !err.contains("unknown seller option"),
+            "fees must not reach the seller parser: {err}"
+        );
+        // After `serve`, `fees`/`drain`/`serve` are not subcommands but unknown seller options.
+        for word in ["fees", "drain", "serve"] {
+            let (code, _out, err) = run_seller(&["serve", word]);
+            assert_eq!(code, USAGE_ERROR, "seller serve {word}");
+            assert!(
+                err.contains(&format!("unknown seller option: {word}")),
+                "seller serve {word}: {err}"
+            );
+            assert!(
+                !err.contains("without `serve` is deprecated"),
+                "a refused parse never starts, so never warns: {err}"
+            );
+        }
+        // Both forms reach the SAME parser (what verify-seller-surface.sh probes).
+        for prefix in [&[][..], &["serve"][..]] {
+            let mut tokens = prefix.to_vec();
+            tokens.push("--not-a-sell-option");
+            let (code, _out, err) = run_seller(&tokens);
+            assert_eq!(code, USAGE_ERROR);
+            assert!(
+                err.contains("unknown seller option: --not-a-sell-option"),
+                "{err}"
+            );
+        }
+        // `seller serve --help` is help (stdout, exit 0), naming the documented form.
+        let (code, out, err) = run_seller(&["serve", "--help"]);
+        assert_eq!(code, SUCCESS, "{err}");
+        assert!(out.contains("maxplayer seller serve --agent"), "{out}");
+        assert!(err.is_empty(), "{err}");
+    }
+
+    /// The verbless form still STARTS (reaches the same startup path) and prints exactly one
+    /// deprecation line, right after the version start line, naming `maxplayer seller serve`;
+    /// `seller serve` prints none.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn verbless_seller_starts_with_one_deprecation_line_and_serve_with_none() {
+        for (verb, deprecated) in [(None, true), (Some("serve"), false)] {
+            let home = std::env::temp_dir().join(format!(
+                "maxplayer-sell-verb-{}-{}",
+                verb.unwrap_or("bare"),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            let home_arg = home.to_string_lossy().into_owned();
+            let mut tokens: Vec<&str> = verb.into_iter().collect();
+            tokens.extend(["--non-interactive", "--home", &home_arg]);
+            let (code, _out, err) = run_seller(&tokens);
+            // Same outcome both ways: the startup path ran and refused on the missing first-run fields.
+            assert_eq!(code, USAGE_ERROR, "{tokens:?}: {err}");
+            assert!(
+                err.contains("missing required field(s)"),
+                "{tokens:?} must reach startup: {err}"
+            );
+            let warnings = err
+                .lines()
+                .filter(|l| l.contains("without `serve` is deprecated"))
+                .count();
+            // The version start line is FIRST either way (#1354); the deprecation comes second.
+            let start = crate::build_stamp::start_line("seller", &format!("home {}", home.display()));
+            assert_eq!(err.lines().next(), Some(start.as_str()), "{tokens:?}: {err}");
+            if deprecated {
+                assert_eq!(warnings, 1, "exactly one deprecation line: {err}");
+                assert_eq!(
+                    err.lines().nth(1),
+                    Some(
+                        "maxplayer: `maxplayer seller` without `serve` is deprecated and still works; use `maxplayer seller serve`"
+                    ),
+                    "the deprecation follows the version line, before any other seller line: {err}"
+                );
+            } else {
+                assert_eq!(warnings, 0, "`seller serve` is the documented form: {err}");
+            }
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 }

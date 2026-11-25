@@ -538,7 +538,7 @@ pub(super) fn facts(
     } else {
         None
     };
-    let latest_turn = if context.home.config.sessions.enabled {
+    let latest_turn = if context.home.config.sessions.enabled() {
         context
             .store
             .session_turns(job_id)

@@ -23,6 +23,9 @@ LoadCredential=resend-webhook:/var/lib/secrets/maxplayer-registration-resend-web
 ExecStartPre=/usr/bin/install -m 0600 ${CREDENTIALS_DIRECTORY}/admin-key %t/maxplayer-registration/admin-key
 ExecStartPre=/usr/bin/install -m 0600 ${CREDENTIALS_DIRECTORY}/resend-key %t/maxplayer-registration/resend-key
 ExecStartPre=/usr/bin/install -m 0600 ${CREDENTIALS_DIRECTORY}/resend-webhook %t/maxplayer-registration/resend-webhook
+# Team invite links (optional; [teams] invite_key_file = "/run/maxplayer-registration/invite-key"):
+#LoadCredential=invite-key:/var/lib/secrets/maxplayer-team-invite-key
+#ExecStartPre=/usr/bin/install -m 0600 ${CREDENTIALS_DIRECTORY}/invite-key %t/maxplayer-registration/invite-key
 # config.toml points admin_key_file / api_key_file / webhook_secret_file at the copies:
 #   /run/maxplayer-registration/{admin-key,resend-key,resend-webhook}
 ExecStart=/usr/local/bin/maxplayer-registration serve --config /etc/maxplayer-registration/config.toml

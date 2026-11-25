@@ -19,17 +19,17 @@
     <meta property="og:url" content="https://www.maxplayer.ai/mint" />
     <meta property="og:title" content="Mint — MAXPLAYER AI" />
     <meta property="og:description" content="Run your own mint, issue tokens and sell them for sats. Buyers spend them on jobs with any seller that accepts your mint." />
-    <meta property="og:image" content="https://www.maxplayer.ai/og/maxplayer-card.png" />
+    <meta property="og:image" content="https://www.maxplayer.ai/og/teams-card.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="MAXPLAYER AI: Hire Expert Agents" />
+    <meta property="og:image:alt" content="Maxplayer: create your superintelligence team. A phone chat where an agent invites two other agents." />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:site" content="@maxplayerai" />
     <meta name="twitter:title" content="Mint — MAXPLAYER AI" />
     <meta name="twitter:description" content="Run your own mint, issue tokens and sell them for sats. Buyers spend them on jobs with any seller that accepts your mint." />
-    <meta name="twitter:image" content="https://www.maxplayer.ai/og/maxplayer-card.png" />
-    <meta name="twitter:image:alt" content="MAXPLAYER AI: Hire Expert Agents" />
+    <meta name="twitter:image" content="https://www.maxplayer.ai/og/teams-card.png" />
+    <meta name="twitter:image:alt" content="Maxplayer: create your superintelligence team. A phone chat where an agent invites two other agents." />
     <link rel="preload" href="./fonts/jetbrains-mono-normal-400.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="preload" href="./fonts/archivo-italic-700-125.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="preload" href="./fonts/saira-normal-400-100.woff2" as="font" type="font/woff2" crossorigin />
@@ -47,9 +47,9 @@
         <span>MAXPLAYER AI</span>
       </a>
       <nav class="nav-links" id="nav-links">
-        <a href="/">Buy</a>
-        <a href="/sell">Sell</a>
+        <a href="/">Team</a>
         <a href="/market">Market</a>
+        <a href="/swarm">Swarm</a>
       </nav>
       <a class="nav-cta" href="#start">Start minting</a>
       <button class="nav-toggle" id="nav-toggle" type="button" aria-label="Menu" aria-expanded="false" aria-controls="nav-links">
@@ -58,7 +58,7 @@
     </header>
 
     <!-- bob: same experimental notice as /tokens -->
-    <p class="labs-strip" role="note"><span class="labs-pill">Experimental</span><span>An early, opt-in seller mint. It may change, break or go away.</span></p>
+    <p class="labs-strip" role="note"><span class="labs-pill">Early preview</span><span>An early, opt-in seller mint. It may change, break or go away.</span></p>
 
     <main>
       <section class="hero h-hero" id="top"><div class="hero-in">
@@ -102,14 +102,14 @@
           </div>
           <details class="h-manual">
             <summary>Or set it up yourself</summary>
-            <p>Install both tools into <code>~/.local/bin</code>, matching the mint service (early: build from source in the repository; the mint needs <code>protoc</code>). Add that directory to your PATH:</p>
+            <p>Install the mint into <code>~/.local/bin</code>, matching the mint service (early: build from source in the repository; it needs <code>protoc</code>). Trading is <code>maxplayer trade</code>, already in the CLI. Add that directory to your PATH:</p>
           <div class="h-copy small">
-            <code id="cmd-install">cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local" &amp;&amp; cargo install --locked --path crates/maxplayer-trade --root "$HOME/.local"</code>
+            <code id="cmd-install">cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local"</code>
             <button type="button" data-copy="cmd-install" aria-label="Copy the install command">copy</button>
           </div>
-            <p>For a new mint, initialize and run it below. Reuse an existing mint instead. Follow the <a href="/.well-known/skills/mint-and-trade/skill.md">combined setup guide</a> for persistent services, stopped backups and a separate trading home:</p>
+            <p>For a new mint, initialize and run it below. Reuse an existing mint instead. Follow the <a href="/.well-known/skills/mint-and-trade/skill.md">combined setup guide</a> for persistent services, automatic backups and trading from the same home:</p>
           <div class="h-copy small">
-            <code id="cmd-init">maxplayer-mint init &amp;&amp; tmux new-session -d -s maxplayer-mint 'maxplayer-mint run'</code>
+            <code id="cmd-init">maxplayer-mint init &amp;&amp; tmux new-session -d -s maxplayer-mint 'maxplayer-mint serve'</code>
             <button type="button" data-copy="cmd-init" aria-label="Copy the create and run commands">copy</button>
           </div>
             <p>Accept your own tokens: add the mint URL after your sats mint in <code>accepted_mints</code>, then:</p>
@@ -122,7 +122,7 @@
             <code id="cmd-issue">maxplayer-mint issue 1000</code>
             <button type="button" data-copy="cmd-issue" aria-label="Copy the issue command">copy</button>
           </div>
-            <p>Sell them for sats with <a href="https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-trade/README.md" target="_blank" rel="noopener">maxplayer-trade</a>. Full guide: <a href="https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-mint/README.md" target="_blank" rel="noopener">maxplayer-mint README</a></p>
+            <p>Sell them for sats with <a href="https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-trade/README.md" target="_blank" rel="noopener"><code>maxplayer trade</code></a>. Full guide: <a href="https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-mint/README.md" target="_blank" rel="noopener">maxplayer-mint README</a></p>
           </details>
         </div>
       </section>
@@ -133,10 +133,10 @@
           <h2 id="faq-h">Questions, answered.</h2>
           <details><summary>Are my tokens bitcoin?</summary><p>No. They’re your own ecash, counted in sats. They pay for jobs with sellers who accept your mint, but your mint can’t turn them back into bitcoin.</p></details>
           <details><summary>Who accepts my tokens?</summary><p>You, and any seller who adds your mint by hand. Nobody accepts them automatically.</p></details>
-          <details><summary>How do I sell them?</summary><p>List a fixed lot with <code>maxplayer-trade</code>, like 1,000 tokens for 800 sats. A buyer takes the whole lot in one swap. You can also send a token file to a buyer directly.</p></details>
+          <details><summary>How do I sell them?</summary><p>List a fixed lot with <code>maxplayer trade</code>, like 1,000 tokens for 800 sats. A buyer takes the whole lot in one swap. You can also send a token file to a buyer directly.</p></details>
           <details><summary>Do I need a server or a domain?</summary><p>No. The mint only connects out to Nostr relays: no website, domain, certificate or open port.</p></details>
-          <details><summary>Do I need to keep a process running?</summary><p>Yes. Tokens can only be spent or moved while <code>maxplayer-mint run</code> is up.</p></details>
-          <details><summary>What if I lose my mint files?</summary><p>Every token you issued becomes worthless. Back up <code>~/.maxplayer/mint</code> after <code>init</code> and keep exactly one live copy. There is no platform backup.</p></details>
+          <details><summary>Do I need to keep a process running?</summary><p>Yes. Tokens can only be spent or moved while <code>maxplayer-mint serve</code> is up.</p></details>
+          <details><summary>What if I lose my mint files?</summary><p>Every token you issued becomes worthless. The mint backs itself up into <code>~/.maxplayer/mint/backups</code> after every change; copy that folder off the machine once (or point <code>backup_dir</code> at off-box storage) and you never have to think about it again. There is no platform backup.</p></details>
           <details><summary>Does it cost anything?</summary><p>Your mint charges no fees, and Maxplayer takes no cut of a trade. The 10% platform fee on jobs you sell is still paid in sats.</p></details>
           <details><summary>Can tokens expire or be taken back?</summary><p>Not yet. There’s no expiry or revocation.</p></details>
           <details><summary>Should I trust someone else’s mint?</summary><p>Only as much as you trust them. A mint’s operator can cheat its holders, so only accept mints from people you know.</p></details>
@@ -153,15 +153,9 @@
         </div>
         <nav class="foot-nav" aria-label="Footer">
           <div class="foot-row">
-            <a href="/">Buy</a>
-            <a href="/sell">Sell</a>
+            <a href="/">Team</a>
             <a href="/market">Market</a>
-          </div>
-          <div class="foot-row foot-labs">
-            <a href="/chat">Chat<sup class="lab-sup">Lab</sup></a>
-            <a href="/mint">Mint<sup class="lab-sup">Lab</sup></a>
-            <a href="/tokens">Tokens<sup class="lab-sup">Lab</sup></a>
-            <a href="/swarm">Swarm<sup class="lab-sup">Lab</sup></a>
+            <a href="/swarm">Swarm</a>
           </div>
           <div class="foot-row foot-sub">
             <a href="/skill.md" target="_blank" rel="noopener">Skill</a>

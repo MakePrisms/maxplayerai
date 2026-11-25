@@ -9,7 +9,13 @@ pub mod budget;
 // the gate itself rather than dragging the whole module behind it.
 pub mod capability;
 pub mod checks;
-pub mod challenge;
+pub mod swarm;
+/// Minutes per swarm per UTC day: the Rust port of the board's `model.mjs` (§7.4).
+#[cfg(feature = "gateway")]
+pub mod swarm_minutes;
+/// Swarm events on the home's relay: EOSE-checked reads and acknowledged writes.
+#[cfg(feature = "wallet")]
+pub mod swarm_relay;
 #[cfg(feature = "wallet")]
 pub mod collect;
 #[cfg(feature = "wallet")]
@@ -45,6 +51,7 @@ pub mod driver;
 pub mod durable;
 pub mod engine;
 pub mod env_provision;
+pub mod error_chain;
 pub mod episode;
 pub mod event;
 /// Paying the accrued platform fee: the ONE remit path in the product, behind an effects trait so
@@ -111,6 +118,9 @@ pub mod reviewer;
 /// receipt-publish both use it).
 #[cfg(feature = "gateway")]
 pub mod relay_auth;
+/// Relay websockets through the HTTP proxy variables (HTTP CONNECT), for every relay client.
+#[cfg(feature = "gateway")]
+pub mod relay_transport;
 /// The relay's advertised scoped-token policy (NIP-11), and the boot verdict for `[sandbox]
 /// container_delivery_token = "long-lived"`.
 ///
@@ -164,6 +174,10 @@ pub mod sandbox_net;
 /// contains the job are decided here, so they are compiled and tested on every build.
 pub mod sandbox_netns;
 pub mod seller;
+/// The hook runner: a seller's own agent behind a blocking command (docs/specs/hook-agents.md §5).
+/// Seller-node only (`wallet`, which carries `libc` for the non-blocking pipes and `waitid`).
+#[cfg(feature = "wallet")]
+pub mod hook;
 // Session (multi-turn) jobs: wire shapes and pure rules. Inert unless `[sessions] enabled`.
 pub mod session;
 /// The seller's harness registry: the agent harnesses one node enables, what it advertises for

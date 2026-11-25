@@ -37,9 +37,9 @@ That wire is specified in [`specs/private-offers-wire-v2.md`](specs/private-offe
 here; a reader that implements it accepts `v` = `2` on those events. The shipped client does.
 
 The maxplayer-owned kinds are `3400` through `3409`, `3412` and `30340` (`3410`/`3411` belong to
-`maxplayer-trade`, and relay.maxplayer.ai stores them too, see `crates/maxplayer-trade/README.md`;
-the challenge kinds `30341`–`30343` also carry both tags and are specified in
-[`challenges-v1.md`](challenges-v1.md)). Kinds `0`, `1059`, and `30617` are
+`maxplayer trade` (crate `maxplayer-trade`), and relay.maxplayer.ai stores them too, see `crates/maxplayer-trade/README.md`;
+the swarm kinds `30341`–`30344` also carry both tags and are specified in
+[`specs/swarm.md`](specs/swarm.md) §4). Kinds `0`, `1059`, and `30617` are
 borrowed from other specifications. They do not carry `["t","maxplayer"]`, and a reader MUST ignore
 `t` on them.
 
@@ -112,7 +112,10 @@ replaces it on every beat. Every fact below is current as of that beat, EXCEPT `
 | `["v","1"]` | 1 | yes | Protocol major |
 | `["rate", sats]` | 1 | yes | Lowest price the seat accepts, in satoshis |
 | `["accepting", "y"` or `"n"]` | 1 | yes | The seat is alive and serving. NOT a free-slot signal |
-| `["queue_depth", n]` | 1 | yes | Jobs the seat holds in `Awarded` or `Executing` — its live load |
+| `["in_flight", n]` | 0..1 | no* | Jobs the seat holds in `Awarded` or `Executing` — its live load |
+| `["queue_depth", n]` | 1 | yes | DEPRECATED name for `in_flight`, same value. Still emitted |
+| `["slots", n]` | 0..1 | no | The seat's total execution seats (`[seller] slots`). Read with `free_slots` |
+| `["free_slots", n]` | 0..1 | no | Execution seats free now: the number the seat's claim gate tests. Absent is UNKNOWN |
 | `["serving", "a/n"]` | 0..1 | no | Harnesses able to run a job now (`a`) out of those resolved at boot (`n`). Absent is UNKNOWN |
 | `["status", "not_serving"]` | 0..1 | no | Emitted exactly when `serving` is `0/n`: running, but no harness can take a job |
 | `["accepted_mints", url, ...]` | 1 | yes | Every mint the seat accepts payment on |
@@ -203,20 +206,41 @@ sets above, states no policy — a reader MUST NOT infer the missing or unrecogn
 These tags appear on the announcement ONLY. A reader MUST NOT expect them on a kind `3402` claim: a
 claim already demonstrates admission, because the seat sent it.
 
-`queue_depth` is a live count of the jobs occupying an execution slot: those in `Awarded` or
+`in_flight` is a live count of the jobs occupying an execution slot: those in `Awarded` or
 `Executing`. Offers waiting unclaimed in the pool are not counted, and neither is a `Delivered` job
-awaiting payment. It returns to `0` when the seat holds no such job.
+awaiting payment. It returns to `0` when the seat holds no such job. A seat has no queue: it claims an
+offer into a free seat or does not claim it.
 
-`queue_depth` is NOT the count of occupied execution slots. A seat reserves a slot when it claims,
+`queue_depth` is the deprecated name of `in_flight`. A seat that publishes `in_flight` publishes
+`queue_depth` beside it with the same value, so readers built before `in_flight` keep working. (*)
+`in_flight` is optional on the wire only so that older seats, which publish `queue_depth` alone,
+stay valid: a reader takes `in_flight` when it parses and falls back to `queue_depth` otherwise. A
+future revision may stop emitting `queue_depth`; new readers MUST NOT depend on it.
+
+`in_flight` is NOT the count of occupied execution slots. A seat reserves a slot when it claims,
 before any award exists, and holds that reservation until the award arrives or the reservation
-lapses; those claim-time reservations are excluded from `queue_depth`. A seat with every slot
-reserved by unawarded claims publishes `queue_depth` `0` while it declines every further offer. A
-reader MUST NOT compute free capacity from `queue_depth`.
+lapses; those claim-time reservations are excluded from `in_flight`. A seat with every slot
+reserved by unawarded claims publishes `in_flight` `0` while it declines every further offer. A
+reader MUST NOT compute free capacity from `in_flight` (or `queue_depth`); it reads `free_slots`.
+
+`slots` and `free_slots` are the seat's execution seats. `slots` is the seat's configured
+concurrency (at least 1). `free_slots` is `slots` minus every seat held right now — by an `Awarded`
+or `Executing` job, by a session turn, and by a claim-time reservation awaiting its award — which is
+exactly the number the seat's claim gate tests: a seat publishing `free_slots=0` claims nothing until
+a seat frees. The two are read together: one without the other, a value that is not a decimal
+integer, `slots=0` or `free_slots > slots` states nothing. **Absent is UNKNOWN**, never full and
+never free: every seat built before these tags publishes neither, and a reader MUST then behave as it
+did before they existed. Like `accepting`, `free_slots` is the seat's own statement as of the beat,
+not a reservation — another buyer can take the seat after the beat — and it says nothing about the
+seat's other gates (`accepting`, `rate`, admission, harness). Whenever `free_slots` changes, the seat
+republishes after its next housekeeping tick (seconds), at most once per 15 s for seat changes,
+rather than waiting for its next beat.
 
 `accepting` says the seat is alive and serving — it has at least one harness able to take work. It
 does NOT say the seat has a free execution slot: a seat holding one job of its three slots publishes
-`accepting=y`, and so does a seat holding all three. Read `accepting` and `queue_depth` together —
-`y` with a depth is "open, carrying that much load"; `n` is "not serving", whatever the depth.
+`accepting=y`, and so does a seat holding all three. Read `accepting` with `in_flight` and
+`free_slots` — `y` with `free_slots=0` is "open, every seat taken"; `n` is "not serving", whatever the
+counts.
 
 `serving` and `status` say whether the seat can run a job at all, and how much of its roster is
 left. A harness that fails in a way the seat cannot attribute is dropped from service and re-probed
@@ -705,6 +729,14 @@ message on a turn whose `turn_status` is `out_of_time`. Single-turn jobs have ne
 
 A buyer MUST refuse to bind an inline result to a `contribution`-class offer.
 
+**Hook agents** (docs/specs/hook-agents.md). A seller MAY serve a job with its own agent behind a
+hook command instead of a harness it runs. Such a job has no work tree of the seller daemon's: files
+the seller's agent writes are not part of any delivery, so the snapshot rule above is vacuous and the
+job settles inline or not at all. The hook's exit-0 envelope `{"status":"done","answer":…}` is the
+success opt-in that stands in for the §8.3 marker. `needs_input` and `out_of_time` remain
+session-turn-only: on a single-turn job the seller MUST NOT deliver them. A hook entry is never
+selected for a `contribution`-class offer or one that does not declare `inline`.
+
 This document does not yet specify the contribution tags field by field. An offer is
 contribution-class when it carries `["job-class","contribution"]`; it pins its target with
 `target-repo`, `base` and `accepts` (only `fork` today), and the seller's result adds `fork-ref` and
@@ -879,6 +911,7 @@ to determine the class.
 | `delivery_failed` | `error` | yes |
 | `no_sentinel` | `refusal` | yes |
 | `session_expired` | `refusal` | no |
+| `turn_too_large` | `refusal` | no |
 | `capability_missing` | `refusal` | no |
 
 `capability_missing` means the awarded seat cannot run what the job requires (for example the
@@ -888,6 +921,11 @@ allowlist, `capability_missing` included, to `other`.
 
 `session_expired` answers a follow-up (§6.9) whose parked session is gone; it carries
 `["e", followup_id, "", "reply"]`. Nothing was delivered or charged.
+
+`turn_too_large` answers a private follow-up that the seller cannot send for review even
+without earlier history, because the minimal review request does not fit one NIP-44 seal. It
+carries the same `reply` tag. Nothing was run or charged, and the session stays parked: a
+shorter turn may still run.
 
 The vocabulary is extensible. A reader that meets an unknown `reason_code` MUST fall back to the
 class named by `status`. That reader MUST NOT treat the event as malformed.
@@ -979,7 +1017,9 @@ ask to be paid for it.
 
 The marker is an opt-in for SUCCESS and carries no failure value. Every UNMARKED outcome — an error
 string, a turn that said nothing, a decline the model did not mark — takes the refusal path
-unchanged. The only exceptions are the two session-turn cases in §6.4.
+unchanged. The only exceptions are the two session-turn cases in §6.4. A hook agent's
+envelope (§6.4) carries the same opt-in explicitly: only `status = done` with a non-empty answer is a
+deliverable, and an adapter MUST NOT wrap a failed run's text as `answer`.
 
 A reader MUST NOT treat the marker as proof of correctness, and MUST NOT treat it as proof that the
 task was done. A model that marks an answer and then writes that it could not determine one is

@@ -7,10 +7,10 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Json;
@@ -106,6 +106,12 @@ pub struct FakeRelay {
     /// When set, every request must carry this `Host` header (buzz binds the tenant
     /// from Host, so a loopback request must name the public host).
     pub expect_host: Mutex<Option<String>>,
+    /// Team channels: id -> member hex keys (buzz `channel_members`).
+    pub teams: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    /// NIP-98 event ids already used (buzz `check_nip98_replay`: a reuse is 401).
+    pub seen_auth: Mutex<BTreeSet<String>>,
+    /// Every /query answers this many ms late (widens race windows in tests).
+    pub query_delay_ms: AtomicU64,
     clock: Arc<Clock>,
 }
 
@@ -132,8 +138,15 @@ impl FakeRelay {
         }
         let url = format!("{}{path}", self.expect_origin.lock().unwrap());
         let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
-        nip98::verify(auth, &url, "POST", body, self.clock.unix(), 60)
-            .map_err(|e| json_err(StatusCode::UNAUTHORIZED, &format!("NIP-98: {}", e.code())))
+        let v = nip98::verify(auth, &url, "POST", body, self.clock.unix(), 60)
+            .map_err(|e| json_err(StatusCode::UNAUTHORIZED, &format!("NIP-98: {}", e.code())))?;
+        if !self.seen_auth.lock().unwrap().insert(v.event_id.to_hex()) {
+            return Err(json_err(
+                StatusCode::UNAUTHORIZED,
+                "NIP-98: replay detected",
+            ));
+        }
+        Ok(v)
     }
 }
 
@@ -144,6 +157,66 @@ impl FakeRelay {
     pub fn commands(&self) -> Vec<Event> {
         self.events.lock().unwrap().clone()
     }
+    /// A new private team with these members.
+    pub fn team(&self, members: &[&Keys]) -> String {
+        let h = rand_hex(16);
+        let channel = format!(
+            "{}-{}-{}-{}-{}",
+            &h[..8],
+            &h[8..12],
+            &h[12..16],
+            &h[16..20],
+            &h[20..]
+        );
+        let set = members.iter().map(|k| k.public_key().to_hex()).collect();
+        self.teams.lock().unwrap().insert(channel.clone(), set);
+        channel
+    }
+    pub fn in_team(&self, channel: &str, keys: &Keys) -> bool {
+        self.teams.lock().unwrap()[channel].contains(&keys.public_key().to_hex())
+    }
+    pub fn add_to_team(&self, channel: &str, keys: &Keys) {
+        let mut teams = self.teams.lock().unwrap();
+        teams
+            .get_mut(channel)
+            .unwrap()
+            .insert(keys.public_key().to_hex());
+    }
+}
+
+/// buzz `side_effects.rs` 9000/9001 on a private channel: the actor must be an active member;
+/// this service only ever removes itself.
+fn team_command(r: &FakeRelay, event: &Event) -> axum::response::Response {
+    let tag = |name: &str| {
+        event.tags.iter().find_map(|t| {
+            let s = t.as_slice();
+            (s.first().map(String::as_str) == Some(name))
+                .then(|| s.get(1).cloned())
+                .flatten()
+        })
+    };
+    let (Some(channel), Some(target)) = (tag("h"), tag("p")) else {
+        return json_err(StatusCode::BAD_REQUEST, "invalid: missing h or p tag");
+    };
+    let mut teams = r.teams.lock().unwrap();
+    let Some(members) = teams.get_mut(&channel) else {
+        return json_err(StatusCode::BAD_REQUEST, "invalid: channel not found");
+    };
+    let actor = event.pubkey.to_hex();
+    if !members.contains(&actor) {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "invalid: actor is not an active member",
+        );
+    }
+    if event.kind.as_u16() == 9000 {
+        members.insert(target);
+    } else if target == actor {
+        members.remove(&actor);
+    } else {
+        return json_err(StatusCode::BAD_REQUEST, "invalid: actor not authorized");
+    }
+    Json(json!({ "event_id": event.id.to_hex(), "accepted": true, "message": "" })).into_response()
 }
 
 async fn relay_events(
@@ -174,6 +247,9 @@ async fn relay_events(
         );
     }
     let kind = event.kind.as_u16();
+    if kind == 9000 || kind == 9001 {
+        return team_command(&r, &event);
+    }
     if kind != 9030 && kind != 9031 {
         return json_err(StatusCode::BAD_REQUEST, "invalid: unexpected kind");
     }
@@ -240,10 +316,35 @@ async fn relay_query(
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
-    if let Err(resp) = r.check(&headers, "/query", &body) {
-        return resp;
-    }
+    let reader = match r.check(&headers, "/query", &body) {
+        Ok(v) => v.pubkey.to_hex(),
+        Err(resp) => return resp,
+    };
     r.queries.fetch_add(1, Ordering::SeqCst);
+    let delay = r.query_delay_ms.load(Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    let filter: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    if filter[0]["kinds"][0] == 39002 {
+        // A private channel's 39002 is channel-scoped: only its members read it.
+        let channel = filter[0]["#d"][0].as_str().unwrap_or_default().to_string();
+        let members = r.teams.lock().unwrap().get(&channel).cloned();
+        let Some(members) = members.filter(|m| m.contains(&reader)) else {
+            return Json(json!([])).into_response();
+        };
+        let mut tags = vec![Tag::identifier(channel)];
+        for pk in &members {
+            tags.push(Tag::parse(["p", pk.as_str(), "", "member"]).unwrap());
+        }
+        let ev = EventBuilder::new(Kind::Custom(39002), "")
+            .tags(tags)
+            .allow_self_tagging()
+            .sign_with_keys(&r.keys)
+            .unwrap();
+        return Json(json!([
+            serde_json::from_str::<Value>(&ev.as_json()).unwrap()
+        ]))
+        .into_response();
+    }
     let mut tags = vec![Tag::protected()];
     for (pk, role) in r.members.lock().unwrap().iter() {
         tags.push(Tag::parse(["member", pk.as_str(), role.as_str()]).unwrap());
@@ -327,6 +428,44 @@ async fn resend_emails(
     Json(json!({ "id": format!("email_{}", rand_hex(8)) })).into_response()
 }
 
+/// The website's `/legal/versions.json` (the service's `legal.versions_url`). Starts out
+/// listing the two published versions; tests change the answer and count the fetches.
+pub struct FakeSite {
+    pub status: std::sync::atomic::AtomicU16,
+    pub body: Mutex<String>,
+    pub content_type: Mutex<&'static str>,
+    pub hits: AtomicUsize,
+}
+
+pub const SITE_MANIFEST: &str = r#"{"current":{"terms":"20261123","privacy":"20261123"},"terms":["20261029","20261123"],"privacy":["20261029","20261123"]}"#;
+
+impl FakeSite {
+    pub fn serve(&self, status: u16, content_type: &'static str, body: &str) {
+        self.status.store(status, Ordering::SeqCst);
+        *self.content_type.lock().unwrap() = content_type;
+        *self.body.lock().unwrap() = body.to_string();
+    }
+    pub fn manifest(&self, terms: &[&str], privacy: &[&str]) {
+        let body = json!({
+            "current": { "terms": terms.last().unwrap(), "privacy": privacy.last().unwrap() },
+            "terms": terms,
+            "privacy": privacy,
+        });
+        self.serve(200, "application/json", &body.to_string());
+    }
+    pub fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+async fn site_manifest(State(s): State<Arc<FakeSite>>) -> axum::response::Response {
+    s.hits.fetch_add(1, Ordering::SeqCst);
+    let status = StatusCode::from_u16(s.status.load(Ordering::SeqCst)).unwrap();
+    let ct = *s.content_type.lock().unwrap();
+    let body = s.body.lock().unwrap().clone();
+    (status, [("content-type", ct)], body).into_response()
+}
+
 // ------------------------------------------------------------------ the app
 
 pub struct TestApp {
@@ -335,7 +474,10 @@ pub struct TestApp {
     pub http: reqwest::Client,
     pub relay: Arc<FakeRelay>,
     pub resend: Arc<FakeResend>,
+    pub site: Arc<FakeSite>,
     pub admin: Keys,
+    /// The team invite key (`teams.invite_key_file`).
+    pub invite: Keys,
     pub db: PgPool,
 }
 
@@ -371,6 +513,9 @@ impl TestApp {
             queries: AtomicUsize::new(0),
             expect_origin: Mutex::new(relay_base.clone()),
             expect_host: Mutex::new(None),
+            teams: Mutex::new(BTreeMap::new()),
+            seen_auth: Mutex::new(BTreeSet::new()),
+            query_delay_ms: AtomicU64::new(0),
             clock: clock.clone(),
         });
         let router = axum::Router::new()
@@ -389,7 +534,21 @@ impl TestApp {
             .with_state(resend.clone());
         tokio::spawn(async move { axum::serve(resend_l, router).await.unwrap() });
 
+        let (site_l, site_base) = bind().await;
+        let site = Arc::new(FakeSite {
+            status: std::sync::atomic::AtomicU16::new(200),
+            body: Mutex::new(SITE_MANIFEST.to_string()),
+            content_type: Mutex::new("application/json"),
+            hits: AtomicUsize::new(0),
+        });
+        let router = axum::Router::new()
+            .route("/legal/versions.json", axum::routing::get(site_manifest))
+            .with_state(site.clone());
+        tokio::spawn(async move { axum::serve(site_l, router).await.unwrap() });
+
         let mut cfg = Config::default();
+        // Never the live site from a test.
+        cfg.legal.versions_url = format!("{site_base}/legal/versions.json");
         cfg.relay.base_url = relay_base;
         cfg.relay.relay_pubkey = Some(relay.keys.public_key().to_hex());
         cfg.email.resend_api_base = resend_base;
@@ -406,6 +565,8 @@ impl TestApp {
         )
         .unwrap();
         state.clock = clock;
+        let invite = Keys::generate();
+        state.invite = Some(invite.clone());
         let state = Arc::new(state);
         let (api_l, base) = bind().await;
         let s = state.clone();
@@ -417,7 +578,9 @@ impl TestApp {
             http: reqwest::Client::new(),
             relay,
             resend,
+            site,
             admin,
+            invite,
             db,
         }
     }

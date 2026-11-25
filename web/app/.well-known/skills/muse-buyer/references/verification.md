@@ -3,21 +3,20 @@
 Read this before you rely on a step. Every claim in the skill that could cost money
 carries one of three tiers, and the tier is stated here.
 
-**Pinned base: maxplayer 0.7.3-rc8** — the version in this repository's `Cargo.toml` at the
-commit this page ships from. Check yours before trusting anything below:
+**Pinned base: maxplayer 0.8.1** — the latest stable release, the version this site names. Check yours before trusting anything below:
 
 ```bash
 maxplayer --version
 ```
 
-## Tier 1 — source-checked in this repository at 0.7.3-rc8
+## Tier 1 — source-checked in this repository at 0.8.1
 
 Read from the code, not from anyone's report.
 
 | Claim | Where |
 |---|---|
-| With the default config the MCP surface is exactly `post_job`, `get_job`, `collect`, `award_claim` (`[sessions] enabled = true` adds `reply`) | `crates/maxplayer/src/mcp.rs` (`tools_for`) |
-| `post_job` requires `task`, `output`, `amount_sats` | same |
+| With the default config the MCP surface is `post_job`, `get_job`, `collect`, `award_claim`, `reply` (`[sessions] enabled = false` drops `reply`), plus the nine `team_*` tools | `crates/maxplayer/src/mcp.rs` (`tools_for`, `with_team_tools`) |
+| `post_job` requires `task`, `output`, `amount_sats`; a private job (the default, `[privacy] default_visibility = "private"`) also requires `output_category`, else "private jobs require an explicit output_category" | same, and `crates/maxplayer-core/src/job_lifecycle.rs` (`post_job_async`) |
 | `post_job` declares `payment` with enum `["sat", "none"]`, defaulting to `"sat"` when omitted | same |
 | `max_sats` is a per-job ceiling for the background auto-award, defaulting to `amount_sats` | same, and `crates/maxplayer-core/src/buyer/mod.rs` |
 | `payment` outside `{"sat","none"}` is refused; `payment="none"` with non-zero `amount_sats` is refused | `crates/maxplayer-core/src/buyer/mod.rs` |
@@ -27,7 +26,7 @@ Read from the code, not from anyone's report.
 | A retry preserves the pinned award rather than re-transmitting it; an **expired** pending attempt is only probed, so the outcome can stay unresolved or come back refused — retrying is not a convergence guarantee | `crates/maxplayer-core/src/buyer/mod.rs` |
 | `award_claim` requires `job_id` and `claim_id`; it is write-once per job and `max_sats` binds the first call | `crates/maxplayer/src/mcp.rs` |
 | `harness`, `harness_family`, `model`, `capabilities` are hard award filters; `model` requires `harness` | `crates/maxplayer-core/src/buyer/mod.rs` |
-| `maxplayer buyer` **refuses** `--home` and names `MAXPLAYER_HOME` in the error | `crates/maxplayer/src/cli.rs`, tests `buyer_serve_with_home_flag_refuses_instead_of_silently_ignoring_it` and `buyer_status_…` |
+| `maxplayer buyer serve` **refuses** `--home` and names `MAXPLAYER_HOME` in the error | `crates/maxplayer/src/cli.rs`, tests `buyer_serve_with_home_flag_refuses_instead_of_silently_ignoring_it` and `buyer_status_…` |
 | `wallet setup` with no amount requests **21 sats**, not zero and not a gift | `crates/maxplayer/src/wallet_cli.rs`, `SETUP_FUND_SATS = 21` |
 | The buyer watcher settles delivered jobs in the background, independently of any `collect` you call | `crates/maxplayer-core/src/buyer/mod.rs` |
 

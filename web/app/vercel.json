@@ -6,22 +6,37 @@
   "cleanUrls": true,
   "redirects": [
     { "source": "/skill.md", "has": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }], "destination": "/skill-preview", "permanent": false },
+    { "source": "/sell", "destination": "/market#sell", "permanent": false },
+    { "source": "/sell.html", "destination": "/market#sell", "permanent": false },
+    { "source": "/chat", "destination": "/", "permanent": false },
+    { "source": "/chat.html", "destination": "/", "permanent": false },
     { "source": "/challenges", "destination": "/swarm", "permanent": true },
     { "source": "/challenges.html", "destination": "/swarm", "permanent": true },
     { "source": "/.well-known/skills/challenge-join/skill.md", "destination": "/.well-known/skills/swarm-join/skill.md", "permanent": true },
-    { "source": "/terms", "destination": "/terms/20261029", "permanent": false },
+    { "source": "/terms", "destination": "/terms/20261123", "permanent": false },
     { "source": "/terms/v1", "destination": "/terms/20261029", "permanent": false },
-    { "source": "/privacy", "destination": "/privacy/20261029", "permanent": false },
+    { "source": "/privacy", "destination": "/privacy/20261123", "permanent": false },
     { "source": "/privacy/v1", "destination": "/privacy/20261029", "permanent": false },
     { "source": "/fees", "destination": "/fees/20261029", "permanent": false },
     { "source": "/fees/v1", "destination": "/fees/20261029", "permanent": false }
   ],
   "rewrites": [
     { "source": "/terms/20261029", "destination": "/terms-20261029" },
+    { "source": "/terms/20261123", "destination": "/terms-20261123" },
     { "source": "/privacy/20261029", "destination": "/privacy-20261029" },
-    { "source": "/fees/20261029", "destination": "/fees-20261029" }
+    { "source": "/privacy/20261123", "destination": "/privacy-20261123" },
+    { "source": "/fees/20261029", "destination": "/fees-20261029" },
+    { "source": "/swarm/:address", "destination": "/swarm" },
+    { "source": "/join/:token", "has": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }], "destination": "/join-preview" },
+    { "source": "/join/:token", "has": [{ "type": "header", "key": "user-agent", "value": { "re": "^Mozilla/5\\.0 \\(" } }], "missing": [{ "type": "header", "key": "user-agent", "value": { "re": "compatible;|[Bb]ot/|[Bb]ot\\)|ChatGPT|Claude|GPT|Perplexity|OpenAI|Anthropic|HeadlessChrome|Google-|[Ss]pider|[Cc]rawl" } }], "destination": "/join-invite" },
+    { "source": "/join/:token", "destination": "/join.md" }
   ],
   "headers": [
+    {
+      "source": "/(.*)\\.(css|js|woff2|webp|png|jpg|svg)",
+      "has": [{ "type": "query", "key": "v", "value": "^[0-9a-f]{12}$" }],
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }]
+    },
     {
       "source": "/(.*)",
       "headers": [
@@ -44,7 +59,7 @@
       ]
     },
     {
-      "source": "/((?!(?:tokens|swarm)$).*)",
+      "source": "/((?!tokens$).*)",
       "headers": [
         {
           "key": "Content-Security-Policy",
@@ -57,7 +72,7 @@
       "headers": [
         {
           "key": "Content-Security-Policy",
-          "value": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self' wss://nos.lol wss://relay.primal.net wss://offchain.pub; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+          "value": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self' wss://relay.maxplayer.ai wss://nos.lol wss://relay.primal.net wss://offchain.pub; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
         },
         {
           "key": "X-Robots-Tag",
@@ -71,10 +86,63 @@
         {
           "key": "X-Robots-Tag",
           "value": "noindex, nofollow"
-        },
+        }
+      ]
+    },
+    {
+      "source": "/join/:token",
+      "headers": [
         {
-          "key": "Content-Security-Policy",
-          "value": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' wss://relay.maxplayer.ai wss://nos.lol wss://relay.primal.net wss://offchain.pub https://api.coinbase.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
+        }
+      ]
+    },
+    {
+      "source": "/join/:token",
+      "missing": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }, { "type": "header", "key": "user-agent", "value": { "re": "^Mozilla/5\\.0 \\(" } }],
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "text/plain; charset=utf-8"
+        }
+      ]
+    },
+    {
+      "source": "/join/:token",
+      "has": [{ "type": "header", "key": "user-agent", "value": { "re": "^Mozilla/5\\.0 \\(" } }, { "type": "header", "key": "user-agent", "value": { "re": "compatible;|[Bb]ot/|[Bb]ot\\)|ChatGPT|Claude|GPT|Perplexity|OpenAI|Anthropic|HeadlessChrome|Google-|[Ss]pider|[Cc]rawl" } }],
+      "missing": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }],
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "text/plain; charset=utf-8"
+        }
+      ]
+    },
+    {
+      "source": "/join-invite",
+      "headers": [
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
+        }
+      ]
+    },
+    {
+      "source": "/join-preview",
+      "headers": [
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
+        }
+      ]
+    },
+    {
+      "source": "/swarm/:address",
+      "headers": [
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
         }
       ]
     }

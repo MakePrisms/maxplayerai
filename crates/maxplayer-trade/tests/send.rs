@@ -19,6 +19,15 @@ async fn home() -> (tempfile::TempDir, Journal) {
     let j = Journal::open(h.path()).await.unwrap();
     (h, j)
 }
+/// A legacy standalone home (journal and `wallet.seed` at its root) holding `n` sats: the only
+/// kind of home `trade send` still makes new sends from (draining it). A maxplayer home sends with
+/// `maxplayer wallet send`; `send --reclaim` and `status` run on both.
+async fn legacy_funded(m: &MintFixture, n: u64) -> (tempfile::TempDir, Journal) {
+    let h = tempfile::tempdir().unwrap();
+    let j = Journal::open(h.path()).await.unwrap();
+    fund_wallet(h.path(), &m.url, n).await;
+    (h, j)
+}
 async fn funded(m: &MintFixture, n: u64) -> (tempfile::TempDir, Journal) {
     let (h, j) = home().await;
     fund(h.path(), &m.url, n).await;
@@ -496,7 +505,7 @@ async fn cli_never_prints_or_takes_the_token_and_reports_redemption() {
     );
     assert!(!help.contains("--token"), "SAFETY: no token flag");
     let m = MintFixture::start(0).await;
-    let (a, _ja) = funded(&m, 64).await;
+    let (a, _ja) = legacy_funded(&m, 64).await;
     let out = a.path().join("t");
     let o = out.to_str().unwrap();
     let ok = cli(
@@ -592,7 +601,7 @@ async fn cli_never_prints_or_takes_the_token_and_reports_redemption() {
 #[cfg(feature = "lab")]
 async fn crash_then_recover(var: &'static str, code: i32, swaps_at_crash: u64) {
     let m = MintFixture::start(100).await;
-    let (a, ja) = funded(&m, 64).await;
+    let (a, ja) = legacy_funded(&m, 64).await;
     let out = a.path().join("t");
     let o = out.to_str().unwrap();
     let args = [
@@ -648,7 +657,7 @@ async fn crash_then_recover(var: &'static str, code: i32, swaps_at_crash: u64) {
 #[tokio::test]
 async fn recovery_never_overwrites_a_path_taken_after_the_crash() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 32).await;
+    let (a, ja) = legacy_funded(&m, 32).await;
     let out = a.path().join("t");
     let o = out.to_str().unwrap();
     let args = ["send", &m.url, "--amount", "8", "--out", o];
@@ -698,7 +707,7 @@ async fn crash_after_swap_before_file_write_then_recover_rewrites_same_token() {
 #[tokio::test]
 async fn non_nut_400_stays_submitted_and_replays_the_same_swap() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 32).await;
+    let (a, ja) = legacy_funded(&m, 32).await;
     let out = a.path().join("t");
     // 1: non-JSON 400 body. 2: JSON 400 without a numeric NUT `code` (e.g. a
     // transport `expired`). Neither proves the mint refused this request.
@@ -745,7 +754,7 @@ async fn non_nut_400_stays_submitted_and_replays_the_same_swap() {
 #[tokio::test]
 async fn journal_write_failure_does_not_report_a_false_terminal_state() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 32).await;
+    let (a, ja) = legacy_funded(&m, 32).await;
     let out = a.path().join("t");
     let o = out.to_str().unwrap();
     m.faults.swap_nut_error.store(true, SeqCst);
@@ -781,7 +790,7 @@ async fn journal_write_failure_does_not_report_a_false_terminal_state() {
 #[tokio::test]
 async fn reclaim_journal_write_failure_is_not_reported_reclaimed() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 64).await;
+    let (a, ja) = legacy_funded(&m, 64).await;
     let out = a.path().join("t");
     let r = send::send(a.path(), &ja, &m.url, 32, &out, None)
         .await
@@ -862,7 +871,7 @@ async fn same_out_after_file_removed_rewrites_same_token_never_resends() {
 #[tokio::test]
 async fn refused_reclaim_cli_reports_still_outstanding_and_retries() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 32).await;
+    let (a, ja) = legacy_funded(&m, 32).await;
     let r = sent(&m, a.path(), &ja, 8, "t").await;
     m.faults.swap_nut_error.store(true, SeqCst);
     let out = cli(a.path(), &["send", "--reclaim", &r.id], None).await;
@@ -884,7 +893,7 @@ async fn refused_reclaim_cli_reports_still_outstanding_and_retries() {
 #[tokio::test]
 async fn reclaim_inputs_spent_keeps_secrets_and_needs_manual_recovery() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 32).await;
+    let (a, ja) = legacy_funded(&m, 32).await;
     let r = sent(&m, a.path(), &ja, 8, "t").await;
     let token = read(&a.path().join("t"));
     m.faults.reject_swap.store(true, SeqCst);
@@ -926,7 +935,7 @@ async fn reclaim_inputs_spent_keeps_secrets_and_needs_manual_recovery() {
 #[tokio::test]
 async fn swapped_send_whose_file_cannot_be_placed_is_reclaimable() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 32).await;
+    let (a, ja) = legacy_funded(&m, 32).await;
     let out = a.path().join("t");
     let o = out.to_str().unwrap();
     let args = ["send", &m.url, "--amount", "8", "--out", o];
@@ -957,7 +966,7 @@ async fn swapped_send_whose_file_cannot_be_placed_is_reclaimable() {
 #[tokio::test]
 async fn journaled_unreserved_inputs_are_excluded_from_a_new_send() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 64).await;
+    let (a, ja) = legacy_funded(&m, 64).await;
     let o = a.path().join("t");
     let args = [
         "send",
@@ -997,7 +1006,7 @@ async fn journaled_unreserved_inputs_are_excluded_from_a_new_send() {
 #[tokio::test]
 async fn prepared_send_whose_inputs_were_taken_is_refused() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 64).await;
+    let (a, ja) = legacy_funded(&m, 64).await;
     let o = a.path().join("t");
     let args = [
         "send",
@@ -1058,7 +1067,7 @@ async fn ambiguous_50000_keeps_send_submitted() {
 #[tokio::test]
 async fn reused_out_unredeemed_rewrites_same_token_with_notice() {
     let m = MintFixture::start(0).await;
-    let (a, _ja) = funded(&m, 32).await;
+    let (a, _ja) = legacy_funded(&m, 32).await;
     let out = a.path().join("t");
     let o = out.to_str().unwrap().to_owned();
     let args = ["send", &m.url, "--amount", "8", "--out", &o];
@@ -1087,7 +1096,7 @@ async fn reused_out_unredeemed_rewrites_same_token_with_notice() {
 #[tokio::test]
 async fn reused_out_of_redeemed_token_is_refused() {
     let m = MintFixture::start(0).await;
-    let (a, _ja) = funded(&m, 32).await;
+    let (a, _ja) = legacy_funded(&m, 32).await;
     let out = a.path().join("t");
     let o = out.to_str().unwrap().to_owned();
     let args = ["send", &m.url, "--amount", "8", "--out", &o];
@@ -1116,7 +1125,7 @@ async fn reused_out_of_redeemed_token_is_refused() {
 #[tokio::test]
 async fn unposted_reclaim_raced_by_recipient_ends_redeemed() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 32).await;
+    let (a, ja) = legacy_funded(&m, 32).await;
     let r = sent(&m, a.path(), &ja, 8, "t").await;
     let token = read(&a.path().join("t"));
     let swaps = m.faults.swaps.load(SeqCst);
@@ -1176,7 +1185,7 @@ async fn unposted_reclaim_raced_by_recipient_ends_redeemed() {
 async fn landed_reclaim_refused_with_outputs_hidden_twice_is_never_redeemed() {
     for stay_absent in [false, true] {
         let m = MintFixture::start(0).await;
-        let (a, ja) = funded(&m, 32).await;
+        let (a, ja) = legacy_funded(&m, 32).await;
         let r = sent(&m, a.path(), &ja, 8, "t").await;
         let swaps = m.faults.swaps.load(SeqCst);
         m.faults.refuse_after_swap_blanks.store(2, SeqCst);
@@ -1257,7 +1266,7 @@ async fn force_state(j: &Journal, id: &str, state: &str) {
 #[tokio::test]
 async fn readable_status_lists_unresolved_and_settled_sends_with_json_matching_counts() {
     let m = MintFixture::start(0).await;
-    let (a, ja) = funded(&m, 128).await;
+    let (a, ja) = legacy_funded(&m, 128).await;
     // Terminal `sent` (reclaimable) and terminal `reclaimed`.
     let sent_ok = send::send(a.path(), &ja, &m.url, 8, &a.path().join("s1"), None)
         .await
@@ -1367,4 +1376,220 @@ async fn readable_status_lists_unresolved_and_settled_sends_with_json_matching_c
     );
     // The readable view never prints the journaled token.
     assert_secret_free(&human, &read(&a.path().join("s1")));
+}
+
+// ---- Automatic reclaim retry ----
+
+/// Make the pending automatic reclaim retry of `id` due now (test-only journal edit).
+async fn retry_due(j: &Journal, id: &str) {
+    let mut v: serde_json::Value = j.get("send", id).await.unwrap().unwrap();
+    v["reclaim_retry_at"] = 0.into();
+    j.put("send", id, &v).await.unwrap();
+}
+fn retry_of(r: &SendAttempt) -> Option<u32> {
+    r.reclaim_retry().map(|(n, _)| n)
+}
+
+/// A refused `send --reclaim` is retried by recovery once due, with no second human command;
+/// a transient failure (PENDING proofs) does not use up a retry.
+#[tokio::test]
+async fn refused_reclaim_is_retried_by_recovery() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let r = sent(&m, a.path(), &ja, 8, "t").await;
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let back = send::reclaim(a.path(), &ja, &r.id, None).await.unwrap();
+    assert_eq!(back.state, SendState::Sent);
+    let refused = send::verdict(&back, true).unwrap_err();
+    assert!(refused.to_string().contains("retry 1/3"), "{refused:#}");
+    let row = attempts(&ja).await.remove(0);
+    assert_eq!(row.state, SendState::Sent);
+    assert_eq!(retry_of(&row), Some(1));
+    let swaps = m.faults.swaps.load(SeqCst);
+    // Not due yet: recovery leaves it alone but reports it unresolved.
+    assert!(money::recover(a.path(), &ja).await.unwrap());
+    assert_eq!(
+        m.faults.swaps.load(SeqCst),
+        swaps,
+        "retried before it was due"
+    );
+    // Due, but the sent proofs read PENDING: transient, the retry is not used up.
+    retry_due(&ja, &r.id).await;
+    m.faults.pending_inputs.store(true, SeqCst);
+    assert!(money::recover(a.path(), &ja).await.unwrap());
+    m.faults.pending_inputs.store(false, SeqCst);
+    assert_eq!(m.faults.swaps.load(SeqCst), swaps);
+    assert_eq!(
+        retry_of(&attempts(&ja).await[0]),
+        Some(1),
+        "transient counted"
+    );
+    // The mint accepts again: recovery reclaims it, credited once.
+    m.faults.swap_nut_error.store(false, SeqCst);
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    let done = attempts(&ja).await.remove(0);
+    assert_eq!(done.state, SendState::Reclaimed);
+    assert!(done.reclaim_retry().is_none());
+    assert_eq!(
+        m.faults.swaps.load(SeqCst),
+        swaps + 1,
+        "SAFETY: one reclaim swap"
+    );
+    assert_eq!(balance(a.path(), &m.url).await, 32, "SAFETY: credited once");
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+}
+
+/// SAFETY: a mint that keeps refusing gets exactly three automatic retries, then recovery
+/// stops; the token stays outstanding and a new `send --reclaim` starts over.
+#[tokio::test]
+async fn reclaim_retries_stop_after_three_refusals() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let r = sent(&m, a.path(), &ja, 8, "t").await;
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let back = send::reclaim(a.path(), &ja, &r.id, None).await.unwrap();
+    assert_eq!(back.state, SendState::Sent, "refused");
+    let swaps = m.faults.swaps.load(SeqCst);
+    for n in 1..=3u32 {
+        assert_eq!(retry_of(&attempts(&ja).await[0]), Some(n));
+        retry_due(&ja, &r.id).await;
+        money::recover(a.path(), &ja).await.unwrap();
+        assert_eq!(m.faults.swaps.load(SeqCst), swaps + u64::from(n));
+    }
+    let row = attempts(&ja).await.remove(0);
+    assert_eq!(row.state, SendState::Sent, "token still outstanding");
+    assert!(
+        row.reclaim_retry().is_none(),
+        "SAFETY: retried past the limit"
+    );
+    assert!(
+        !money::recover(a.path(), &ja).await.unwrap(),
+        "nothing left pending"
+    );
+    retry_due(&ja, &r.id).await;
+    money::recover(a.path(), &ja).await.unwrap();
+    assert_eq!(
+        m.faults.swaps.load(SeqCst),
+        swaps + 3,
+        "SAFETY: a fourth retry"
+    );
+    // The human asks again: a fresh retry budget, even if refused again.
+    let back = send::reclaim(a.path(), &ja, &r.id, None).await.unwrap();
+    assert_eq!(
+        retry_of(&back),
+        Some(1),
+        "manual reclaim restarts the count"
+    );
+    m.faults.swap_nut_error.store(false, SeqCst);
+    retry_due(&ja, &r.id).await;
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    assert_eq!(attempts(&ja).await[0].state, SendState::Reclaimed);
+    assert_eq!(balance(a.path(), &m.url).await, 32, "SAFETY: credited once");
+}
+
+/// SAFETY: a retry never pays more than the human's `--max-fees`; when it would, retrying
+/// stops before anything is journaled or sent.
+#[tokio::test]
+async fn reclaim_retry_keeps_the_original_fee_cap() {
+    let m = MintFixture::start(100).await;
+    let (a, ja) = funded(&m, 64).await;
+    let r = send::send(a.path(), &ja, &m.url, 32, &a.path().join("t"), Some(5))
+        .await
+        .unwrap();
+    m.faults.swap_nut_error.store(true, SeqCst);
+    let back = send::reclaim(a.path(), &ja, &r.id, Some(5)).await.unwrap();
+    assert_eq!(back.state, SendState::Sent, "refused");
+    m.faults.swap_nut_error.store(false, SeqCst);
+    let swaps = m.faults.swaps.load(SeqCst);
+    // The journaled cap is what a retry uses; lower it below the reclaim fee.
+    let mut v: serde_json::Value = ja.get("send", &r.id).await.unwrap().unwrap();
+    assert_eq!(
+        v["reclaim_max_fees"], 5,
+        "the human's --max-fees is journaled"
+    );
+    v["reclaim_max_fees"] = 0.into();
+    v["reclaim_retry_at"] = 0.into();
+    ja.put("send", &r.id, &v).await.unwrap();
+    assert!(
+        !money::recover(a.path(), &ja).await.unwrap(),
+        "a stopped retry is settled, not deferred"
+    );
+    let row = attempts(&ja).await.remove(0);
+    assert_eq!(row.state, SendState::Sent);
+    assert!(
+        row.reclaim_retry().is_none(),
+        "over the cap: needs the human"
+    );
+    assert_eq!(
+        m.faults.swaps.load(SeqCst),
+        swaps,
+        "SAFETY: a swap over the fee cap"
+    );
+}
+
+/// A `send --reclaim` that cannot reach the mint's verdict (sent proofs PENDING) is recorded and
+/// retried by recovery; meanwhile the same `--out` is refused, so the token is never re-emitted.
+#[tokio::test]
+async fn reclaim_blocked_by_pending_proofs_is_recorded_and_retried() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let r = sent(&m, a.path(), &ja, 8, "t").await;
+    m.faults.pending_inputs.store(true, SeqCst);
+    let error = send::reclaim(a.path(), &ja, &r.id, None)
+        .await
+        .err()
+        .expect("PENDING proofs");
+    assert!(
+        format!("{error:#}").contains("reclaim recorded"),
+        "{error:#}"
+    );
+    let row = attempts(&ja).await.remove(0);
+    assert_eq!(row.state, SendState::Sent);
+    assert_eq!(retry_of(&row), Some(0));
+    let report = maxplayer_trade::report::render(a.path()).unwrap();
+    assert!(
+        report.contains("reclaim pending since") && !report.contains("1970"),
+        "{report}"
+    );
+    let again = send::send(a.path(), &ja, &m.url, 8, &a.path().join("t"), None)
+        .await
+        .err()
+        .expect("SAFETY: --out reused while a reclaim is pending");
+    assert!(again.to_string().contains("being reclaimed"), "{again:#}");
+    m.faults.pending_inputs.store(false, SeqCst);
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    assert_eq!(attempts(&ja).await[0].state, SendState::Reclaimed);
+    assert_eq!(balance(a.path(), &m.url).await, 32, "SAFETY: credited once");
+}
+
+/// SAFETY: a `swapped` send (token file never placed) whose reclaim hit PENDING proofs keeps the
+/// reclaim and becomes `sent`: recovery never places the token the human asked back.
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn swapped_send_reclaim_blocked_by_pending_is_never_placed() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = legacy_funded(&m, 32).await;
+    let out = a.path().join("t");
+    let o = out.to_str().unwrap();
+    let args = ["send", &m.url, "--amount", "8", "--out", o];
+    let crashed = cli(a.path(), &args, Some("TRADE_CRASH_BEFORE_SEND_FILE")).await;
+    assert_eq!(crashed.status.code(), Some(85));
+    let row = attempts(&ja).await.remove(0);
+    assert_eq!(row.state, SendState::Swapped);
+    m.faults.pending_inputs.store(true, SeqCst);
+    send::reclaim(a.path(), &ja, &row.id, None)
+        .await
+        .err()
+        .expect("PENDING proofs");
+    let row = attempts(&ja).await.remove(0);
+    assert_eq!(row.state, SendState::Sent);
+    assert!(row.reclaim_retry_pending());
+    m.faults.pending_inputs.store(false, SeqCst);
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    assert_eq!(attempts(&ja).await[0].state, SendState::Reclaimed);
+    assert!(
+        !out.exists(),
+        "SAFETY: recovery placed a token being reclaimed"
+    );
+    assert_eq!(balance(a.path(), &m.url).await, 32, "SAFETY: credited once");
 }

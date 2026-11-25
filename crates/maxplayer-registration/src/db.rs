@@ -22,6 +22,37 @@ pub async fn mark_nip98_seen(db: &PgPool, event_id: &str, now: DateTime<Utc>) ->
     Ok(r.rows_affected() == 1)
 }
 
+// ---------------------------------------------------------------- legal versions
+
+/// Whether `version` of `doc` (`terms`/`privacy`) was learned from the website's manifest.
+pub async fn legal_version_known(db: &PgPool, doc: &str, version: &str) -> Result<bool> {
+    let row = sqlx::query("SELECT 1 AS one FROM legal_versions WHERE doc = $1 AND version = $2")
+        .bind(doc)
+        .bind(version)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Store versions listed by the manifest; ones already stored keep their first-seen time.
+pub async fn record_legal_versions(
+    db: &PgPool,
+    doc: &str,
+    versions: &[String],
+    now: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO legal_versions (doc, version, first_seen_at) \
+         SELECT $1, v, $3 FROM unnest($2::text[]) AS v ON CONFLICT DO NOTHING",
+    )
+    .bind(doc)
+    .bind(versions)
+    .bind(now)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 pub async fn count_rate(
     db: &PgPool,
     bucket: &str,
@@ -613,6 +644,11 @@ pub async fn cleanup(db: &PgPool, now: DateTime<Utc>) -> Result<u64> {
             "DELETE FROM member_sync_outbox WHERE status <> 'pending' AND updated_at < $1",
             TimeDelta::days(30),
         ),
+        // Kept a while past expiry so a late redeem reads "expired", not "not found".
+        (
+            "DELETE FROM team_invite_links WHERE expires_at < $1",
+            TimeDelta::days(30),
+        ),
     ] {
         n += sqlx::query(sql)
             .bind(now - age)
@@ -621,6 +657,130 @@ pub async fn cleanup(db: &PgPool, now: DateTime<Utc>) -> Result<u64> {
             .rows_affected();
     }
     Ok(n)
+}
+
+// ---------------------------------------------------------------- team invite links
+
+/// What a token's row says at `now`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LinkState {
+    Live { channel: String },
+    Expired,
+    Revoked,
+    Unknown,
+}
+
+/// Mark a team as one the invite key is in, so the sweep makes it leave once no link is live.
+pub async fn track_invite_channel(db: &PgPool, channel: &str, now: DateTime<Utc>) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO team_invite_channels (channel, updated_at) VALUES ($1, $2) \
+         ON CONFLICT (channel) DO UPDATE SET updated_at = EXCLUDED.updated_at",
+    )
+    .bind(channel)
+    .bind(now)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Store a new link (hash only).
+pub async fn insert_invite_link(
+    db: &PgPool,
+    token_hash: &[u8],
+    channel: &str,
+    created_by: &str,
+    expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO team_invite_links (token_hash, channel, created_by, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(token_hash)
+    .bind(channel)
+    .bind(created_by)
+    .bind(now)
+    .bind(expires_at)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub async fn invite_link_state(
+    db: &PgPool,
+    token_hash: &[u8],
+    now: DateTime<Utc>,
+) -> Result<LinkState> {
+    let row = sqlx::query(
+        "SELECT channel, expires_at, revoked_at FROM team_invite_links WHERE token_hash = $1",
+    )
+    .bind(token_hash)
+    .fetch_optional(db)
+    .await?;
+    let Some(row) = row else {
+        return Ok(LinkState::Unknown);
+    };
+    let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+    let revoked_at: Option<DateTime<Utc>> = row.try_get("revoked_at")?;
+    Ok(if revoked_at.is_some() {
+        LinkState::Revoked
+    } else if expires_at <= now {
+        LinkState::Expired
+    } else {
+        LinkState::Live {
+            channel: row.try_get("channel")?,
+        }
+    })
+}
+
+/// Revoke every live link of a team, or only those `created_by` made. Returns how many.
+pub async fn revoke_invite_links(
+    db: &PgPool,
+    channel: &str,
+    created_by: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE team_invite_links SET revoked_at = $2 \
+         WHERE channel = $1 AND revoked_at IS NULL AND expires_at > $2 \
+         AND ($3::text IS NULL OR created_by = $3)",
+    )
+    .bind(channel)
+    .bind(now)
+    .bind(created_by)
+    .execute(db)
+    .await?
+    .rows_affected())
+}
+
+/// Teams the invite key may still be in.
+pub async fn invite_channels(db: &PgPool) -> Result<Vec<String>> {
+    let rows = sqlx::query("SELECT channel FROM team_invite_channels")
+        .fetch_all(db)
+        .await?;
+    rows.iter().map(|r| Ok(r.try_get("channel")?)).collect()
+}
+
+/// Whether a tracked team has no live link left, i.e. the invite key should leave it. `false`
+/// when the team is not tracked. Call it holding [`crate::AppState::lock_team`].
+pub async fn idle_invite_channel(db: &PgPool, channel: &str, now: DateTime<Utc>) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM team_invite_channels WHERE channel = $1) \
+         AND NOT EXISTS (SELECT 1 FROM team_invite_links \
+         WHERE channel = $1 AND revoked_at IS NULL AND expires_at > $2)",
+    )
+    .bind(channel)
+    .bind(now)
+    .fetch_one(db)
+    .await?)
+}
+
+pub async fn forget_invite_channel(db: &PgPool, channel: &str) -> Result<()> {
+    sqlx::query("DELETE FROM team_invite_channels WHERE channel = $1")
+        .bind(channel)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- managed members

@@ -68,6 +68,11 @@
     # Before adding a new service that writes, add its key to the member list first.
     requireRelayMembership = true;
 
+    # Maxplayer Team repos (#1338). Before the first switch with this on: the private service key is a
+    # relay member, kind 1059 stays enabled, and
+    # `SELECT count(*) FROM private_job_repositories WHERE job_id ~ '0{32}$'` returns 0.
+    teamRepos = true;
+
     # Relay identity key. Referenced by PATH only — gudnuf places a file here containing
     #   BUZZ_RELAY_PRIVATE_KEY=<64-hex>
     # before the first switch. It must PERSIST across reboots (the relay's stable NIP-42/NIP-11
@@ -129,6 +134,9 @@
     # document, top-level "self" (NIP-11 `pubkey` is null on buzz; `self` is the relay keypair, derived
     # from BUZZ_RELAY_PRIVATE_KEY in /var/lib/secrets/buzz-relay.env).
     relayPubkey = "5fda3774ed565fd500ae7e4289f839a0f06dc2aee4cc19a1acf783b77bfe73ec";
+    # Team invite links (#1360). Secret generated on this box by Josip, 2026-11-21; its pubkey
+    # 632471e9… is maxplayer_team::INVITE_PUBKEY and was made a relay member (owner kind 9030).
+    inviteKeyFile = "/var/lib/secrets/maxplayer-team-invite-key";
   };
 
   # The relay binds 127.0.0.1:3000 (loopback, no public bind), so something must terminate TLS and proxy
@@ -151,6 +159,13 @@
       # DNS: relay.maxplayer.ai → 34.225.223.145 (live); ACME issues on first switch.
       enableACME = true;
       forceSSL = true;
+      # TEMPORARY (nginx2root, 18 Nov 2026): HTTP/2 off until nixpkgs ships nginx >= 1.31.9 or a
+      # backport. CVE-2026-123007 (any h2 server) and CVE-2026-123633 (h2 + proxied upstream) are
+      # pre-auth RCEs in the nginx worker and both need h2; our pin ships 1.30.6. Nothing here needs h2:
+      # websocket upgrades are HTTP/1.1, and git smart-HTTP and uploads work on h1. Re-enable (drop this
+      # line) in the same change that bumps nginx past the fix.
+      # https://xint.io/blog/nginx2root-remote-code-execution
+      http2 = false;
       locations."/" = {
         proxyPass = "http://127.0.0.1:3000";
         proxyWebsockets = true;
@@ -201,6 +216,16 @@
   # watched reboot and an EBS snapshot. The scripted stage 1 is removed in 26.11, so this must go before then.
   boot.kernelPackages = pkgs.linuxPackages_6_12;
   boot.initrd.systemd.enable = false;
+
+  # nginx2root (18 Nov 2026): the published chain goes from the nginx worker to root through a kernel SCTP
+  # bug. Nothing on this host uses SCTP. The blacklist stops alias autoload (an unprivileged
+  # socket(..., IPPROTO_SCTP) is how the module gets pulled in); the install line also refuses an explicit
+  # `modprobe sctp`. Both take effect on switch for future loads; neither unloads a module that is already
+  # loaded (check `lsmod | grep sctp`). Keep this after the nginx fix too: it is defence in depth.
+  boot.blacklistedKernelModules = [ "sctp" ];
+  boot.extraModprobeConfig = ''
+    install sctp ${pkgs.coreutils}/bin/false
+  '';
 
   networking.firewall.allowedTCPPorts = [
     80

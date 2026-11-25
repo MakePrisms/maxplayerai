@@ -29,6 +29,16 @@ struct Args {
     config: PathBuf,
 }
 
+/// `maxplayer-registration <version> — registration starting, config <path>`: the first log line of
+/// `serve`. This crate has no build stamp, so the version stands alone. `starting`, not the verb.
+fn start_line(config: &std::path::Path) -> String {
+    format!(
+        "maxplayer-registration {} — registration starting, config {}",
+        env!("CARGO_PKG_VERSION"),
+        config.display()
+    )
+}
+
 fn parse_args() -> Result<Args> {
     let mut args = std::env::args().skip(1);
     let mut command = None;
@@ -72,7 +82,7 @@ async fn shutdown_signal() {
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
 }
 
-/// Background loops: outbox retries, reconcile, cleanup. Errors are logged and retried.
+/// Background loops: outbox retries, reconcile (+ the invite link sweep), cleanup. Errors are logged and retried.
 fn spawn_loops(state: Arc<AppState>) {
     let s = state.clone();
     tokio::spawn(async move {
@@ -94,6 +104,9 @@ fn spawn_loops(state: Arc<AppState>) {
             t.tick().await;
             if let Err(e) = sync::reconcile_once(&s).await {
                 warn!(error = %format!("{e:#}"), "reconcile failed");
+            }
+            if let Err(e) = sync::sweep_invites(&s).await {
+                warn!(error = %format!("{e:#}"), "invite link sweep failed");
             }
         }
     });
@@ -123,6 +136,10 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     let args = parse_args()?;
+    if args.command == "serve" {
+        // First log line of the service, before the config is read: which build is serving.
+        info!("{}", start_line(&args.config));
+    }
     let cfg = Config::load(&args.config)?;
     let pool = maxplayer_registration::connect(&cfg).await?;
 
@@ -144,6 +161,10 @@ async fn main() -> Result<()> {
                 warn!("no Resend webhook secret: /account/webhooks/resend answers 503");
             }
             info!(admin = %state.relay.admin_pubkey(), "relay admin key loaded");
+            match &state.invite {
+                Some(k) => info!(invite = %k.public_key(), "team invite key loaded"),
+                None => warn!("no teams.invite_key_file: team invite links answer 503"),
+            }
             spawn_loops(state.clone());
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
@@ -157,6 +178,7 @@ async fn main() -> Result<()> {
             let sent = sync::run_outbox_once(&state).await?;
             let report = sync::reconcile_once(&state).await?;
             let sent_after = sync::run_outbox_once(&state).await?;
+            // No invite link sweep here: its per-team lock is in-process, so only `serve` sweeps.
             println!(
                 "confirmed {} command(s); reconcile: {report:?}",
                 sent + sent_after

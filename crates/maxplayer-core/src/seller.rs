@@ -55,9 +55,11 @@ pub fn require_seller_config(home: &MaxplayerHome) -> Result<&SellerConfig, Sell
     let seller = home.config.seller.as_ref().ok_or_else(|| {
         SellerError::Config("missing required [seller] section (agent_command, rate_sats, git_remote)".into())
     })?;
-    if seller.agent_command.is_empty() {
+    // `agent_command` is the unlabelled fallback, used only when `agents` is empty; a named roster
+    // (e.g. a hook-only seat, which has no ACP fallback) satisfies readiness on its own.
+    if seller.agent_command.is_empty() && seller.agents.is_empty() {
         return Err(SellerError::Config(
-            "missing required field agent_command (argv array)".into(),
+            "missing required field agent_command (argv array), or a [seller] agents list".into(),
         ));
     }
     if seller.agent_command.iter().any(|part| part.is_empty()) {

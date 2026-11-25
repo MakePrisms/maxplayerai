@@ -129,8 +129,21 @@ export const TRADE_KINDS: readonly number[] = Object.freeze([TRADE_LOT, TRADE_ST
 /** NIP-98 HTTP request authentication, never a market event. */
 export const HTTP_AUTH = 27235;
 
-/** Community challenge records and NIP-42 relay authentication. */
-export const CHALLENGE = 30341;
-export const MEMBERSHIP = 30342;
-export const DECISION = 30343;
+/**
+ * Swarm events (docs/specs/swarm.md §4), addressable, newest per (author, kind, d) wins.
+ * SWARM_JOB (buyer, `a` = its swarm), SWARM_MEMBERSHIP (seller, d = `<buyer>:<swarm d>`),
+ * SWARM_DECISION (buyer, buyer-wide or per swarm) and SWARM (buyer: name, purpose).
+ */
+export const SWARM_JOB = 30341;
+export const SWARM_MEMBERSHIP = 30342;
+export const SWARM_DECISION = 30343;
+export const SWARM = 30344;
+/**
+ * The pre-swarm names of 30341–30343, read only by the old runner (scripts/challenges, retired in
+ * PR 6 of docs/specs/swarm.md) through src/challenge/shared. The board uses the SWARM_* names.
+ */
+export const CHALLENGE = SWARM_JOB;
+export const MEMBERSHIP = SWARM_MEMBERSHIP;
+export const DECISION = SWARM_DECISION;
+/** NIP-42 relay authentication. */
 export const RELAY_AUTH = 22242;

@@ -22,18 +22,134 @@ use sha2::{Digest, Sha256};
 
 /// Terms of Service version this build shows and accepts: its effective date (spec §7.1: one page
 /// per version; Bob, 29 Oct 2026: versions are dates, not v1/v2).
-pub const TERMS_VERSION: &str = "20261029";
+pub const TERMS_VERSION: &str = "20261123";
 /// Privacy Policy version shown when the email is asked for (spec §7.1, §3 step 1).
-pub const PRIVACY_VERSION: &str = "20261029";
+pub const PRIVACY_VERSION: &str = "20261123";
 /// Version of [`MARKETING_NOTICE`] (spec §8.1: the notice version shown is recorded).
 pub const MARKETING_NOTICE_VERSION: &str = "v1";
 /// The versioned pages the CLI links (the service also returns its own URLs on `link/request`).
-pub const TERMS_URL: &str = "https://www.maxplayer.ai/terms/20261029";
-pub const PRIVACY_URL: &str = "https://www.maxplayer.ai/privacy/20261029";
+pub const TERMS_URL: &str = "https://www.maxplayer.ai/terms/20261123";
+pub const PRIVACY_URL: &str = "https://www.maxplayer.ai/privacy/20261123";
 
 /// Spec §3 step 1: shown when the CLI asks for the email, or before it sends one given by flag.
 pub fn privacy_notice() -> String {
-    format!("Your email is used as described in our Privacy Policy: {PRIVACY_URL}")
+    LegalVersions::builtin().privacy_notice()
+}
+
+/// The website's legal versions manifest (`web/app/public/legal/versions.json`). Its `current`
+/// entry is the terms and privacy version a new `account link` offers, so a new version needs no
+/// release; the registration service accepts the versions it lists. [`LEGAL_VERSIONS_ENV`] points
+/// it elsewhere (tests; empty = this build's versions only).
+pub const LEGAL_VERSIONS_URL: &str = "https://www.maxplayer.ai/legal/versions.json";
+pub const LEGAL_VERSIONS_ENV: &str = "MAXPLAYER_LEGAL_VERSIONS_URL";
+const LEGAL_VERSIONS_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+
+/// The terms and privacy versions one `account link` shows and sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegalVersions {
+    pub terms: String,
+    pub privacy: String,
+}
+
+#[derive(Deserialize)]
+struct ManifestCurrent {
+    terms: String,
+    privacy: String,
+}
+
+#[derive(Deserialize)]
+struct Manifest {
+    current: ManifestCurrent,
+    terms: Vec<String>,
+    privacy: Vec<String>,
+}
+
+fn is_dated_version(v: &str) -> bool {
+    v.len() == 8 && v.bytes().all(|b| b.is_ascii_digit())
+}
+
+impl LegalVersions {
+    /// The versions this build ships with ([`TERMS_VERSION`], [`PRIVACY_VERSION`]).
+    pub fn builtin() -> Self {
+        Self {
+            terms: TERMS_VERSION.to_owned(),
+            privacy: PRIVACY_VERSION.to_owned(),
+        }
+    }
+
+    /// The site's current versions, read from the manifest at `url`. This build's versions when
+    /// `url` is `None`/empty or the manifest cannot be read, so linking never depends on the
+    /// site being up.
+    pub fn current(url: Option<&str>) -> Self {
+        let builtin = Self::builtin();
+        match url.filter(|u| !u.is_empty()).and_then(fetch_manifest) {
+            Some(body) => builtin.with_manifest(&body),
+            None => builtin,
+        }
+    }
+
+    /// The manifest's `current` versions when it is well formed (every entry `YYYYMMDD`,
+    /// `current` listed). Each document only moves forward: a manifest older than this build
+    /// (a stale cache, a rollback) never makes it offer an earlier version.
+    pub fn with_manifest(self, body: &[u8]) -> Self {
+        let Ok(m) = serde_json::from_slice::<Manifest>(body) else {
+            return self;
+        };
+        let valid = |list: &[String], current: &str| {
+            !list.is_empty()
+                && list.iter().all(|v| is_dated_version(v))
+                && list.iter().any(|v| v == current)
+        };
+        if !valid(&m.terms, &m.current.terms) || !valid(&m.privacy, &m.current.privacy) {
+            return self;
+        }
+        // Same-length digit strings compare as dates.
+        let newer = |site: String, ours: String| if site > ours { site } else { ours };
+        Self {
+            terms: newer(m.current.terms, self.terms),
+            privacy: newer(m.current.privacy, self.privacy),
+        }
+    }
+
+    pub fn terms_url(&self) -> String {
+        format!("https://www.maxplayer.ai/terms/{}", self.terms)
+    }
+
+    pub fn privacy_url(&self) -> String {
+        format!("https://www.maxplayer.ai/privacy/{}", self.privacy)
+    }
+
+    /// Spec §3 step 1, naming this privacy version's page.
+    pub fn privacy_notice(&self) -> String {
+        format!(
+            "Your email is used as described in our Privacy Policy: {}",
+            self.privacy_url()
+        )
+    }
+}
+
+/// The manifest's bytes, or `None` on any failure (no redirects, 5 s, at most 64 KiB).
+fn fetch_manifest(url: &str) -> Option<Vec<u8>> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .connect_timeout(LEGAL_VERSIONS_TIMEOUT)
+        .timeout(LEGAL_VERSIONS_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("maxplayer/", env!("CARGO_PKG_VERSION")));
+    if is_loopback_host(url) {
+        builder = builder.no_proxy();
+    }
+    let response = builder.build().ok()?.get(url).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let mut body = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(response, MAX_MANIFEST_BYTES + 1),
+        &mut body,
+    )
+    .ok()?;
+    (body.len() as u64 <= MAX_MANIFEST_BYTES).then_some(body)
 }
 
 /// Spec §3 step 6 / §8.1, text version [`MARKETING_NOTICE_VERSION`]. Product news is automatic
@@ -46,6 +162,10 @@ pub const PATH_LINK_REQUEST: &str = "/link/request";
 pub const PATH_LINK_CONFIRM: &str = "/link/confirm";
 pub const PATH_STATUS: &str = "/status";
 pub const PATH_MARKETING: &str = "/marketing";
+/// Team invite links (docs/specs/maxplayer-team.md §12).
+pub const PATH_TEAM_INVITE: &str = "/team/invite";
+pub const PATH_TEAM_JOIN: &str = "/team/join";
+pub const PATH_TEAM_REVOKE: &str = "/team/revoke";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -129,6 +249,29 @@ pub struct Status {
 pub struct Marketing {
     /// `subscribed` or `unsubscribed`.
     pub marketing: String,
+}
+
+/// `POST /team/invite`: a join link for a team.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TeamLink {
+    pub link: String,
+    pub channel: String,
+    pub expires_at: String,
+    pub expires_in_secs: u64,
+}
+
+/// `POST /team/join`: the invite key added this key to `channel`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TeamJoined {
+    pub status: String,
+    pub channel: String,
+}
+
+/// `POST /team/revoke`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TeamRevoked {
+    pub revoked: u64,
+    pub channel: String,
 }
 
 /// A refusal the service answered with its `{error, message}` body.
@@ -263,11 +406,15 @@ pub fn plain_message_for(api: &ApiError, link: &str) -> String {
         "invalid_label" => {
             "The label must be 1-64 letters, digits, spaces, '.', '_' or '-'.".to_owned()
         }
-        "unknown_terms_version" | "unknown_privacy_version" | "unknown_notice_version" => format!(
-            "The registration service no longer accepts the terms or privacy version this \
-             maxplayer offers ({TERMS_VERSION}). Update maxplayer and try again."
-        ),
-        "invalid_entered_by" | "invalid_body" => format!(
+        "unknown_terms_version" | "unknown_privacy_version" | "unknown_notice_version" => {
+            "The registration service does not accept the terms or privacy version this \
+             maxplayer offered. Update maxplayer and try again."
+                .to_owned()
+        }
+        "legal_versions_unavailable" => "The registration service could not check the terms \
+             version this maxplayer offered. Try again in a few minutes."
+            .to_owned(),
+        "invalid_entered_by" | "invalid_body" | "invalid_channel" => format!(
             "The registration service did not accept this request ({}). Update maxplayer and try \
              again.",
             api.code
@@ -278,6 +425,30 @@ pub fn plain_message_for(api: &ApiError, link: &str) -> String {
         "not_registered" => {
             format!("This key is not linked to an email yet. Run `{link}` first.")
         }
+        "invite_expired" => "This invite link has expired. Ask a team member for a new one \
+             (`maxplayer team invite <team> --link`)."
+            .to_owned(),
+        "invite_revoked" => {
+            "This invite link was revoked. Ask a team member for a new one.".to_owned()
+        }
+        "invalid_invite" => "No such invite link. Check that the whole link was copied.".to_owned(),
+        "not_team_member" => {
+            "Only a member of the team can make or revoke its invite links.".to_owned()
+        }
+        "invite_key_not_in_team" => {
+            "The team's invite key was not added yet. Try again in a moment.".to_owned()
+        }
+        "invites_not_configured" => {
+            "Team invite links are not enabled on this registration service.".to_owned()
+        }
+        "invalid_expiry" => "An invite link lasts between 1 minute and 30 days.".to_owned(),
+        "relay_unavailable" => "The registration service could not reach the team on the relay. \
+             Try again in a few minutes."
+            .to_owned(),
+        // The relay answered: waiting will not help (the invite key was removed, or the team is gone).
+        "relay_refused" => "The relay did not add this key to the team. Try again, or ask a team \
+             member for a new link."
+            .to_owned(),
         "stale_auth" => "The registration service refused the request's signature as too old or \
              too new. Check that this computer's clock is right, then try again."
             .to_owned(),
@@ -487,8 +658,14 @@ impl RegistrationClient {
         format!("{}{path}", self.base)
     }
 
-    /// Spec §3 steps 3–4: ask the service to email a 6-digit code to `email`.
-    pub fn request_code(&self, email: &str, label: &str) -> Result<CodeSent, RegistrationError> {
+    /// Spec §3 steps 3–4: ask the service to email a 6-digit code to `email`, accepting
+    /// `legal`'s terms and privacy versions.
+    pub fn request_code(
+        &self,
+        email: &str,
+        label: &str,
+        legal: &LegalVersions,
+    ) -> Result<CodeSent, RegistrationError> {
         let email = email.trim();
         if !looks_like_email(email) {
             return Err(RegistrationError::Input(
@@ -503,8 +680,8 @@ impl RegistrationClient {
         let body = serde_json::json!({
             "email": email,
             "label": label,
-            "terms_version": TERMS_VERSION,
-            "privacy_version": PRIVACY_VERSION,
+            "terms_version": legal.terms,
+            "privacy_version": legal.privacy,
             "notice_version": MARKETING_NOTICE_VERSION,
         });
         self.send("POST", PATH_LINK_REQUEST, Some(&body))
@@ -530,6 +707,38 @@ impl RegistrationClient {
         let body =
             serde_json::json!({ "enabled": enabled, "notice_version": MARKETING_NOTICE_VERSION });
         self.send("POST", PATH_MARKETING, Some(&body))
+    }
+
+    /// A join link for the team `channel` (the caller must be a member, and the team invite key
+    /// must already be in it).
+    pub fn team_invite_link(
+        &self,
+        channel: &str,
+        expires_in_secs: Option<u64>,
+    ) -> Result<TeamLink, RegistrationError> {
+        let mut body = serde_json::json!({ "channel": channel });
+        if let Some(secs) = expires_in_secs {
+            body["expires_in_secs"] = secs.into();
+        }
+        self.send("POST", PATH_TEAM_INVITE, Some(&body))
+    }
+
+    /// Redeem a link's token: the service adds this key to the team.
+    pub fn team_join(&self, token: &str) -> Result<TeamJoined, RegistrationError> {
+        self.send(
+            "POST",
+            PATH_TEAM_JOIN,
+            Some(&serde_json::json!({ "token": token })),
+        )
+    }
+
+    /// Revoke every live link of the team `channel`.
+    pub fn team_revoke(&self, channel: &str) -> Result<TeamRevoked, RegistrationError> {
+        self.send(
+            "POST",
+            PATH_TEAM_REVOKE,
+            Some(&serde_json::json!({ "channel": channel })),
+        )
     }
 
     fn send<T: serde::de::DeserializeOwned>(
@@ -800,12 +1009,23 @@ mod tests {
             "unknown_terms_version",
             "unknown_privacy_version",
             "unknown_notice_version",
+            "legal_versions_unavailable",
             "invalid_entered_by",
             "rate_limited",
             "email_send_failed",
             "no_pending_code",
             "too_many_attempts",
             "not_registered",
+            "invite_expired",
+            "invite_revoked",
+            "invalid_invite",
+            "not_team_member",
+            "invite_key_not_in_team",
+            "invites_not_configured",
+            "invalid_expiry",
+            "invalid_channel",
+            "relay_unavailable",
+            "relay_refused",
         ] {
             let text = plain_message(&api(code, 400));
             assert!(!text.contains("refused the request ("), "{code}: {text}");
@@ -893,6 +1113,60 @@ mod tests {
     }
 
     #[test]
+    fn the_sites_manifest_only_moves_each_version_forward() {
+        let built = LegalVersions::builtin();
+        assert_eq!(
+            (built.terms.as_str(), built.privacy.as_str()),
+            (TERMS_VERSION, PRIVACY_VERSION)
+        );
+        assert_eq!(built.terms_url(), TERMS_URL);
+        assert_eq!(built.privacy_url(), PRIVACY_URL);
+        assert_eq!(built.privacy_notice(), privacy_notice());
+        let with = |body: &str| LegalVersions::builtin().with_manifest(body.as_bytes());
+        let newer = with(
+            r#"{"current":{"terms":"20990101","privacy":"20990202"},
+                "terms":["20261123","20990101"],"privacy":["20990202"],"fees":["x"]}"#,
+        );
+        assert_eq!(
+            (newer.terms.as_str(), newer.privacy.as_str()),
+            ("20990101", "20990202")
+        );
+        assert_eq!(newer.terms_url(), "https://www.maxplayer.ai/terms/20990101");
+        assert!(
+            newer
+                .privacy_notice()
+                .ends_with("https://www.maxplayer.ai/privacy/20990202")
+        );
+        // Per document: an older privacy entry keeps this build's.
+        let mixed = with(
+            r#"{"current":{"terms":"20990101","privacy":"20261029"},
+                "terms":["20990101"],"privacy":["20261029"]}"#,
+        );
+        assert_eq!(
+            (mixed.terms.as_str(), mixed.privacy.as_str()),
+            ("20990101", PRIVACY_VERSION)
+        );
+        for bad in [
+            "",
+            "<!doctype html><title>Maxplayer</title>",
+            r#"{"current":{"terms":"20990101","privacy":"20990101"},"terms":["20261123"],"privacy":["20990101"]}"#,
+            r#"{"current":{"terms":"20990101","privacy":"20990101"},"terms":["20990101","v2"],"privacy":["20990101"]}"#,
+            r#"{"current":{"terms":"2099010","privacy":"20990101"},"terms":["2099010"],"privacy":["20990101"]}"#,
+            r#"{"current":{"terms":"20990101","privacy":"20990101"},"terms":[],"privacy":["20990101"]}"#,
+            r#"{"terms":["20990101"],"privacy":["20990101"]}"#,
+        ] {
+            assert_eq!(with(bad), LegalVersions::builtin(), "{bad}");
+        }
+        // No URL, or one that cannot answer: this build's versions.
+        assert_eq!(LegalVersions::current(None), LegalVersions::builtin());
+        assert_eq!(LegalVersions::current(Some("")), LegalVersions::builtin());
+        assert_eq!(
+            LegalVersions::current(Some("http://127.0.0.1:9/legal/versions.json")),
+            LegalVersions::builtin()
+        );
+    }
+
+    #[test]
     fn wait_text_reads_plainly() {
         assert_eq!(wait_text(1), "1 second");
         assert_eq!(wait_text(59), "59 seconds");
@@ -902,8 +1176,10 @@ mod tests {
 
     #[test]
     fn notices_carry_the_versioned_links_and_the_off_switch() {
-        assert!(privacy_notice().contains("https://www.maxplayer.ai/privacy/20261029"));
+        assert!(privacy_notice().contains("https://www.maxplayer.ai/privacy/20261123"));
         assert!(MARKETING_NOTICE.contains("maxplayer account marketing off"));
-        assert_eq!(TERMS_URL, "https://www.maxplayer.ai/terms/20261029");
+        assert_eq!(TERMS_URL, "https://www.maxplayer.ai/terms/20261123");
+        assert_eq!((TERMS_VERSION, PRIVACY_VERSION), ("20261123", "20261123"));
+        assert!(PRIVACY_URL.ends_with(PRIVACY_VERSION) && TERMS_URL.ends_with(TERMS_VERSION));
     }
 }

@@ -47,6 +47,10 @@ divergence, mirroring `crates/maxplayer-core/src/kinds.rs`):
 | `KIND_MAXPLAYER_REVIEW` | 3408 | signed execution-safety assessment |
 | `KIND_MAXPLAYER_REVIEW_REQUEST` | 3409 | request an execution-safety assessment |
 | `KIND_MOBEE_SELLER_HEARTBEAT` | 30340 | addressable seller liveness |
+| `KIND_MAXPLAYER_SWARM_JOB` | 30341 | addressable buyer swarm job (docs/specs/swarm.md) |
+| `KIND_MAXPLAYER_SWARM_MEMBERSHIP` | 30342 | addressable seller swarm membership |
+| `KIND_MAXPLAYER_SWARM_DECISION` | 30343 | addressable buyer accept/deny of a seller |
+| `KIND_MAXPLAYER_SWARM` | 30344 | addressable buyer swarm (name, purpose) |
 | `KIND_MOBEE_NIP89_HANDLER`    | 31990 | NIP-89 handler advertisement |
 | `KIND_MOBEE_DM_RELAY_LIST`    | 10050 | NIP-17 DM-relay list (size-bounded, no `p`-tag req) |
 

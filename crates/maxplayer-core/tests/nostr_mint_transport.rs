@@ -958,3 +958,409 @@ async fn nostr_mint_identity_authors_the_request() {
         "{authors:?}"
     );
 }
+
+/// A relay that accepts TCP and never completes the WebSocket handshake (a hung or filtered relay).
+async fn black_hole() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    url
+}
+
+/// Field report 2026-11-16: one mint relay never connected, and every request waited the full
+/// connect timeout for it (5.3 s per request; a maker's lock missed its 60 s deadline). The request
+/// now goes out as soon as ONE relay is connected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_an_unreachable_relay_does_not_delay_the_request() {
+    let (_relay, relay_url) = relay().await;
+    let mint = start_mint(&relay_url, Mode::Answer).await;
+    let dead = black_hole().await;
+    let c = NostrMintConnector::new(
+        &MintUrl::from_str(&mint.url).unwrap(),
+        vec![dead.clone(), relay_url.clone()],
+    )
+    .unwrap()
+    .with_timing(
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+        Duration::from_secs(3),
+    );
+    for _ in 0..2 {
+        let started = std::time::Instant::now();
+        let (result, obs) = c.call_observed("info", Value::Null).await;
+        assert!(result.is_ok(), "{result:?} {obs:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "waited {:?} for the unreachable relay: {obs:?}",
+            started.elapsed()
+        );
+        assert!(
+            !obs.relays[dead.trim_end_matches('/')].ever_connected,
+            "{obs:?}"
+        );
+    }
+}
+
+fn members_relay(registered: &Keys, mint: &Keys) -> auth_gated_relay::AuthRelayOptions {
+    auth_gated_relay::AuthRelayOptions {
+        members: Some([registered.public_key(), mint.public_key()]),
+        ..Default::default()
+    }
+}
+
+/// With persistent connections, every request (and every connector built the same way) reuses one
+/// signed-in connection instead of opening and signing in per request. Without them, as before,
+/// each request opens its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_persistent_connection_is_opened_and_signed_in_once() {
+    use auth_gated_relay::{AuthRelay, Counters};
+    let registered = Keys::generate();
+    let mint_keys = Keys::generate();
+    let relay = AuthRelay::start(members_relay(&registered, &mint_keys)).await;
+    let mint = start_mint_as(&relay.url, Mode::Answer, mint_keys).await;
+    let opened = || Counters::get(&relay.counters.connections);
+    let signed_in = || Counters::get(&relay.counters.auths);
+    let (connections, auths) = (opened(), signed_in());
+    let persistent = || {
+        connector(&mint, &relay.url, 8000, 10_000)
+            .with_identity(registered.clone())
+            .with_persistent_connections()
+    };
+    let c = persistent();
+    for n in 0..3 {
+        let (result, obs) = c.call_observed("info", Value::Null).await;
+        assert!(result.is_ok(), "request {n}: {result:?} {obs:?}");
+    }
+    let (result, obs) = persistent().call_observed("info", Value::Null).await;
+    assert!(result.is_ok(), "{result:?} {obs:?}");
+    assert_eq!(opened() - connections, 1, "{:?}", relay.counters);
+    assert_eq!(signed_in() - auths, 1, "{:?}", relay.counters);
+    // A reused connection asks nothing of the relay first: the reply is the mint's latency only.
+    let started = std::time::Instant::now();
+    c.call_observed("info", Value::Null).await.0.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let plain = connector(&mint, &relay.url, 8000, 10_000).with_identity(registered.clone());
+    plain.call_observed("info", Value::Null).await.0.unwrap();
+    plain.call_observed("info", Value::Null).await.0.unwrap();
+    assert_eq!(opened() - connections, 3, "{:?}", relay.counters);
+}
+
+/// A shared connection whose sockets all dropped is replaced at once on the next request, instead
+/// of waiting out the SDK's reconnect backoff (10 s and more). A fresh mint process answers right
+/// after the drop, so only the client's own reconnect can delay the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_persistent_connection_recovers_from_a_drop_without_backoff() {
+    use auth_gated_relay::{AuthRelay, Counters};
+    let registered = Keys::generate();
+    let mint_keys = Keys::generate();
+    let relay = AuthRelay::start(members_relay(&registered, &mint_keys)).await;
+    let mint = start_mint_as(&relay.url, Mode::Answer, mint_keys.clone()).await;
+    let c = connector(&mint, &relay.url, 8000, 10_000)
+        .with_identity(registered)
+        .with_persistent_connections();
+    c.call_observed("info", Value::Null).await.0.unwrap();
+    relay.drop_connections();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The restarted mint is connected and signed in, with its subscription re-sent.
+    let _restarted = start_mint_as(&relay.url, Mode::Answer, mint_keys).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while Counters::get(&relay.counters.deaf) != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}",
+            relay.counters
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let connections = Counters::get(&relay.counters.connections);
+    let started = std::time::Instant::now();
+    let (result, obs) = c.call_observed("info", Value::Null).await;
+    assert!(result.is_ok(), "{result:?} {obs:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "waited {:?} after a drop: {obs:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        Counters::get(&relay.counters.connections),
+        connections + 1,
+        "one fresh connection, opened at once: {:?}",
+        relay.counters
+    );
+}
+
+/// The shared connection belongs to one tokio runtime: a later runtime (the payment worker builds
+/// its own) never reuses a client whose tasks died with an earlier one.
+#[test]
+fn nostr_mint_persistent_connection_is_per_runtime() {
+    let main = tokio::runtime::Runtime::new().unwrap();
+    let registered = Keys::generate();
+    let (_relay, mint, c) = main.block_on(async {
+        let (relay, relay_url) = relay().await;
+        let mint = start_mint(&relay_url, Mode::Answer).await;
+        let c = connector(&mint, &relay_url, 8000, 10_000)
+            .with_identity(registered)
+            .with_persistent_connections();
+        (relay, mint, c)
+    });
+    for n in 0..3 {
+        let worker = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (result, obs) = worker.block_on(c.call_observed("info", Value::Null));
+        assert!(result.is_ok(), "runtime {n}: {result:?} {obs:?}");
+        drop(worker);
+    }
+    drop(mint);
+}
+
+fn shared(mint_url: &str, relays: &[String], keys: &Keys, window_ms: u64) -> NostrMintConnector {
+    NostrMintConnector::new(&MintUrl::from_str(mint_url).unwrap(), relays.to_vec())
+        .unwrap()
+        .with_timing(
+            Duration::from_millis(window_ms),
+            // Longer than any window: only a live REQ+EVENT on a (re)connect or sign-in answers.
+            Duration::from_secs(60),
+            Duration::from_secs(3),
+        )
+        .with_identity(keys.clone())
+        .with_persistent_connections()
+}
+
+fn silent_mint_url() -> String {
+    format!(
+        "nostr://{}",
+        Keys::generate().public_key().to_bech32().unwrap()
+    )
+}
+
+/// Wait until `value()` is `want`, or fail with `context`.
+async fn eventually(value: impl Fn() -> usize, want: usize, context: impl Fn() -> String) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while value() != want {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} != {want}: {}",
+            value(),
+            context()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Review r1 H1-H3. The shared connection stays up on an open relay (no mint there) while the
+/// sign-in-required relay the mint listens on drops; the SDK reconnects it ~10 s later.
+/// - H2: a request made while that relay is down is never queued for it, so nothing reaches it
+///   when it comes back, after the request returned and maybe after its `exp`.
+/// - H1: a request started while it is down gets its subscription and request out as soon as it
+///   reconnects (and again after sign-in), and is answered without any re-send.
+/// - H3: on the reconnected socket the next request is answered at once, never on a deaf
+///   subscription.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_persistent_connection_survives_its_mint_relay_reconnecting() {
+    use auth_gated_relay::{AuthRelay, Counters};
+    let registered = Keys::generate();
+    let mint_keys = Keys::generate();
+    let (_open, open_url) = relay().await;
+    let gated = AuthRelay::start(members_relay(&registered, &mint_keys)).await;
+    let mint = start_mint_as(&gated.url, Mode::Answer, mint_keys.clone()).await;
+    let relays = vec![open_url.clone(), gated.url.clone()];
+    let gated_key = gated.url.trim_end_matches('/').to_owned();
+    let c = shared(&mint.url, &relays, &registered, 25_000);
+    c.call_observed("info", Value::Null).await.0.unwrap();
+
+    gated.drop_connections();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _restarted = start_mint_as(&gated.url, Mode::Answer, mint_keys).await;
+    eventually(
+        || Counters::get(&gated.counters.deaf),
+        0,
+        || format!("{:?}", gated.counters),
+    )
+    .await;
+
+    // H2.
+    let silent = shared(&silent_mint_url(), &relays, &registered, 1500);
+    let (result, obs) = silent.call_observed("info", Value::Null).await;
+    assert!(matches!(result, Err(Error::Timeout)), "{result:?} {obs:?}");
+    assert!(
+        !obs.relays[&gated_key].ever_connected,
+        "the mint relay was down during this request: {obs:?}"
+    );
+    let late = obs.request_event.clone().unwrap();
+
+    // H1.
+    let (result, obs) = c.call_observed("info", Value::Null).await;
+    assert!(result.is_ok(), "{result:?} {obs:?} {:?}", gated.counters);
+    assert_eq!(obs.attempts, 1, "answered without a re-send: {obs:?}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !gated.counters.client_events.lock().unwrap().contains(&late),
+        "a request sent while the relay was down reached it after returning: {:?}",
+        gated.counters
+    );
+
+    // H3.
+    let started = std::time::Instant::now();
+    let (result, obs) = c.call_observed("info", Value::Null).await;
+    assert!(result.is_ok(), "{result:?} {obs:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?} {obs:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        Counters::get(&gated.counters.events_while_deaf),
+        0,
+        "{:?}",
+        gated.counters
+    );
+    assert_eq!(
+        Counters::get(&gated.counters.dropped_live),
+        0,
+        "{:?}",
+        gated.counters
+    );
+}
+
+/// Review r1 H4 and L2. Concurrent first requests share one connection and one sign-in; every
+/// request closes its reply subscription on the shared connection, also when its caller gives up
+/// on it mid-wait (an outer timeout drops the future).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nostr_mint_persistent_connection_closes_every_request_subscription() {
+    use auth_gated_relay::{AuthRelay, Counters};
+    let registered = Keys::generate();
+    let mint_keys = Keys::generate();
+    let relay = AuthRelay::start(members_relay(&registered, &mint_keys)).await;
+    let mint = start_mint_as(&relay.url, Mode::Answer, mint_keys).await;
+    let relays = vec![relay.url.clone()];
+    // The mint's own subscription.
+    eventually(
+        || Counters::get(&relay.counters.open_subs),
+        1,
+        || format!("{:?}", relay.counters),
+    )
+    .await;
+    let (connections, auths) = (
+        Counters::get(&relay.counters.connections),
+        Counters::get(&relay.counters.auths),
+    );
+
+    let c = shared(&mint.url, &relays, &registered, 8000);
+    let calls: Vec<_> = (0..8)
+        .map(|_| {
+            let c = c.clone();
+            tokio::spawn(async move { c.call_observed("info", Value::Null).await })
+        })
+        .collect();
+    for call in calls {
+        let (result, obs) = call.await.unwrap();
+        assert!(result.is_ok(), "{result:?} {obs:?}");
+    }
+    assert_eq!(
+        Counters::get(&relay.counters.connections) - connections,
+        1,
+        "{:?}",
+        relay.counters
+    );
+    assert_eq!(
+        Counters::get(&relay.counters.auths) - auths,
+        1,
+        "{:?}",
+        relay.counters
+    );
+    eventually(
+        || Counters::get(&relay.counters.open_subs),
+        1,
+        || format!("{:?}", relay.counters),
+    )
+    .await;
+
+    let silent = shared(&silent_mint_url(), &relays, &registered, 10_000);
+    for _ in 0..20 {
+        let given_up = tokio::time::timeout(
+            Duration::from_millis(300),
+            silent.call_observed("info", Value::Null),
+        )
+        .await;
+        assert!(given_up.is_err(), "the silent mint answered");
+    }
+    eventually(
+        || Counters::get(&relay.counters.open_subs),
+        1,
+        || {
+            format!(
+                "cancelled requests left subscriptions open: {:?}",
+                relay.counters
+            )
+        },
+    )
+    .await;
+    let (result, obs) = c.call_observed("info", Value::Null).await;
+    assert!(result.is_ok(), "{result:?} {obs:?}");
+    assert_eq!(
+        Counters::get(&relay.counters.connections) - connections,
+        1,
+        "{:?}",
+        relay.counters
+    );
+}
+
+/// Review r1 M1. A relay that refuses sign-in and keeps the socket open fails EVERY request fast
+/// as a sign-in error on a shared connection, not only the first: later requests see the
+/// refusal from the connection's state, since no new notification will report it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_persistent_refused_sign_in_fails_every_request_fast() {
+    use auth_gated_relay::{AuthRelay, AuthRelayOptions};
+    let relay = AuthRelay::start(AuthRelayOptions {
+        refuse_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let c = shared(
+        &silent_mint_url(),
+        std::slice::from_ref(&relay.url),
+        &Keys::generate(),
+        10_000,
+    );
+    for n in 0..3 {
+        let started = std::time::Instant::now();
+        let (result, obs) = c.call_observed("info", Value::Null).await;
+        let error = result.expect_err("refused sign-in");
+        assert!(!matches!(error, Error::Timeout), "request {n}: {error:?}");
+        assert!(
+            error.to_string().contains("sign-in"),
+            "request {n}: {error}"
+        );
+        assert!(!error.is_definitive_failure(), "{error:?}");
+        assert_eq!(obs.reachability, "auth_failed", "request {n}: {obs:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "request {n} took {:?}: {obs:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// Review r1 L3: an unusable relay URL is refused up front instead of being skipped silently.
+#[test]
+fn nostr_mint_invalid_relay_url_is_refused() {
+    let npub = Keys::generate().public_key().to_bech32().unwrap();
+    let error = NostrMintConnector::new(
+        &MintUrl::from_str(&format!("nostr://{npub}")).unwrap(),
+        vec!["wss://relay.example".into(), "not a relay".into()],
+    )
+    .expect_err("invalid relay url");
+    assert!(error.to_string().contains("not a relay"), "{error}");
+}

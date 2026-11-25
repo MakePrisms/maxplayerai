@@ -320,6 +320,9 @@ pub struct Config {
     pub private_job_repos: bool,
     /// Configured private-content service reader; never obtained from a caller's event.
     pub private_service_pubkey: Option<String>,
+    /// MAXPLAYER: serve team repositories, named after a private Buzz channel (default false).
+    /// Off denies them; a team-shaped name never falls through to public hosting.
+    pub team_repos: bool,
 
     /// When true, anonymous WebSocket REQ reads are allowed against community-global
     /// (channel-less) rows, and HTTP bridge `/query` requests skip the relay
@@ -863,6 +866,9 @@ impl Config {
             std::env::var("MAXPLAYER_PRIVATE_SERVICE_PUBKEY")
                 .unwrap_or_else(|_| maxplayer_private_protocol::DEFAULT_SERVICE_PUBKEY.into()),
         );
+        let team_repos = std::env::var("MAXPLAYER_TEAM_REPOS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
         let open_read = std::env::var("BUZZ_OPEN_READ")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -1512,6 +1518,7 @@ impl Config {
             git_public_read,
             private_job_repos,
             private_service_pubkey,
+            team_repos,
             open_read,
             klipy,
             media,
@@ -1666,12 +1673,13 @@ mod tests {
     #[test]
     fn private_defaults_and_explicit_overrides() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let names = ["MAXPLAYER_PRIVATE_JOB_REPOS", "MAXPLAYER_PRIVATE_SERVICE_PUBKEY"];
+        let names = ["MAXPLAYER_PRIVATE_JOB_REPOS", "MAXPLAYER_PRIVATE_SERVICE_PUBKEY", "MAXPLAYER_TEAM_REPOS"];
         let saved = names.map(|name| std::env::var_os(name));
         for name in names { std::env::remove_var(name); }
         let default = Config::from_env();
         std::env::set_var(names[0], "false");
         std::env::set_var(names[1], "custom-service");
+        std::env::set_var(names[2], "true");
         let custom = Config::from_env();
         for (name, value) in names.into_iter().zip(saved) {
             match value {
@@ -1681,10 +1689,12 @@ mod tests {
         }
         let default = default.unwrap();
         assert!(default.private_job_repos);
+        assert!(!default.team_repos, "teams are off unless enabled");
         assert_eq!(default.private_service_pubkey.as_deref(),
             Some(maxplayer_private_protocol::DEFAULT_SERVICE_PUBKEY));
         let custom = custom.unwrap();
         assert!(!custom.private_job_repos);
+        assert!(custom.team_repos);
         assert_eq!(custom.private_service_pubkey.as_deref(), Some("custom-service"));
     }
 

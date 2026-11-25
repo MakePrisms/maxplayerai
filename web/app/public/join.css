@@ -1,0 +1,77 @@
+/* /join/<token> in a browser (public/join-invite.html; Bob, 2026-11-23): the team invite in the look of / . site.css
+   gives the colours, type, logo, buttons, the copy box (.copy), the list of what a team gets (.gets) and the agent
+   marks (.av-*); this file lays out the one page. Loaded after site.css and scoped by html.jn or .jn-* classes, so
+   nothing here changes another page. No inline styles: the site's CSP drops them. */
+
+html.jn{overscroll-behavior-y:auto;color-scheme:dark}
+html.jn :focus-visible{outline:2px solid var(--giallo);outline-offset:3px}
+.jn-wrap{position:relative;min-height:100vh;min-height:100svh;overflow:hidden}
+
+.jn-nav{position:relative;z-index:5;height:var(--nav);display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 var(--pad)}
+.jn-navl{display:flex;align-items:center;gap:6px;font-size:15.5px;color:var(--mut);transition:color .2s}
+.jn-navl:hover{color:#fff}
+.jn-navl svg{width:16px;height:16px}
+
+/* the warm glow and the field of agent marks, right of the text (as on the invite card) */
+.jn-glow{position:absolute;left:58%;top:40px;width:820px;height:760px;border-radius:50%;filter:blur(96px);opacity:.42;z-index:1;pointer-events:none;
+  background:radial-gradient(300px 280px at 30% 30%,#ff2800 0,transparent 70%),radial-gradient(330px 320px at 78% 46%,#ff8a1c 0,transparent 70%),radial-gradient(380px 340px at 44% 88%,#ffdf00 0,transparent 70%)}
+.jn-field{position:absolute;right:0;top:var(--nav);width:44%;height:820px;z-index:0;pointer-events:none}
+.jn-m{position:absolute}
+.jn-f1{left:90%;top:70px;width:30px;height:30px;margin:-15px 0 0 -15px;opacity:0.3;filter:blur(1.8px) saturate(.75)}
+.jn-f2{left:60%;top:690px;width:30px;height:30px;margin:-15px 0 0 -15px;opacity:0.3;filter:blur(1.8px) saturate(.75)}
+.jn-f3{left:22%;top:90px;width:28px;height:28px;margin:-14px 0 0 -14px;opacity:0.28;filter:blur(1.8px) saturate(.75)}
+.jn-f4{left:30%;top:650px;width:26px;height:26px;margin:-13px 0 0 -13px;opacity:0.25;filter:blur(2px) saturate(.75)}
+.jn-f5{left:95%;top:470px;width:26px;height:26px;margin:-13px 0 0 -13px;opacity:0.25;filter:blur(2px) saturate(.75)}
+.jn-f6{left:66%;top:260px;width:24px;height:24px;margin:-12px 0 0 -12px;opacity:0.22;filter:blur(2.2px) saturate(.75)}
+.jn-f7{left:12%;top:560px;width:22px;height:22px;margin:-11px 0 0 -11px;opacity:0.2;filter:blur(2.4px) saturate(.75)}
+.jn-f8{left:63%;top:130px;width:54px;height:54px;margin:-27px 0 0 -27px;opacity:0.55;filter:blur(0.8px) saturate(.75)}
+.jn-f9{left:50%;top:520px;width:56px;height:56px;margin:-28px 0 0 -28px;opacity:0.55;filter:blur(0.8px) saturate(.75)}
+.jn-f10{left:82%;top:600px;width:50px;height:50px;margin:-25px 0 0 -25px;opacity:0.5;filter:blur(1px) saturate(.75)}
+.jn-f11{left:84%;top:190px;width:48px;height:48px;margin:-24px 0 0 -24px;opacity:0.45;filter:blur(1px) saturate(.75)}
+.jn-f12{left:18%;top:300px;width:46px;height:46px;margin:-23px 0 0 -23px;opacity:0.45;filter:blur(1px) saturate(.75)}
+.jn-f13{left:70%;top:380px;width:82px;height:82px;margin:-41px 0 0 -41px;opacity:0.8;filter:saturate(.75)}
+.jn-f14{left:27%;top:450px;width:72px;height:72px;margin:-36px 0 0 -36px;opacity:0.8;filter:saturate(.75)}
+.jn-f15{left:38%;top:210px;width:100px;height:100px;margin:-50px 0 0 -50px;opacity:0.78;filter:saturate(.75)}
+
+.jn-main{position:relative;z-index:3;max-width:calc(720px + var(--pad));padding:96px var(--pad) 72px}
+.jn-ey{display:flex;align-items:center;gap:9px}
+.jn-ey svg{width:20px;height:20px;color:var(--green)}
+.jn-main h1{margin-top:12px;font-weight:400;font-size:clamp(40px,4.6vw,66px);line-height:1.04;letter-spacing:-.022em;text-wrap:balance}
+.jn-lede{margin-top:16px;max-width:560px;font-size:clamp(17px,1.4vw,20px);line-height:1.4;letter-spacing:-.015em;color:var(--mut)}
+.jn-lede b{font-weight:500;color:#fff}
+.jn-main .copy{margin-top:30px}
+.jn-main .copy button.ok{background:var(--giallo)}
+/* the Copy button is as wide as "Copied" from the start, so the line beside it never reflows (Bob, 2026-11-23; the
+   same fix as /swarm's, swarm.css) */
+.jn-main .copy button{display:inline-flex;flex-direction:column;align-items:center;justify-content:center}
+.jn-main .copy button::after{content:"Copied";height:0;overflow:hidden;visibility:hidden}
+.jn-row{display:flex;gap:6px}
+.jn-row .av{width:24px;height:24px}
+.jn-works{margin-top:16px;display:flex;align-items:center;flex-wrap:wrap;gap:10px;font-size:14px;color:var(--mut)}
+.jn-main .gets{margin-top:34px}
+.jn-cta{margin-top:34px;display:flex;align-items:center;flex-wrap:wrap;gap:22px}
+.jn-ghost{background:transparent;color:#fff;box-shadow:inset 0 0 0 1px rgba(255,255,255,.28)}
+.jn-ghost:hover{background:rgba(255,255,255,.08)}
+
+/* the steps of join.md, closed until asked for */
+.jn-agent{margin-top:44px;border-top:1px solid rgba(255,255,255,.09);padding-top:4px}
+.jn-agent summary{list-style:none;display:flex;align-items:center;justify-content:space-between;height:52px;font-size:16px;color:var(--ink2);cursor:pointer}
+.jn-agent summary::-webkit-details-marker{display:none}
+.jn-agent summary i{font-style:normal;font-size:20px;color:var(--mut);transition:transform .2s}
+.jn-agent[open] summary i{transform:rotate(45deg)}
+.jn-steps{border-radius:14px;background:var(--card);box-shadow:inset 0 0 0 1px rgba(255,255,255,.1);padding:20px 22px;font-size:14.5px;line-height:1.55;color:var(--ink2)}
+.jn-steps p+p,.jn-steps ol,.jn-steps ol+p{margin-top:10px}
+.jn-steps ol{padding-left:20px}
+.jn-steps li+li{margin-top:8px}
+.jn-steps b,.jn-warn{color:#fff}
+.jn-steps b{font-weight:500}
+.jn-steps a{color:#fff;text-decoration:underline;text-decoration-color:rgba(255,255,255,.35);text-underline-offset:3px}
+.jn-steps code{font-family:var(--mono);font-size:13px;color:#fff;background:rgba(255,255,255,.07);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}
+
+@media (max-width:899px){
+  .jn-field,.jn-glow,.jn-navl span{display:none}
+  .jn-wrap::before{content:"";position:absolute;left:-20%;right:-20%;top:-60px;height:520px;filter:blur(80px);opacity:.33;pointer-events:none;
+    background:radial-gradient(220px 200px at 30% 40%,#ff2800 0,transparent 70%),radial-gradient(240px 220px at 75% 55%,#ff8a1c 0,transparent 70%),radial-gradient(260px 240px at 45% 90%,#ffdf00 0,transparent 70%)}
+  .jn-main{padding-top:40px}
+}
+.copysrc{position:fixed;left:0;top:0;opacity:0;pointer-events:none;white-space:pre;-webkit-user-select:text;user-select:text}   /* ui/clipboard.ts */

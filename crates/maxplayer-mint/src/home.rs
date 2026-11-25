@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 /// The relay used when `mint.toml` lists none (plus [`FALLBACK_RELAYS`]).
 pub const DEFAULT_RELAY: &str = "wss://relay.maxplayer.ai";
 
+/// How long [`MintHome::lock_run`] waits out a busy lock before deciding another `run` holds it.
+pub const LOCK_RUN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// `mint.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -28,6 +31,11 @@ pub struct MintConfig {
     /// Unset ⇒ [`default_name`] (`maxplayer-mint-<8 hex>`, like a seller's `maxplayer-seller-<8 hex>`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Where `run` writes its automatic backups. Unset ⇒ `<home>/mint/backups`. Point it at
+    /// storage on another machine or disk so a lost disk doesn't take the backups with it.
+    /// A relative path is taken from `<home>/mint/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_dir: Option<PathBuf>,
 }
 
 impl Default for MintConfig {
@@ -36,6 +44,7 @@ impl Default for MintConfig {
             relays: Vec::new(),
             rate_limit: 20,
             name: None,
+            backup_dir: None,
         }
     }
 }
@@ -61,6 +70,14 @@ impl MintConfig {
     /// The name `run` advertises: `name`, else [`default_name`].
     pub fn effective_name(&self, keys: &Keys) -> String {
         self.name.clone().unwrap_or_else(|| default_name(keys))
+    }
+
+    /// The backup directory of the mint in `mint_dir`.
+    pub fn backup_dir_in(&self, mint_dir: &Path) -> PathBuf {
+        match &self.backup_dir {
+            Some(dir) => mint_dir.join(dir),
+            None => mint_dir.join("backups"),
+        }
     }
 
     pub fn effective_relays(&self) -> Vec<String> {
@@ -121,17 +138,27 @@ impl MintHome {
     /// Locking the directory rather than a lock file means deleting a file can't sidestep it.
     /// `issue` doesn't take it: it never runs saga recovery and its journal is safe next to a
     /// live `run`.
+    ///
+    /// A busy lock is retried for about a second before it counts as another `run`: readers such
+    /// as `maxplayer mint` may probe it with a shared lock they release at once (macOS has no
+    /// `/proc/locks` to read instead), and such a probe must never stop a `run` from starting.
     pub fn lock_run(&self) -> Result<fs::File> {
         let dir =
             fs::File::open(&self.dir).with_context(|| format!("open {}", self.dir.display()))?;
-        match dir.try_lock() {
-            Ok(()) => Ok(dir),
-            Err(fs::TryLockError::WouldBlock) => bail!(
-                "another `maxplayer-mint run` is already serving {}",
-                self.dir.display()
-            ),
-            Err(fs::TryLockError::Error(error)) => {
-                Err(error).with_context(|| format!("lock {}", self.dir.display()))
+        let deadline = std::time::Instant::now() + LOCK_RUN_PATIENCE;
+        loop {
+            match dir.try_lock() {
+                Ok(()) => return Ok(dir),
+                Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(fs::TryLockError::WouldBlock) => bail!(
+                    "another `maxplayer-mint serve` is already serving {}",
+                    self.dir.display()
+                ),
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| format!("lock {}", self.dir.display()));
+                }
             }
         }
     }
@@ -189,12 +216,9 @@ impl MintHome {
         Ok(())
     }
 
-    pub fn load(&self) -> Result<Secrets> {
-        let key = read(&self.key_path())?;
-        let keys = Keys::parse(key.trim()).context("parse nostr.key")?;
-        let mnemonic =
-            Mnemonic::parse_normalized(read(&self.seed_path())?.trim()).context("parse seed")?;
-        let config = match fs::read_to_string(self.config_path()) {
+    /// `mint.toml` alone (defaults when it is missing).
+    pub fn config(&self) -> Result<MintConfig> {
+        let config: MintConfig = match fs::read_to_string(self.config_path()) {
             Ok(text) => toml::from_str(&text).context("parse mint.toml")?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => MintConfig::default(),
             Err(error) => return Err(error).context("read mint.toml"),
@@ -202,12 +226,22 @@ impl MintHome {
         if let Some(name) = &config.name {
             validate_name(name).context("mint.toml")?;
         }
-        Ok(Secrets {
-            keys,
-            seed: mnemonic.to_seed_normalized(""),
-            config,
-        })
+        Ok(config)
     }
+
+    pub fn load(&self) -> Result<Secrets> {
+        let key = read(&self.key_path())?;
+        let keys = Keys::parse(key.trim()).context("parse nostr.key")?;
+        let seed = parse_seed(&read(&self.seed_path())?)?;
+        let config = self.config()?;
+        Ok(Secrets { keys, seed, config })
+    }
+}
+
+/// The 64-byte seed from the text of a `seed` file (a BIP-39 mnemonic).
+pub fn parse_seed(text: &str) -> Result<[u8; 64]> {
+    let mnemonic = Mnemonic::parse_normalized(text.trim()).context("parse seed")?;
+    Ok(mnemonic.to_seed_normalized(""))
 }
 
 /// `nostr://<npub>` for the mint's key.
@@ -233,4 +267,35 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
 
 fn read(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    /// A reader's momentary shared probe (`maxplayer mint` on macOS) must not make `run` fail
+    /// "already serving"; a real holder still does, after [`LOCK_RUN_PATIENCE`].
+    #[test]
+    fn lock_run_waits_out_a_momentary_probe_but_not_a_real_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MintHome::at(tmp.path());
+        fs::create_dir(home.dir()).unwrap();
+
+        let probe = fs::File::open(home.dir()).unwrap();
+        probe.try_lock_shared().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(probe);
+        });
+        let held = home
+            .lock_run()
+            .expect("a probe released within the patience window");
+        releaser.join().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = MintHome::at(tmp.path()).lock_run().unwrap_err();
+        assert!(error.to_string().contains("already serving"), "{error:#}");
+        assert!(started.elapsed() >= LOCK_RUN_PATIENCE);
+        drop(held);
+    }
 }

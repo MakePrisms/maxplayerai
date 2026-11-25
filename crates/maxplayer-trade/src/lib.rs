@@ -647,7 +647,11 @@ mod tests {
 }
 
 pub fn lot_event(keys: &Keys, give: Leg, want: Leg) -> Result<Event> {
-    let now = Timestamp::now();
+    lot_event_at(keys, give, want, Timestamp::now())
+}
+/// [`lot_event`] created at `now` (tests build a lot that is already past its expiry).
+#[doc(hidden)]
+pub fn lot_event_at(keys: &Keys, give: Leg, want: Leg, now: Timestamp) -> Result<Event> {
     let l = Lot {
         trade_v: 1,
         give,
@@ -932,7 +936,9 @@ mod listing_tests {
 }
 
 pub mod backoff;
+pub mod cli;
 pub mod coordinator;
+pub mod host;
 pub mod journal;
 pub mod market;
 pub mod mint;

@@ -43,9 +43,9 @@ REPO_HOST_PATH="github.com/MakePrisms/maxplayerai"
 # is the point: a target released here but refused there (or the reverse) is a user finding out from a
 # 404 which install paths were really meant to work.
 #
-# `x86_64-apple-darwin` is deliberately absent — the matrix builds Apple Silicon only, and install.sh
-# refuses an Intel mac for exactly that reason.
-SUPPORTED_TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin)
+# A release older than the first one to ship `x86_64-apple-darwin` publishes no Intel mac asset: pass
+# `--unreleased x86_64-apple-darwin` when verifying one.
+SUPPORTED_TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin)
 
 die() { echo "verify-binstall-metadata: $*" >&2; exit 1; }
 usage() {

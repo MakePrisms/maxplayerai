@@ -13,10 +13,11 @@ const os = require("node:os");
 const PLATFORM_PACKAGES = {
   "linux-x64": "@maxplayerai/linux-x64",
   "linux-arm64": "@maxplayerai/linux-arm64",
-  // Apple Silicon only. An Intel mac reports darwin-x64, finds no entry, and gets the "not
-  // published yet" refusal below — the same answer install.sh gives it, for the same reason: the
-  // release matrix builds no x86_64 darwin artifact.
+  // Apple Silicon. Node under Rosetta reports darwin-x64, and gets the Intel build below, which
+  // runs there too (translated) — install.sh instead picks the native arm64 build for that case.
   "darwin-arm64": "@maxplayerai/darwin-arm64",
+  // Intel macs, built natively on an Intel runner (.github/release-platforms.json).
+  "darwin-x64": "@maxplayerai/darwin-x64",
 };
 
 const key = `${process.platform}-${process.arch}`;

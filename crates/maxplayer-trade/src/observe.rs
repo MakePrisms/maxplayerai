@@ -41,9 +41,9 @@ pub fn journal_rows(home: &Path, ns: &str) -> Result<Vec<(String, Vec<u8>, u64)>
     };
     let mut stmt = db.prepare(
         "SELECT key, value, updated_time FROM kv_store WHERE primary_namespace='trade-v1' \
-         AND secondary_namespace=?1 ORDER BY created_time, key",
+         AND secondary_namespace=?1 AND key != ?2 ORDER BY created_time, key",
     )?;
-    let rows = stmt.query_map([ns], |r| {
+    let rows = stmt.query_map([ns, crate::journal::OBSOLETE_TOMBSTONE_KEY], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, Vec<u8>>(1)?,

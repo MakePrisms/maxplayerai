@@ -352,9 +352,9 @@ pub fn read_status(home: &std::path::Path) -> Result<serde_json::Value> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     db.busy_timeout(std::time::Duration::from_secs(2))?;
-    let mut stmt = db.prepare("SELECT secondary_namespace, value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace IN ('swap','funding','withdrawal','receive','send')")?;
+    let mut stmt = db.prepare("SELECT secondary_namespace, value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace IN ('swap','funding','withdrawal','receive','send') AND key != ?1")?;
     let mut records = vec![];
-    for row in stmt.query_map([], |r| {
+    for row in stmt.query_map([crate::journal::OBSOLETE_TOMBSTONE_KEY], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
     })? {
         let (kind, bytes) = row?;
@@ -466,9 +466,9 @@ pub fn mixed_refusal(home: &Path) -> String {
         } else {
             format!(
                 "Move exactly those files into a new directory <dir> (e.g. {h}-legacy-trade), finish \
-                 and drain it there (`maxplayer-trade --home <dir> recover`, then `maxplayer-trade \
+                 and drain it there (`maxplayer trade --home <dir> recover`, then `maxplayer trade \
                  --home <dir> send <mint> --amount <n> --out <file>` and `maxplayer wallet receive \
-                 \"$(cat <file>)\" --home {h}`), then retry here.",
+                 --token-file <file> --home {h}`), then retry here.",
                 h = home.display()
             )
         }
@@ -723,6 +723,15 @@ pub async fn credit(
     db.update_proofs(added, remove).await?;
     Ok(())
 }
+/// Whether operation `op` (a uuid string) still holds any reserved proof in `mint`'s wallet.
+pub async fn holds(home: &Path, mint: &str, op: &str) -> Result<bool> {
+    let op = uuid::Uuid::parse_str(op)?;
+    Ok(!database(home, mint)
+        .await?
+        .get_reserved_proofs(&op)
+        .await?
+        .is_empty())
+}
 /// Release every proof `op` holds (`UPDATE … WHERE used_by_operation = op`), under the selection
 /// lock like every other proof write on a shared wallet.
 pub async fn release(home: &Path, mint: &str, op: &uuid::Uuid) -> Result<()> {
@@ -736,7 +745,7 @@ pub fn legacy_warning(home: &Path) -> String {
     format!(
         "warning: {} is a legacy standalone trading home (wallet.seed / trade.key); this mode is \
          deprecated. Only draining it and finishing in-flight trades are allowed there (balance, \
-         status, recover, send, withdraw, serve, cancel, doctor). Move its funds to your maxplayer \
+         status, recover, send, serve, cancel, doctor). Move its funds to your maxplayer \
          home and trade from there.",
         home.display()
     )
@@ -746,9 +755,9 @@ pub fn legacy_refusal(home: &Path) -> String {
     format!(
         "refused: {h} is a legacy standalone trading home; new trades and deposits are no longer \
          made there (finish in-flight trades with `serve`/`recover`/`cancel` first). Move its funds \
-         to your maxplayer home: `maxplayer-trade --home {h} send <mint> --amount <n> --out <file>`, \
-         then `maxplayer wallet receive \"$(cat <file>)\"`. Then trade from the maxplayer home \
-         (`maxplayer-trade` with no --home uses $MAXPLAYER_HOME or ~/.maxplayer).",
+         to your maxplayer home: `maxplayer trade --home {h} send <mint> --amount <n> --out <file>`, \
+         then `maxplayer wallet receive --token-file <file>`. Then trade from the maxplayer home \
+         (`maxplayer trade` with no --home uses $MAXPLAYER_HOME or ~/.maxplayer).",
         h = home.display()
     )
 }

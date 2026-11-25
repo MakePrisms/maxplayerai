@@ -7,7 +7,7 @@ repository = "https://github.com/MakePrisms/maxplayerai"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# ITS OWN WORKSPACE, like crates/maxplayer-mint and crates/maxplayer-challenges: sqlx/Postgres and
+# ITS OWN WORKSPACE, like crates/maxplayer-mint: sqlx/Postgres and
 # axum stay out of the root graph, so `cargo build --workspace` and the `maxplayer` binary are
 # byte-for-byte unchanged. Build it with `--manifest-path crates/maxplayer-registration/Cargo.toml`.
 [workspace]

@@ -42,12 +42,8 @@ path = "src/main.rs"
 #   any top-level template would therefore be a guess naming assets no release publishes. With only
 #   the overrides below, an unlisted target resolves nothing and binstall falls back to building from
 #   source, which is the honest outcome. This deliberately mirrors `install.sh`: the supported
-#   platform set is linux x86_64, linux aarch64 and macOS arm64, and nothing else is guessed at.
-#
-# ★ Note what is NOT here: `x86_64-apple-darwin`. The release matrix builds `aarch64-apple-darwin`
-#   only, so an Intel-mac override would name an asset no release publishes — 404, and binstall
-#   silently compiles from source instead. Same refusal `install.sh` makes for an Intel mac, for the
-#   same reason. The two must agree; `scripts/verify-binstall-metadata.sh` holds them to it.
+#   platform set is linux x86_64, linux aarch64, macOS arm64 and macOS x86_64, and nothing else is
+#   guessed at. The two must agree; `scripts/verify-binstall-metadata.sh` holds them to it.
 [package.metadata.binstall]
 pkg-fmt = "tgz"
 
@@ -68,6 +64,12 @@ bin-dir = "maxplayer-{ version }-linux-arm64/maxplayer"
 pkg-url = "https://github.com/MakePrisms/maxplayerai/releases/download/v{ version }/maxplayer-{ version }-darwin-arm64.tar.gz"
 bin-dir = "maxplayer-{ version }-darwin-arm64/maxplayer"
 
+# Intel macs. Releases before the first darwin-x64 one publish no such asset; binstall then builds
+# from source.
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "https://github.com/MakePrisms/maxplayerai/releases/download/v{ version }/maxplayer-{ version }-darwin-x64.tar.gz"
+bin-dir = "maxplayer-{ version }-darwin-x64/maxplayer"
+
 [features]
 default = ["wallet"]
 # `acp` compiles in the seller surface (agent execution + the `sell` advertise path). That surface
@@ -76,7 +78,7 @@ default = ["wallet"]
 # there is no acp-without-wallet build, so the `#[cfg(feature = "acp")]` gates on the seller surface
 # are sound (they can rely on the wallet-gated code being present). #360.
 acp = ["wallet", "maxplayer-core/acp"]
-wallet = ["maxplayer-core/wallet", "dep:git2", "dep:nostr-sdk"]
+wallet = ["maxplayer-core/wallet", "dep:git2", "dep:nostr-sdk", "dep:maxplayer-trade", "dep:reqwest", "dep:sha2", "dep:hex", "dep:flate2", "dep:tar", "dep:toml", "dep:semver", "dep:maxplayer-team"]
 # Dev-only: exposes `maxplayer stub-pay` (budget-gate exercise). Not on the settlement
 # path and not part of the default user CLI surface.
 stub-pay = []
@@ -94,6 +96,28 @@ git2 = { workspace = true, optional = true }
 # already resolves under `wallet`, so no new resolution — gated by `wallet` because the public key
 # it encodes comes from `maxplayer-core::home::public_key_hex`, itself `wallet`-gated.
 nostr-sdk = { version = "0.44.1", optional = true }
+# `maxplayer trade ...` (token trading on this home's key and wallet). Never with `local-test-mints`:
+# a user build refuses http:// mints and ws:// mint relays (scripts/check-user-build-mint-fence.sh).
+maxplayer-trade = { path = "../maxplayer-trade", optional = true }
+# `maxplayer team …` and the team MCP tools (docs/specs/maxplayer-team.md). Needs core `gateway` +
+# `wallet`, which `wallet` already brings; a no-default-features build compiles no team code.
+maxplayer-team = { path = "../maxplayer-team", optional = true }
+# `maxplayer mint install`: download the released `maxplayer-mint` (https only, redirects kept on
+# https), check it against the release's SHA256SUMS and read the executable out of its .tar.gz in
+# memory. All already in the lockfile through maxplayer-core / maxplayer-trade except `tar`
+# (default features off: no xattr). `toml` reads the mint's name from `<home>/mint/mint.toml`.
+reqwest = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4.3", optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", default-features = false, optional = true }
+toml = { version = "0.8", optional = true }
+# `mint upgrade` / the newer-version notice: which `maxplayer-mint` (or maxplayer release) is older.
+# Already in the lockfile.
+semver = { version = "1", optional = true }
+# `mint install`: renameat2(RENAME_NOREPLACE) / renamex_np(RENAME_EXCL) and the stale-stage pid
+# check. Already in the lockfile.
+libc = "0.2"
 
 # #905: the retired-seat reaper's `--dry-run` must remove nothing. Drives the shipped binary against
 # a recording stand-in `docker` on PATH, so it needs the subcommand compiled in (`acp`); a buyer-only
@@ -120,3 +144,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 libc = "0.2"
+tempfile = "3"

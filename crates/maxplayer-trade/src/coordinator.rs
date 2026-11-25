@@ -83,6 +83,22 @@ pub struct Listing {
     pub reservation: String,
     pub active: Option<String>,
     pub cancelled: bool,
+    /// Recovery found the lot past its expiry (plus [`EXPIRED_LOT_GRACE_SECONDS`]) with no live
+    /// maker swap: it is never served or reserved again. Journaled before the release.
+    #[serde(default)]
+    pub expired: bool,
+    /// The expired lot's reservation is released (set after the release succeeded).
+    #[serde(default)]
+    pub expired_released: bool,
+}
+/// How long past a lot's `expires_at` recovery waits before it releases the reservation of a lot
+/// nobody traded. A request admitted just before expiry holds the lot's `lot:<id>` unit key until
+/// its swap row is saved, so this is a margin, not the guard; the live-swap check is the guard.
+pub const EXPIRED_LOT_GRACE_SECONDS: u64 = QUOTE_SECONDS;
+/// Whether `l` is past its signed expiry plus [`EXPIRED_LOT_GRACE_SECONDS`] at `at`.
+fn lot_past_expiry(l: &Listing, at: u64) -> bool {
+    serde_json::from_str::<Lot>(&l.event.content)
+        .is_ok_and(|lot| at >= lot.expires_at.saturating_add(EXPIRED_LOT_GRACE_SECONDS))
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Swap {
@@ -254,6 +270,8 @@ pub async fn list(
         reservation: uuid::Uuid::new_v4().to_string(),
         active: None,
         cancelled: false,
+        expired: false,
+        expired_released: false,
     };
     // Persist reservation intent first; recovery completes it before any new wallet operation.
     mint::reserve_new(home, &row.plan, &row.reservation, || {
@@ -275,6 +293,10 @@ pub async fn cancel(home: &Path, j: &Journal, m: &Market, id: &str) -> Result<()
     ensure!(
         lifecycle(&l.event, &l.statuses)? == Status::Available,
         "lot is terminal"
+    );
+    ensure!(
+        !l.expired,
+        "lot expired; recovery releases its reservation on its own (nothing to cancel)"
     );
     ensure!(l.active.is_none(), "cannot cancel active swap");
     // The swap rows are authoritative (`active` may lag them after a crash or timeout).
@@ -606,6 +628,7 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
             .context("unknown lot")?;
         ensure!(
             !l.cancelled
+                && !l.expired
                 && l.published > 0
                 && lifecycle(&l.event, &l.statuses)? == Status::Available
                 && l.active.is_none(),
@@ -1183,9 +1206,11 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
     Ok(())
 }
 pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
-    recover_pass(home, j, m).await.map(|_| ())
+    recover_pass(home, j, m, false).await.map(|_| ())
 }
-async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
+/// `explicit`: the `recover` command, which also re-polls `expired_unpaid` fundings
+/// ([`crate::money::recover_explicit`]).
+async fn recover_pass(home: &Path, j: &Journal, m: &Market, explicit: bool) -> Result<bool> {
     let mut deferred = false;
     // Swaps first: their claims and refunds have hard deadlines, while wallet money recovery
     // (funding, withdraw, receive, send) has none and can spend a whole item budget on one slow
@@ -1203,7 +1228,20 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     for s in swaps {
         deferred |= recover_swap(home, j, m, s).await?;
     }
-    deferred |= recover_money(home, j, None).await;
+    deferred |= if explicit {
+        match crate::money::recover_fundings(home, j, None, true).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                eprintln!(
+                    "money recovery deferred; journal retained: {}",
+                    crate::redact_reason(&format!("{error:#}"))
+                );
+                true
+            }
+        }
+    } else {
+        recover_money(home, j, None).await
+    };
     let swaps = j.all::<Swap>("swap").await?;
     for l in j.all::<Listing>("listing").await? {
         deferred |= recover_listing(home, j, m, l, &swaps).await;
@@ -1349,8 +1387,43 @@ async fn recover_listing(
             l.active = Some(s.id.clone());
             j.put("listing", &l.event.id.to_hex(), &l).await?;
         }
+        // An expired lot nobody traded: no new request can be admitted (`parse_lot` refuses
+        // it), so release its reservation instead of waiting for a manual `cancel`. Only when
+        // every maker swap on it ended `expired` (no lock): a live swap keeps it reserved until
+        // it ends, and a completed, refunded or quarantined one spent (or holds) its inputs and
+        // is settled by swap recovery, never here. Nothing is published: relays already drop
+        // the listing at its NIP-40 expiration.
+        if !l.expired
+            && !l.cancelled
+            && l.active.is_none()
+            && lifecycle(&l.event, &l.statuses)? == Status::Available
+            && lot_past_expiry(&l, now())
+            && !swaps
+                .iter()
+                .any(|s| s.role == "maker" && s.lot.id == l.event.id && s.state != "expired")
+        {
+            l.expired = true;
+            j.put("listing", &l.event.id.to_hex(), &l).await?;
+        }
+        if l.expired
+            && !l.expired_released
+            && lifecycle(&l.event, &l.statuses)? == Status::Available
+        {
+            // Idempotent across a crash after the wallet release but before this journal write
+            // (the freed inputs may be spent since): nothing held under the reservation is done.
+            if crate::wallet::holds(home, &l.plan.mint, &l.reservation).await? {
+                mint::release(home, &l.plan, &l.reservation).await?;
+            }
+            l.expired_released = true;
+            j.put("listing", &l.event.id.to_hex(), &l).await?;
+            eprintln!(
+                "{}",
+                serde_json::json!({"lot_id":l.event.id,"status":"expired","released_debit":l.plan.debit,"mint":l.plan.mint})
+            );
+        }
         if l.active.is_none()
             && !l.cancelled
+            && !l.expired
             && lifecycle(&l.event, &l.statuses)? == Status::Available
         {
             mint::reserve(home, &l.plan, &l.reservation).await?;
@@ -1572,13 +1645,46 @@ async fn run_units(
     mut jobs: Option<tokio::sync::mpsc::Receiver<crate::serve::Job>>,
 ) -> Result<()> {
     let mut sched: crate::sched::Scheduler<'_, Unit> = crate::sched::Scheduler::default();
+    let result = run_loop(home, j, m, inbox, until, &mut jobs, &mut sched).await;
+    // An error ends serve (a hosting daemon restarts it): requests handed off but not started
+    // are answered "not started" instead of a dropped connection (exit 3, "may have been
+    // applied"). A stop already answered them.
+    if result
+        .as_ref()
+        .is_err_and(|e| !e.is::<crate::shutdown::Stopped>())
+    {
+        const WHY: &str =
+            "serve ended on an error before starting this request; nothing was applied";
+        for unit in sched.drain_queued() {
+            if let Unit::Job(job) = unit {
+                crate::serve::refuse(job, WHY);
+            }
+        }
+        if let Some(rx) = jobs.as_mut() {
+            rx.close();
+            while let Ok(job) = rx.try_recv() {
+                crate::serve::refuse(job, WHY);
+            }
+        }
+    }
+    result
+}
+async fn run_loop<'a>(
+    home: &'a Path,
+    j: &'a Journal,
+    m: &'a Market,
+    inbox: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    until: Option<&str>,
+    jobs: &mut Option<tokio::sync::mpsc::Receiver<crate::serve::Job>>,
+    sched: &mut crate::sched::Scheduler<'a, Unit>,
+) -> Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut warned = crate::observe::Warned::default();
     let mut inbox_open = true;
     let mut job_seq: u64 = 0;
     // Startup recovery comes first in every key's line: before any message or request.
-    enqueue_recovery(j, &mut sched).await?;
+    enqueue_recovery(j, sched).await?;
     loop {
         // A stop request (serve: SIGTERM/SIGINT) admits nothing new: queued requests are refused
         // as not started, queued units are dropped (nothing of theirs ran), and units already
@@ -1666,7 +1772,7 @@ async fn run_units(
                 }
             }
             Next::Tick => {
-                if let Err(error) = enqueue_recovery(j, &mut sched).await {
+                if let Err(error) = enqueue_recovery(j, sched).await {
                     eprintln!("recovery scan deferred: {error}");
                 }
                 // Display only: derived from the journal, never fed back into the state machine.
@@ -1758,7 +1864,7 @@ pub async fn recovery_status(j: &Journal, mut unresolved: bool) -> Result<()> {
         println!("{}", r.summary());
     }
     for r in j.all::<crate::send::SendAttempt>("send").await? {
-        unresolved |= !r.terminal();
+        unresolved |= !r.terminal() || r.reclaim_retry_pending();
         manual |= r.manual_recovery();
         println!("{}", r.summary());
     }
@@ -1786,7 +1892,7 @@ impl std::error::Error for ManualRecovery {}
 /// One bounded pass, without admitting fresh requests or waiting for deadlines.
 /// The historical function name is retained for library callers.
 pub async fn recover_until_settled(home: &Path, j: &Journal, m: &mut Market) -> Result<()> {
-    let deferred = recover_pass(home, j, m).await?;
+    let deferred = recover_pass(home, j, m, true).await?;
     recovery_status(j, deferred).await
 }
 
@@ -2193,6 +2299,8 @@ mod t7_review_regressions {
                 reservation: uuid::Uuid::new_v4().to_string(),
                 active: None,
                 cancelled: false,
+                expired: false,
+                expired_released: false,
             },
         )
         .await
@@ -2272,6 +2380,8 @@ mod review_r2 {
                 reservation: uuid::Uuid::new_v4().to_string(),
                 active: None,
                 cancelled,
+                expired: false,
+                expired_released: false,
             },
         )
     }

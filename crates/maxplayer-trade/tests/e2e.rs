@@ -442,3 +442,184 @@ async fn expired_quote_recovers_interrupted_active_index() {
     // Inventory is still backed; expiry only releases the soft quote hold.
     assert!(mint::plan(&f.maker, &f.a.url, 100, 16).await.is_err());
 }
+
+/// Rewrite the maker's journaled lot `lot` as one created `age` seconds ago (same plan and
+/// reservation, re-signed), so recovery sees it past its 24 h expiry. Returns the new lot id.
+async fn age_lot(f: &Fixture, lot: &str, age: u64) -> String {
+    let l = f.jm.get::<Listing>("listing", lot).await.unwrap().unwrap();
+    let terms: maxplayer_trade::Lot = serde_json::from_str(&l.event.content).unwrap();
+    let at = nostr_sdk::Timestamp::from(coordinator::now() - age);
+    let event = maxplayer_trade::lot_event_at(&f.mm.keys, terms.give, terms.want, at).unwrap();
+    let status =
+        maxplayer_trade::status_event(&f.mm.keys, event.id, 1, event.id, Status::Available)
+            .unwrap();
+    let id = event.id.to_hex();
+    let aged = Listing {
+        event,
+        statuses: vec![status],
+        ..l
+    };
+    f.jm.remove("listing", lot).await.unwrap();
+    f.jm.put("listing", &id, &aged).await.unwrap();
+    id
+}
+
+/// An expired lot nobody traded: recovery releases its reservation without a manual `cancel`,
+/// publishes nothing, and never reserves it again. Before: the sats stayed reserved until
+/// `cancel <lot>` (Petar, 2026-11-16).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_untraded_lot_releases_its_reservation() {
+    let f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    assert!(
+        mint::plan(&f.maker, &f.a.url, 100, 16).await.is_err(),
+        "the listed lot reserves its inputs"
+    );
+    // Expired, but still inside the grace: nothing is released yet.
+    let lot = age_lot(&f, &lot, 86400 + 5).await;
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    assert!(!l.expired, "released inside the grace period");
+    assert!(mint::plan(&f.maker, &f.a.url, 100, 16).await.is_err());
+    // Past the grace.
+    let lot = age_lot(&f, &lot, 86400 + coordinator::EXPIRED_LOT_GRACE_SECONDS + 5).await;
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    assert!(l.expired && l.expired_released && !l.cancelled);
+    assert_eq!(
+        lifecycle(&l.event, &l.statuses).unwrap(),
+        Status::Available,
+        "nothing published: relays drop the listing at its NIP-40 expiration"
+    );
+    assert!(
+        mint::plan(&f.maker, &f.a.url, 100, 16).await.is_ok(),
+        "the expired lot's inputs are spendable again"
+    );
+    // A later pass must not reserve it again, and `cancel` has nothing left to do.
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert!(mint::plan(&f.maker, &f.a.url, 100, 16).await.is_ok());
+    let error = coordinator::cancel(&f.maker, &f.jm, &f.mm, &lot)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("lot expired"), "{error:#}");
+    assert_eq!(balance(&f.maker, &f.a.url).await, 128);
+    let report = maxplayer_trade::report::render(&f.maker).unwrap();
+    assert!(
+        report.contains("(expired; reservation released)") && !report.contains("reserves debit"),
+        "{report}"
+    );
+    // Spendable through the real coin selection (which excludes journaled lot inputs).
+    let sent = maxplayer_trade::send::send(
+        &f.maker,
+        &f.jm,
+        &f.a.url,
+        100,
+        &f.root.path().join("expired.token"),
+        Some(16),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent.amount, 100);
+    assert_eq!(sent.state, maxplayer_trade::send::SendState::Sent);
+}
+
+/// SAFETY: an expired lot whose maker swap ended locked (here `claim_quarantined`; likewise
+/// `complete`/`refunded` before the lot is finished) is not an untraded lot: recovery never
+/// expires or releases it, so swap recovery and the manual-recovery exit keep owning it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_lot_with_a_quarantined_swap_is_not_released() {
+    let f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    let lot = age_lot(&f, &lot, 86400 + coordinator::EXPIRED_LOT_GRACE_SECONDS + 5).await;
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    let p = l.plan.clone();
+    let swap = Swap {
+        created: coordinator::now(),
+        id: uuid::Uuid::new_v4().to_string(),
+        lot: l.event.clone(),
+        role: "maker".into(),
+        peer: nostr_sdk::Keys::generate().public_key().to_hex(),
+        key: "11".repeat(32),
+        preimage: None,
+        request: coordinator::Request {
+            hash: "00".repeat(32),
+            taker_key: f.mm.keys.public_key().to_hex(),
+            funding: coordinator::Terms::from(&p),
+            max_give: 10,
+            min_receive: 10,
+            max_fees: 0,
+        },
+        quote: None,
+        plan: p,
+        state: "claim_quarantined".into(),
+        outgoing: vec![],
+        incoming: vec![],
+        max_fees: 0,
+        refund_generation: 0,
+    };
+    f.jm.put("swap", &swap.id, &swap).await.unwrap();
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    assert!(
+        !l.expired && !l.expired_released,
+        "SAFETY: a lot whose swap ended locked was treated as untraded"
+    );
+    assert!(
+        mint::plan(&f.maker, &f.a.url, 100, 16).await.is_err(),
+        "SAFETY: the quarantined swap's lot inputs were released"
+    );
+}
+
+/// SAFETY: a maker swap still live when its lot expires keeps the reservation; it is released
+/// only once that swap is terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_lot_with_a_live_swap_keeps_its_reservation() {
+    let f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    let lot = age_lot(&f, &lot, 86400 + coordinator::EXPIRED_LOT_GRACE_SECONDS + 5).await;
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    let p = l.plan.clone();
+    let mut swap = Swap {
+        created: coordinator::now(),
+        id: uuid::Uuid::new_v4().to_string(),
+        lot: l.event.clone(),
+        role: "maker".into(),
+        peer: nostr_sdk::Keys::generate().public_key().to_hex(),
+        key: "11".repeat(32),
+        preimage: None,
+        request: coordinator::Request {
+            hash: "00".repeat(32),
+            taker_key: f.mm.keys.public_key().to_hex(),
+            funding: coordinator::Terms::from(&p),
+            max_give: 10,
+            min_receive: 10,
+            max_fees: 0,
+        },
+        // No quote: recovery leaves this swap where it is.
+        quote: None,
+        plan: p,
+        state: "second_locked".into(),
+        outgoing: vec![],
+        incoming: vec![],
+        max_fees: 0,
+        refund_generation: 0,
+    };
+    f.jm.put("swap", &swap.id, &swap).await.unwrap();
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    assert!(
+        !l.expired && !l.expired_released,
+        "SAFETY: an expired lot with a live maker swap was released"
+    );
+    assert!(
+        mint::plan(&f.maker, &f.a.url, 100, 16).await.is_err(),
+        "SAFETY: the live swap's inputs became spendable"
+    );
+    // The swap ends without a lock: now the reservation is released.
+    swap.state = "expired".into();
+    f.jm.put("swap", &swap.id, &swap).await.unwrap();
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    assert!(l.expired && l.expired_released);
+    assert!(mint::plan(&f.maker, &f.a.url, 100, 16).await.is_ok());
+}

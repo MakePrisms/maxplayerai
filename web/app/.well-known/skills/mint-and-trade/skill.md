@@ -1,13 +1,16 @@
 ---
 name: maxplayer-mint-and-trade
-description: Set up a seller's own token mint and token trading together. Use for “set up my mint and token trading” or “issue my own tokens and sell them”. Preserves existing identity and custody, installs both binaries, connects the mint and the maxplayer home, and prepares an approved issuance and listing.
+description: Early preview. Set up a seller's own token mint and token trading together. Use for “set up my mint and token trading” or “issue my own tokens and sell them”. Preserves existing identity and custody, installs the mint, connects the mint and the maxplayer home, and prepares an approved issuance and listing.
 ---
 
 # Set up a mint and token trading
 
+> **Early preview.** The seller mint and the token market are early and opt-in. They may change,
+> break or go away; check with your human before relying on them.
+
 Complete both parts of setup from this one instruction. `maxplayer-mint` issues
-and services the human's tokens; `maxplayer-trade` exchanges them for another
-mint's tokens. Installing ordinary `maxplayer` does not install either binary.
+and services the human's tokens; `maxplayer trade` (part of the `maxplayer` CLI) exchanges
+them for another mint's tokens. Installing ordinary `maxplayer` does not install the mint.
 These are service credits counted in sats, **not automatically bitcoin-backed
 sats**. The credit mint has no Lightning cash-out. A listing sells only if a buyer
 accepts the price; it is not guaranteed redemption.
@@ -26,46 +29,88 @@ database or start a second writer to fix a setup failure. Record the chosen
 revision and paths without displaying secrets.
 
 The mint lives under `<MAXPLAYER_HOME>/mint` (default `~/.maxplayer/mint`).
-Trading uses the **same maxplayer home**: `maxplayer-trade` signs with its `key`, pays from
+Trading uses the **same maxplayer home**: `maxplayer trade` signs with its `key`, pays from
 its wallet, and keeps its journal in `<MAXPLAYER_HOME>/trade` (pass `--home <path>` only to
 pick a home other than `$MAXPLAYER_HOME`/`~/.maxplayer`). Only the home's mints can be traded: the
 default, `extra_mints` (`maxplayer wallet mints add`) and, on a seller, `accepted_mints`. A seller
 can trade from its own home: job payments land in the same wallet. An older standalone trading
 home (with `wallet.seed`/`trade.key`) is drain-only: move its funds with its `send`, then
-`maxplayer wallet receive`. Preserve all state across restarts.
+`maxplayer wallet receive --token-file`. Money in and out (fund, receive, send, pay an
+invoice) is `maxplayer wallet`; `maxplayer trade` lists, takes and recovers. Preserve all state
+across restarts.
 
 ## 2. Install and connect both tools
 
-From one checkout of the chosen revision, install missing binaries using the mint
-README and [trading build instructions](https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-trade/README.md).
-Both are separate Cargo workspaces; check Rust prerequisites. The mint build also
-needs `protoc`; the production trading build does not. From the repository root:
+Install the mint with `maxplayer` itself. It downloads the released `maxplayer-mint` for **this**
+`maxplayer`'s version (GitHub release archive, checked against the release's `SHA256SUMS` and the
+version it reports; no npm package, no `protoc`), installs it into `~/.local/bin` and runs
+`maxplayer-mint init` only when `<home>/mint/` does not exist yet:
+
+```sh
+maxplayer mint                       # read-only: installed?, version, mint URL, running?, linked?, updates
+maxplayer mint install --name <name>
+maxplayer account link --mint --email <your account email>   # emails a code
+maxplayer account link --mint --code <6 digits from the email>
+```
+
+Use the email the human's Maxplayer account already uses. The mint is version-locked to
+`maxplayer`: after updating `maxplayer` (the way it was installed), run `maxplayer mint upgrade`
+(it replaces only an older released mint, keeps `<home>/mint/`, never runs `init`), then restart
+the mint service; a running mint keeps the old version until restarted. `maxplayer mint` and
+`maxplayer doctor` show two separate notices: `upgrade:` when the installed mint is older than
+`maxplayer` (run `maxplayer mint upgrade`), and `update:` when a newer `maxplayer` is released
+(update it the way it was installed; `--offline` skips that check). In `--json` they are
+`mint_update` and `maxplayer_update`. `maxplayer mint uninstall` removes only the
+binary (refused while the mint is serving) and never `<home>/mint/`; never delete that folder, it
+is the mint and every credit it issued. To build a chosen revision from source instead, use the
+mint README: the mint is its own Cargo workspace, and building it needs `protoc`. From the
+repository root:
 
 ```sh
 cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local"
-cargo install --locked --path crates/maxplayer-trade --root "$HOME/.local"
 ```
 
-This explicitly installs both binaries in `~/.local/bin`, matching the mint
-README's `ExecStart=%h/.local/bin/maxplayer-mint run`. Use those absolute executable
+Trading needs no install: it is `maxplayer trade`. If `maxplayer trade --help` fails, the
+installed `maxplayer` predates it; upgrade it (see the
+[trading build instructions](https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-trade/README.md)).
+Delete any old standalone `maxplayer-trade` binary (`maxplayer doctor` warns about one).
+
+This explicitly installs the mint in `~/.local/bin`, matching the mint
+README's `ExecStart=%h/.local/bin/maxplayer-mint serve`. Use those absolute executable
 paths for services and checks; add `~/.local/bin` to the interactive PATH if needed.
 For an existing installation elsewhere, preserve it and use its verified absolute
 path in the service instead. Verify the service's executable exists and is the
 chosen build before starting it; do not rely on the service inheriting shell PATH.
 Check the installed commands' usage; do not guess flags or overwrite a running
 installation without checking its current version and obligations. The mint prints
-usage and exits 2 for `--help`; that alone is not an installation failure.
+usage and exits 2 for `--help`; that alone is not an installation failure. An
+existing `maxplayer-mint` whose usage has no `restore` predates automatic backups:
+upgrade it (`maxplayer mint upgrade` for an older release, or from the chosen revision at the
+same path), then restart its service, and drop any stopped-backup procedure recorded for it
+earlier.
 
 - Initialize a mint **only if none exists**, with `maxplayer-mint init --name <name>`: wallets
   show the name next to the mint URL. Use the seller's own name unless the operator chose another.
   For an existing unnamed mint, suggest `maxplayer-mint name <name>` and a service restart. Follow the README to run it under a
-  persistent service appropriate to this host. Inspect and preserve existing
+  persistent service appropriate to this host (a systemd unit runs the binary by absolute path;
+  without systemd, e.g. macOS, run `maxplayer mint --home <home> [--bin-dir <dir>] serve` in
+  tmux or a launchd agent). Every mint command is also `maxplayer mint [--home <home>]
+  [--bin-dir <dir>] <init|name|serve|issue|restore|version> [args...]`: it runs the binary
+  `maxplayer mint` reports with `MAXPLAYER_HOME` set to that home, so it cannot start another
+  copy of the mint from PATH or serve the default home by mistake. Inspect and preserve existing
   service configuration. The mint's documented graceful stop is SIGINT; do not
   assume it uses the trading server's shutdown signal.
-- Keep exactly one live mint. Establish a protected backup of the whole mint
-  directory while the mint is stopped, and a procedure to keep that backup
-  current. An old database is not a safe substitute for the latest spent-proof
-  record. Never print seeds, keys, proofs, token contents or raw databases.
+- Keep exactly one live mint. **Backups are automatic:** `maxplayer-mint serve`
+  snapshots the database online after every change and keeps the key, seed,
+  config and issued token files in its backup directory (`<home>/mint/backups/`,
+  or `backup_dir` in `mint.toml`). The only backup step is **one-time, at setup**:
+  ask the human to get that directory off this machine, either by pointing
+  `backup_dir` at off-box storage (then restart the mint) or by adding it to an
+  existing off-box backup or sync. Record which. **Never ask the human to back up
+  or stop the mint after a trade, issue or receive**, and never stop it to copy
+  files: the backups are already current. Restore only with `maxplayer-mint
+  restore` (newest backup only, mint stopped). Never print seeds, keys, proofs,
+  token contents or raw databases.
 - Configure the trading client to reach the mint using compatible **mint relays**.
   These are distinct from **market relays**, which carry lots and trade messages.
   Follow the trading references. `relay.maxplayer.ai` is the first default market relay
@@ -84,8 +129,8 @@ usage and exits 2 for `--help`; that alone is not an installation failure.
   human also wants to set one up; do not start an unconfigured seller.
 
 **Setup is complete** when both binaries are usable, the mint service is running,
-the trading client can reach it, and the persistent homes and backup procedure
-are recorded. Report any host limitation instead of claiming a temporary process
+the trading client can reach it, and the persistent homes and the backup
+directory's off-box location are recorded. Report any host limitation instead of claiming a temporary process
 will survive logout or reboot.
 
 ## 3. Prepare the first issuance and sale
@@ -94,12 +139,6 @@ will survive logout or reboot.
 trading limits. Explain these limits before asking for the amount, then validate
 the proposed terms against the chosen mint and existing trading home:
 
-- A token received must be at most **100,000 sats gross**. All funding intents
-  plus charged receives share a **100,000-sat cumulative cap per mint per home**.
-  Inspect `status` and the recorded history, not just the current balance. Count
-  `prepared`, `submitted`, `done` and `quarantined` receives; exclude `refused` and
-  `already_spent`. Remaining capacity is `100,000 - funding intents - charged
-  receives`. Spending or sending tokens out does not reset this lifetime cap.
 - Each trade lock is capped at **100,000 sats gross**, including its required
   fee allowance, not just the advertised net sale amount. Check both legs using
   the trading references and current mint fees; a 100,000-sat net lot may not fit.
@@ -108,10 +147,10 @@ the proposed terms against the chosen mint and existing trading home:
   chosen revision's issuance split and receive sizing rules before issuing;
   a face amount under the cap alone is not proof that an arbitrary token fits.
 
-If remaining capacity, fee-inclusive locks or proof/payload fit cannot be
-established, stop before issuance and report the uncertainty. Do not test capacity
-by issuing spendable tokens, silently lower amounts, split batches to evade the
-cumulative cap, or create a new home to bypass it. Propose supported terms for
+If fee-inclusive locks or proof/payload fit cannot be established, stop before
+issuance and report the uncertainty. Do not test capacity by issuing spendable
+tokens, silently lower amounts, split batches to evade a cap, or create a new home
+to bypass it. Propose supported terms for
 fresh approval. Recheck capacity immediately before issuance if the home changed.
 
 Ask only for missing terms: how many tokens to issue and import, how many to sell,
@@ -122,9 +161,10 @@ Do not invent a price or assume that “set up” authorizes issuance or trading
    README. Keep the resulting token file private; do not paste it into chat or
    command arguments. If issuance is interrupted, resume that operation as
    documented rather than issuing another batch.
-2. Import that file into the home's wallet, using the trading skill's `receive`
-   workflow (it lands in the same wallet `maxplayer wallet balance` shows). Verify the receive state and balance.
-   An ambiguous result needs recovery of the existing attempt, not new issuance.
+   No backup step follows `issue`, `receive` or a trade: `serve` already has it.
+2. Import that file into the home's wallet with `maxplayer wallet receive --token-file <file>
+   --add-mint` (it lands in the same wallet `maxplayer wallet balance` shows). Verify the
+   balance. An ambiguous result needs the same file received again, not new issuance.
 3. Show the listing's `--dry-run` using the agreed mint pair, amounts and fee cap.
    Explain the debits, receipts and lock/recovery obligations from the trading
    skill, then obtain approval for publishing those exact terms. No automatic

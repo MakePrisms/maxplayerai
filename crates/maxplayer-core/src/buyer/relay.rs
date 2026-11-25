@@ -271,7 +271,7 @@ impl RelayHandle {
 /// down. Only a malformed url or a relay the pool refuses to register fails here; those are
 /// configuration errors, not weather.
 pub async fn spawn(keys: Keys, relay_url: &str) -> Result<RelayHandle, RelayBootError> {
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     // Explicit, not inherited. The SDK's `auth-required:` resend is conditional on this being
     // true, and it fails SILENTLY if it is not — see the module doc.
     client.automatic_authentication(true);

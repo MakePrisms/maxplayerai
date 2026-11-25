@@ -34,6 +34,8 @@ mod auto_award_retry;
 mod session_reply;
 /// `get_job.settlement`: whether the daemon settles a delivery on its own, and where it stands.
 mod settlement;
+/// The swarm engine (docs/specs/swarm.md §7, §8): inert unless `[swarm] enabled = true`.
+mod swarm;
 /// What a settled `get_job.settlement` reads back (commit, files, pay), so collect is not a read.
 mod settled_view;
 /// `read_delivery` / `extract_delivery`: the way into a settled git delivery kept in the store.
@@ -95,6 +97,14 @@ const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// floor is half a fix. What this bound must NOT do is smuggle the old conclusion back in: it parks
 /// on "we could not read", never on "the offer is gone", and the recorded reason says so.
 const AUTO_AWARD_MAX_UNCONFIRMED_READS: u32 = 12;
+/// The budget for ONE job-view read in the daemon's background loops (auto-award, reconcile).
+/// [`job_lifecycle::fetch_job_view_async`] bounds the WHOLE read (connect, offer, probe, recheck,
+/// claim/result or v2 history reads) by the budget it is given, so these loops pass what one read
+/// could take when each REQ had its own [`RELAY_TIMEOUT`] (four legacy REQs): a relay that answers
+/// each REQ in a few seconds still yields a full view, reconcile's claim-liveness read is not cut
+/// shorter than before, and the [`AUTO_AWARD_MAX_UNCONFIRMED_READS`] park keeps its old span on a
+/// stalled relay. MCP-facing reads keep [`RELAY_TIMEOUT`] so they stay inside the tool deadline.
+const BACKGROUND_VIEW_BUDGET: Duration = Duration::from_secs(20);
 /// How often the delivery watcher re-checks awarded-unsettled jobs with no event to wake it. The
 /// subscription is the fast path; this backstop is what makes a dropped or missed result event a
 /// latency cost rather than a stranded payment.
@@ -309,8 +319,19 @@ fn bind_socket(path: &std::path::Path) -> Result<UnixListener, BuyerError> {
 /// Run the buyer until the process is terminated. Acquires the home lock (fail
 /// closed if held), binds the socket, and serves connections forever.
 pub async fn run(home: MaxplayerHome) -> Result<(), BuyerError> {
+    run_with_ready(home, || {}).await
+}
+
+/// [`run`], calling `ready` once this daemon owns the home (the exclusive lock is held), before
+/// anything else starts. A second daemon that fails closed at the lock never calls it, so work
+/// started from `ready` (the hosted trade serve) runs in the one daemon that owns the home.
+pub async fn run_with_ready(
+    home: MaxplayerHome,
+    ready: impl FnOnce() + Send,
+) -> Result<(), BuyerError> {
     // `_lock` is held for the whole run; dropping it releases the OS lock.
     let (_lock, context, socket_path) = bootstrap(home).await?;
+    ready();
     // Reconcile the reservation ledger against relay + journal truth before serving: a reservation
     // orphaned by a prior crash (dead job → release, paid job → spent) is resolved here, so the
     // daemon starts from a converged ledger. A failure is logged, not fatal — an unreachable relay
@@ -356,6 +377,8 @@ pub async fn run(home: MaxplayerHome) -> Result<(), BuyerError> {
     // freed within the hour rather than at the next restart.
     spawn_reconcile_loop(context.clone());
     spawn_private_content_worker(context.clone());
+    // `[swarm] enabled` only (default off): with it off no engine task exists.
+    swarm::spawn(context.clone());
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
 }
@@ -460,6 +483,11 @@ async fn dispatch(context: &Arc<BuyerContext>, request: Request) -> Response {
         "reply" => session_reply::reply(context, id, request.params).await,
         "read_delivery" => delivery_rpc::read(context, id, request.params).await,
         "extract_delivery" => delivery_rpc::extract(context, id, request.params).await,
+        // Swarm methods exist only with `[swarm] enabled`; otherwise they are unknown methods,
+        // exactly as before the engine existed.
+        method if context.home.config.swarm.enabled && swarm::METHODS.contains(&method) => {
+            swarm::rpc(context, method, id, request.params).await
+        }
         "accept_claim" | "authorize_pay" => Response::err(
             id,
             CODE_NOT_IMPLEMENTED,
@@ -643,7 +671,7 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
     };
     let max_session_sats = match post_job_session_cap(
         params.max_session_sats,
-        context.home.config.sessions.enabled,
+        context.home.config.sessions.enabled(),
     ) {
         Ok(cap) => cap,
         Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
@@ -1569,7 +1597,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     if params.close_session {
         crate::opline!("{}", close_session_deprecation_line(&params.job_id));
     }
-    let sessions = context.home.config.sessions.enabled;
+    let sessions = context.home.config.sessions.enabled();
     if !sessions && (params.turn.is_some_and(|t| t > 1) || params.close_session) {
         return Response::err(id, CODE_REFUSED, session_reply::disabled());
     }
@@ -1969,7 +1997,7 @@ async fn drive_auto_award(
             &context.home,
             &keys,
             job_id,
-            RELAY_TIMEOUT,
+            BACKGROUND_VIEW_BUDGET,
             now_unix() as u64,
         )
         .await
@@ -3413,6 +3441,13 @@ fn release_reservation_on_failure_feedback(
 /// state-guarded inside its transaction ([`BuyerStore::reconcile`] re-reads each row and acts only
 /// on the state it expects), so a disposition that went stale during gather is a no-op rather than a
 /// wrong write.
+/// Reconcile's claim-liveness reading of one view. A view with no offer that the relay never
+/// confirmed (`read_confirmed: false`: timeout, stall, refused read) is unknown, not dead: it
+/// counts as live so the reservation is kept, exactly like a read that returned `Err`.
+fn reconcile_claim_live(view: &job_lifecycle::JobView) -> bool {
+    view.live_claim_id.is_some() || (view.offer.is_none() && !view.read_confirmed)
+}
+
 async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileReport, String> {
     let reserved = context
         .store
@@ -3470,12 +3505,12 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
             &context.home,
             &keys,
             job_id,
-            RELAY_TIMEOUT,
+            BACKGROUND_VIEW_BUDGET,
             now_unix() as u64,
         )
         .await
         {
-            Ok(view) => view.live_claim_id.is_some(),
+            Ok(view) => reconcile_claim_live(&view),
             Err(_) => true,
         };
         payable.insert(job_id.clone(), claim_live || has_bind);
@@ -6858,7 +6893,8 @@ mod tests {
         drop(relay);
     }
 
-    // Shared fixture for the close/read-back handler tests: a buyer with `[sessions] enabled`, the
+    // Shared fixture for the close/read-back handler tests: a buyer on the DEFAULT `[sessions]`
+    // (sessions on, `enabled` unset), the
     // buyer-signed offer on a local relay, a recorded award, and a FREE INLINE accept-bind, so the
     // real `collect` handler settles end to end (no wallet, no mint) and `send_close` really publishes.
     async fn free_session_job(
@@ -6878,7 +6914,6 @@ mod tests {
         let relay = LocalRelay::new(RelayBuilder::default());
         relay.run().await.expect("relay run");
         home.config.relay_url = relay.url().await.to_string();
-        home.config.sessions.enabled = true;
         let (lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let keys = buyer_keys(&context.home).expect("buyer keys");
         let offer = EventBuilder::new(Kind::Custom(crate::kinds::JOB_OFFER_KIND), "")
@@ -7102,6 +7137,29 @@ mod tests {
     // a peer of the flattened JobView, carrying the 3405 identity + amount; with no award the field
     // is absent (never a false empty object). Pins the wire shape the handler relies on, free of any
     // relay. Red-on-revert: drop `awarded` from GetJobResponse and the Some case loses the field.
+    /// An unanswered relay read is not evidence the claim is gone: reconcile keeps the
+    /// reservation. Only a confirmed read with no live claim lets it go.
+    #[test]
+    fn reconcile_keeps_a_reservation_when_the_read_was_not_confirmed() {
+        let view = |read_confirmed: bool, live: bool| job_lifecycle::JobView {
+            job_id: "a".repeat(64),
+            offer: None,
+            claims: vec![],
+            results: vec![],
+            live_claim_id: live.then(|| "c".repeat(64)),
+            accepted: None,
+            pending: false,
+            read_confirmed,
+            publish_refused: None,
+        };
+        assert!(reconcile_claim_live(&view(false, false)), "unanswered read");
+        assert!(
+            !reconcile_claim_live(&view(true, false)),
+            "confirmed absent"
+        );
+        assert!(reconcile_claim_live(&view(true, true)), "live claim");
+    }
+
     #[test]
     fn get_job_response_serializes_a_committed_award_beside_the_flattened_view() {
         let view = job_lifecycle::JobView {

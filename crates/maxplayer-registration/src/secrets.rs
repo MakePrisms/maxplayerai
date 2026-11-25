@@ -49,11 +49,16 @@ pub fn file_or_env(file: Option<&Path>, env: &str) -> Result<Option<String>> {
 
 /// The relay admin key: 64-hex or `nsec1...`.
 pub fn load_admin_keys(path: &Path) -> Result<nostr::Keys> {
+    load_keys(path, "relay admin key")
+}
+
+/// A secret key file (64-hex or `nsec1...`); `what` names it in errors.
+pub fn load_keys(path: &Path, what: &str) -> Result<nostr::Keys> {
     let raw = read_secret_file(path)?;
     // Never include `raw` in the error.
     nostr::Keys::parse(&raw).map_err(|_| {
         anyhow!(
-            "relay admin key file {} does not hold a 64-hex or nsec secret key",
+            "{what} file {} does not hold a 64-hex or nsec secret key",
             path.display()
         )
     })

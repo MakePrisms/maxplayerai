@@ -20,10 +20,13 @@ const AT_CAPACITY_TURN_FEEDBACK: &str = "seller is at capacity and could not sta
      and the session stays parked — send the turn again";
 const REVIEW_REFUSED_FEEDBACK: &str =
     "the seller's review refused this follow-up; nothing was run or charged";
+/// #1349: sizes follow in parentheses; never buyer text.
+const TURN_TOO_LARGE_FEEDBACK: &str = "this follow-up is too large for the seller's private review even without earlier \
+     history; nothing was run or charged — send a shorter turn, or close the session and post a new job";
 /// Bound on private follow-ups waiting for their encrypted message.
 const PENDING_FOLLOWUPS_CAP: usize = 256;
 /// Poll interval while a follow-up waits for the previous turn's payment (§8.3).
-const PAYMENT_WAIT_POLL: Duration = Duration::from_secs(5);
+pub(super) const PAYMENT_WAIT_POLL: Duration = Duration::from_secs(5);
 
 /// Per-runner session bookkeeping. The store is the durable half; this is only what must not be
 /// repeated within one process (a second task for the same follow-up).
@@ -32,6 +35,20 @@ pub(super) struct SessionRuntime {
     in_flight: Mutex<std::collections::HashSet<String>>,
     /// Private follow-ups whose encrypted message has not arrived yet; re-driven on the tick.
     pending: Mutex<HashMap<String, nostr_sdk::Event>>,
+}
+
+impl SessionRuntime {
+    /// #1299: turn tasks started and not yet returned. Counted from `spawn_turn`'s insert, which
+    /// runs BEFORE the task is spawned, so a drain never sees a just-admitted turn as idle (a turn
+    /// holds no slot until `run_turn` acquires one).
+    pub(super) fn in_flight_turns(&self) -> usize {
+        self.in_flight.lock().expect("session state").len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_in_flight_for_test(&self, fid: &str) {
+        self.in_flight.lock().expect("session state").insert(fid.to_owned());
+    }
 }
 
 /// The host's verdict on a follow-up (§6.1 step 3).
@@ -112,12 +129,41 @@ fn feedback_text(code: ReasonCode) -> &'static str {
         ReasonCode::DeliveryFailed => DELIVERY_FAILURE_FEEDBACK,
         ReasonCode::AtCapacity => AT_CAPACITY_TURN_FEEDBACK,
         ReasonCode::SessionExpired => SESSION_EXPIRED_FEEDBACK,
+        ReasonCode::TurnTooLarge => TURN_TOO_LARGE_FEEDBACK,
         _ => EXEC_FAILURE_FEEDBACK,
     }
 }
 
+/// Codes that answer a follow-up nothing was attempted for and that do not count against the seller
+/// (protocol-v1 §7.1 table): `refusal`, everything else keeps `error`.
+fn refusal_status(code: ReasonCode) -> Option<&'static str> {
+    matches!(code, ReasonCode::SessionExpired | ReasonCode::TurnTooLarge).then_some("refusal")
+}
+
 fn setup<E: std::fmt::Display>(error: E) -> (ReasonCode, String) {
     (ReasonCode::ExecutionFailed, error.to_string())
+}
+
+/// The one constructor of a `turn_too_large` failure (#1349): sizes only, never buyer text.
+fn too_large(needed: usize, limit: usize) -> (ReasonCode, String) {
+    (
+        ReasonCode::TurnTooLarge,
+        format!("needs {needed} sealed bytes; limit {limit}"),
+    )
+}
+
+/// The detail a failure may show the buyer: only a `turn_too_large` whose detail has exactly the
+/// digits-only shape [`too_large`] builds. Every other detail is log-only, so a future error string
+/// returned under this code cannot reach the buyer.
+fn buyer_sizes(code: ReasonCode, detail: &str) -> Option<&str> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if code != ReasonCode::TurnTooLarge {
+        return None;
+    }
+    let (needed, limit) = detail
+        .strip_prefix("needs ")?
+        .split_once(" sealed bytes; limit ")?;
+    (digits(needed) && digits(limit)).then_some(detail)
 }
 
 fn now_secs() -> u64 {
@@ -126,7 +172,7 @@ fn now_secs() -> u64 {
 
 impl SellerNodeRunner {
     fn sessions_enabled(&self) -> bool {
-        self.node.home().config.sessions.enabled
+        self.node.home().config.sessions.enabled()
     }
 
     /// A kind-3412 FOLLOW-UP (§2.1, §6.1 step 1): parse, admit, and either close the session or
@@ -204,25 +250,37 @@ impl SellerNodeRunner {
             record.turn,
             record.state.is_live(),
         ) {
-            opline!("seller node follow-up ignore id={fid} job_id={job_id}: {why:?}");
-            // An ended session answers its buyer's turn once (the refused row dedups re-sends).
+            if why == session::Ignore::SessionEnded {
+                // Routine after a session closes (relay replays): counted, not printed.
+                super::QuietTally::bump(&self.quiet.ended_followups);
+                opline_verbose!("seller node follow-up ignore id={fid} job_id={job_id}: {why:?}");
+            } else {
+                opline!("seller node follow-up ignore id={fid} job_id={job_id}: {why:?}");
+            }
+            // An ended session answers each follow-up for a turn it never reached once, ever
+            // (#1203). The marker is written only after the refusal is out (or, private, durably
+            // queued), so a failed publish is retried by the next replay instead of silencing it.
             if why == session::Ignore::SessionEnded
                 && followup.status == FollowUpStatus::Turn
-                && let (Some(turn), Some(deadline)) = (followup.turn, followup.deadline_unix)
-                && matches!(
-                    store.record_turn(
-                        &fid,
-                        &job_id,
-                        turn,
-                        deadline,
-                        TurnState::Refused,
-                        now_secs()
-                    ),
-                    Ok(true)
-                )
+                && let Some(turn) = followup.turn.filter(|turn| *turn > record.turn)
             {
-                self.turn_feedback(&job_id, &award_buyer, &fid, ReasonCode::SessionExpired)
-                    .await;
+                match store.ended_refusal_due(&fid, &job_id, turn) {
+                    Ok(true) => {
+                        if self
+                            .turn_feedback(&job_id, &award_buyer, &fid, ReasonCode::SessionExpired)
+                            .await
+                            && let Err(error) = store.mark_ended_refusal(&fid, &job_id, now_secs())
+                        {
+                            opline!(
+                                "seller node follow-up id={fid}: refusal marker write failed ({error})"
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        opline!("seller node follow-up id={fid}: refusal check failed ({error})")
+                    }
+                }
             }
             return;
         }
@@ -273,6 +331,17 @@ impl SellerNodeRunner {
         }
         if let Err(error) = store.set_turn_text(&fid, &text) {
             opline!("seller node follow-up id={fid}: message write failed ({error})");
+            return;
+        }
+        // #1299: a draining node starts no new turn, but it journals the turn first. The `received`
+        // row (with its text) is what `recover_sessions` re-drives at the next boot, so the restarted
+        // seller runs it without depending on relay history depth (an open-pool award REQ pages at
+        // the relay's limit). It is not spawned, so it does not hold the drain. `close` above is
+        // still honoured.
+        if self.drain.is_requested() {
+            opline!(
+                "seller node follow-up deferred id={fid} job_id={job_id} turn={turn}: draining; journaled for the restarted seller"
+            );
             return;
         }
         opline!("seller node follow-up admitted id={fid} job_id={job_id} turn={turn}");
@@ -427,10 +496,27 @@ impl SellerNodeRunner {
         }
     }
 
-    async fn turn_feedback(&self, job_id: &str, buyer: &str, fid: &str, code: ReasonCode) {
+    /// Whether it went out (see [`SellerNodeRunner::publish_buyer_feedback`]).
+    async fn turn_feedback(&self, job_id: &str, buyer: &str, fid: &str, code: ReasonCode) -> bool {
+        self.turn_feedback_with(job_id, buyer, fid, code, None)
+            .await
+    }
+
+    /// `sizes`: a seller-computed, buyer-text-free detail appended for `turn_too_large` (#1349).
+    async fn turn_feedback_with(
+        &self,
+        job_id: &str,
+        buyer: &str,
+        fid: &str,
+        code: ReasonCode,
+        sizes: Option<&str>,
+    ) -> bool {
         // The follow-up id makes each turn's encrypted feedback a distinct content intent.
-        let reason = format!("{} (follow-up {fid})", feedback_text(code));
-        let status = (code == ReasonCode::SessionExpired).then_some("refusal");
+        let reason = match sizes {
+            Some(sizes) => format!("{} ({sizes}; follow-up {fid})", feedback_text(code)),
+            None => format!("{} (follow-up {fid})", feedback_text(code)),
+        };
+        let status = refusal_status(code);
         self.publish_buyer_feedback_tagged(
             job_id,
             buyer,
@@ -440,7 +526,7 @@ impl SellerNodeRunner {
             status,
             vec![gateway::TagSpec::new(["e", fid, "", "reply"])],
         )
-        .await;
+        .await
     }
 
     /// One follow-up end to end: §8.3 payment gate, slot, §4 start margin, §5.5 holder gate, the
@@ -486,6 +572,17 @@ impl SellerNodeRunner {
                             turn.turn,
                             turn.turn - 1
                         );
+                    }
+                    // #1299: a draining node does not wait out an unpaid previous turn (up to the
+                    // turn deadline). The row stays `waiting_payment`, which `unfinished_turns`
+                    // includes, so the restarted seller's `recover_sessions` re-drives it.
+                    if self.drain.is_requested() {
+                        opline!(
+                            "seller node session job_id={}: turn {} left waiting for payment; draining, the restarted seller resumes it",
+                            turn.job_id,
+                            turn.turn
+                        );
+                        return;
                     }
                     tokio::time::sleep(PAYMENT_WAIT_POLL).await;
                 }
@@ -627,7 +724,9 @@ impl SellerNodeRunner {
                     code.as_str()
                 );
                 let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
-                self.turn_feedback(&job_id, &buyer, fid, code).await;
+                let sizes = buyer_sizes(code, &detail);
+                self.turn_feedback_with(&job_id, &buyer, fid, code, sizes)
+                    .await;
             }
         }
         if store.session_close_requested(&job_id).unwrap_or(false)
@@ -706,14 +805,76 @@ impl SellerNodeRunner {
             .last()
             .cloned()
             .ok_or_else(|| setup("follow-up message missing"))?;
+        // A private follow-up is reviewed ONLY over the encrypted lane (§9): its request
+        // carries the signed carriers + encrypted bodies of this and earlier follow-ups, trimmed
+        // to what seals. Built before anything starts, so a turn too large to review even
+        // without history is refused with `turn_too_large` and nothing runs (#1349).
+        let review = home.config.review.clone();
+        let buyer = offer.buyer_pubkey.clone();
+        let private_request = if private
+            && matches!(
+                review.enabled(crate::kinds::SESSION_FOLLOWUP_KIND, &buyer),
+                Ok(true)
+            ) {
+            let turns: Vec<SessionTurnRecord> = store
+                .turns(job_id)
+                .map(|turns| {
+                    turns
+                        .into_iter()
+                        .filter(|t| t.turn < n && t.state != TurnState::Refused)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let earlier: Vec<String> = turns.iter().map(|t| t.followup_id.clone()).collect();
+            // Earlier deliveries (§9): turn 1's published RESULT, then each earlier
+            // turn's with the follow-up it answers. The reviewer re-authenticates each
+            // and keeps one line (turn, status, commit); unpublished ones are skipped.
+            let turn_one = store
+                .outbox_row(&format!("result:{job_id}"))
+                .ok()
+                .flatten()
+                .and_then(|(_, _, id)| id);
+            let deliveries: Vec<(String, Option<String>)> = turn_one
+                .map(|id| (id, None))
+                .into_iter()
+                .chain(turns.iter().filter_map(|t| {
+                    t.result_id
+                        .clone()
+                        .map(|id| (id, Some(t.followup_id.clone())))
+                }))
+                .collect();
+            match crate::review::private::followup_request(
+                home,
+                &seller_pubkey,
+                job_id,
+                &earlier,
+                fid,
+                &deliveries,
+            ) {
+                Err(crate::review::private::FollowUpRequestError::TooLarge { needed, limit }) => {
+                    return Err(too_large(needed, limit));
+                }
+                Err(error) => Some(Err(error.to_string())),
+                Ok(request) => Some(Ok(request)),
+            }
+        } else {
+            None
+        };
         let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref()).map_err(setup)?;
         let delivery_policy = sandbox
             .container_delivery()
             .ok_or_else(|| setup("container delivery is not enabled for this seat"))?;
         let (agent_command, agent_label, harness) = {
+            // Same resolver as turn 1 (review r1 #1): the claim pin decides, an unpinned session
+            // stays on ACP entries, and a follow-up never reaches a hook in this stage.
+            let pin = store.claim_pin(job_id).map_err(setup)?;
             let selected = self
                 .agents
-                .dispatch(offer.requested_agent.as_deref())
+                .for_execution(
+                    pin.as_ref().map(|p| (p.label.as_str(), p.kind.as_str(), p.fingerprint.as_str())),
+                    offer.requested_agent.as_deref(),
+                    false,
+                )
                 .ok_or((
                     ReasonCode::CapabilityMissing,
                     "requested agent unavailable".to_owned(),
@@ -833,57 +994,12 @@ impl SellerNodeRunner {
             reset_prompt,
         };
         {
-            let review = home.config.review.clone();
             let (client, relay) = (self.client.clone(), self.relay_url.clone());
             let subject = crate::review::Subject {
                 offer: job_id.to_owned(),
                 event: fid.to_owned(),
                 kind: crate::kinds::SESSION_FOLLOWUP_KIND,
                 commit: None,
-            };
-            let buyer = offer.buyer_pubkey.clone();
-            // A private follow-up is reviewed ONLY over the encrypted lane (§9): its request
-            // carries the signed carriers + encrypted bodies of this and earlier follow-ups.
-            let private_request = if private
-                && matches!(review.enabled(subject.kind, &buyer), Ok(true))
-            {
-                let turns: Vec<SessionTurnRecord> = store
-                    .turns(job_id)
-                    .map(|turns| {
-                        turns
-                            .into_iter()
-                            .filter(|t| t.turn < n && t.state != TurnState::Refused)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let earlier: Vec<String> = turns.iter().map(|t| t.followup_id.clone()).collect();
-                // Earlier deliveries (§9): turn 1's published RESULT, then each earlier
-                // turn's with the follow-up it answers. The reviewer re-authenticates each
-                // and keeps one line (turn, status, commit); unpublished ones are skipped.
-                let turn_one = store
-                    .outbox_row(&format!("result:{job_id}"))
-                    .ok()
-                    .flatten()
-                    .and_then(|(_, _, id)| id);
-                let deliveries: Vec<(String, Option<String>)> = turn_one
-                    .map(|id| (id, None))
-                    .into_iter()
-                    .chain(turns.iter().filter_map(|t| {
-                        t.result_id
-                            .clone()
-                            .map(|id| (id, Some(t.followup_id.clone())))
-                    }))
-                    .collect();
-                Some(crate::review::private::followup_request(
-                    home,
-                    &seller_pubkey,
-                    job_id,
-                    &earlier,
-                    fid,
-                    &deliveries,
-                ))
-            } else {
-                None
             };
             let review_home = home.clone();
             let review_signer = self.node.signer().clone();
@@ -1243,6 +1359,9 @@ impl SellerNodeRunner {
             .map_err(|error| delivery_failed(error.to_string()))?;
         let key = format!("result:{}", r.fid);
         self.publish_now(&key).await;
+        // #1299 advisor r1: a PRIVATE turn's encrypted copies go out on the content flush, not with
+        // the carrier above. Flush now, as `execute_job` does, rather than on a later paced pass.
+        self.drain(DrainMode::Routine, true).await;
         if let Ok(Some((_, _, Some(result_id)))) = store.outbox_row(&key) {
             let _ = store.set_turn_result(r.fid, &result_id);
         }
@@ -1486,7 +1605,7 @@ mod tests {
             holder_proxy_ports: None,
         };
         let mut config = crate::home::MaxplayerConfig::default();
-        config.sessions.enabled = true;
+        config.sessions.enabled = Some(true);
         let docker = SandboxConfig {
             mode: SandboxMode::Docker,
             ..Default::default()
@@ -1555,6 +1674,46 @@ mod tests {
                     .map(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
                     .unwrap_or(false)
             })
+    }
+
+    /// #1349: an oversized follow-up is a typed refusal with sizes and advice, never the generic
+    /// execution failure, and it does not count against the seller.
+    #[test]
+    fn turn_too_large_is_a_visible_refusal() {
+        assert_eq!(ReasonCode::TurnTooLarge.as_str(), "turn_too_large");
+        assert_eq!(refusal_status(ReasonCode::TurnTooLarge), Some("refusal"));
+        assert_eq!(refusal_status(ReasonCode::SessionExpired), Some("refusal"));
+        assert_eq!(refusal_status(ReasonCode::ExecutionFailed), None);
+        let text = feedback_text(ReasonCode::TurnTooLarge);
+        assert_ne!(text, EXEC_FAILURE_FEEDBACK);
+        assert!(
+            text.contains("too large") && text.contains("post a new job"),
+            "{text}"
+        );
+    }
+
+    /// Only the sizes `too_large` builds reach the buyer; any other detail stays in the log.
+    #[test]
+    fn only_too_large_sizes_reach_the_buyer() {
+        let (code, detail) = too_large(65_971, 65_408);
+        assert_eq!(
+            buyer_sizes(code, &detail),
+            Some("needs 65971 sealed bytes; limit 65408")
+        );
+        assert_eq!(buyer_sizes(ReasonCode::ExecutionFailed, &detail), None);
+        for leaked in [
+            "needs 1 sealed bytes; limit 2 and the buyer said hi",
+            "needs hi sealed bytes; limit 2",
+            "needs  sealed bytes; limit 2",
+            "the buyer's text",
+            "",
+        ] {
+            assert_eq!(
+                buyer_sizes(ReasonCode::TurnTooLarge, leaked),
+                None,
+                "{leaked}"
+            );
+        }
     }
 
     /// Failure test 5 (host half): a refused review writes `abort` and never the buyer's text;

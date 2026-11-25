@@ -1,6 +1,10 @@
 [package]
 name = "maxplayer-mint"
-version = "0.5.11"
+# LOCKSTEP with `[workspace.package].version` in the root Cargo.toml: the mint is released from the
+# same tag as `maxplayer`, at the same version (RELEASE.md). `scripts/verify-release-version.sh`
+# fails CI when the two differ. It cannot inherit the root's version because this is its own
+# workspace (see below).
+version = "0.8.2-rc1"
 edition = "2024"
 description = "Opt-in Cashu mint sidecar for Maxplayer seller credits, reachable only over Nostr relays"
 repository = "https://github.com/MakePrisms/maxplayerai"
@@ -34,6 +38,9 @@ getrandom = "0.3"
 # the request subscription after NIP-42 sign-in (nostr-sdk is already a direct dependency).
 maxplayer-core = { path = "../maxplayer-core", features = ["gateway"] }
 nostr-sdk = { version = "0.44.1", features = ["nip44"] }
+# Online backups (`VACUUM INTO`). The same rusqlite cdk-sqlite already links (bundled SQLite), so
+# no new library enters the build.
+rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

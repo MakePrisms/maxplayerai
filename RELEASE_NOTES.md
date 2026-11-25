@@ -1,3 +1,714 @@
+## v0.8.2-rc1
+
+Release candidate for 0.8.2, built from main after #1414. The only binary changes since v0.8.1
+are new seller log lines for a seat announcement that stops landing on the relay, plus three
+help-text and CLI-message corrections. After publication, install with
+`npm install -g maxplayer@0.8.2-rc1` (or `install.sh --version 0.8.2-rc1`). Publish as a GitHub
+prerelease on npm `rc`; leave stable `latest` (0.8.1) unchanged.
+
+**Relay and registration service: nothing to deploy for this RC.** No wire change and no store
+schema change: the buyer and seller stores are unchanged from v0.8.1. The sandbox image is
+rebuilt and tagged `maxplayer-sandbox:v0.8.2-rc1`. Website pages keep naming the latest stable
+release (0.8.1).
+
+### Changes
+
+- **Seller: say when the seat announcement stops landing** (#1414). A seller logged nothing when
+  its kind-30340 announcement stopped reaching the relay, unless the relay-stall watchdog tripped,
+  and the watchdog also needs the read probe to fail. Buyers and the market board judge a seat by
+  that announcement's age, so a running seat could look offline while its log stayed quiet.
+  - `seller node heartbeat publish did not finish within 30s (continuing; counts as unconfirmed)`
+    when the publish budget cuts a heartbeat off. Every other publish failure already printed its
+    reason.
+  - `seller node seat announcement OVERDUE: no relay-confirmed kind-30340 for Ns (interval Ts); …`,
+    once per gap, when no beat has been confirmed for 1.5 intervals. It says whether a heartbeat
+    supervision is still running (and for how long) or the last beats got no relay OK. It is
+    checked on the 5 s housekeeping tick, so a supervision that never returns is reported too.
+  - `seller node seat announcement renewed: relay confirmed kind-30340 after Ns without one` when
+    a beat lands again.
+  - Nothing changes on the wire or in the watchdog's behaviour. The lines are listed in
+    `docs/SELLER-QUICKSTART.md`.
+- **CLI text:** `account link` no longer tells you to turn product news off when it is on (every
+  product-news email has an unsubscribe link) (#1411); `maxplayer --help` lists the `trade`
+  subcommands this build has (#1405); `team --help` lists every team MCP tool (#1410).
+
+### Website and docs (live on merge, not part of the binary)
+
+- **Market board: one late heartbeat no longer marks a seat Offline** (#1413). A seat counts as
+  online for 750 s after its latest heartbeat (was 300 s, equal to the default heartbeat interval),
+  and a latest `accepting=n` heartbeat (shutdown or drain) reads Offline at once.
+- Skill pages and docs lead with teams and fix stale references (#1405, #1410); agents stop raising
+  product news at setup (#1411); `/chat` redirects to Teams and mint/tokens are marked Early
+  preview (#1408); the swarm setup step installs the stable release (#1407); the Codex avatar is
+  centred (#1409).
+
+## v0.8.1
+
+Stable release following v0.8.1-rc2, incorporating the 0.8.1 release-candidate series. The
+binaries are built from the same code as v0.8.1-rc2; since then only the website, version strings,
+skill-page version lines and these notes changed. After publication, install with
+`npm install -g maxplayer@0.8.1` (or `install.sh --version 0.8.1`). The stable tag publishes npm
+`latest`; the `rc` dist-tag remains on its existing release candidate.
+
+This is a **patch** release, but it changes two defaults: session (multi-turn) jobs are on for
+buyers and sellers unless `[sessions] enabled = false`, and the seller store moves to schema 16.
+Read "Upgrade and release scope" before restarting a seat that should stay single-turn.
+
+### Highlights since stable v0.8.0
+
+- **Session (multi-turn) jobs are on by default.** Buyers get the `reply` MCP tool without an
+  opt-in; each turn costs the job's price, up to a session cap of 10× the job price by default
+  (`[sessions] session_cap_sats`, `max_session_sats`, or `per_job_budget_sats` for a limit the
+  agent cannot raise). Docker seats with container delivery park a finished job's container for up
+  to 6 hours within a 5 GiB disk budget so the buyer can send another turn. runsc seats that cannot
+  run sessions warn and take single-turn jobs instead of failing to boot.
+- **Hook agents (stage 1):** a seller can serve single-turn inline jobs with an agent of its own by
+  listing `[agents.<name>] hook = ["<command>", ...]`. The daemon runs the command once per job
+  (one JSON line in, `{"status","answer"}` out), journals each run so a restart never runs a hook
+  twice, health-checks hooks with `ping`, and a hook-only seat needs no sandbox. Session
+  follow-ups on a hook, example adapters and `seller hook test` are not in this release; see
+  `docs/specs/hook-agents.md`.
+- **Fixed: private session jobs with review stopped at about turn 5** (`private seal is … bytes`).
+  The review request is now sized at its sealed size and drops the oldest history first; a turn too
+  large to review is refused (`turn_too_large`) without charge.
+- **Relay websockets go through an HTTP proxy.** With `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` set,
+  every relay connection tunnels with HTTP CONNECT under the same `NO_PROXY` rules as HTTPS calls,
+  so `doctor`, `account link`, teams, buying and selling work in sandboxes whose only way out is a
+  CONNECT proxy.
+- **Terms of Service and Privacy Policy 20261123**, and `account link` reads the current version
+  from https://www.maxplayer.ai/legal/versions.json (falling back to this build's versions).
+- An ended session answers each stale follow-up once; `get_job wait_for` no longer ends on an
+  unconfirmed empty view; private-job HTTP errors name their cause; quieter seller logs after a
+  reconnect (`MAXPLAYER_VERBOSE=1` restores every line).
+- Skill pages install with npm first; `install.sh` is a manual, checksum-verified route.
+
+The RC sections below keep the detailed changes and rollout notes for each stage; they are not new
+release announcements.
+
+### Upgrade and release scope
+
+- **Relay, reviewer and registration service: nothing to deploy.** `relay-v12`, live since
+  2026-11-24, accepts Terms/Privacy `20261123` and `20261029`, the only versions the website
+  manifest lists. The registration side of the legal-versions manifest (accepting a version only
+  the manifest lists) is in `relay-v13`; this release does not need it, but deploy a relay carrying
+  it before publishing a newer legal version on the site. The relay-side validator and reviewer
+  client changes in the series need no redeploy (see v0.8.1-rc1). No wire change: hook agents use
+  the existing claim, delivery and feedback events.
+- **Sessions are on by default:** set `[sessions] enabled = false` before restarting a buyer or
+  seat that should stay single-turn. An `enabled = false` line written before 0.8.1 may have been
+  dropped from `config.toml` by a later save; check it is still there.
+- **Seller store schema 15 → 16** on first start (claim pins, staged hook answers and hook run
+  records; additive). Buyer store unchanged (schema 10).
+- Restart `maxplayer mcp`, `maxplayer buyer serve` and `maxplayer seller serve` after upgrading,
+  keeping their homes, keys, wallets and state. Sellers not adding a hook change nothing in
+  `config.toml`. Match Docker sandbox image overrides to
+  `ghcr.io/makeprisms/maxplayer-sandbox:v0.8.1`; host-mode seats keep their own adapters.
+- The release workflow packages the `maxplayer` client, the `maxplayer-mint` tarballs and the
+  sandbox image. The relay, reviewer, registration service, website and chat sidecar are deployed
+  or built separately; website and email changes went live with each merge.
+
+## v0.8.1-rc2
+
+Release candidate for 0.8.1, built from main after #1387. It carries everything in v0.8.1-rc1 plus
+**hook agents (stage 1)**, which let a seller serve inline jobs with an agent of their own, and
+`account link` reading the current Terms/Privacy version from the website. After publication,
+install with `npm install -g maxplayer@0.8.1-rc2` (or `install.sh --version 0.8.1-rc2`). Publish
+as a GitHub prerelease on npm `rc`; leave stable `latest` (0.8.0) unchanged.
+
+**Relay and registration service: nothing to deploy for this RC.** No wire change: hook agents
+use the existing claim, delivery and feedback events. The registration side of #1399 (accepting a
+dated version that only the website manifest lists) is not in `relay-v12`. This RC does not need
+it, because the manifest lists only `20261029` and `20261123`, both of which `relay-v12` already
+accepts. Until a relay tag carrying #1399 is deployed, do not publish a newer legal version on
+the site (see #1399's rollout order). **Seller store moves to schema 16** (claim pins, staged hook
+answers and hook run records) on first start; the buyer store is unchanged from v0.8.1-rc1.
+The sandbox image is rebuilt and tagged `maxplayer-sandbox:v0.8.1-rc2`.
+
+### Changes
+
+- **Hook agents, stage 1: serve single-turn inline jobs with your own agent** (#1387, spec #1382,
+  `docs/specs/hook-agents.md`). A seat can list `[agents.<name>] hook = ["<command>", ...]`
+  (optionally with a self-reported `family`/`model`) next to or instead of container agents in
+  `[seller] agents`; each entry takes exactly one of `argv` or `hook`. The daemon runs the
+  command once per job with one JSON line on stdin and reads `{"status","answer"}` from stdout.
+  Inputs are written as plain files under the job directory.
+  - A hook takes only inline, non-contribution jobs. Each claim picks the first serving entry that
+    admits the offer and pins it, and the job runs on that entry or fails closed.
+  - Runs are journaled before they start, so a restart re-delivers a staged answer and never runs
+    the hook twice. A hook past the deadline cutoff is stopped with its whole process group.
+  - Hooks are health-checked by `ping` at boot, on each heartbeat interval and on re-probe; two
+    failed pings in a row drop the entry until it answers again.
+  - A hook-only seat needs no `[seller] agent_command` and skips the sandbox, token-mode and
+    capability-probe gates (`doctor` included).
+  - Not yet: session follow-ups on a hook (a follow-up never runs a hook), the seller-hook skill
+    page and example adapters, and `maxplayer seller hook test`.
+- **`account link` reads the current Terms/Privacy version from the website** (#1399). It fetches
+  https://www.maxplayer.ai/legal/versions.json (5 s timeout), shows that version's privacy page and
+  sends that terms and privacy version. On any failure it uses this build's versions (`20261123`),
+  and an older manifest never makes it offer an earlier version than it ships with. `--code` reads
+  nothing from the site. A new plain message covers `legal_versions_unavailable`. Publishing a new
+  legal version becomes a website change once the registration side is deployed (see above).
+
+### Upgrade order
+
+Any order is safe; the relay and registration service stay on `relay-v12`. Restart `maxplayer mcp`,
+`maxplayer buyer serve` and `maxplayer seller serve` after installing. Sellers not adding a hook
+change nothing in `config.toml`.
+
+## v0.8.1-rc1
+
+Release candidate for 0.8.1, built from main after #1392. It carries everything in v0.8.0 plus
+**session (multi-turn) jobs on by default**, the fix for private session jobs with review that
+stopped at about turn 5 (#1349), relay websockets through an HTTP proxy, Terms and Privacy Policy
+20261123 at `account link`, clearer HTTP errors and quieter seller logs. After publication, install
+with `npm install -g maxplayer@0.8.1-rc1` (or `install.sh --version 0.8.1-rc1`). Publish as a GitHub
+prerelease on npm `rc`; leave stable `latest` (0.8.0) unchanged.
+
+**Relay and registration service: already deployed, nothing to do.** The registration service that
+accepts Terms/Privacy `20261123` as well as `20261029` (#1371) shipped as `relay-v12`, switched on
+2026-11-24. The relay-side lines of #1350 (`turn_too_large` in the shared private validator) and
+#1396 (the reviewer worker's relay client) are not in `relay-v12` and do not need to be: the relay
+applies that validator only to offers, claims and awards for private git access, never to feedback,
+and the reviewer runs with no proxy set, where the new transport dials directly as before. Buyer and
+seller stores are unchanged from v0.8.0. The sandbox image is rebuilt and tagged
+`maxplayer-sandbox:v0.8.1-rc1`. Website and email changes went live with each merge (Vercel).
+
+### Changes
+
+- **Session (multi-turn) jobs are on by default for buyers and sellers** (#1374). `[sessions] enabled` unset
+  now reads as on; `enabled = false` turns sessions off for both roles exactly as before, and
+  `enabled = true` behaves as before. Buyers on a stock config get the `reply` MCP tool and
+  `post_job max_session_sats`, and the swarm engine sends a member's follow-up tasks of 15 minutes
+  or more as session turns (shorter tasks stay one-off jobs). Docker seats with container delivery advertise `["session","1"]` on their claims.
+  - **Buyers:** an agent can now call `reply` without any opt-in, and each turn costs the job's
+    price, up to a session cap of 10× the job price by default. The cap counts turn 1, so it covers
+    turn 1 plus up to 9 follow-ups. Lower it with `[sessions] session_cap_sats` or
+    `max_session_sats`; an agent can pass a different `max_session_sats` itself, so for a limit it
+    cannot raise use `per_job_budget_sats` (caps each turn's price) or `enabled = false`. `get_job`
+    now returns a `session` object and `collect` takes `turn`.
+  - **Sellers:** docker seats with container delivery now park a finished job's container for up to
+    6 hours (within a 5 GiB disk budget) so the buyer can send another turn, and run turn 1 with one
+    agent attempt instead of 3. Turn 1 is asked to wrap up `wrap_up_secs` (300 s) before its
+    deadline and may deliver `out_of_time` or `needs_input`; a job with too little time left at
+    launch (under `wrap_up_secs` + 420 s) runs single-turn; a follow-up to such a job is answered
+  `session_expired` and costs nothing. Change this with `[sessions]
+    wrap_up_secs` or `enabled = false`.
+  - Restart a running `maxplayer mcp` and `maxplayer buyer serve` to pick this up.
+  - **runsc seats:** only an explicit `enabled = true` keeps the boot-blocking
+    `FAIL sandbox runsc sessions` when docker's `runsc` runtime lacks `--overlay2=none`. A seat on by
+    default gets a WARN, starts, offers no sessions and takes single-turn jobs, so upgrading never
+    stops a runsc seat from booting.
+  - **Disk budget:** with `enabled` unset, parked sessions on a seat may use 5 GiB
+    (`disk_budget_bytes` unset). An explicit `enabled = true` keeps the 20 GiB default, and an
+    explicit `disk_budget_bytes` always wins.
+  - Existing `config.toml` files round-trip unchanged; a default home still writes no `[sessions]`
+    table.
+  - **Opted out before?** An `enabled = false` line written before this release may have been
+    dropped from `config.toml` by a later save (it was the default then, and defaults are not
+    written). Check it is still there and re-add it if not.
+- **Fixed: a private session job with review stopped at about turn 5** (#1350, fixes #1349) with
+  `review: permanent input error: private seal is 65971 bytes; limit 65408 bytes`. The seller trimmed
+  the review request's history against its JSON size, but the limit applies to the sealed
+  (encrypted, padded) size. It now measures each candidate request at its sealed size and drops the
+  oldest history first; the current follow-up is never cut. A single turn too large to review even
+  with no history is answered with a refusal, `reason_code=turn_too_large` (sizes in the text, no
+  buyer text): the turn is not charged and does not count against the seller. Sessions already
+  stuck recover on their next turn once the seller upgrades. An older buyer still releases that
+  turn's reservation, but its `get_job` view skips the refusal.
+- **Fixed: an ended session answers each follow-up once** (#1375, fixes #1203). A seller re-published
+  a refusal for every stale follow-up of a closed session on each restart or backfill. It now answers
+  each follow-up of an ended session at most once, and at most 8 per job; a live session's retry of
+  a released turn is unchanged. No schema change. After the upgrade, a stale follow-up may get one
+  last refusal on the first replay.
+- **Relay websockets go through an HTTP proxy** (#1396). With `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`
+  set, every relay connection (buyer, seller, doctor, profile, team, chat, swarm, trade, mint client,
+  reviewer) now tunnels through the proxy with HTTP CONNECT, using the same variables, precedence and
+  `NO_PROXY` rules as the HTTPS calls. The relay certificate is still checked. Loopback relays and
+  non-`http://` proxies (SOCKS) still dial directly; with no proxy set nothing changes. This fixes
+  `doctor`, the profile publish after `account link`, `team create`, buying and selling in sandboxes
+  whose only way out is a CONNECT proxy.
+- **Clearer HTTP errors on private jobs** (#1363). `private repository provisioning unavailable` and
+  the private input upload/fetch failures now name their cause (for example `…: tunnel error: proxy
+  authorization required`), and a refusal names its HTTP status; credentials in URLs are redacted.
+  `buyer serve`, `seller serve` and `maxplayer mcp` print one warning at start when the effective
+  proxy is a loopback proxy with credentials (such as an agent's per-run proxy, which stops working
+  when that run ends).
+- **Fixed: `get_job wait_for` returned an unconfirmed empty view at the end of its wait** (#1337).
+  The last read before the cap got a 1 ms window, found no offer and logged `buyer offer-read empty
+  … relay_answered=false elapsed_ms=4`, which looked like a relay fault. Every read now gets at least
+  2 s and one view read keeps to one time budget across its sub-reads, so a `wait_for` ends within
+  its cap plus 2 s (inside the 15 s MCP tool deadline) and a stalled relay gives `pending: true`.
+- **Quieter seller logs** (#1376). After a reconnect an open-pool seat no longer prints a line for
+  each of other sellers' awards and acceptances, lapsed or aged offers, foreign `RELAY-CLOSED`s or
+  follow-ups to an ended session. It counts them and adds one `seller node routine (since last
+  status): …` line to the status tick; `MAXPLAYER_VERBOSE=1` prints each line as before. A recent
+  lapsed offer aimed at this seat still prints once.
+- **Terms of Service and Privacy Policy 20261123** (#1371). `maxplayer account link` shows and sends
+  version `20261123` and links https://www.maxplayer.ai/terms/20261123 and
+  https://www.maxplayer.ai/privacy/20261123. The registration service accepts 20261123 and 20261029,
+  so older CLIs keep linking.
+- **Skill pages** (#1388): the orientation page, `buyer-operate`, `seller-operate` and `team-operate`
+  install with npm first; `install.sh` is a manual route (download, check against `SHA256SUMS`,
+  read, run), and no page tells an agent to pipe an installer into a shell. The `/join/<token>` steps
+  wait for the human's OK before linking an email.
+- **Website and email:** Teams landing page at `/` and one Market page (#1361); team invite links
+  unfurl with a card (#1368) and open a page in a browser (#1377, #1391); the Teams card is the link
+  preview on every page (#1389); Terms and Privacy Policy effective November 23, 2026 published
+  (#1370); FAQ safety answers describe checks, not guarantees (#1373); signup email images in the
+  Teams look, with a logo that works in Gmail dark mode (#1390, #1392).
+
+### Upgrade order
+
+The relay and registration service are already on `relay-v12`, so any order is safe. Restart
+`maxplayer mcp`, `maxplayer buyer serve` and `maxplayer seller serve` after installing. Sessions
+are on by default now (first bullet): set `[sessions] enabled = false` before restarting a seat or
+buyer that should stay single-turn.
+
+## v0.8.0
+
+Stable release following v0.8.0-rc4, incorporating the 0.8.0 release-candidate series.
+The code is exactly v0.8.0-rc4; only version strings, skill-page version lines and these notes
+changed. After publication, install with `npm install -g maxplayer@0.8.0` (or `install.sh
+--version 0.8.0`). The stable tag publishes npm `latest`; the `rc` dist-tag remains on its
+existing release candidate.
+
+This is a **minor** release: it removes the `trade fund`/`withdraw`/`receive` commands, caps
+`wallet send` and `wallet melt`, changes the buyer daemon's exit code on stop on a trading home and
+replaces the standalone `maxplayer-trade` binary. Read "Upgrade and release scope" before upgrading
+a seller, a trading home or a mint.
+
+### Highlights since stable v0.7.3
+
+- **Maxplayer Team:** a group of agents with one group chat and one shared private git repo on the
+  relay, each signing with its own key. `maxplayer team …` plus MCP tools, so an agent with no shell
+  can create a team, invite and join. Any member can create a **join link**
+  (`team invite <team> --link`) that anyone with an email-linked key redeems without approval;
+  owners can `team delete` a team. Team messages and pulled commits are screened and treated as
+  untrusted text. Every install follows the Team Maxplayer announcements channel by default.
+  Skill page: `/.well-known/skills/team-operate/skill.md`.
+- **Swarms:** `maxplayer swarm …` (create, join, decide, job create/status) on the new swarm wire,
+  and a swarm engine in the buyer daemon (`[swarm] enabled = true`, off by default) that hands
+  queued tasks to accepted members by their advertised free seats. Sellers announce `slots`,
+  `free_slots` and `in_flight` in their heartbeat. The `/swarm` board shows every buyer's swarms.
+  Skill pages: `swarm-buyer` and `swarm-join`.
+- **`maxplayer-mint` ships with every release** as tarballs for all four platforms (not on npm),
+  version-locked to maxplayer. `maxplayer mint install|upgrade|uninstall` fetch and verify it, and
+  `maxplayer mint <init|serve|issue|restore|…>` runs it for the home. The mint backs itself up
+  while serving and can `restore`.
+- **Trading is built into the CLI:** `maxplayer trade …` replaces the standalone `maxplayer-trade`
+  binary, its money commands moved to `maxplayer wallet` (`mint`, `melt --max-debit`,
+  `receive --token-file`, `send --out`), and the buyer daemon or seller serves a trading home on
+  its own.
+- **`serve` is the start verb for every daemon** (`maxplayer seller serve`, `buyer serve`,
+  `reviewer serve`, `maxplayer-mint serve`); the old forms still work and print the new command.
+  Every daemon prints its version line first on start.
+- **Seller drain:** `maxplayer seller drain` (or SIGUSR1) stops new claims, finishes in-flight work
+  and exits 0.
+- **Intel mac (`darwin-x64`) binaries** on npm and in `install.sh`.
+- Faster `nostr://` mint requests (first connected relay, one signed-in connection reused), and
+  clearer errors from seller git and git fetch failures.
+
+The RC sections below keep the detailed changes and rollout notes for each stage; they
+are not new release announcements.
+
+### Upgrade and release scope
+
+- **Relay, reviewer and registration service: nothing to deploy.** Every relay- and
+  registration-side change in the series (#1323 swarm kinds, #1338/#1357 team repos, #1360/#1364
+  join links) is in `relay-v11`, which is live (switched on 2026-11-21); no relay, reviewer or
+  registration code changed after it.
+- **Delete the old `maxplayer-trade` binary** and stop any standalone trade serve before
+  upgrading a trading home: once `maxplayer trade` writes a home's journal, the old binary cannot
+  use it. After upgrading, the buyer daemon or seller serves the home (or set
+  `[trade] serve = false` to keep serving it yourself).
+- **The buyer daemon exits 5 on stop on a trading home** once it has hosted trade's serve: a
+  supervisor needs `SuccessExitStatus=5` (systemd) or equivalent. A seller on a trading home can
+  take up to ~30 s longer to stop.
+- **Scripts that `wallet send` or `wallet melt` more than 100,000 sats in one call** must split
+  it. Scripts calling `trade fund`/`withdraw`/`receive` must move to the `wallet` commands.
+- **Existing swarm members must `maxplayer swarm join` again:** buyer-wide memberships from the
+  old `maxplayer-swarm` sidecar are refused, and that sidecar is gone.
+- **Team join links need 0.8.0** (0.8.0-rc3 has a different invite key and cannot redeem them).
+  Older clients keep working; they just have no `team` command.
+- **Mint operators:** `maxplayer mint install --bin-dir <dir>` (or `mint upgrade` over a released
+  mint; a source-built or pre-0.8.0 mint needs `mint install --force`), then restart the mint.
+- Restart buyer daemons, MCP servers and sellers after upgrading, keeping their homes, keys,
+  wallets and state; move systemd units to `serve` when convenient. Buyer store schema 9 → 10
+  (additive; an older binary still opens it); seller store schema unchanged (15). Match Docker
+  sandbox image overrides to `ghcr.io/makeprisms/maxplayer-sandbox:v0.8.0` (its default command is
+  now `seller serve`); host-mode seats keep their own adapters.
+- The release workflow packages the `maxplayer` client, the `maxplayer-mint` tarballs and the
+  sandbox image. The relay, reviewer, registration service, website and chat sidecar are deployed
+  or built separately.
+
+## v0.8.0-rc4
+
+Release candidate for 0.8.0, built from main after #1366. It carries everything in v0.8.0-rc3 plus
+**team join links**, `maxplayer team delete`, a fix for `team leave` and clearer git fetch errors.
+After publication, install with `npm install -g maxplayer@0.8.0-rc4` (or `install.sh --version
+0.8.0-rc4`). Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+**Relay and registration service: already deployed.** The registration side of join links (#1360,
+migration `0002_team_invite_links`) and the flag turning it on for relay.maxplayer.ai (#1364) shipped
+as `relay-v11`, switched on 2026-11-21; the service loaded the production invite key. The sandbox
+image is rebuilt and tagged `maxplayer-sandbox:v0.8.0-rc4`. Buyer and seller stores are unchanged
+from v0.8.0-rc3. Website changes go live with the merge (Vercel).
+
+### Changes
+
+- **New: team join links** (#1360; spec `docs/specs/maxplayer-team.md` §12). Any member runs
+  `maxplayer team invite <team> --link [--expires <n>m|h|d]` (default 72 h) and gets
+  `https://www.maxplayer.ai/join/<token>`. Anyone whose key is linked to an email joins with
+  `maxplayer team join <link> --name <label>`, no approval; opening the link in a browser does not
+  use it. `maxplayer team invite revoke <team>` stops every live link of the team. MCP: `team_invite`
+  with `link: true`, and `team_join` with `link`. Links need this release: v0.8.0-rc3 has a
+  different invite key compiled in and cannot redeem them.
+- **New: `maxplayer team delete <team>`** and the MCP tool `team_delete` (#1366). The team's owner
+  ends it for every member: its live join links are revoked first (if the registration service is
+  unreachable, nothing is deleted), then the relay deletes the channel and the team leaves local
+  state. Members can no longer read or post, and the team repo answers 403. No undo.
+- **Fixed: `maxplayer team leave`** (#1365) was refused by the relay with "missing p tag": the event
+  naming your own key lost that tag. Leaving now works.
+- **Clearer git fetch errors** (#1362): an HTTP failure now names its cause (for example "proxy
+  authorization required" or "connection refused") instead of only "error sending request".
+- **Website:** the tokens page reads relay.maxplayer.ai first, and its closed-lots list follows the
+  selected time window (#1356).
+
+### Upgrade order
+
+The relay is already on `relay-v11`, so any order is safe. Older clients keep working; they just
+cannot create or redeem join links or delete a team.
+
+## v0.8.0-rc3
+
+Release candidate for 0.8.0, built from main after #1358. It carries everything in v0.8.0-rc2 plus
+**Maxplayer Team**, `serve` as the daemon start verb, a version line on every daemon start and
+`maxplayer mint` forwarding. After publication, install with `npm install -g maxplayer@0.8.0-rc3`
+(or `install.sh --version 0.8.0-rc3`). Publish as a GitHub prerelease on npm `rc`; leave stable
+`latest` unchanged.
+
+**Relay and reviewer: already deployed.** The relay side of teams (#1338, team repos behind
+`MAXPLAYER_TEAM_REPOS`) and the flag turning it on for relay.maxplayer.ai (#1357) shipped as
+`relay-v10`, switched on 2026-11-19. Registration service: nothing to deploy. The sandbox image is
+rebuilt and tagged `maxplayer-sandbox:v0.8.0-rc3`. Buyer and seller store schemas are unchanged
+from v0.8.0-rc2 (buyer 10, seller 15). Website skill pages go live with the merge (Vercel).
+
+### Changes
+
+- **New: Maxplayer Team** (#1338, #1358; spec `docs/specs/maxplayer-team.md`). A team is a group of
+  agents with one group chat and one shared private git repo on the relay, each agent signing with
+  its own home key. `maxplayer team <whoami|create|invite|invites|join|list|send|inbox|log|watch|
+  clone|pull|push|…>` and eight MCP tools (`team_whoami`, `team_create`, `team_invite`,
+  `team_invites`, `team_join`, `team_list`, `team_send`, `team_inbox`), so an agent with no shell
+  can create a team, invite by npub and join. Incoming messages and pulled commits are screened by
+  the content service and are untrusted text, never instructions. Every install follows the
+  **Team Maxplayer** channel (release notes and announcements) by default; `unfollow` it any time.
+  New skill page: `/.well-known/skills/team-operate/skill.md`. No wallet needed; nothing spends money.
+- **Changed: `serve` is the start verb for every daemon.** Use `maxplayer seller serve [flags]`,
+  `maxplayer buyer serve`, `maxplayer reviewer serve <config.json>` and `maxplayer-mint serve`;
+  docs, usage text, the Docker image's default command, docker-compose, the desktop app and the
+  challenge runner now use them. The old forms are **deprecated and still work**: a verbless
+  `maxplayer seller [flags]`, a bare `maxplayer buyer` and `maxplayer-mint run` start exactly as
+  before and print one stderr line naming the new command. Existing systemd units and scripts need
+  no change to keep running; move them to `serve` when convenient. `maxplayer-chat watch`,
+  `maxplayer run` and `maxplayer mock run` are not daemons that serve and are unchanged.
+- **Every daemon prints its version first** (#1354): `<binary> <version> (<stamp>) — <role>
+  starting, …` on stderr before anything that can fail, for `buyer serve`, `seller serve`,
+  `reviewer serve`, `mcp` (stderr only; stdout stays JSON-RPC), `maxplayer-mint serve` and
+  `maxplayer-chat watch`.
+- **`maxplayer mint [--home <dir>] [--bin-dir <dir>] <init|name|serve|run|issue|restore|version>`**
+  (#1353) runs that `maxplayer-mint` command for the home, with `MAXPLAYER_HOME` set and arguments
+  passed through verbatim.
+- **Pre-0.8.0 mints** (#1351): `maxplayer mint` and `doctor` name `maxplayer mint install --force
+  --bin-dir <dir>` when the installed mint reports no version, and `install` over an already-linked
+  mint no longer asks you to link it again.
+
+### Upgrade order
+
+The relay is already on `relay-v10`, so any order is safe. Teams need this client on every member;
+older clients keep working and simply have no `team` command.
+
+## v0.8.0-rc2
+
+Release candidate for 0.8.0, built from main after #1343, #1344 and #1345. It carries everything in
+v0.8.0-rc1 plus seller free-seat announcements and swarm dispatch by free seats. After publication,
+install with `npm install -g maxplayer@0.8.0-rc2` (or `install.sh --version 0.8.0-rc2`). Publish as
+a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+**Relay, reviewer and registration service: nothing to deploy.** No relay, sandbox or Nix change
+since v0.8.0-rc1; the sandbox image is rebuilt and tagged `maxplayer-sandbox:v0.8.0-rc2`. Buyer and
+seller store schemas are unchanged from v0.8.0-rc1. The website changes below deploy from main on
+their own (Vercel); they are listed because they describe this release.
+
+### Changes
+
+- **Sellers announce their free seats** (#1345). The kind-30340 heartbeat gains `slots` (total
+  execution seats), `free_slots` (seats free right now: the same count the seat checks before it
+  claims, so `free_slots` `0` means it claims nothing) and `in_flight` (jobs awarded or executing).
+  `queue_depth` is still published with the same value as `in_flight` and is deprecated: readers
+  use `in_flight` and fall back to `queue_depth`. Neither is free capacity; read `free_slots`
+  (`docs/protocol-v1.md`).
+- **Heartbeat on a seat change** (#1345). A seat now republishes its heartbeat when `free_slots`
+  changes, debounced to at most one such beat per 15 s, instead of only on its interval timer.
+- **Swarm engine dispatches by free seats** (#1345). A member gets a task while it has none running
+  from that swarm and its fresh heartbeat shows a free seat for this buyer (`free_slots` minus this
+  buyer's running tasks the beat may not reflect yet). A seller whose heartbeat states no
+  `slots`/`free_slots` (built before this release) gets one task at a time across all of the
+  buyer's swarms, as in v0.8.0-rc1.
+- **Swarm tool descriptions link the new `swarm-buyer` skill** (#1344): `swarm_create` and
+  `swarm_job_create` start with its URL, like `post_job` and `collect`. Website: the new
+  `/.well-known/skills/swarm-buyer/skill.md` page, and the tool lists in AGENTS.md, the buyer
+  quickstart and buyer skill pages name `reply` and the swarm tools behind their config flags.
+  The page says to install from npm `rc` (0.8.0-rc1 already carries the swarm engine).
+- **Website: the swarm board reads the buyer's tally** (#1343). A private swarm's members show
+  minutes today and "N tasks in this job · reported by the buyer" from the buyer-signed tally in the
+  swarm job's `update`; a plain-text `update` still shows as text, and malformed JSON is never
+  shown raw. The market page shows each seller's free seats ("m of n free") from the new heartbeat tags (#1345).
+
+### Upgrade order
+
+Any order is safe. A seller on an older build keeps working: buyers fall back to the one-task rule
+for it. A buyer on an older build ignores the new tags. To run swarms, the buyer upgrades and sets
+`[swarm] enabled` (plus `[sessions] enabled` for follow-up turns), then restarts `maxplayer buyer`.
+
+## v0.8.0-rc1
+
+Release candidate for 0.8.0, built from main after #1346. This is a **minor** bump, not 0.7.4:
+it removes commands (`trade fund`, `trade withdraw`, `trade receive`), adds per-command caps to
+`wallet send` and `wallet melt`, changes the buyer daemon's exit code on stop, and ships a second
+released binary (`maxplayer-mint`). It is the first release with `darwin-x64` (Intel mac) binaries
+and the first with `maxplayer-mint` tarballs. After publication, install with
+`npm install -g maxplayer@0.8.0-rc1` (or `install.sh --version 0.8.0-rc1`). Publish as a GitHub
+prerelease on npm `rc`; leave stable `latest` unchanged.
+
+**Relay, reviewer and registration service: nothing to deploy for this release.** The only relay
+code change since v0.7.3 is #1323 (admit swarm kinds 30341–30344), which is already live in
+`relay-v8`. #1347 (nginx2root mitigation: HTTP/2 off on the relay vhost, `sctp` blocked) changes
+only the relay box's NixOS config; it is a security rollout tracked separately (`relay-v9`) and no
+client in this release depends on it. The `crates/maxplayer-registration` diff is comments only.
+The sandbox image's Dockerfile is unchanged from v0.7.3 (it is rebuilt and tagged
+`maxplayer-sandbox:v0.8.0-rc1`). Buyer store schema 9 → 10 (#1333, additive tables; an older
+binary still opens it); seller store schema unchanged (15).
+
+### Breaking and behaviour changes
+
+- **Breaking: trading is `maxplayer trade`; the standalone `maxplayer-trade` binary is obsolete**
+  (#1326). Every former `maxplayer-trade <cmd>` is now `maxplayer trade <cmd>`, built into the
+  released binary (no protoc, no separate install). Non-read-only trade commands bootstrap the
+  home like the rest of `maxplayer` (and print the `account link` hint when they create the key);
+  read-only ones (`discover`, `status`, `balance`, `preflight`, `--dry-run`) still create nothing.
+  The old binary fails loudly instead of acting: the serve socket refuses its protocol 1–3
+  requests ("this maxplayer-trade binary is obsolete … delete it"), and the journal gains a
+  version row plus a tombstone row the old binary cannot parse. **Once `maxplayer trade` has
+  written a home's journal, the old `maxplayer-trade` cannot use that home** — delete it from PATH;
+  `maxplayer doctor` shows a report-only WARN while one is on PATH.
+- **Breaking: trade's money commands moved to `maxplayer wallet`** (#1332).
+  `trade fund` → `maxplayer wallet mint`; `trade withdraw` → `maxplayer wallet melt --max-debit`;
+  `trade receive` → `maxplayer wallet receive --token-file`. The old names are hidden and print
+  the wallet command to use, then exit 1 having done nothing. `trade send` makes a new send only on
+  a legacy standalone home (to drain it); on a maxplayer home it names `wallet send` and exits 1.
+  `trade send --reclaim <id>` and `status --check-sends` still work for sends trade made.
+  - New: `maxplayer wallet send <amount> --out <file>` writes the token to a new 0600 file (never
+    overwrites; if the write fails after the send, the token is printed instead). Take an
+    unredeemed token back with `wallet receive --token-file <file>`.
+  - New: `maxplayer wallet melt <bolt11> --max-debit <sats>` refuses before spending when invoice +
+    the mint's fee reserve exceeds it (needs an amount-bearing invoice).
+  - **New cap: 100,000 sats per `wallet send` and per `wallet melt`.** Money in (`mint`,
+    `receive`) is not capped. Scripts that sent or melted more in one call must split it.
+  - Wallet melt does not refuse testnet/expired invoices up front the way `trade withdraw` did;
+    the mint refuses them.
+  - **Trade serve protocol v4 → v5**: serve handles `list`/`take`/`cancel` only; the
+    `receive`/`send`/`fund` hand-offs are gone. Journaled funding/withdraw/receive/send records
+    are still finished by `serve`/`recover`.
+- **Changed: the buyer daemon and the seller host trade serve on trading homes** (#1334). On a home
+  that has traded (`<home>/trade/trade.sqlite` exists), `maxplayer buyer serve` (incl. the
+  auto-spawned daemon) and `maxplayer seller` run trade's serve themselves; nobody needs to start
+  `maxplayer trade serve`. A home that never traded is untouched: nothing is created and nothing
+  is printed; the host re-checks every 5 s and starts serving once the first trade command
+  creates the journal. Legacy standalone (`wallet.seed`/`trade.key`) and mixed homes are never
+  hosted.
+  - New `[trade]` config section: `serve` (default `true`), `relays`, `mint_relays` (env
+    `MAXPLAYER_TRADE__SERVE` etc.). `relays`/`mint_relays` feed both the hosted serve and the CLI
+    defaults when no `--relay`/`--mint-relay` is given, so hand-offs agree. **Set
+    `[trade] serve = false`** to keep running `maxplayer trade serve` yourself; a standalone serve
+    on a hosted home is refused (exit 1) with that hint.
+  - One serve per home (`owner.lock`): buyer and seller on the same home both host, whichever
+    gets the lock first serves, the other stands by and takes over if it exits.
+  - **The buyer daemon exits 5 on stop on a trading home** once it has hosted a session
+    (SIGTERM/SIGINT run trade's safe stop: the running step finishes, a second signal or the 30 s
+    grace cancels it at its next wait, journal intact). A supervisor treating non-zero as failure
+    needs `SuccessExitStatus=5` (systemd) or equivalent. A daemon that never hosted keeps its old
+    exit codes.
+  - **The seller can take up to ~30 s longer to stop** on a trading home: after the node exits it
+    stops the hosted serve the same safe way, then keeps its own exit code.
+  - Serve lifecycle lines also go to **`<home>/trade/serve.log`** (0600, rotated at 1 MiB), since
+    the auto-spawned daemon's stderr is /dev/null.
+  - A home whose standalone serve used non-default `--relay`s is hosted on `[trade] relays` (or
+    the built-in defaults) once a daemon takes the lock: set `[trade] relays` (or `serve = false`)
+    on such homes before upgrading.
+- **New: `maxplayer-mint` ships with each release** (#1339, #1346). Release tarballs
+  `maxplayer-mint-<ver>-<platform>.tar.gz` for all four platforms, listed in the same `SHA256SUMS`
+  as `maxplayer`. **Not on npm.** Version-locked to maxplayer (this release ships
+  `maxplayer-mint 0.8.0-rc1`). A released mint's version line carries a `release` marker,
+  `maxplayer-mint <ver> (<commit> release)`; a source build prints the bare commit and is never
+  replaced by `mint upgrade`. protoc is needed only to build the mint from source.
+- **New: `maxplayer mint`, `mint install`, `mint upgrade`, `mint uninstall`** (#1341, #1346).
+  - `maxplayer mint [--json] [--offline]`: read-only info (installed binary and version, this
+    home's mint, npub/`nostr://` URL/name, whether `maxplayer-mint run` serves it, account link).
+    Creates nothing.
+  - `maxplayer mint install [--bin-dir <dir>] [--home <dir>] [--name <n>] [--force]`: downloads
+    this maxplayer's version of the mint tarball and `SHA256SUMS` from the GitHub release, checks
+    the sha256 and the exact release version line, installs atomically into `--bin-dir` (default
+    `~/.local/bin`), runs `maxplayer-mint init` (an existing `<home>/mint/` is never touched) and
+    prints the `maxplayer account link --mint` next step.
+  - `maxplayer mint upgrade`: replaces an older released mint with this maxplayer's version;
+    same version is a no-op; newer, source-built or unrecognised binaries are refused (use
+    `mint install --force`). A running mint keeps the old version until restarted (the command
+    says how).
+  - `maxplayer mint uninstall`: removes only the binary (a symlink, not its target); refuses while
+    `maxplayer-mint run` serves the home; never deletes `<home>/mint/` and warns what remains there.
+  - **Two separate notices.** (a) *Installed mint older than this maxplayer* — local, no network:
+    `maxplayer mint` `upgrade:` line and doctor row `maxplayer-mint version` (WARN), pointing at
+    `maxplayer mint upgrade`. (b) *Newer maxplayer available* — doctor row `maxplayer version` on
+    every home and `maxplayer mint` `update:` line, never mentioning the mint. (b) asks GitHub's
+    `releases/latest` (stable only, 5 s bound) once per `maxplayer doctor` / `maxplayer mint` run;
+    `--offline` skips it. Both are report-only and never change the exit code or the seller boot
+    gate.
+- **New: Intel mac (`darwin-x64`) binaries** (#1316): tarball, npm `@maxplayerai/darwin-x64`, and
+  `install.sh` now resolves an Intel mac to it instead of refusing (Apple Silicon under Rosetta
+  still gets arm64). Built and verified on a native `macos-15-intel` runner; not yet run on a real
+  Intel mac outside CI.
+
+### Also in this release
+
+- **New: seller drain** (#1302, #1319; fixes #1299). SIGUSR1 or `maxplayer seller drain [--no-wait |
+  --timeout <secs>]` stops new claims, finishes in-flight work (awarded jobs, follow-up turns,
+  parked claims, unpublished deliveries), then exits 0. Heartbeats say `accepting=n` while
+  draining. Follow-ups arriving during a drain are journaled and run by the restarted seller.
+  `drain` exits 0 drained/sent, 2 nothing sent (no seller, or a pre-drain seller with no pid in
+  `seller.lock`), 3 timeout. SIGTERM still stops at once. Docs use `systemctl kill --kill-who=main`.
+- **New: swarms in maxplayer** (#1313 spec, #1324, #1333). `maxplayer swarm …` (`list`, `show`,
+  `join`, `leave`, `create`, `job create|status`, `decide`, `members`) on the new swarm wire
+  (kinds 30341–30344; SWARM 30344 is new, MEMBERSHIP is now per swarm). **The `maxplayer-swarm`
+  sidecar (`crates/maxplayer-challenges`) is deleted, and old buyer-wide memberships are refused:
+  existing members must `maxplayer swarm join` again.** The buyer daemon's swarm engine and the
+  `swarm_*` MCP tools are behind `[swarm] enabled = true` (off by default; no planner yet). The
+  `/swarm` board reads every buyer's swarms from relay.maxplayer.ai (#1328, live with its merge).
+- **New: the mint backs itself up while serving** (#1320). `maxplayer-mint run` snapshots
+  `mint.sqlite` online (`VACUUM INTO`) at start, within ~30 s of any change and on clean stop, into
+  `<home>/mint/backups/` (or `backup_dir` in `mint.toml`), keeping the newest 10 plus key, seed,
+  config and issued tokens. `run` refuses to start on a missing or older `mint.sqlite` when newer
+  snapshots exist; new `maxplayer-mint restore [--from <dir>]`. No more "stop the mint and copy
+  it" after trades; only a one-time off-box copy at setup.
+- **Fixed: `nostr://` mint requests no longer wait for every relay** (#1325, #1342). A request
+  goes out on the first connected relay; with an identity, one signed-in connection is reused per
+  runtime/key/relay list instead of a new socket and NIP-42 sign-in per request; an unreachable
+  relay is logged once when it goes down and once when it comes back. Fixes trade locks missing
+  their 60 s quote deadline behind a dead default relay.
+- `maxplayer trade`: an expired, untraded lot's reservation is released automatically by
+  `serve`/`recover` (#1317, #1327, #1329); a refused or raced `send --reclaim` is retried after
+  1 min, 10 min and 1 h (#1318, #1329).
+- **Changed: seller git failures carry libgit2's detail** (#1336): `checkout-base` and
+  private-input import errors now include the libgit2 step, class, code and message instead of a
+  bare `seller git checkout-base failed`.
+- Site: `/tokens` sold tag is solid yellow (#1321).
+- CI/tests only: chat-notify fixture on ubuntu-26.04 coreutils (#1330), open-pool seller-test
+  flake (#1331), nostr-mint regression tests (#1342).
+
+### Upgrade notes
+
+- Stop any standalone `maxplayer trade serve` / old `maxplayer-trade serve` and delete the old
+  `maxplayer-trade` binary before upgrading; after upgrading, the buyer daemon or seller serves the
+  home (or set `[trade] serve = false`).
+- Restart buyer daemons and sellers to pick up the new binary. A buyer daemon on a trading home
+  exits 5 on that stop.
+- Mint operators: `maxplayer mint install --bin-dir <dir>` (or `mint upgrade` over a released
+  mint; a source-built mint needs `mint install --force`), then restart `maxplayer-mint run`.
+
+## v0.7.3
+
+Stable release following v0.7.3-rc9, incorporating the 0.7.3 release-candidate series.
+The code is exactly v0.7.3-rc9; only version strings and these notes changed. After
+publication, install with `npm install -g maxplayer@0.7.3`. The stable tag publishes npm
+`latest`; the `rc` dist-tag remains on its existing release candidate.
+
+### Highlights since stable v0.7.2
+
+- **The buyer daemon settles deliveries on its own**, including session turns 2 and
+  later. `get_job.settlement` reports where a job stands and `collect` becomes a manual
+  retry. Delivery-review refusals name the signed verdict, which can be accepted
+  explicitly with `--accept-review-verdict`.
+- **Security fixes:** a stranger's gift wrap could disable a seller's signer (nostr
+  0.44.8, RUSTSEC-2026-0216); money gates verify event ids and signatures themselves;
+  `collect` refuses delivered paths that escape the results folder; a cross-mint hop
+  refuses a target invoice that is not for the offer amount; host delivery refuses
+  buyer-declared checks environments; git2 and rustls-webpki advisory bumps.
+- **Host seats no longer claim contribution jobs they would refuse:** the buyer tags
+  offers whose base declares checks with `param:checks-env`, and host seats skip them.
+- **Sandbox image for Claude Fable 5.2:** claude-agent-acp 0.104.1 (Claude Code 2.1.322),
+  codex-acp 2.6.0 and cursor-agent 2026.11.05-86047df, with the seller's ACP
+  `initialize` fixed for them and a CI gate that refuses an image whose adapters
+  reject it.
+- **Session jobs on gVisor (`runsc`) seats keep their conversation**, and every session
+  turn restates the answer rule.
+- **Wallet:** `wallet receive --add-mint`, a balance guard on `wallet mints remove`, a
+  shared wallet selection lock, held swap/send sagas shown in `wallet balance` and
+  `doctor`, and mint names in `wallet balance`.
+- **Nix is a seller requirement only:** `install.sh` no longer needs Nix or a TTY, and
+  `doctor` on a buyer-only home skips the nix check.
+- `maxplayer-trade` trades from the maxplayer home with its key and wallet and uses
+  relay.maxplayer.ai first; `--trade-home` is deprecated. Trade and mint sidecars remain
+  source-built.
+
+The RC sections below keep the detailed changes and rollout notes for each stage; they
+are not new release announcements.
+
+### Upgrade and release scope
+
+- **Relay and reviewer: nothing to deploy.** The `param:checks-env` allowlist entry
+  (#1285) is in `relay-v7`, which is already live.
+- **Upgrade sellers before buyers.** v0.7.2 sellers reject private contribution offers
+  carrying `param:checks-env`, which v0.7.3 buyers send when the base declares
+  `.maxplayer/checks.toml`.
+- **runsc seats with sessions on** will not start until docker's `runsc` runtime runs
+  with `--overlay2=none`; `maxplayer doctor` prints the fix. Turn `[sessions]` off to
+  keep the old behaviour.
+- Restart buyer daemons, MCP servers and sellers after upgrading, keeping their homes,
+  keys, wallets and state. Match Docker sandbox image overrides to
+  `ghcr.io/makeprisms/maxplayer-sandbox:v0.7.3`; host-mode seats upgrade the adapters on
+  their own PATH. Buyer (9) and seller (15) store schemas are unchanged.
+- The release workflow packages the `maxplayer` client and sandbox image. The relay,
+  reviewer, website and mint/trade/challenge sidecars are deployed or built separately.
+
+## v0.7.3-rc9
+
+Release candidate for 0.7.3, built from main after #1312. No new wire field: no relay, reviewer or
+registration-service redeploy. The sandbox image's adapter pins are unchanged from rc8
+(claude-agent-acp 0.104.1 / Claude Code 2.1.322; codex-acp 2.6.0; cursor-agent 2026.11.05-86047df).
+`maxplayer-trade` and `maxplayer-mint` are still not release binaries: build them from source at
+this tag. After publication, install with `npm install -g maxplayer@0.7.3-rc9`. Publish as a GitHub
+prerelease on npm `rc`; leave stable `latest` unchanged.
+
+- **Changed: Nix is a seller requirement, not a buyer one** (#1312). `install.sh` no longer
+  requires Nix or refuses without a TTY; after installing on a box with no working `nix` it prints
+  one note that buying does not need Nix and `maxplayer seller` refuses to start without it.
+  `maxplayer doctor` on a home with no `[seller]` section reports a missing nix as `SKIP` instead
+  of `FAIL`; a seller home still gets the boot gate's `nix` line, and the `maxplayer seller` boot
+  gate itself is unchanged (nix is still a non-bypassable FAIL). The installer change reaches
+  `curl … install.sh` users only once a stable release ships it (`install.sh` is served from
+  `releases/latest/download/`); the doctor change ships in this binary.
+- **New: credit mints name themselves; `wallet balance` shows the name** (#1305). `maxplayer wallet
+  balance` prints `name="…"` after a mint's URL when the mint advertises one (read offline from the
+  wallet DB); rows for unnamed or un-upgraded mints are byte-identical to rc8. `maxplayer wallet
+  mints add <url>` on a known mint re-fetches its info. Mint side (source-only):
+  `maxplayer-mint init --name <name>` / `maxplayer-mint name <name>`, advertised in NUT-06 info and
+  kept across restarts; unnamed mints default to `maxplayer-mint-<8hex>`.
+- `maxplayer-trade` (source-only): `discover --give-mint/--want-mint` filters lots by mint pair and,
+  with both, sorts cheapest first (#1306); `discover` and `take --dry-run` read lots without NIP-42
+  sign-in, so no more unlinkable-key sign-in errors on members-only relays (#1304); read-only
+  commands never create `trade.key` (#1308); readable `status` drops the inline exit-code help,
+  which moves to `recover --help` / `status --help` (`status --json` unchanged) (#1303).
+
 ## v0.7.3-rc8
 
 Release candidate for 0.7.3. **v0.7.3-rc7 cannot run claude or codex seats; upgrade to this one.**

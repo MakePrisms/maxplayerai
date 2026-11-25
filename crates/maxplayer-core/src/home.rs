@@ -47,6 +47,9 @@
 //! | `buyer.blocked_sellers` | `MAXPLAYER_BUYER__BLOCKED_SELLERS` (comma-separated) |
 //! | `buyer.hop_fee_buffer_multiplier` | `MAXPLAYER_BUYER__HOP_FEE_BUFFER_MULTIPLIER` |
 //! | `contribution.allowed_paths` (list) | `MAXPLAYER_CONTRIBUTION__ALLOWED_PATHS=…` |
+//! | `trade.serve` | `MAXPLAYER_TRADE__SERVE` |
+//! | `trade.relays` (list) | `MAXPLAYER_TRADE__RELAYS=wss://a,wss://b` |
+//! | `trade.mint_relays` (list) | `MAXPLAYER_TRADE__MINT_RELAYS=wss://a` |
 //!
 //! List fields comma-split only for the paths in [`LIST_ENV_KEYS`]. The `agents` map is file-only
 //! via env: its keys are dynamic, so a nested `argv` list path cannot be pre-registered for
@@ -192,11 +195,18 @@ pub const DEFAULT_RELAY_GIT_REPO: &str = "maxplayer-seller";
 /// Seller daemon config (`[seller]` in config.toml). Key never lives here.
 ///
 /// `agent_command` MUST be an argv array — a TOML string/shell value is refused at parse
-/// (no-shell by construction).
+/// (no-shell by construction). It is the UNLABELLED fallback harness, used only when `agents` is
+/// empty, so it may be absent when `agents` names the harnesses (a hook-only seat has no ACP
+/// fallback to name); `require_seller_config` refuses a config with neither. Present-but-empty is
+/// still refused at parse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SellerConfig {
-    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_agent_command_argv"
+    )]
     pub agent_command: Vec<String>,
     pub rate_sats: u64,
     /// This seat TAKES NO PAYMENT (§2.1, §4.1). Default **false**. Opting in does two things and
@@ -1607,6 +1617,13 @@ where
     deserializer.deserialize_any(EndpointArgsVisitor)
 }
 
+fn deserialize_optional_agent_argv<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_agent_command_argv(deserializer).map(Some)
+}
+
 fn deserialize_agent_command_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1648,13 +1665,106 @@ where
     deserializer.deserialize_any(ArgvVisitor)
 }
 
-/// One custom agent preset (`[agents.<name>] argv = [...]`). The argv is a launch command
-/// for the seller ACP driver — same no-shell argv-array rule as `agent_command`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One custom agent preset. Exactly one of two forms (docs/specs/hook-agents.md §2):
+///
+/// - `[agents.<name>] argv = [...]` — a launch command for the seller ACP driver, run in our
+///   sandbox, same no-shell argv-array rule as `agent_command`.
+/// - `[agents.<name>] hook = [...]` — the seller's OWN agent behind a command the daemon runs once
+///   per turn (the hook contract). It serves inline, non-contribution jobs only. `family`/`model`
+///   are optional SELF-REPORTED filter values for a hook; refused on an `argv` preset, whose
+///   harness reports its own model.
+///
+/// The one-of rule is checked by [`AgentPresetConfig::validate`] at config load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentPresetConfig {
-    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_agent_command_argv"
+    )]
     pub argv: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_agent_argv"
+    )]
+    pub hook: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl AgentPresetConfig {
+    /// An ACP preset from its argv (the historical form).
+    pub fn acp(argv: Vec<String>) -> Self {
+        Self {
+            argv,
+            ..Self::default()
+        }
+    }
+
+    /// A hook preset from its argv.
+    pub fn hook(argv: Vec<String>) -> Self {
+        Self {
+            hook: Some(argv),
+            ..Self::default()
+        }
+    }
+
+    /// Whether this preset is a hook (the seller's own agent behind a command).
+    pub fn is_hook(&self) -> bool {
+        self.hook.is_some()
+    }
+
+    /// The one-of rule and the self-report rules, for preset `name`.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        match (self.argv.is_empty(), &self.hook) {
+            (false, Some(_)) => {
+                return Err(format!(
+                    "[agents.{name}]: set exactly one of `argv` (an ACP harness) or `hook` (your own agent), not both"
+                ));
+            }
+            (true, None) => {
+                return Err(format!(
+                    "[agents.{name}]: set `argv` (an ACP harness) or `hook` (your own agent)"
+                ));
+            }
+            _ => {}
+        }
+        if !self.is_hook() && (self.family.is_some() || self.model.is_some()) {
+            return Err(format!(
+                "[agents.{name}]: `family`/`model` apply to a `hook` preset only (an ACP harness reports its own model)"
+            ));
+        }
+        if let Some(family) = self.family.as_deref() {
+            if !crate::agent_presets::HARNESS_FAMILIES.contains(&family) {
+                return Err(format!(
+                    "[agents.{name}]: unknown family {family:?} (want one of {})",
+                    crate::agent_presets::HARNESS_FAMILIES.join("|")
+                ));
+            }
+            if let Some(derived) = crate::agent_presets::builtin_family_for_name(name) {
+                if derived != family {
+                    return Err(format!(
+                        "[agents.{name}]: family {family:?} contradicts the built-in name {name:?} (family {derived:?})"
+                    ));
+                }
+            }
+        }
+        if let Some(model) = self.model.as_deref() {
+            if model.trim().is_empty() {
+                return Err(format!("[agents.{name}]: `model` must not be empty"));
+            }
+            if self.family.is_none() && crate::agent_presets::builtin_family_for_name(name).is_none() {
+                return Err(format!(
+                    "[agents.{name}]: `model` needs `family` (a model is advertised per harness family)"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `[buyer]` new-award policy and hop planner knobs.
@@ -1759,25 +1869,37 @@ impl PrivacyConfig {
 
 /// Default parked-session lifetime (`docs/specs/session-jobs.md` §0 item 5): 6 h.
 pub const DEFAULT_SESSION_LIFETIME_SECS: u64 = 21_600;
-/// Default parked-session disk budget per seat (§0 item 12): 20 GiB.
+/// Default parked-session disk budget per seat (§0 item 12): 20 GiB, for a seat whose operator set
+/// `[sessions] enabled = true`.
 pub const DEFAULT_SESSION_DISK_BUDGET_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// Default parked-session disk budget for a seat that has sessions on only because `enabled` is
+/// unset (the default): 5 GiB, so a seat that never chose sessions does not give them 20 GiB.
+pub const DEFAULT_SESSION_DISK_BUDGET_BYTES_UNSET: u64 = 5 * 1024 * 1024 * 1024;
 /// Default wrap-up margin before a turn's deadline (§4): 300 s, unmeasured.
 pub const DEFAULT_SESSION_WRAP_UP_SECS: u64 = 300;
 /// Default per-session cap multiplier when no `max_session_sats` is given (§0 item 12).
 pub const DEFAULT_SESSION_CAP_MULTIPLIER: u64 = 10;
 
-/// `[sessions]` — session (multi-turn) jobs, both roles. OFF by default: with `enabled = false`
-/// no claim carries `["session","1"]`, no follow-up is sent or accepted, and every code path and
-/// every wire byte is today's. Absent from a written config while it equals the default, so an
-/// existing `config.toml` round-trips unchanged.
+/// `[sessions]` — session (multi-turn) jobs, both roles. ON by default: `enabled` unset reads as on
+/// ([`SessionsConfig::enabled`]). With `enabled = false` no claim carries `["session","1"]`, no
+/// follow-up is sent or accepted, and every code path and every wire byte is the pre-session one.
+/// Whether the operator SET `enabled = true` ([`SessionsConfig::explicitly_enabled`]) still matters
+/// on a seller: only then does a runsc seat that cannot keep a session FAIL `maxplayer doctor`
+/// (unset: WARN, single-turn jobs continue), and only then is the disk budget 20 GiB (unset:
+/// 5 GiB). Absent from a written config while it equals the default, so an existing `config.toml`
+/// round-trips unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionsConfig {
-    pub enabled: bool,
+    /// `None` (unset) = on. Read it through [`SessionsConfig::enabled`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// Seller: a parked session idle this long is expired by the GC pass.
     pub lifetime_secs: u64,
-    /// Seller: sum of parked sessions' measured size; oldest evicted first when exceeded.
-    pub disk_budget_bytes: u64,
+    /// Seller: sum of parked sessions' measured size; oldest evicted first when exceeded. `None`
+    /// (unset) resolves through [`SessionsConfig::disk_budget`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_budget_bytes: Option<u64>,
     /// Seller: `session/cancel` is sent at `deadline - wrap_up_secs`.
     pub wrap_up_secs: u64,
     /// Buyer: default session cap; `None` => `10 x` the job price.
@@ -1787,9 +1909,9 @@ pub struct SessionsConfig {
 impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: None,
             lifetime_secs: DEFAULT_SESSION_LIFETIME_SECS,
-            disk_budget_bytes: DEFAULT_SESSION_DISK_BUDGET_BYTES,
+            disk_budget_bytes: None,
             wrap_up_secs: DEFAULT_SESSION_WRAP_UP_SECS,
             session_cap_sats: None,
         }
@@ -1799,11 +1921,44 @@ impl SessionsConfig {
     pub fn is_default(&self) -> bool {
         self == &Self::default()
     }
+    /// Whether session jobs are on for this home (both roles): unset reads as on.
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+    /// Whether the operator wrote `enabled = true`, as opposed to inheriting the default.
+    pub fn explicitly_enabled(&self) -> bool {
+        self.enabled == Some(true)
+    }
+    /// Seller parked-session disk budget: an explicit `disk_budget_bytes` wins; otherwise 20 GiB
+    /// when the operator set `enabled = true`, and 5 GiB when sessions are on only by default.
+    pub fn disk_budget(&self) -> u64 {
+        self.disk_budget_bytes
+            .unwrap_or(if self.explicitly_enabled() {
+                DEFAULT_SESSION_DISK_BUDGET_BYTES
+            } else {
+                DEFAULT_SESSION_DISK_BUDGET_BYTES_UNSET
+            })
+    }
     /// The session cap for a job priced `price_sats`: explicit > config > `10 x price`.
     pub fn cap_for(&self, explicit: Option<u64>, price_sats: u64) -> u64 {
         explicit
             .or(self.session_cap_sats)
             .unwrap_or_else(|| price_sats.saturating_mul(DEFAULT_SESSION_CAP_MULTIPLIER))
+    }
+}
+
+/// `[swarm]` — the buyer daemon's swarm engine (docs/specs/swarm.md §7, §8). OFF by default: with
+/// `enabled = false` no engine task starts, no `swarm_*` MCP tool is listed and the daemon answers a
+/// `swarm_*` call exactly as it answers any unknown method. Absent from a written config while it
+/// equals the default, so an existing `config.toml` round-trips unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SwarmConfig {
+    pub enabled: bool,
+}
+impl SwarmConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
     }
 }
 
@@ -1911,9 +2066,51 @@ pub struct MaxplayerConfig {
     /// `[seat]` operator-declared seat colour. Defaults (both fields unstated) when absent.
     #[serde(default, skip_serializing_if = "SeatConfig::is_default")]
     pub seat: SeatConfig,
-    /// `[sessions]` multi-turn jobs. Defaults (OFF) when absent; never written while default.
+    /// `[sessions]` multi-turn jobs. Defaults (ON) when absent; never written while default.
     #[serde(default, skip_serializing_if = "SessionsConfig::is_default")]
     pub sessions: SessionsConfig,
+    /// `[trade]` token trading hosted by the daemons. Defaults (serve ON, default relays) when
+    /// absent; never written while default.
+    #[serde(default, skip_serializing_if = "TradeConfig::is_default")]
+    pub trade: TradeConfig,
+    /// `[swarm]` the buyer daemon's swarm engine. Defaults (OFF) when absent; never written while default.
+    #[serde(default, skip_serializing_if = "SwarmConfig::is_default")]
+    pub swarm: SwarmConfig,
+}
+
+/// `[trade]` — token trading (`maxplayer trade`) on this home.
+///
+/// `serve`: the buyer daemon (`maxplayer buyer serve`) and the seller (`maxplayer seller serve`) host trade's
+/// `serve` for this home, so nobody runs `maxplayer trade serve` by hand. Only a home that already
+/// trades is served (it has a trade journal, `<home>/trade/trade.sqlite`); a home that never traded
+/// gets nothing created. Default **true**; `false` leaves serving to a standalone
+/// `maxplayer trade serve`.
+///
+/// `relays` / `mint_relays`: the market relays and the `nostr://` mint relays trading uses on this
+/// home, both by the hosted serve and as the `maxplayer trade` defaults (so commands hand off to
+/// it). Empty ⇒ trade's built-in defaults. Checked by trade, not here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TradeConfig {
+    pub serve: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mint_relays: Vec<String>,
+}
+impl Default for TradeConfig {
+    fn default() -> Self {
+        Self {
+            serve: true,
+            relays: Vec::new(),
+            mint_relays: Vec::new(),
+        }
+    }
+}
+impl TradeConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// `[seat]` — the operator-declared half of the seat's advertisement (#784).
@@ -2071,6 +2268,8 @@ impl Default for MaxplayerConfig {
             sandbox: None,
             seat: SeatConfig::default(),
             sessions: SessionsConfig::default(),
+            trade: TradeConfig::default(),
+            swarm: SwarmConfig::default(),
         }
     }
 }
@@ -2364,6 +2563,11 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
         .try_into()
         .map_err(|error| HomeError::Config(format!("config.toml: {error}")))?;
     config.review.validate().map_err(HomeError::Config)?;
+    for (name, preset) in &config.agents {
+        preset
+            .validate(name)
+            .map_err(|error| HomeError::Config(format!("config.toml: {error}")))?;
+    }
     Ok(config)
 }
 
@@ -2374,6 +2578,9 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
 /// `MAXPLAYER_*` spelling, so excluding them costs no config coverage.
 const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_HOME",
+    // Set by the daemon for a hook agent (docs/specs/hook-agents.md §5.1), so a `maxplayer` command
+    // the seller's agent runs does not refuse it as an unknown config field.
+    "MAXPLAYER_HOOK_V",
     "MAXPLAYER_VERBOSE",
     "MAXPLAYER_HEARTBEAT_INTERVAL_SECS",
     "MAXPLAYER_HEARTBEAT_ENABLED",
@@ -2385,6 +2592,16 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_ACP_SMOKE",
     "MAXPLAYER_ACP_SMOKE_CMD",
     "MAXPLAYER_EVALS_SNAPSHOT_DIR",
+    // `maxplayer mint` / `doctor`: where the latest-release check asks (tests point it at a file).
+    "MAXPLAYER_RELEASES_LATEST_URL",
+    // `maxplayer team watch --notify`: the team id it passes to the notify command. The team
+    // relay is the home's `relay_url` (MAXPLAYER_RELAY_URL), so it has no variable of its own.
+    "MAXPLAYER_TEAM",
+    // Test deployments only: the team invite key their registration service holds.
+    "MAXPLAYER_TEAM_INVITE_PUBKEY",
+    // `maxplayer account link`: where the website's legal versions manifest is read (tests point it
+    // at a fake; empty = this build's terms and privacy versions only).
+    "MAXPLAYER_LEGAL_VERSIONS_URL",
 ];
 
 /// [`MaxplayerConfig`] fields whose env value is a comma-separated list. The env source must be told
@@ -2400,6 +2617,8 @@ const LIST_ENV_KEYS: &[&str] = &[
     "telemetry.command",
     "contribution.allowed_paths",
     "contribution.forbidden_paths",
+    "trade.relays",
+    "trade.mint_relays",
 ];
 
 /// The process environment's config-layer variables: every `MAXPLAYER_`-prefixed var that is not a
@@ -2564,7 +2783,7 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
     let mut out = String::new();
     out.push_str("# maxplayer config.toml — written on first run.\n");
     out.push_str("# Edit freely. Comments are NOT preserved when the app rewrites this file\n");
-    out.push_str("# (e.g. `maxplayer seller` setup or a wallet change).\n");
+    out.push_str("# (e.g. `maxplayer seller serve` setup or a wallet change).\n");
     out.push_str("# ⚠ This node's DEFAULTS accept and pay REAL sats — see accepted_mints.\n\n");
     for line in body.lines() {
         let key = line.split('=').next().unwrap_or("").trim();
@@ -2842,6 +3061,106 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    /// `[sessions]` defaults ON: unset `enabled` reads as on but not as explicitly chosen, and the
+    /// disk budget follows that (5 GiB unset, 20 GiB with `enabled = true`, an explicit value wins).
+    /// An explicit `enabled = false` still turns sessions off. Parsed from real `config.toml` text,
+    /// and a default home still writes no `[sessions]` table.
+    #[test]
+    fn sessions_default_on_and_explicit_settings_parse_from_config_toml() {
+        let unset = parse_config_toml("").unwrap().sessions;
+        assert!(unset.enabled());
+        assert!(!unset.explicitly_enabled());
+        assert_eq!(unset.disk_budget(), DEFAULT_SESSION_DISK_BUDGET_BYTES_UNSET);
+        let table_only = parse_config_toml("[sessions]\nlifetime_secs = 60\n")
+            .unwrap()
+            .sessions;
+        assert!(table_only.enabled() && !table_only.explicitly_enabled());
+
+        let on = parse_config_toml("[sessions]\nenabled = true\n")
+            .unwrap()
+            .sessions;
+        assert!(on.enabled() && on.explicitly_enabled());
+        assert_eq!(on.disk_budget(), DEFAULT_SESSION_DISK_BUDGET_BYTES);
+
+        let off = parse_config_toml("[sessions]\nenabled = false\n")
+            .unwrap()
+            .sessions;
+        assert!(!off.enabled() && !off.explicitly_enabled());
+
+        let sized = parse_config_toml("[sessions]\ndisk_budget_bytes = 1234\n")
+            .unwrap()
+            .sessions;
+        assert_eq!(sized.disk_budget(), 1234);
+        let sized_on = parse_config_toml("[sessions]\nenabled = true\ndisk_budget_bytes = 1234\n")
+            .unwrap()
+            .sessions;
+        assert_eq!(sized_on.disk_budget(), 1234);
+
+        // Round trip: an explicit setting is written back as written; the default writes nothing.
+        let mut config = MaxplayerConfig::default();
+        assert!(!toml::to_string(&config).unwrap().contains("sessions"));
+        config.sessions.enabled = Some(false);
+        let reloaded = parse_config_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reloaded.sessions.enabled, Some(false));
+    }
+
+    /// A `[sessions]` table that sets neither `enabled` nor `disk_budget_bytes` is written back by
+    /// `save_config` without them, and re-reads as on by default with the 5 GiB budget.
+    #[test]
+    fn a_partial_sessions_table_is_written_back_without_unset_keys() {
+        let root = temp_home("sessions-partial");
+        let _ = fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        fs::write(
+            home.root.join(CONFIG_FILE),
+            "[sessions]\nlifetime_secs = 60\n",
+        )
+        .expect("write");
+        save_config(&mut home, |_| {}).expect("save");
+        let raw = fs::read_to_string(home.root.join(CONFIG_FILE)).expect("read config.toml");
+        let table = raw
+            .split("[sessions]")
+            .nth(1)
+            .expect("[sessions] written back");
+        let table = table.split("\n[").next().unwrap();
+        assert!(table.contains("lifetime_secs = 60"), "{raw}");
+        assert!(!table.contains("enabled"), "{raw}");
+        assert!(!table.contains("disk_budget_bytes"), "{raw}");
+        let sessions = load_config(&home.root.join(CONFIG_FILE))
+            .expect("reload")
+            .sessions;
+        assert_eq!(sessions.enabled, None);
+        assert_eq!(sessions.disk_budget(), 5 * 1024 * 1024 * 1024);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `MAXPLAYER_SESSIONS__ENABLED` overrides both ways; without it `enabled` stays unset through
+    /// the env layer's JSON bridge.
+    #[test]
+    fn sessions_enabled_env_override_reads_both_ways() {
+        let base = MaxplayerConfig::default();
+        let unset = apply_env_layer(&base, env(&[])).expect("no env").sessions;
+        assert_eq!(unset.enabled, None);
+        assert_eq!(unset.disk_budget(), 5 * 1024 * 1024 * 1024);
+        let off = apply_env_layer(&base, env(&[("MAXPLAYER_SESSIONS__ENABLED", "false")]))
+            .expect("env off")
+            .sessions;
+        assert_eq!(off.enabled, Some(false));
+        assert!(!off.enabled());
+        let on = apply_env_layer(&base, env(&[("MAXPLAYER_SESSIONS__ENABLED", "true")]))
+            .expect("env on")
+            .sessions;
+        assert!(on.explicitly_enabled());
+        assert_eq!(on.disk_budget(), 20 * 1024 * 1024 * 1024);
+        let budget = apply_env_layer(
+            &base,
+            env(&[("MAXPLAYER_SESSIONS__DISK_BUDGET_BYTES", "1024")]),
+        )
+        .expect("env budget")
+        .sessions;
+        assert_eq!(budget.disk_budget(), 1024);
+    }
+
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
@@ -3035,6 +3354,47 @@ mod tests {
                 "{why}: `{entry}` cannot match a wire pubkey and must not be counted as a route in"
             );
         }
+    }
+
+    #[test]
+    fn hook_preset_parses_round_trips_and_enforces_one_of_and_self_report_rules() {
+        let base = "relay_url = 'r'\nmint_url = 'm'\nper_job_budget_sats = 1\ntotal_budget_sats = 2\n";
+        let ok = format!(
+            "{base}[agents.mine]\nhook = ['/bin/my-hook', '--x']\nfamily = 'claude-code'\nmodel = 'claude-opus-5'\n"
+        );
+        let config = parse_config_toml(&ok).expect("parse hook preset");
+        let preset = config.agents.get("mine").expect("mine");
+        assert!(preset.is_hook());
+        assert!(preset.argv.is_empty());
+        assert_eq!(preset.hook.as_deref(), Some(&["/bin/my-hook".to_owned(), "--x".to_owned()][..]));
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        assert!(!serialized.contains("argv"), "an empty argv must not be written: {serialized}");
+        assert_eq!(parse_config_toml(&serialized).expect("reparse"), config);
+
+        // A hook named after a built-in derives its family; model alone is then enough.
+        parse_config_toml(&format!("{base}[agents.claude]\nhook = ['h']\nmodel = 'm'\n"))
+            .expect("built-in name supplies the family");
+
+        for (body, why) in [
+            ("hook = ['h']\nargv = ['a']\n", "both argv and hook"),
+            ("family = 'codex'\n", "neither argv nor hook"),
+            ("hook = 'h --x'\n", "shell-string hook"),
+            ("hook = []\n", "empty hook argv"),
+            ("argv = ['a']\nfamily = 'codex'\n", "family on an ACP preset"),
+            ("argv = ['a']\nmodel = 'm'\n", "model on an ACP preset"),
+            ("hook = ['h']\nfamily = 'nope'\n", "unknown family"),
+            ("hook = ['h']\nmodel = 'm'\n", "model without a family"),
+            ("hook = ['h']\nfamily = 'codex'\nmodel = '  '\n", "blank model"),
+        ] {
+            assert!(
+                parse_config_toml(&format!("{base}[agents.mine]\n{body}")).is_err(),
+                "{why} must be refused"
+            );
+        }
+        assert!(
+            parse_config_toml(&format!("{base}[agents.claude]\nhook = ['h']\nfamily = 'codex'\n")).is_err(),
+            "a family contradicting a built-in name must be refused"
+        );
     }
 
     #[test]
@@ -4106,6 +4466,31 @@ mod tests {
                 .blocked_sellers
                 .is_empty()
         );
+    }
+
+    /// `[trade]` defaults (serve on, no relays), is never written while default, and every key is
+    /// reachable through the environment (`MAXPLAYER_TRADE__SERVE=false` is the documented off
+    /// switch).
+    #[test]
+    fn trade_table_defaults_and_env_overrides() {
+        let config = MaxplayerConfig::default();
+        assert!(config.trade.serve);
+        assert!(config.trade.relays.is_empty() && config.trade.mint_relays.is_empty());
+        assert!(!toml::to_string(&config).unwrap().contains("[trade]"));
+        let config = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[
+                ("MAXPLAYER_TRADE__SERVE", "false"),
+                ("MAXPLAYER_TRADE__RELAYS", "wss://a.example,wss://b.example"),
+                ("MAXPLAYER_TRADE__MINT_RELAYS", "wss://m.example"),
+            ]),
+        )
+        .expect("trade env");
+        assert!(!config.trade.serve);
+        assert_eq!(config.trade.relays, vec!["wss://a.example", "wss://b.example"]);
+        assert_eq!(config.trade.mint_relays, vec!["wss://m.example"]);
+        assert!(!parse_config_toml("[trade]\nserve = false\n").unwrap().trade.serve);
+        assert!(parse_config_toml("[trade]\nbogus = 1\n").is_err());
     }
 
     #[test]

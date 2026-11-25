@@ -13,7 +13,7 @@
 //! human's behalf (spec §12: no non-interactive terms acceptance). There is no unlink (spec §4).
 //!
 //! The key is the home `key` file (the same key the wallet signs mint requests with, #1210, and the
-//! key `maxplayer-trade` signs listings and mint requests with), or with `--mint` the mint server's
+//! key `maxplayer trade` signs listings and mint requests with), or with `--mint` the mint server's
 //! `<home>/mint/nostr.key`. `--trade-home <dir>` is deprecated: it still parses, is ignored with a
 //! warning on stderr, and never creates a `trade.key`. The secret is never printed.
 
@@ -45,7 +45,7 @@ fn write_usage(out: &mut dyn Write) {
          agent's Nostr profile name unless the agent already has one (`maxplayer profile set`).\n\
          --entered-by: who typed the code (default: human at the prompt, agent with --code).\n\
          --mint: use this home's mint server key (<home>/mint/nostr.key) instead of the agent key.\n\
-         The agent key is also the key maxplayer-trade trades with, so linking it covers trading.\n\
+         The agent key is also the key `maxplayer trade` trades with, so linking it covers trading.\n\
          --trade-home <dir>: deprecated and ignored (trading uses this home's key).\n\
          Service: registration_url in config.toml or MAXPLAYER_REGISTRATION_URL\n\
          (default https://relay.maxplayer.ai/account).\n\
@@ -218,8 +218,8 @@ mod wallet {
     use maxplayer_core::home::{self, MaxplayerHome};
     use maxplayer_core::profile::{self, NameFill};
     use maxplayer_core::registration::{
-        self, CodeSent, EnteredBy, Linked, MARKETING_NOTICE, RegistrationClient, RegistrationError,
-        TERMS_VERSION,
+        self, CodeSent, EnteredBy, LegalVersions, Linked, MARKETING_NOTICE, RegistrationClient,
+        RegistrationError,
     };
     use nostr_sdk::prelude::{Keys, ToBech32};
 
@@ -238,6 +238,17 @@ mod wallet {
         pub home: Option<MaxplayerHome>,
         /// `[profile].name` when it is a valid label: the label prompt's default.
         pub profile_name: Option<String>,
+        /// The site's legal versions manifest (`registration::LEGAL_VERSIONS_URL`, or
+        /// `MAXPLAYER_LEGAL_VERSIONS_URL`); `None` = this build's versions only.
+        pub legal_versions_url: Option<String>,
+    }
+
+    fn legal_versions_url() -> Option<String> {
+        match std::env::var(registration::LEGAL_VERSIONS_ENV) {
+            Ok(url) if url.is_empty() => None,
+            Ok(url) => Some(url),
+            Err(_) => Some(registration::LEGAL_VERSIONS_URL.to_owned()),
+        }
     }
 
     /// `{"error": <code>, "message": <text>}` on stdout: the `--json` failure shape.
@@ -312,6 +323,7 @@ mod wallet {
                 flags,
                 home: Some(home),
                 profile_name,
+                legal_versions_url: legal_versions_url(),
             })
         }
 
@@ -344,6 +356,7 @@ mod wallet {
                 flags,
                 home: None,
                 profile_name: None,
+                legal_versions_url: legal_versions_url(),
             })
         }
 
@@ -378,13 +391,13 @@ mod wallet {
         );
     }
 
-    fn print_code_sent(out: &mut dyn Write, email: &str, sent: &CodeSent) {
+    fn print_code_sent(out: &mut dyn Write, email: &str, sent: &CodeSent, legal: &LegalVersions) {
         let minutes = sent.expires_in_secs.div_ceil(60);
         let _ = writeln!(
             out,
             "Check {email} for a 6-digit code (it expires in {minutes} minutes, {} tries).\n\
-             Entering it accepts the Maxplayer Terms of Service, effective {TERMS_VERSION}: {}",
-            sent.max_attempts, sent.terms_url
+             Entering it accepts the Maxplayer Terms of Service, effective {}: {}",
+            sent.max_attempts, legal.terms, sent.terms_url
         );
     }
 
@@ -432,7 +445,7 @@ mod wallet {
             let _ = writeln!(
                 out,
                 "\"{label}\" becomes this agent's public name once the relay adds this key (the \
-                 next `maxplayer buyer` or seller start sets it)."
+                 next `maxplayer buyer serve` or `maxplayer seller serve` start sets it)."
             );
             return;
         }
@@ -475,8 +488,8 @@ mod wallet {
 
     fn marketing_line(state: &str) -> String {
         match state {
-            "subscribed" => "Product news: on. Turn it off any time with `maxplayer account \
-                 marketing off`."
+            "subscribed" => "Product news: on. No action needed: every product-news email has an \
+                 unsubscribe link."
                 .to_owned(),
             "unsubscribed" => "Product news: off. `maxplayer account marketing on` turns it back \
                  on."
@@ -527,8 +540,11 @@ mod wallet {
         }
 
         let _ = writeln!(out, "Linking {} ({}) to an email.", ctx.whose, ctx.npub);
+        // The site's current terms and privacy versions (this build's if it cannot be read): the
+        // notice below names that privacy page and the request accepts those versions.
+        let legal = LegalVersions::current(ctx.legal_versions_url.as_deref());
         // Spec §3 steps 1 and 6: both notices, when the email is asked for or before it is sent.
-        let _ = writeln!(out, "{}", registration::privacy_notice());
+        let _ = writeln!(out, "{}", legal.privacy_notice());
         let _ = writeln!(out, "{MARKETING_NOTICE}");
 
         let email = match &opts.email {
@@ -572,11 +588,11 @@ mod wallet {
             }
         };
 
-        let sent = match client.request_code(&email, &label) {
+        let sent = match client.request_code(&email, &label, &legal) {
             Ok(sent) => sent,
             Err(error) => return report(ctx, err, &error),
         };
-        print_code_sent(out, &email, &sent);
+        print_code_sent(out, &email, &sent, &legal);
         if !interactive {
             next_step(ctx, out);
             return SUCCESS;
@@ -773,6 +789,7 @@ mod interactive_tests {
             flags: String::new(),
             home: None,
             profile_name: None,
+            legal_versions_url: None,
         }
     }
 
@@ -808,16 +825,16 @@ mod interactive_tests {
         let (code, out, err) = drive(&fake, &keys, Opts::default(), stdin);
         assert_eq!(code, SUCCESS, "{out}\n{err}");
         assert!(
-            out.contains("https://www.maxplayer.ai/privacy/20261029"),
+            out.contains("https://www.maxplayer.ai/privacy/20261123"),
             "{out}"
         );
         assert!(out.contains("maxplayer account marketing off"), "{out}");
         assert!(
-            out.contains("accepts the Maxplayer Terms of Service, effective 20261029"),
+            out.contains("accepts the Maxplayer Terms of Service, effective 20261123"),
             "{out}"
         );
         assert!(
-            out.contains("https://www.maxplayer.ai/terms/20261029"),
+            out.contains("https://www.maxplayer.ai/terms/20261123"),
             "{out}"
         );
         assert!(

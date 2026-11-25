@@ -11,6 +11,7 @@ import {
   RESULT, SELF_TRADE_TAG, TRADE_STAGES, type Stage,
 } from "./kinds.js";
 import { servingFromTags } from "./serving.mjs";
+import { inFlightFromTags, seatSlotsFromTags } from "./seats.mjs";
 
 /** A raw NIP-01 event as the relay sends it. Untrusted input. */
 export interface RawEvent {
@@ -89,7 +90,10 @@ export interface ParsedEvent {
   d?: string;
   version?: string | null;
   accepting?: string | null;
+  /** Live load: `in_flight`, falling back to the deprecated `queue_depth`. NOT free capacity. */
   queueDepth?: number | null;
+  /** `["slots",n]` + `["free_slots",m]`, or null when the beat states no valid pair (unknown). */
+  seats?: { total: number; free: number } | null;
   /** R3-2 `["serving","a/n"]`, or null when the beat states none (unknown, never "not serving"). */
   serving?: { available: number; configured: number } | null;
   servingState?: "serving" | "not_serving" | "unknown";
@@ -326,6 +330,9 @@ const REASON_CODE_CLASS = new Map<string, string>([
   ["execution_failed", "error"],
   ["delivery_failed", "error"],
   ["no_sentinel", "refusal"],
+  ["session_expired", "refusal"],
+  ["turn_too_large", "refusal"],
+  ["capability_missing", "refusal"],
 ]);
 
 /** protocol-v1 §7.2. `progress` is explicitly non-terminal; the rest end an attempt. */
@@ -384,9 +391,11 @@ const PARSE_CACHE = new Map<string, ParsedEvent | null>();
 
 export function parseEvent(event: RawEvent | null | undefined): ParsedEvent | null {
   if (!event || typeof event.kind !== "number" || typeof event.created_at !== "number") return null;
-  if (!isHex32(event.id) || !isHex32(event.pubkey)) return null;
+  // The cache first (speed review of #1361, #1): the two hex checks were 38% of a recompute. Only hex ids are ever
+  // cached, and a hit must be for the same author.
   const hit = PARSE_CACHE.get(event.id);
-  if (hit !== undefined) return hit;
+  if (hit !== undefined && (hit === null || hit.pubkey === event.pubkey)) return hit;
+  if (!isHex32(event.id) || !isHex32(event.pubkey)) return null;
   const parsed = parseEventUncached(event);
   PARSE_CACHE.set(event.id, parsed);
   return parsed;
@@ -502,7 +511,9 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
                d: firstTag(event, "d") || "",
                version: firstTag(event, "v"),
                accepting: firstTag(event, "accepting"),
-               queueDepth: firstNumber(event, "queue_depth"),
+               // `in_flight` (new name) or the deprecated `queue_depth` (older seats).
+               queueDepth: inFlightFromTags(event.tags),
+               seats: seatSlotsFromTags(event.tags),
                // R3-2: harnesses able to run a job now, out of those the seat resolved.
                serving: servingFromTags(event.tags).count,
                servingState: servingFromTags(event.tags).state,

@@ -14,7 +14,7 @@ seller) can take it over cold.
 You are the mover here. Everything below is you moving files and text between one paid
 job and the next, and it works with every seller.
 
-**Check for `reply` first.** When your buyer runs with `[sessions] enabled = true` and the
+**Check for `reply` first.** When your buyer runs with sessions on (the default) and the
 awarded claim advertised sessions (`get_job` → `session.supported: true`), the protocol
 itself carries the next turn: once `get_job` → `settlement.state` reads `"settled"`, call
 the MCP tool **`reply`** with the `job_id` and your next text (or the answer to
@@ -23,8 +23,9 @@ you look, and the settled `settlement` carries the commit and the file list, so 
 `collect` is needed to read it. The same
 seller resumes the same agent conversation and working tree; each turn is priced like the
 job, and the daemon settles turns 2 and later on its own too, strictly in turn order
-(`get_job` → `settlement`, `turn: <n>`, goes `settling` → `settled`). `collect` is only the explicit retry of a `failed` settle, and it is your call,
-not the human's. `reply close: true` ends the
+(`get_job` → `settlement`, `turn: <n>`, goes `settling` → `settled`). Every turn costs the job's price again, up to `max_session_sats` in total (default 10×
+`amount_sats`, turn 1 included; buyer-operate §5 has the limits). `collect` is only the explicit
+retry of a `failed` settle, and it is your call, not the human's. `reply close: true` ends the
 session; that is optional, since a parked session expires at `session.expires_hint`. Keep the
 `QUESTIONS.md` convention below inside a session too — it is still how open questions
 travel. Use the rest of this skill when `reply` is unavailable (flag off, or a seller

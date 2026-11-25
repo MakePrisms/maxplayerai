@@ -9,6 +9,7 @@ pub mod api;
 pub mod config;
 pub mod db;
 pub mod email;
+pub mod legal;
 pub mod nip98;
 pub mod relay;
 pub mod secrets;
@@ -34,21 +35,44 @@ pub struct AppState {
     pub db: PgPool,
     pub relay: relay::RelayClient,
     pub email: email::EmailClient,
+    /// The website's legal versions manifest (`legal.versions_url`).
+    pub legal_versions: legal::ManifestSource,
     pub pepper: [u8; 32],
     pub webhook_secret: Option<Vec<u8>>,
     pub clock: Arc<Clock>,
+    /// The team invite key (`teams.invite_key_file`); `None` = invite links are off.
+    pub invite: Option<nostr::Keys>,
+    /// One team at a time for link creation, revoke and the invite key leaving (striped by
+    /// channel). In-process, so no database transaction spans a relay call; it assumes one
+    /// `serve` process writes invite links and sweeps (`sync` does not sweep).
+    invite_locks: Vec<tokio::sync::Mutex<()>>,
 }
 
+/// Proof that one team's invite links are locked ([`AppState::lock_team`]).
+pub struct TeamLock<'a>(#[allow(dead_code)] tokio::sync::MutexGuard<'a, ()>);
+
 /// Wall clock plus a test-only offset, so code expiry, rate windows and retry
-/// backoff can be tested without sleeping. The offset is always 0 in `serve`.
+/// backoff can be tested without sleeping. The offset is always 0 in `serve`, and the clock
+/// is never frozen there.
 #[derive(Debug, Default)]
 pub struct Clock {
     offset_secs: AtomicI64,
+    /// Test-only: when non-zero, `now` is this unix second (plus the offset).
+    frozen_at: AtomicI64,
 }
 
 impl Clock {
     pub fn now(&self) -> DateTime<Utc> {
-        Utc::now() + TimeDelta::seconds(self.offset_secs.load(Ordering::Relaxed))
+        let base = match self.frozen_at.load(Ordering::Relaxed) {
+            0 => Utc::now(),
+            secs => DateTime::from_timestamp(secs, 0).unwrap_or_else(Utc::now),
+        };
+        base + TimeDelta::seconds(self.offset_secs.load(Ordering::Relaxed))
+    }
+    /// Test-only: stop the clock at the current second (`advance` still moves it).
+    pub fn freeze(&self) {
+        self.frozen_at
+            .store(Utc::now().timestamp().max(1), Ordering::Relaxed);
     }
     pub fn unix(&self) -> u64 {
         self.now().timestamp().max(0) as u64
@@ -69,14 +93,18 @@ impl AppState {
         let pepper = secrets::code_pepper(&admin);
         let relay = relay::RelayClient::new(&cfg.relay, admin)?;
         let email = email::EmailClient::new(&cfg.email, resend_api_key)?;
+        let legal_versions = legal::ManifestSource::new(&cfg.legal)?;
         Ok(Self {
             cfg,
             db,
             relay,
             email,
+            legal_versions,
             pepper,
             webhook_secret,
             clock: Arc::new(Clock::default()),
+            invite: None,
+            invite_locks: (0..64).map(|_| tokio::sync::Mutex::new(())).collect(),
         })
     }
 
@@ -92,11 +120,31 @@ impl AppState {
             webhook::parse_secret(&raw).context("Resend webhook secret is not whsec_<base64>")
         })
         .transpose()?;
-        Self::new(cfg, db, admin, resend, webhook)
+        let invite = cfg
+            .teams
+            .invite_key_file
+            .as_deref()
+            .map(|p| secrets::load_keys(p, "team invite key"))
+            .transpose()?;
+        let mut state = Self::new(cfg, db, admin, resend, webhook)?;
+        state.invite = invite;
+        Ok(state)
     }
 
     pub fn now(&self) -> DateTime<Utc> {
         self.clock.now()
+    }
+
+    /// The lock of one team's invite links. Not reentrant: take it once per request.
+    pub async fn lock_team(&self, channel: &str) -> TeamLock<'_> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        channel.hash(&mut h);
+        TeamLock(
+            self.invite_locks[h.finish() as usize % self.invite_locks.len()]
+                .lock()
+                .await,
+        )
     }
 }
 

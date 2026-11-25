@@ -17,6 +17,8 @@ mod daemon;
 mod doctor;
 mod exec;
 mod mcp;
+// `maxplayer mint` (info) and `maxplayer mint install` (the released `maxplayer-mint` + <home>/mint/).
+mod mint_cli;
 mod profile_cli;
 // The `sell` surface is the seller advertise path: it publishes the kind-0 identity and boots the
 // heartbeat loop that announces capability. `acp` compiles in the agent-execution that lets a seat
@@ -29,6 +31,9 @@ mod sell;
 // `sell`: it is reached only through the `seller` arm and reads the seller node's store.
 #[cfg(feature = "acp")]
 mod seller_fees;
+// `maxplayer seller drain` (#1299): signals the seller holding this home's lock. Same gate as `sell`.
+#[cfg(feature = "acp")]
+mod seller_drain;
 // The containment probe is compiled on every build, not only the seller one: the payload half runs
 // INSIDE the launcher, and a seat may reasonably run the probe from a binary it already trusts.
 #[cfg(feature = "wallet")]
@@ -41,16 +46,39 @@ mod sandbox_reap;
 // MCP handshake all print from. Every build: a box with nothing but the binary must be able to
 // find the documentation.
 mod skill;
+mod swarm_cli;
+// `maxplayer team …` (docs/specs/maxplayer-team.md); replaces the separate team binary.
+#[cfg(feature = "wallet")]
+mod team_cli;
+// Trade's serve hosted in the buyer daemon and the seller (`[trade] serve`).
+#[cfg(feature = "wallet")]
+mod trade_host;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
 mod wallet_cli;
 mod whoami;
 
 fn main() {
-    let code = cli::run(
-        std::env::args(),
-        &mut std::io::stdout(),
-        &mut std::io::stderr(),
-    );
+    // Token trading (crates/maxplayer-trade): lots, takes, swap recovery and its own money commands on
+    // this home's key and wallet. It gets the OS arguments as they are (paths need not be UTF-8);
+    // clap owns its parsing, help and exit codes. Every other command needs UTF-8 and gets a usage
+    // error (exit 1) instead of the panic `std::env::args()` gives.
+    let os: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    #[cfg(feature = "wallet")]
+    if os.get(1).and_then(|a| a.to_str()) == Some("trade") {
+        std::process::exit(i32::from(maxplayer_trade::cli::main_from(
+            std::iter::once(std::ffi::OsString::from("maxplayer trade"))
+                .chain(os[2..].iter().cloned()),
+        )));
+    }
+    let Some(args) = os
+        .into_iter()
+        .map(|a| a.into_string().ok())
+        .collect::<Option<Vec<String>>>()
+    else {
+        eprintln!("maxplayer: arguments must be valid UTF-8");
+        std::process::exit(1);
+    };
+    let code = cli::run(args, &mut std::io::stdout(), &mut std::io::stderr());
     std::process::exit(code);
 }

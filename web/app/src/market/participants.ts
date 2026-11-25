@@ -36,8 +36,14 @@ export const WINDOWS: readonly Window[] = Object.freeze([
 
 export const DEFAULT_WINDOW = "week";
 
-/** A seller with no heartbeat this recently is not claimed to be online. */
-export const LIVE_WITHIN_SECONDS = 300;
+/**
+ * A seller whose LATEST heartbeat is older than this is not claimed to be online.
+ * Sellers beat every 300 s by default (`[seller_heartbeat] interval_secs`), so a
+ * window equal to the interval called a running seat Offline whenever one beat
+ * landed a few seconds late. 2.5 intervals absorb one late or lost beat; a seat
+ * that has stopped still goes Offline within ~12.5 minutes.
+ */
+export const LIVE_WITHIN_SECONDS = 750;
 
 export function windowSeconds(key: string): number | null {
   const w = WINDOWS.find((x) => x.key === key);
@@ -309,7 +315,11 @@ export function buyerBoard(events: RawEvent[], now: number, activeEvents: RawEve
   // detail view keeps showing the award. `workingJobs` is the subset that is
   // still current execution. Split here, once.
   for (const job of inProgressJobs(activeEvents, now)) {
-    const row = get(job.buyer);
+    // As on the seller board: historical overdue work enriches a row this window earned, but is not evidence of
+    // activity in it. Only current work may add a missing buyer. (Adding every overdue job let an award from months
+    // ago put a buyer on this week's board, and only once the older history had been read.)
+    const row = rows.get(job.buyer) ?? (job.state === JOB_WORKING ? get(job.buyer) : null);
+    if (!row) continue;
     row.inProgressJobs.push(job);
     if (job.state === JOB_WORKING) row.workingJobs.push(job);
   }
@@ -341,6 +351,8 @@ export interface SellerRow extends NamedRow {
   askSats: number | null;
   accepting: string | null;
   queueDepth: number | null;
+  /** Seats from the same newest beat; null ⇒ the seat states none (unknown, never full/free). */
+  seats: { total: number; free: number } | null;
   /** R3-2 serving count from the same newest beat; null ⇒ the seat states none (unknown). */
   serving: { available: number; configured: number } | null;
   servingState: "serving" | "not_serving" | "unknown";
@@ -398,7 +410,7 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
             // Self-advertised, from the newest protocol-v1 heartbeat. Claims,
             // not measurements. Unknown tags stay intact for the detail view.
             name: null, about: null, profile: null, profileAt: 0,
-            askSats: null, accepting: null, queueDepth: null,
+            askSats: null, accepting: null, queueDepth: null, seats: null,
             serving: null, servingState: "unknown",
             acceptedMints: [],
             harnessFamilies: [], harnessModels: [], capabilities: [],
@@ -443,12 +455,16 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
     if (p.kind === HEARTBEAT) {
       const r = get(p.pubkey);
       r.lastSeen = Math.max(r.lastSeen, p.created_at);
-      if (now - p.created_at <= LIVE_WITHIN_SECONDS) r.online = true;
       if (p.created_at >= r.advertisedAt) {
         r.advertisedAt = p.created_at;
+        // Judged on the latest beat only: a seat that retracted itself
+        // (`accepting=n`, e.g. on shutdown or drain) is not available, however
+        // recent that retraction is.
+        r.online = now - p.created_at <= LIVE_WITHIN_SECONDS && p.accepting !== "n";
         r.askSats = p.rateSats ?? null;
         r.accepting = p.accepting ?? null;
         r.queueDepth = p.queueDepth ?? null;
+        r.seats = p.seats ?? null;
         r.serving = p.serving ?? null;
         r.servingState = p.servingState ?? "unknown";
         r.acceptedMints = p.acceptedMints ?? [];

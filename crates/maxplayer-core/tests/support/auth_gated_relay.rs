@@ -76,6 +76,11 @@ pub struct Counters {
     /// Subscriptions open right now that were sent before sign-in and not re-sent since: they
     /// get no live events. A test barrier ("everyone can hear") is `deaf == 0` after sign-in.
     pub deaf: AtomicUsize,
+    /// Subscriptions open right now on all client connections (REQ ids not CLOSEd yet, on
+    /// connections still open).
+    pub open_subs: AtomicUsize,
+    /// The id of every EVENT a client sent, in arrival order, refused or not.
+    pub client_events: std::sync::Mutex<Vec<String>>,
     /// Per connection: the kind of its first EVENT and the time since its first REQ on the same
     /// socket. Relative and intra-socket, so connect and mint latency don't enter it (#1156 N2).
     pub req_to_first_event: std::sync::Mutex<Vec<(u64, Duration)>>,
@@ -106,6 +111,33 @@ impl Drop for PreAuth {
         self.counters
             .deaf
             .fetch_sub(self.subs.len(), Ordering::SeqCst);
+    }
+}
+
+/// Per-connection open subscription ids, mirrored into `Counters::open_subs`.
+struct OpenSubs {
+    ids: std::collections::HashSet<String>,
+    counters: Arc<Counters>,
+}
+
+impl OpenSubs {
+    fn insert(&mut self, id: String) {
+        if self.ids.insert(id) {
+            self.counters.open_subs.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn remove(&mut self, id: &str) {
+        if self.ids.remove(id) {
+            self.counters.open_subs.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for OpenSubs {
+    fn drop(&mut self) {
+        self.counters
+            .open_subs
+            .fetch_sub(self.ids.len(), Ordering::SeqCst);
     }
 }
 
@@ -193,6 +225,10 @@ async fn connection(
         subs: HashMap::new(),
         counters: counters.clone(),
     };
+    let mut open_subs = OpenSubs {
+        ids: std::collections::HashSet::new(),
+        counters: counters.clone(),
+    };
     loop {
         tokio::select! {
             _ = kill.changed() => return,
@@ -205,6 +241,10 @@ async fn connection(
             frame = front.next() => {
                 let Some(Ok(frame)) = frame else { return };
                 let Some(v) = parse(&frame) else { continue };
+                if v[0].as_str() == Some("EVENT") {
+                    let id = v[1]["id"].as_str().unwrap_or_default().to_owned();
+                    counters.client_events.lock().unwrap().push(id);
+                }
                 match v[0].as_str() {
                     Some("REQ") => {
                         first_req.get_or_insert_with(std::time::Instant::now);
@@ -254,6 +294,7 @@ async fn connection(
                     }
                     Some("REQ") => {
                         let id = v[1].as_str().unwrap_or_default().to_owned();
+                        open_subs.insert(id.clone());
                         if authenticated {
                             counters.post_auth_reqs.fetch_add(1, Ordering::SeqCst);
                             pre_auth.remove(&id);
@@ -266,6 +307,7 @@ async fn connection(
                     }
                     Some("CLOSE") => {
                         pre_auth.remove(v[1].as_str().unwrap_or_default());
+                        open_subs.remove(v[1].as_str().unwrap_or_default());
                     }
                     Some("EVENT") if authenticated && !pre_auth.subs.is_empty() => {
                         counters.events_while_deaf.fetch_add(1, Ordering::SeqCst);

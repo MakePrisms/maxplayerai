@@ -505,32 +505,6 @@ impl Env {
         assert_eq!(r.state, receive::ReceiveState::Done, "{}", r.summary());
         assert_eq!(balance(home, &m.url).await, amount, "fee-free sidecar");
     }
-    /// The same through the built `maxplayer-trade receive --token-file` binary.
-    async fn fund_nostr_cli(&self, home: &Path, m: &NostrMint, amount: u64) {
-        let dir = tempfile::tempdir().unwrap();
-        let issued = issue::issue(&m.mint, dir.path(), &m.url, amount)
-            .await
-            .unwrap();
-        let hex_input = format!("nostr://{}", m.keys.public_key().to_hex());
-        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-            .arg("--home")
-            .arg(home)
-            .args(["--mint-relay", &self.mint_relay_url, "receive", &hex_input])
-            .arg("--token-file")
-            .arg(&issued.file)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(summary["mint"], m.url.as_str(), "canonical nostr mint");
-        assert_eq!(summary["credited"], amount);
-        assert_eq!(balance(home, &m.url).await, amount);
-    }
     async fn list(&self, give: &str, give_net: u64, want: &str, want_net: u64) -> String {
         coordinator::list(
             &self.maker,
@@ -696,7 +670,7 @@ async fn nostr_issue_receive_then_https_trade_completes_on_mint_relays_only() {
     let n = e.nostr_mint().await;
     let b = MintFixture::start(0).await;
     // issue -> `maxplayer-trade receive` (CLI) -> trade nostr<->https.
-    e.fund_nostr_cli(&e.maker.clone(), &n, 128).await;
+    e.fund_nostr(&e.maker.clone(), &n, 128).await;
     support::fund(&e.taker, &b.url, 128).await;
     let lot = e.list(&n.url, 32, &b.url, 24).await;
     let id = e.take(&lot, 40, 32).await;
@@ -1176,36 +1150,6 @@ async fn nostr_fund_and_withdraw_refused_before_any_intent() {
             r.is_some_and(|e| e.to_string().contains("not available for nostr:// mints")),
             "clear refusal"
         );
-    }
-    for args in [
-        vec![
-            "fund".to_string(),
-            n.url.clone(),
-            "--amount".into(),
-            "10".into(),
-        ],
-        vec![
-            "withdraw".to_string(),
-            n.url.clone(),
-            "--invoice".into(),
-            invoice(10),
-        ],
-    ] {
-        let home = e.root.path().join("never-created");
-        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-            .arg("--home")
-            .arg(&home)
-            .args(&args)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            !home.exists(),
-            "SAFETY: CLI {} refused before creating or locking the home",
-            args[0]
-        );
-        assert!(!out.status.success());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("not available for nostr:// mints"));
     }
 }
 
@@ -1840,26 +1784,15 @@ async fn nostr_oversized_send_refused_before_journal() {
     e.tap.reset();
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("big.token");
-    let (code, stdout, err) = cli(
-        &e,
-        &e.maker,
-        &[
-            "send",
-            &n.url,
-            "--amount",
-            "127",
-            "--out",
-            out.to_str().unwrap(),
-        ],
-    )
-    .await;
+    // A refusal, not a retained attempt: the library send errs before journaling anything.
+    let err = send::send(&e.maker, &e.jm, &n.url, 127, &out, None)
+        .await
+        .err()
+        .expect("SAFETY: refused")
+        .to_string();
     assert!(
         err.contains("NIP-44") && err.contains("nothing journaled"),
         "clear refusal: {err}"
-    );
-    assert_eq!(
-        code, 1,
-        "SAFETY: a refusal, not a retained attempt: {stdout}"
     );
     assert!(
         e.jm.all::<serde_json::Value>("send")

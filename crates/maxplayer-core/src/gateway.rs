@@ -1219,6 +1219,10 @@ pub enum ReasonCode {
     /// Session jobs (docs/specs/session-jobs.md §2.3): the parked session behind a follow-up is
     /// gone. Nothing was delivered or charged, and it does not count against the seller.
     SessionExpired,
+    /// Session jobs: the follow-up cannot be reviewed even without earlier history, because the
+    /// minimal private review request does not fit one NIP-44 seal (#1349). Nothing ran or was
+    /// charged, the session stays parked, and it does not count against the seller.
+    TurnTooLarge,
 }
 
 impl ReasonCode {
@@ -1234,6 +1238,7 @@ impl ReasonCode {
             Self::DeliveryFailed => "delivery_failed",
             Self::NoSentinel => "no_sentinel",
             Self::SessionExpired => "session_expired",
+            Self::TurnTooLarge => "turn_too_large",
         }
     }
 }

@@ -148,7 +148,10 @@ pub fn verify(
 }
 
 /// Sign a NIP-98 event for `url`/`method` (with a `payload` tag when `body` is given)
-/// and return the full `Authorization` header value.
+/// and return the full `Authorization` header value. A random `nonce` tag makes every event
+/// unique: the relay refuses a reused event id (`NIP-98: replay detected`), and two calls with
+/// the same key, URL, body and second (two invite links for one team, an invite and a revoke)
+/// would otherwise sign the same event.
 pub fn authorization(
     keys: &Keys,
     url: &str,
@@ -163,6 +166,9 @@ pub fn authorization(
     if let Some(body) = body {
         tags.push(Tag::custom(TagKind::Payload, [body_sha256_hex(body)]));
     }
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).expect("OS RNG");
+    tags.push(Tag::custom(TagKind::custom("nonce"), [hex::encode(nonce)]));
     let event = EventBuilder::new(Kind::HttpAuth, "")
         .tags(tags)
         .custom_created_at(created_at)
@@ -308,6 +314,20 @@ mod tests {
             .unwrap();
         let h = format!("Nostr {}", STANDARD.encode(ev.as_json()));
         assert_eq!(check(&h, b"").unwrap_err(), Nip98Error::MethodMismatch);
+    }
+
+    #[test]
+    fn two_identical_requests_in_one_second_sign_different_events() {
+        // The relay keeps every NIP-98 event id it has seen and answers a second use with 401.
+        let k = Keys::generate();
+        let body = br#"{"kinds":[39002]}"#;
+        let id = |h: String| check(&h, body).unwrap().event_id;
+        let a = id(sign(&k, URL, "POST", Some(body), NOW));
+        let b = id(sign(&k, URL, "POST", Some(body), NOW));
+        assert_ne!(
+            a, b,
+            "same key, URL, body and second must not reuse an event id"
+        );
     }
 
     #[test]

@@ -2117,7 +2117,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "maxplayer-core"
-version = "0.7.3-rc8"
+version = "0.8.2-rc1"
 dependencies = [
  "async-trait",
  "async-wsocket",
@@ -2133,7 +2133,9 @@ dependencies = [
  "getrandom 0.3.4",
  "git2",
  "hex",
+ "http",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "libc",
@@ -2146,6 +2148,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "toml",
  "unicode-normalization",
  "uuid",
@@ -2153,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-mint"
-version = "0.5.11"
+version = "0.8.2-rc1"
 dependencies = [
  "anyhow",
  "bip39",
@@ -2169,6 +2172,7 @@ dependencies = [
  "nostr-relay-builder",
  "nostr-sdk",
  "rcgen",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

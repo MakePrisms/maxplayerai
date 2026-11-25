@@ -292,6 +292,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("limit 65408 bytes"), "{error}");
+        // #1349: past the largest sealable rumor the seal jumps a whole NIP-44 padding step.
+        assert!(error.contains("private seal is 65971 bytes"), "{error}");
+        // #1349: the message guard is derived from the seal limit, so a message that can never
+        // seal is refused by name at the message layer, not passed on to fail inside the seal.
+        draft.content = "x".repeat(45_000);
+        let inner = crate::gateway::nostr::event_builder(&draft)
+            .unwrap()
+            .sign_with_keys(&buyer)
+            .unwrap();
+        let error = wrap(&buyer, service.public_key(), &inner)
+            .await
+            .unwrap_err();
+        assert!(error.contains("private message is"), "{error}");
+        assert!(error.contains("limit 40960 bytes"), "{error}");
         assert!(super::super::permanent_error(&error));
         assert!(!error.contains("xxxx"));
     }

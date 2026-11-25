@@ -94,3 +94,28 @@
   src: url('./fonts/saira-normal-400-100.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
+/* The Teams and Market pages (site.css): Instrument Sans for text, and the logo word in a subset of Work Sans
+   Medium Italic that holds only the letters of MAXPLAYER. */
+@font-face {
+  font-family: 'Instrument Sans';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('./fonts/instrument-sans-normal-latin.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Instrument Sans';
+  font-style: italic;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('./fonts/instrument-sans-italic-latin.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Work Sans Logo';
+  font-style: italic;
+  font-weight: 400 700;
+  /* block, not swap: the logo word is in the nav, which shows at once (site.css), and the fallback italic is wider.
+     The file is a few KB, preloaded and cached, so after the first visit there is no wait at all. */
+  font-display: block;
+  src: url('./fonts/work-sans-italic-logo.woff2') format('woff2');
+}

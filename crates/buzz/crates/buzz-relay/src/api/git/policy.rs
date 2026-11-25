@@ -310,6 +310,40 @@ pub async fn hook_policy_check(
 
     // Private job repos never inherit permissions from public repository announcements.
     if maxplayer_private_protocol::is_hex(&req.repo_id, 32) {
+        // MAXPLAYER teams (docs/specs/maxplayer-team.md §4): only an active member
+        // reaches the ref rule; the service key and everyone else are refused.
+        use super::private_jobs::{team_access, team_ref_update_allowed, TeamAccess};
+        match team_access(
+            &state,
+            community,
+            &req.repo_owner,
+            &req.repo_id,
+            &req.pusher_pubkey,
+        )
+        .await
+        {
+            TeamAccess::NotTeam => {}
+            TeamAccess::Allow => {
+                if !req.ref_updates.iter().all(|r| {
+                    team_ref_update_allowed(&r.ref_name, &r.old_oid, &r.new_oid, r.is_ancestor)
+                }) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "team repository ref update denied: create or fast-forward branches only",
+                    )
+                        .into_response();
+                }
+                return Json(HookCallbackResponse {
+                    allowed: true,
+                    denials: vec![],
+                })
+                .into_response();
+            }
+            TeamAccess::Read | TeamAccess::Deny | TeamAccess::Unavailable => {
+                return (StatusCode::FORBIDDEN, "private repository access denied")
+                    .into_response()
+            }
+        }
         let job = match state
             .db
             .private_job_repo(community, &req.repo_owner, &req.repo_id)

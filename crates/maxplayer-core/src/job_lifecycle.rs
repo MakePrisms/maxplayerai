@@ -232,6 +232,12 @@ pub struct JobView {
     /// ⚠ Any caller about to take an IRREVERSIBLE action on absence must check this first. It is
     /// `false` on every view not built by a confirmed read, so the unsafe direction is the one you
     /// have to opt into.
+    ///
+    /// SCOPE: the OFFER read only — the offer was returned, or an offer read ended in the relay's
+    /// `EOSE` after a served liveness probe. It says nothing about the claim/result lists: a legacy
+    /// claim or result read that timed out still comes back as an empty list under
+    /// `read_confirmed: true`, and a v2 history read that cannot complete fails the whole view with an
+    /// error instead. Never read an empty `claims` or `results` as absence on the strength of this.
     pub read_confirmed: bool,
     /// The relay's terminal refusal of this job's offer publication, when one was
     /// recorded (for example `invalid: event timestamp too far from server time`).
@@ -931,8 +937,9 @@ async fn assert_base_readable_by_sellers(
             Err(JobLifecycleError::Input(SELLER_UNREADABLE_BASE.into()))
         }
         Err(error) => Err(JobLifecycleError::Relay(format!(
-            "could not verify that sellers can read the contribution base ({error}); the post \
-             was not published — retry it, or post a targeted private job"
+            "could not verify that sellers can read the contribution base ({}); the post \
+             was not published — retry it, or post a targeted private job",
+            crate::git_transport::operator_cause(&error)
         ))),
     }
 }
@@ -998,9 +1005,10 @@ fn base_validation_refusal(
             JobLifecycleError::Input(SELLER_UNREADABLE_BASE.into())
         }
         error => JobLifecycleError::Relay(format!(
-            "contribution base validation failed ({error}): every seller must be able to fetch \
+            "contribution base validation failed ({}): every seller must be able to fetch \
              base_oid {oid} from target_repo_url, and this fetch could not — the job was not \
-             posted; fix the pin (or the host) and post again"
+             posted; fix the pin (or the host) and post again",
+            crate::git_transport::operator_cause(error)
         )),
     }
 }
@@ -1245,10 +1253,13 @@ pub fn get_job(home: &MaxplayerHome, request: GetJobRequest) -> Result<JobView, 
     runtime.block_on(get_job_async(home, request))
 }
 
-/// Async `get_job` for callers already on a Tokio runtime (MCP dispatch).
+/// Async `get_job` for callers already on a Tokio runtime with no live job subscription (the sync
+/// CLI entry above). MCP goes through the buyer daemon, which uses
+/// [`get_job_awaiting_events_async`].
 ///
 /// `wait_for` is capped at [`WAIT_FOR_CAP_SECS`]. Cap-hit with condition unmet returns
-/// `pending: true` (re-poll) — never an error.
+/// `pending: true` (re-poll) — never an error. Same timing bound as the events variant: the cap
+/// plus at most one [`MIN_WAIT_READ`] view read.
 pub async fn get_job_async(
     home: &MaxplayerHome,
     request: GetJobRequest,
@@ -1270,17 +1281,11 @@ pub async fn get_job_async(
         .min(WAIT_FOR_CAP_SECS);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_cap_secs);
 
+    // Same shape as `get_job_awaiting_events_async`: every pass reads with a floored window, and
+    // the loop ends right after the read that found the deadline passed.
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            let mut view =
-                fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout, now_unix())
-                    .await?;
-            view.pending = !view_is_ready(&view, wait_for);
-            maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
-            return Ok(view);
-        }
-        let this_fetch = fetch_timeout.min(remaining);
+        let this_fetch = wait_read_window(fetch_timeout, remaining);
         let mut view =
             fetch_job_view_async(home, &keys, &request.job_id, this_fetch, now_unix()).await?;
         if view_is_ready(&view, wait_for) {
@@ -1288,13 +1293,41 @@ pub async fn get_job_async(
             maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
             return Ok(view);
         }
-        if tokio::time::Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             view.pending = true;
             maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
             return Ok(view);
         }
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::time::sleep(remaining.min(WAIT_POLL_INTERVAL)).await;
     }
+}
+
+/// The pause between view reads in [`get_job_async`]'s poll loop, cut to the time left.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(400);
+
+/// The shortest window ONE view read inside a `wait_for` long-poll may be given.
+///
+/// The long-poll deadline bounds how long we WAIT for the job to become ready; it must never
+/// shrink the read that reports the job's state. Clamping the read to the time left handed the
+/// final pass of every unmet wait a 1 ms window (or a few ms in the poll variant): the SDK's
+/// auto-closing subscriptions then time out before the relay can answer, the offer read returns
+/// `Ok(empty)`, the liveness probe gives up, and the caller gets a view with no offer,
+/// `read_confirmed: false`, plus a `buyer offer-read empty … relay_answered=false elapsed_ms=4
+/// (#602)` line that looks like a relay or SDK failure. A healthy relay answers in well under
+/// 100 ms, so this floor costs nothing when the relay is fine.
+///
+/// When the relay is slow or stalled, the window is ONE wall-clock budget for the whole view read
+/// ([`fetch_job_view_async`] shares it across connect, offer read, probe, recheck and the
+/// claim/result reads), so a wait ends at most this much (plus a few [`VIEW_SUB_READ_FLOOR`]s)
+/// past its cap: 10 s + 2 s, inside the 15 s MCP tool deadline. A private offer's flush/backfill
+/// adds at most half of each read's window ([`private_sync_budget`]): at worst about 13 s.
+const MIN_WAIT_READ: Duration = Duration::from_secs(2);
+
+/// The window for one view read inside a `wait_for` long-poll: the normal fetch timeout, cut to
+/// the time left on the wait, but never below [`MIN_WAIT_READ`].
+fn wait_read_window(fetch_timeout: Duration, remaining: Duration) -> Duration {
+    fetch_timeout.min(remaining.max(MIN_WAIT_READ))
 }
 
 /// How long a subscription-driven wait will sit before re-reading the view anyway.
@@ -1343,7 +1376,7 @@ pub async fn get_job_awaiting_events_async(
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let this_fetch = fetch_timeout.min(remaining.max(Duration::from_millis(1)));
+        let this_fetch = wait_read_window(fetch_timeout, remaining);
         let mut view =
             fetch_job_view_async(home, &keys, &request.job_id, this_fetch, now_unix()).await?;
         if view_is_ready(&view, wait_for) {
@@ -1569,7 +1602,7 @@ pub async fn send_signed_award_async(
     expected_event_id: &str,
     event_json: &str,
 ) -> SendOutcome {
-    use nostr_sdk::prelude::{Client, Event, JsonUtil};
+    use nostr_sdk::prelude::{Event, JsonUtil};
 
     let event = match Event::from_json(event_json) {
         Ok(event) => event,
@@ -1593,7 +1626,7 @@ pub async fn send_signed_award_async(
             detail: format!("pinned award event fails verification ({error}); probe will resolve"),
         };
     }
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     // Explicit, not a default we hope for: the NIP-42 resend after auth fails SILENTLY when
     // auto-auth is off — the drift guard buyer/relay.rs pins for its own client.
     client.automatic_authentication(true);
@@ -2937,8 +2970,7 @@ async fn publish_draft_async(
     publish_signed_event_async(home, keys, &event).await
 }
 async fn publish_signed_event_async(home: &MaxplayerHome, keys: &nostr_sdk::Keys, event: &nostr_sdk::Event) -> Result<String, JobLifecycleError> {
-    use nostr_sdk::Client;
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     client
         .add_relay(&home.config.relay_url)
         .await
@@ -3142,11 +3174,11 @@ pub(crate) async fn award_presence_async(
     job_id: &str,
     timeout: Duration,
 ) -> Result<PresenceRead<AwardPresence>, JobLifecycleError> {
-    use nostr_sdk::prelude::{Client, EventId, Filter, Kind};
+    use nostr_sdk::prelude::{EventId, Filter, Kind};
 
     let offer_id = EventId::from_hex(job_id)
         .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     // Same discipline as the send path: auto-auth on (NIP-42-gated reads re-issue silently only
     // when it is), and WAIT for the socket — `connect()` only spawns, and a fetch racing the
     // handshake burns its whole window and reads as empty.
@@ -3323,9 +3355,8 @@ async fn presence_of_filter(
     timeout: Duration,
 ) -> Result<PresenceRead<()>, JobLifecycleError> {
     use nostr_sdk::pool::relay::ReqExitPolicy;
-    use nostr_sdk::prelude::Client;
 
-    let client = Client::new(keys.clone());
+    let client = crate::relay_transport::client(keys.clone());
     client.automatic_authentication(true);
     client
         .add_relay(relay_url)
@@ -3643,6 +3674,14 @@ fn serialize_accepted_view<S: serde::Serializer>(bind: &Option<AcceptedBind>, se
 /// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
 /// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
 /// (already-delivered / live-claimed-by-another) without duplicating the relay read.
+///
+/// `timeout` is ONE wall-clock budget for the relay reads of this view, not a per-REQ window: the
+/// connect wait, offer read, liveness probe, offer recheck and claim/result (or v2 history) reads
+/// each get the time left, never less than [`VIEW_SUB_READ_FLOOR`]. The outbox flush/backfill of a
+/// private offer (run first for a locally queued one, or after the reads for one the relay
+/// returned that this home has no record of) is not charged to that budget: it gets its own
+/// [`private_sync_budget`], half of `timeout`, so a whole view read takes at most 1.5 x `timeout`
+/// plus a few floors.
 pub(crate) async fn fetch_job_view_async(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
@@ -3659,14 +3698,40 @@ pub(crate) async fn fetch_job_view_async(
     // publication before any absence decision; retain its exact signed identity.
     let mut local_private = crate::seller_node::privacy::known(home, &keys.public_key().to_hex(), job_id)
         .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    // Bounded by `private_sync_budget`: cutting it short is safe (unsent copies stay in the
+    // outbox, the backfill cursor keeps only finished windows) and the relay reads below then
+    // decide, an absent offer reading as pending and unconfirmed.
     if let Some((ctx, _)) = &mut local_private {
-        if let Ok(mut transport) = crate::private_content::session::AuthenticatedContentRelay::connect(keys, &home.config.relay_url).await {
-            let _ = crate::private_content::session::flush(&mut ctx.store, keys, &mut transport, 64).await;
+        let budget = private_sync_budget(timeout);
+        let sync = async {
+            let mut transport = crate::private_content::session::AuthenticatedContentRelay::connect(
+                keys,
+                &home.config.relay_url,
+            )
+            .await
+            .ok()?;
+            let _ = crate::private_content::session::flush(&mut ctx.store, keys, &mut transport, 64)
+                .await;
             let refreshed = transport.backfill(&mut ctx.store, keys, now).await;
             transport.disconnect().await;
-            refreshed.map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
+            Some(refreshed)
+        };
+        match tokio::time::timeout(budget, sync).await {
+            Ok(Some(refreshed)) => {
+                refreshed.map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
+            }
+            Ok(None) => {}
+            Err(_) => crate::opline!(
+                "buyer private offer {job_id}: outbox flush/backfill did not finish within {}ms; reading the relay anyway (retried next read)",
+                budget.as_millis()
+            ),
         }
     }
+    // The budget starts AFTER the private-offer pre-step above: that step keeps its own I/O
+    // bounds, and charging it to this budget could leave the relay reads below only the floor,
+    // the empty-view symptom the long-poll window exists to prevent.
+    let read_deadline = tokio::time::Instant::now() + timeout;
+    let left = || view_read_left(read_deadline);
     let (client, history_wire) = crate::private_content::history_wire::WireHistory::client(keys);
     // Same discipline as `award_presence_async` / `presence_of_filter`: auto-auth ON so a
     // NIP-42-gated read re-issues after the handshake, and WAIT for the socket before the first
@@ -3682,7 +3747,9 @@ pub(crate) async fn fetch_job_view_async(
         .relay(&home.config.relay_url)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("relay handle: {error}")))?;
-    relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
+    relay
+        .wait_for_connection(RELAY_CONNECT_WAIT.min(left()))
+        .await;
 
     // Every fetch filter carries the `#t=maxplayer` namespace guard so a foreign event squatting a
     // maxplayer kind is never returned.
@@ -3705,7 +3772,7 @@ pub(crate) async fn fetch_job_view_async(
     // content-swapped event. (v2 and private events are additionally validated downstream.)
     let (mut offer_events, mut offer_poisoned) = authentic_split(
         relay
-            .fetch_events(offer_filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
+            .fetch_events(offer_filter.clone(), left(), ReqExitPolicy::ExitOnEOSE)
             .await
             .map_err(|error| JobLifecycleError::Relay(format!("fetch offer: {error}")))?,
         &offer_filter,
@@ -3722,6 +3789,9 @@ pub(crate) async fn fetch_job_view_async(
     // offer_id` at every point we consult the set, so a misbehaving relay's foreign event can
     // neither seed the view nor count as presence (matches the award path's rigor).
     let offer_present = offer_events.iter().any(|event| event.id == offer_id);
+    // Whether the `limit(0)` liveness probe got its `EOSE`. False when it was never sent (offer in
+    // hand, or a poisoned read) or the relay did not answer it inside the budget.
+    let mut probe_answered = false;
     let offer_probe_confirmed = if offer_present {
         // The offer is in hand; there is nothing to disambiguate and the relay owes no round trip.
         false
@@ -3736,29 +3806,39 @@ pub(crate) async fn fetch_job_view_async(
         // must PRECEDE the read it vouches for, and a second read may land what a window-starved
         // first one missed. Deliberately a RESPONSE, not a broadcast we merely hope to receive.
         let confirmed =
-            crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
+            crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), left())
                 .await;
+        probe_answered = confirmed;
+        // The recheck must END IN ITS OWN `EOSE` to certify absence. `fetch_events` returns
+        // `Ok(empty)` on timeout too, so a served probe followed by a recheck that ran out of time
+        // used to certify an absence nobody had read. `read_stored` reports whether the EOSE came;
+        // it also drops (and counts as incomplete) any frame that does not verify, so a same-id
+        // twin can neither occupy the offer nor certify absence.
+        let mut recheck_eose = false;
         if confirmed {
-            (offer_events, offer_poisoned) = authentic_split(
-                relay
-                    .fetch_events(offer_filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
-                    .await
-                    .map_err(|error| {
-                        JobLifecycleError::Relay(format!("fetch offer (recheck): {error}"))
-                    })?,
-                &offer_filter,
-            );
+            let recheck = crate::seller_node::stored_read::read_stored(
+                &relay,
+                vec![offer_filter.clone()],
+                left(),
+            )
+            .await;
+            recheck_eose = recheck.is_complete();
+            (offer_events, offer_poisoned) = authentic_split(recheck.into_events(), &offer_filter);
         }
         // Make the why-empty question observable next time (the report the tree lacked): whether
-        // the relay answered our REQ, whether the recheck found the offer, and how long it took.
+        // the relay answered our REQ, whether the recheck found the offer or ended in EOSE, and
+        // how long the read took against its whole budget (`window_ms`).
         crate::opline!(
             "buyer offer-read empty job={job_id} relay_answered={confirmed} offer_on_recheck={} \
-             elapsed_ms={} (#602)",
+             recheck_eose={recheck_eose} elapsed_ms={} window_ms={} (#602)",
             offer_events.iter().any(|event| event.id == offer_id),
-            offer_read_started.elapsed().as_millis()
+            offer_read_started.elapsed().as_millis(),
+            timeout.as_millis()
         );
         // A recheck that again returned only unverifiable frames does not certify absence either.
-        confirmed && !(offer_poisoned && !offer_events.iter().any(|event| event.id == offer_id))
+        confirmed
+            && recheck_eose
+            && !(offer_poisoned && !offer_events.iter().any(|event| event.id == offer_id))
     };
     let read_confirmed = offer_read_answered(offer_present, offer_probe_confirmed);
 
@@ -3775,16 +3855,26 @@ pub(crate) async fn fetch_job_view_async(
         .event(offer_id);
     let v2_offer = offer_events.iter().find(|event| event.id == offer_id
         && crate::private_content::public_v2::value(event, "v") == Ok(Some("2")));
+    // No offer and no answer to the liveness probe: the relay is not serving this session, and
+    // two more reads would only spend the caller's budget learning that again. The lists stay
+    // empty, and `read_confirmed` is already false.
+    let relay_unanswered = !offer_present && !offer_poisoned && !probe_answered;
     let (feedback_events, result_events, v2_awards) = if let Some(offer) = v2_offer {
-        let read = fetch_v2_history(home, &history_wire, &relay, offer, feedback_filter, result_filter, timeout).await;
+        let read = fetch_v2_history(home, &history_wire, &relay, offer, feedback_filter, result_filter, left()).await;
         if read.is_err() { client.disconnect().await; }
         read?
+    } else if relay_unanswered {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
         let lists: Result<_, JobLifecycleError> = async {
-            let feedback = client.fetch_events(feedback_filter.clone(), timeout).await
+            let feedback = client
+                .fetch_events(feedback_filter.clone(), left())
+                .await
                 .map_err(|error| JobLifecycleError::Relay(format!("fetch feedback: {error}")))?;
             let feedback = authentic_list(feedback, &feedback_filter, "feedback")?;
-            let results = client.fetch_events(result_filter.clone(), timeout).await
+            let results = client
+                .fetch_events(result_filter.clone(), left())
+                .await
                 .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?;
             let results = authentic_list(results, &result_filter, "results")?;
             Ok((feedback, results))
@@ -3802,14 +3892,30 @@ pub(crate) async fn fetch_job_view_async(
             let mut context = if let Some((context, _)) = local_private.take() { context } else {
                 let mut context = crate::private_content::channel::ContentContext::open(home, &keys.public_key().to_hex())
                     .map_err(|e| JobLifecycleError::Input(e.to_string()))?;
-                let mut transport = crate::private_content::session::AuthenticatedContentRelay::connect(keys, &home.config.relay_url).await
-                    .map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
-                let refreshed = async {
-                    crate::private_content::session::flush(&mut context.store, keys, &mut transport, 64).await?;
-                    transport.backfill(&mut context.store, keys, now).await
-                }.await;
-                transport.disconnect().await;
-                refreshed.map_err(|e: crate::private_content::Error| JobLifecycleError::Relay(e.to_string()))?;
+                // Same bound as the pre-step above. Here the private view needs the synced
+                // content, so running out of time is an error the caller retries.
+                let budget = private_sync_budget(timeout);
+                let synced = tokio::time::timeout(budget, async {
+                    let mut transport = crate::private_content::session::AuthenticatedContentRelay::connect(keys, &home.config.relay_url).await
+                        .map_err(|e| JobLifecycleError::Relay(e.to_string()))?;
+                    let refreshed = async {
+                        crate::private_content::session::flush(&mut context.store, keys, &mut transport, 64).await?;
+                        transport.backfill(&mut context.store, keys, now).await
+                    }.await;
+                    transport.disconnect().await;
+                    refreshed.map_err(|e: crate::private_content::Error| JobLifecycleError::Relay(e.to_string()))
+                }).await;
+                match synced {
+                    Ok(refreshed) => {
+                        refreshed?;
+                    }
+                    Err(_) => {
+                        return Err(JobLifecycleError::Relay(format!(
+                            "private content sync for {job_id} did not finish within {}ms; retry",
+                            budget.as_millis()
+                        )));
+                    }
+                }
                 context
             };
             return private_view_from_events(home, &mut context, event, feedback_events.into_iter().collect(),
@@ -3965,8 +4071,29 @@ pub(crate) async fn fetch_job_view_async(
     Ok(view)
 }
 
+/// The shortest window one relay read inside a view read gets once the view's budget is spent:
+/// enough that a read is never handed zero, small enough that the reads left after a stall add
+/// only milliseconds past the budget.
+const VIEW_SUB_READ_FLOOR: Duration = Duration::from_millis(20);
+
+/// The time left on a view read's shared budget, never below [`VIEW_SUB_READ_FLOOR`].
+/// The private-offer outbox flush/backfill's bound inside one view read: half the view's budget.
+/// Each of its steps (connect and NIP-42 sign-in, flush, backfill windows) otherwise waits up to
+/// 20 s on its own, which put a `get_job` wait on a private offer past the 15 s MCP tool deadline.
+fn private_sync_budget(timeout: Duration) -> Duration {
+    (timeout / 2).max(VIEW_SUB_READ_FLOOR)
+}
+
+fn view_read_left(read_deadline: tokio::time::Instant) -> Duration {
+    read_deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .max(VIEW_SUB_READ_FLOOR)
+}
+
 /// Read every v2 dependency to its own EOSE. Then re-read referenced IDs, since
 /// independent subscriptions can straddle publication of a result and its award.
+///
+/// `timeout` bounds the WHOLE history read: each `history::fetch` gets the time left.
 async fn fetch_v2_history(
     home: &MaxplayerHome,
     wire: &crate::private_content::history_wire::WireHistory,
@@ -3986,7 +4113,9 @@ async fn fetch_v2_history(
     use crate::private_content::{history, public_v2 as public};
     use nostr_sdk::prelude::{EventId, Filter, Kind};
     let err = |e: crate::private_content::Error| JobLifecycleError::Relay(e.to_string());
-    let mut feedback = history::fetch(wire, relay, feedback_filter, timeout)
+    let read_deadline = tokio::time::Instant::now() + timeout;
+    let timeout = || view_read_left(read_deadline);
+    let mut feedback = history::fetch(wire, relay, feedback_filter, timeout())
         .await
         .map_err(err)?;
     let award_filter = Filter::new()
@@ -3994,7 +4123,7 @@ async fn fetch_v2_history(
         .author(offer.pubkey)
         .hashtag(gateway::MAXPLAYER_TAG)
         .event(offer.id);
-    let mut awards = history::fetch(wire, relay, award_filter.clone(), timeout)
+    let mut awards = history::fetch(wire, relay, award_filter.clone(), timeout())
         .await
         .map_err(err)?;
     // Locally signed/validated selection evidence survives relay pruning and
@@ -4022,7 +4151,9 @@ async fn fetch_v2_history(
     if let Some(seller) = selected_seller {
         result_filter = result_filter.author(seller);
     }
-    let results = history::fetch(wire, relay, result_filter, timeout).await.map_err(err)?;
+    let results = history::fetch(wire, relay, result_filter, timeout())
+        .await
+        .map_err(err)?;
     let missing: std::collections::BTreeSet<_> = results
         .iter()
         .filter(|r| {
@@ -4040,7 +4171,7 @@ async fn fetch_v2_history(
         .collect();
     if !missing.is_empty() {
         awards.extend(
-            history::fetch(wire, relay, award_filter.ids(missing), timeout)
+            history::fetch(wire, relay, award_filter.ids(missing), timeout())
                 .await
                 .map_err(err)?,
         );
@@ -4060,7 +4191,7 @@ async fn fetch_v2_history(
                     .kind(Kind::Custom(JOB_CLAIM_KIND))
                     .hashtag(gateway::MAXPLAYER_TAG)
                     .event(offer.id),
-                timeout,
+                timeout(),
             )
             .await
             .map_err(err)?,
@@ -6685,6 +6816,23 @@ mod tests {
         assert!(io.contains("contribution base validation failed"), "{io}");
         assert!(io.contains(&oid), "{io}");
         assert!(io.contains("post again"), "{io}");
+        // Public-post text: the transport's own cause, never a server's refusal excerpt or a
+        // URL credential.
+        let refused = base_validation_refusal(
+            &TransportError::Io(
+                "http status 404 for http://u:secret@h/x (refusal: server body text)".into(),
+            ),
+            &oid,
+        )
+        .to_string();
+        assert!(
+            refused.contains("http status 404 for http://***@h/x"),
+            "{refused}"
+        );
+        assert!(
+            !refused.contains("server body text") && !refused.contains("secret"),
+            "{refused}"
+        );
 
         // Quota gate + advisory seed on a real local repository.
         let dir = std::env::temp_dir().join(format!(
@@ -7038,6 +7186,334 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a [`SlowQueries`] relay saw, and the switch that stops it answering.
+    #[derive(Debug, Clone, Default)]
+    struct QueryControl {
+        /// When set, every REQ from now on is held forever: no events, no `EOSE`, no `CLOSED`.
+        stalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Set `stalled` at the first by-id OFFER REQ at or after this instant, so the stall begins
+        /// at the start of a view read rather than in the middle of one.
+        stall_from: std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+        /// When each by-id OFFER REQ (first read or recheck) reached the relay.
+        offer_reads: std::sync::Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    impl QueryControl {
+        fn offer_reads(&self) -> Vec<tokio::time::Instant> {
+            self.offer_reads.lock().unwrap().clone()
+        }
+    }
+
+    /// A relay that answers every REQ after a fixed, realistic delay (a WAN round trip), so a
+    /// read given a near-zero window can never be answered in time; or, once stalled, never.
+    #[derive(Debug)]
+    struct SlowQueries {
+        delay: Duration,
+        control: QueryControl,
+    }
+
+    impl nostr_relay_builder::prelude::QueryPolicy for SlowQueries {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a nostr_sdk::Filter,
+            _addr: &'a std::net::SocketAddr,
+        ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult>
+        {
+            Box::pin(async move {
+                let offer_kind = nostr_sdk::Kind::Custom(JOB_OFFER_KIND);
+                if query.ids.is_some()
+                    && query
+                        .kinds
+                        .as_ref()
+                        .is_some_and(|k| k.contains(&offer_kind))
+                {
+                    let now = tokio::time::Instant::now();
+                    self.control.offer_reads.lock().unwrap().push(now);
+                    if self.control.stall_from.lock().unwrap().is_some_and(|at| now >= at) {
+                        self.control
+                            .stalled
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                if self
+                    .control
+                    .stalled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(self.delay).await;
+                nostr_relay_builder::prelude::PolicyResult::Accept
+            })
+        }
+    }
+
+    /// The two `wait_for` loops: the daemon's event-woken one (MCP) and the CLI's poll loop.
+    #[derive(Debug, Clone, Copy)]
+    enum WaitLoop {
+        Events,
+        Poll,
+    }
+
+    async fn run_wait(
+        wait_loop: WaitLoop,
+        home: &MaxplayerHome,
+        request: GetJobRequest,
+    ) -> Result<JobView, JobLifecycleError> {
+        match wait_loop {
+            WaitLoop::Events => {
+                // Held open for the whole wait: a closed fan-out would wake the loop on every pass.
+                let (_tx, rx) = tokio::sync::broadcast::channel(8);
+                get_job_awaiting_events_async(home, request, rx).await
+            }
+            WaitLoop::Poll => get_job_async(home, request).await,
+        }
+    }
+
+    /// A relay answering each REQ after `delay`, holding a v2 job that is claimed and awarded but
+    /// never delivered, so a `wait_for: result` always runs out its cap.
+    async fn slow_relay_with_an_unready_job(
+        label: &str,
+        delay: Duration,
+    ) -> (
+        nostr_relay_builder::prelude::LocalRelay,
+        std::path::PathBuf,
+        MaxplayerHome,
+        String,
+        QueryControl,
+    ) {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let control = QueryControl::default();
+        let relay = LocalRelay::new(RelayBuilder::default().query_policy(SlowQueries {
+            delay,
+            control: control.clone(),
+        }));
+        relay.run().await.expect("relay run");
+        let (root, mut home) = temp_job_home(label);
+        home.config.relay_url = relay.url().await.to_string();
+        let (evidence, buyer) = crate::private_content::public_v2::tests::fixture(false, false);
+        // Public deterministic fixture identities, never operator credentials.
+        std::fs::write(&home.key_path, format!("{:064x}", 1)).expect("fixture buyer");
+        let seller = nostr_sdk::Keys::parse(&format!("{:064x}", 2)).unwrap();
+        for (signer, event) in [
+            (&buyer, &evidence.offer),
+            (&seller, &evidence.claim),
+            (&buyer, &evidence.award),
+        ] {
+            publish_signed_event_async(&home, signer, event)
+                .await
+                .expect("publish v2 selection");
+        }
+        let job_id = evidence.offer.id.to_hex();
+        (relay, root, home, job_id, control)
+    }
+
+    // The long-poll deadline bounds the WAIT, never the read that reports the job's state.
+    #[test]
+    fn a_wait_read_window_never_shrinks_below_the_floor() {
+        let fetch = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+        for remaining in [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(400),
+        ] {
+            assert_eq!(
+                wait_read_window(fetch, remaining),
+                MIN_WAIT_READ,
+                "{remaining:?}"
+            );
+        }
+        assert_eq!(
+            wait_read_window(fetch, Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(wait_read_window(fetch, Duration::from_secs(9)), fetch);
+        // The floor never stretches a caller's own, shorter fetch timeout.
+        let short = Duration::from_secs(1);
+        assert_eq!(wait_read_window(short, Duration::ZERO), short);
+        const { assert!(MIN_WAIT_READ.as_secs() <= DEFAULT_FETCH_TIMEOUT_SECS) };
+    }
+
+    // TOOTH — the report behind this: every `get_job(wait_for=…)` that ran out its cap ended on a
+    // read given a 1 ms window. Against any real relay that read cannot be answered, so the
+    // returned view had NO offer and `read_confirmed: false`, and the daemon logged
+    // `buyer offer-read empty … relay_answered=false elapsed_ms=4 (#602)` — which an operator read
+    // as the relay or the SDK dropping the award loop's reads.
+    //
+    // The relay here answers each REQ after 150 ms. The job is genuinely not ready (claim + award,
+    // no result), so each wait loop runs out its 2 s cap and returns its FINAL read. That read must
+    // still see the offer the relay holds. The relay's log of offer REQs proves the final read
+    // really ran after the deadline (a loop that exited on its first pass would prove nothing).
+    // 150 ms makes that deterministic: the first view read is four serial REQs (offer + three v2
+    // history reads), so it ends with well over a second left, and both loops then wait out the deadline
+    // exactly (the poll loop's pause is cut to the time left) before their final read.
+    //
+    // BITE: give either loop's read `fetch_timeout.min(remaining)` again (events:
+    // `.max(Duration::from_millis(1))`) and the offer disappears from that loop's returned view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_wait_still_returns_an_answered_read() {
+        for wait_loop in [WaitLoop::Events, WaitLoop::Poll] {
+            let (_relay, root, home, job_id, control) =
+                slow_relay_with_an_unready_job("wait-final-read", Duration::from_millis(150)).await;
+            let started = tokio::time::Instant::now();
+            let view = run_wait(
+                wait_loop,
+                &home,
+                GetJobRequest {
+                    job_id: job_id.clone(),
+                    wait_for: Some(WaitFor::Result),
+                    timeout_secs: Some(2),
+                    include_display_names: false,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{wait_loop:?}: wait failed: {error}"));
+
+            assert!(
+                view.pending,
+                "{wait_loop:?}: no result was published, so the wait must run out"
+            );
+            let reads = control.offer_reads();
+            assert!(
+                reads.len() >= 2
+                    && reads
+                        .iter()
+                        .any(|at| *at >= started + Duration::from_secs(2)),
+                "{wait_loop:?}: the wait must end on an offer read made after its deadline: {:?}",
+                reads
+                    .iter()
+                    .map(|at| at.duration_since(started))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                view.offer.as_ref().map(|offer| offer.event_id.as_str()),
+                Some(job_id.as_str()),
+                "{wait_loop:?}: the final read of a timed-out wait must still be answered by the relay"
+            );
+            assert!(
+                view.read_confirmed,
+                "{wait_loop:?}: the final read must not report an unanswered offer read"
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    // TOOTH — the timing bound behind `MIN_WAIT_READ`: a default `wait_for` (10 s cap) against a
+    // relay that STOPS ANSWERING mid-wait must come back as `Ok(pending: true)` within the cap plus
+    // one floored read, well inside the 15 s MCP tool deadline — never as a tool-deadline error.
+    //
+    // The relay answers normally, then from the first view read that starts after 5.5 s it holds
+    // every REQ forever, offer read first. That read starts with about 4 s left on the wait. (A
+    // stall that begins AFTER an answered v2 offer read fails the history read with an error
+    // instead; that fail-closed path is documented on `JobView::read_confirmed`.) That window must bound the WHOLE view read (connect, offer,
+    // probe, recheck, claim/result reads), and the claim/result reads must be skipped once the
+    // relay failed to answer both the offer read and the liveness probe.
+    //
+    // BITE: give each sub-read of `fetch_job_view_async` the full `timeout` again (one budget per
+    // REQ) and the offer read plus the probe take ~2 x 4 s: the wait ends past 13 s and this fails,
+    // for both loops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_relay_ends_a_default_wait_inside_the_tool_deadline() {
+        let bound = Duration::from_secs(WAIT_FOR_CAP_SECS) + MIN_WAIT_READ + Duration::from_secs(1);
+        let stall_at = Duration::from_millis(5_500);
+        let wait = |wait_loop: WaitLoop| async move {
+            let (_relay, root, home, job_id, control) =
+                slow_relay_with_an_unready_job("wait-stalled", Duration::ZERO).await;
+            let started = tokio::time::Instant::now();
+            *control.stall_from.lock().unwrap() = Some(started + stall_at);
+            let view = run_wait(
+                wait_loop,
+                &home,
+                GetJobRequest {
+                    job_id,
+                    wait_for: Some(WaitFor::Result),
+                    timeout_secs: None,
+                    include_display_names: false,
+                },
+            )
+            .await;
+            let elapsed = started.elapsed();
+            let stalled_reads = control
+                .offer_reads()
+                .iter()
+                .filter(|at| **at >= started + stall_at)
+                .count();
+            let _ = std::fs::remove_dir_all(&root);
+            (wait_loop, view, elapsed, stalled_reads)
+        };
+        let (events, poll) = tokio::join!(wait(WaitLoop::Events), wait(WaitLoop::Poll));
+        for (wait_loop, view, elapsed, stalled_reads) in [events, poll] {
+            let view = view.unwrap_or_else(|error| {
+                panic!("{wait_loop:?}: a stalled relay must not fail the wait: {error}")
+            });
+            assert!(
+                stalled_reads >= 1,
+                "{wait_loop:?}: the wait must have read the stalled relay"
+            );
+            assert!(view.pending, "{wait_loop:?}: the job never became ready");
+            assert!(
+                view.offer.is_none() && !view.read_confirmed,
+                "{wait_loop:?}: an unanswered read certifies nothing"
+            );
+            assert!(
+                elapsed <= bound,
+                "{wait_loop:?}: wait took {elapsed:?}, past the {bound:?} bound (MCP tool deadline 15 s)"
+            );
+        }
+    }
+
+    // TOOTH — a locally queued private offer runs an outbox flush/backfill before the relay reads.
+    // This local relay never sends a NIP-42 challenge, so that step's connect waits out its own
+    // 20 s sign-in window: unbounded, one view read on the default (private) visibility took past
+    // the 15 s MCP tool deadline. The pre-step is cut at `private_sync_budget`, and the view read
+    // then ends within 1.5 x its budget plus slack, whatever it returns.
+    //
+    // BITE: drop the `tokio::time::timeout` around the pre-step and this read takes ~20 s.
+    #[cfg(feature = "wallet")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_private_offer_sync_stays_inside_the_view_budget() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::JsonUtil;
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let (root, mut home) = temp_job_home("private-sync-stall");
+        home.config.relay_url = relay.url().await.to_string();
+        let buyer = nostr_sdk::Keys::generate();
+        let offer = nostr_sdk::EventBuilder::text_note("locally queued private offer")
+            .sign_with_keys(&buyer)
+            .expect("sign");
+        let job_id = offer.id.to_hex();
+        let store = home.root.join("private-content.sqlite");
+        drop(crate::private_content::store::ContentStore::open(&store).expect("content store"));
+        rusqlite::Connection::open(&store)
+            .expect("open content store")
+            .execute(
+                "INSERT INTO content_events(id,root,event) VALUES(?1,?1,?2)",
+                rusqlite::params![job_id, offer.as_json()],
+            )
+            .expect("queue the offer locally");
+        assert!(
+            crate::seller_node::privacy::known(&home, &buyer.public_key().to_hex(), &job_id)
+                .expect("known")
+                .is_some(),
+            "the fixture must take the private pre-step"
+        );
+
+        let timeout = Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+        let _ = fetch_job_view_async(&home, &buyer, &job_id, timeout, now_unix()).await;
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_dir_all(&root);
+        let bound = timeout + private_sync_budget(timeout) + Duration::from_secs(2);
+        assert!(
+            elapsed <= bound,
+            "a stalled private sync held the view read for {elapsed:?}, past {bound:?}"
+        );
     }
 
     // NETWORK (#720): same shape as the wait test above — the relay is local, but the
@@ -9385,6 +9861,44 @@ mod verify_site_teeth {
         serve(vec![vec![ScriptedFrame::event(&genuine), ScriptedFrame::event(&forged)]]);
         let read = view().await.expect("view");
         assert_eq!(read.offer.expect("[genuine, twin]").amount_sats, 10, "[genuine, twin] reads the genuine offer");
+    }
+
+    // ── fetch_job_view_async: the recheck must end in its own EOSE ──────────────────────────
+    // An empty offer read, a served liveness probe, then a recheck the relay never finishes.
+    // `fetch_events` returns `Ok(empty)` on timeout too, so the view used to certify an absence
+    // nobody read: `read_confirmed: true` with no offer, which the award loop parks on terminally.
+    // BITE: drop `recheck_eose` from the `offer_probe_confirmed` conjunction and this certifies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recheck_that_never_ends_does_not_certify_the_offer_absent() {
+        let relay = PGateRelay::start(NO_AUTH).await;
+        let (_dir, home) = buyer_home(&relay).await;
+        let buyer = Keys::generate();
+        let job = view_offer(&buyer, &Keys::generate()).id.to_hex();
+        let now = Timestamp::now().as_secs();
+
+        // Control: both offer reads end in EOSE, so the absence is a read fact.
+        relay.script(asks_id(job.clone()), vec![vec![], vec![]]);
+        let read = fetch_job_view_async(&home, &buyer, &job, READ, now)
+            .await
+            .expect("view");
+        assert!(
+            read.read_confirmed && read.offer.is_none(),
+            "control: answered absence is certified"
+        );
+
+        relay.clear_scripts();
+        relay.script(
+            asks_id(job.clone()),
+            vec![vec![], vec![ScriptedFrame::WithholdEose]],
+        );
+        let read = fetch_job_view_async(&home, &buyer, &job, READ, now)
+            .await
+            .expect("view");
+        assert!(read.offer.is_none(), "the relay holds no offer");
+        assert!(
+            !read.read_confirmed,
+            "a recheck without EOSE must not certify the offer absent"
+        );
     }
 
     // ── fetch_job_view_async: the legacy claim and result lists ──────────────────────────────

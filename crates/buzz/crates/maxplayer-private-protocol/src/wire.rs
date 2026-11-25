@@ -176,6 +176,7 @@ const FEEDBACK_REASONS: &[&str] = &[
     "delivery_failed",
     "no_sentinel",
     "session_expired",
+    "turn_too_large",
     "other",
 ];
 /// Session-job per-turn status on a RESULT (docs/specs/session-jobs.md §2.3).
@@ -884,6 +885,13 @@ mod session_tests {
         fb.push(r(&["status", "refusal"]));
         fb.push(r(&["reason_code", "session_expired"]));
         fb.push(r(&["e", &h, "", "reply"]));
+        validate_private(&sign(3404, fb.clone()), &host()).unwrap();
+        // #1349: a follow-up too large to review rides the same refusal shape.
+        for t in fb.iter_mut() {
+            if t.as_slice().first().map(String::as_str) == Some("reason_code") {
+                *t = r(&["reason_code", "turn_too_large"]);
+            }
+        }
         validate_private(&sign(3404, fb), &host()).unwrap();
     }
 }

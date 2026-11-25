@@ -30,13 +30,13 @@ From `crates/maxplayer-mint/e2e`, with `maxplayer` and `maxplayer-mint` on `PATH
 ```sh
 ../target/release/examples/local_relay 47810       # prints ws://127.0.0.1:47810
 MAXPLAYER_HOME=$A maxplayer-mint init              # then mint.toml: relays = ["ws://127.0.0.1:47810"]
-MAXPLAYER_HOME=$A maxplayer-mint run &
+MAXPLAYER_HOME=$A maxplayer-mint serve &
 MAXPLAYER_HOME=$BUYER maxplayer whoami             # bootstraps; set relay_url, accepted_mints = [A]
 MAXPLAYER_HOME=$A maxplayer-mint issue 300
 MAXPLAYER_HOME=$BUYER maxplayer wallet receive --token-file $A/mint/issued/<id>.token
 MAXPLAYER_HOME=$B maxplayer whoami                 # relay_url; accepted_mints = [<lightning mint>, A]
 MAXPLAYER_HOME=$B maxplayer wallet mints add <A's nostr:// URL>   # so B's wallet can spend what it earns at A
-MAXPLAYER_HOME=$B maxplayer seller --agent-argv node --agent-argv $PWD/stub-acp-agent.mjs \
+MAXPLAYER_HOME=$B maxplayer seller serve --agent-argv node --agent-argv $PWD/stub-acp-agent.mjs \
   --rate-sats 100 --accept-open-targeted --unsafe-no-sandbox --skip-doctor --non-interactive \
   --git-remote https://example.invalid/b.git &
 MAXPLAYER_HOME=$BUYER node mcp-call.mjs maxplayer post_job \

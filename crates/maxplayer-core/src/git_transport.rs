@@ -958,6 +958,34 @@ pub(crate) fn fetch_review_ref(
     fetch_review_ref_inner(repo, remote_url, refspec, Some(header), max_bytes, deadline)
 }
 
+/// Fetch one commit by id with its parents (`depth(2)`), for a team commit review
+/// (docs/specs/maxplayer-team.md §5). The relay offers `allow-reachable-sha1-in-want`; an
+/// unreachable id fails.
+pub(crate) fn fetch_review_commit(
+    repo: &Repository,
+    remote_url: &str,
+    commit: &str,
+    header: String,
+    max_bytes: usize,
+    deadline: std::time::Instant,
+) -> Result<(), TransportError> {
+    assert_allowed_repo_locator(remote_url)?;
+    fetch_review_commit_inner(repo, remote_url, commit, Some(header), max_bytes, deadline)
+}
+/// If the shallow fetch fails, one full fetch under the same byte cap and deadline.
+fn fetch_review_commit_inner(
+    repo: &Repository,
+    remote_url: &str,
+    commit: &str,
+    header: Option<String>,
+    max_bytes: usize,
+    deadline: std::time::Instant,
+) -> Result<(), TransportError> {
+    let refspec = format!("+{commit}:refs/review/delivery");
+    fetch_review_inner(repo, remote_url, &refspec, header.clone(), max_bytes, deadline, Some(2))
+        .or_else(|_| fetch_review_inner(repo, remote_url, &refspec, header, max_bytes, deadline, None))
+}
+
 fn fetch_review_ref_inner(
     repo: &Repository,
     remote_url: &str,
@@ -965,6 +993,18 @@ fn fetch_review_ref_inner(
     header: Option<String>,
     max_bytes: usize,
     deadline: std::time::Instant,
+) -> Result<(), TransportError> {
+    fetch_review_inner(repo, remote_url, refspec, header, max_bytes, deadline, None)
+}
+
+fn fetch_review_inner(
+    repo: &Repository,
+    remote_url: &str,
+    refspec: &str,
+    header: Option<String>,
+    max_bytes: usize,
+    deadline: std::time::Instant,
+    depth: Option<i32>,
 ) -> Result<(), TransportError> {
     ensure_registered()?;
     let budget = Arc::new(ReadBudget {
@@ -980,6 +1020,9 @@ fn fetch_review_ref_inner(
     options
         .download_tags(AutotagOption::None)
         .remote_callbacks(callbacks);
+    if let Some(depth) = depth {
+        options.depth(depth);
+    }
     let mut remote = bound_remote(repo, remote_url)?;
     let context = LegContext {
         mint: header.map(static_auth),
@@ -1385,9 +1428,7 @@ impl HttpStream {
                     .min(BUYER_FETCH_LEG_TIMEOUT),
             );
         }
-        let response = request
-            .send()
-            .map_err(|error| io::Error::other(format!("http request: {error}")))?;
+        let response = request.send().map_err(http_request_error)?;
         let status = response.status();
         if status.is_redirection() {
             // Unfollowed by construction (`no_redirects`). Name it plainly: the hop was never
@@ -1420,6 +1461,74 @@ impl HttpStream {
         Ok(())
     }
 }
+
+/// reqwest's Display stops at "error sending request for url (..)"; the cause (a proxy's 407, a
+/// refused connect, a TLS failure) is only in the source chain, so name all of it.
+fn http_request_error(error: reqwest::Error) -> io::Error {
+    io::Error::other(format!(
+        "http request: {}",
+        crate::error_chain::chain(&error)
+    ))
+}
+
+/// A response body read that failed mid-stream: reqwest wraps its error in an `io::Error` whose
+/// Display is again only reqwest's top line, so name the whole chain. The kind is kept (read loops
+/// retry `Interrupted`); an error with no inner error (an OS error) is returned unchanged.
+pub(crate) fn body_read_error(error: io::Error) -> io::Error {
+    if error.get_ref().is_none() {
+        return error;
+    }
+    io::Error::new(error.kind(), crate::error_chain::chain(&error))
+}
+
+/// A transport error as an operator may read it: server-written text is withheld, never echoed
+/// (an HTTP refusal excerpt, a push status message, libgit2's `remote error:` / `Error
+/// reported:` text), URL credentials are redacted, and what is left is printable ASCII on one
+/// line, at most [`OPERATOR_CAUSE_MAX`] characters.
+#[cfg(feature = "wallet")]
+pub(crate) fn operator_cause(error: &TransportError) -> String {
+    let text = match error {
+        // `require_status_report` builds `<refname>: <server message>`; keep the ref name only.
+        TransportError::Rejected(message) => match message.split_once(": ") {
+            Some((refname, _)) => {
+                format!("remote rejected ref: {refname} (server message withheld)")
+            }
+            None => error.to_string(),
+        },
+        _ => error.to_string(),
+    };
+    let mut text = text
+        .split(REFUSAL_MARKER)
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    for marker in SERVER_TEXT_MARKERS {
+        if let Some(at) = text.find(marker) {
+            text.truncate(at + marker.len());
+            text.push_str("(server text withheld)");
+        }
+    }
+    let text = crate::error_chain::redact_userinfo(&text);
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { ' ' })
+        .collect();
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(OPERATOR_CAUSE_MAX)
+        .collect()
+}
+
+/// libgit2 formats a server's `ERR` packet as `remote error: <text>` and a report-status
+/// failure as `report-status: Error reported: <text>`; the text after either is the server's.
+#[cfg(feature = "wallet")]
+const SERVER_TEXT_MARKERS: [&str; 2] = ["remote error: ", "Error reported: "];
+
+/// Longest transport cause shown to an operator.
+#[cfg(feature = "wallet")]
+const OPERATOR_CAUSE_MAX: usize = 600;
 
 /// Marker before a server-supplied refusal excerpt. Text after it is server data,
 /// not transport evidence, so error classification ignores it.
@@ -1497,13 +1606,13 @@ impl Read for HttpStream {
                     budget.check()?;
                     let remaining = budget.remaining.load(std::sync::atomic::Ordering::Relaxed);
                     let len = buf.len().min(remaining);
-                    let n = response.read(&mut buf[..len])?;
+                    let n = response.read(&mut buf[..len]).map_err(body_read_error)?;
                     budget
                         .remaining
                         .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
                     Ok(n)
                 } else {
-                    response.read(buf)
+                    response.read(buf).map_err(body_read_error)
                 }
             }
             None => Ok(0),
@@ -1539,6 +1648,48 @@ impl Write for HttpStream {
 mod tests {
     use super::*;
 
+    /// Server-written text never reaches an operator line: not a push status message, not
+    /// libgit2's `remote error:` / `Error reported:` text; control characters and length are
+    /// bounded and credentials redacted.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn operator_cause_withholds_server_written_text() {
+        let rejected = operator_cause(&TransportError::Rejected(
+            "refs/heads/input/ab12: hook says EVIL\x1b[31m text".into(),
+        ));
+        assert_eq!(
+            rejected,
+            "remote rejected ref: refs/heads/input/ab12 (server message withheld)"
+        );
+        let fixed = TransportError::Rejected(
+            "private input push did not acknowledge unpack and exactly the intended ref".into(),
+        );
+        assert_eq!(operator_cause(&fixed), fixed.to_string());
+        for (message, kept) in [
+            (
+                "unexpected http status 500: remote error: EVIL server text",
+                "remote error:",
+            ),
+            (
+                "report-status: Error reported: EVIL server text",
+                "Error reported:",
+            ),
+        ] {
+            let shown = operator_cause(&TransportError::Io(message.into()));
+            assert!(!shown.contains("EVIL"), "{shown}");
+            assert!(
+                shown.contains(&format!("{kept} (server text withheld)")),
+                "{shown}"
+            );
+        }
+        let shown = operator_cause(&TransportError::Io(
+            "connect\nfailed\u{7} for http://u:secret@h/x".into(),
+        ));
+        assert_eq!(shown, "io error: connect failed for http://***@h/x");
+        let long = operator_cause(&TransportError::Io("x".repeat(5_000)));
+        assert_eq!(long.chars().count(), OPERATOR_CAUSE_MAX);
+    }
+
     // RUSTSEC-2026-0183: `git2::Remote::list()` passed a NULL pointer to `slice::from_raw_parts` when
     // the remote advertises no refs — undefined behaviour in release builds, and on git2 0.19 a
     // debug build aborts the whole process ("unsafe precondition(s) violated", non-unwinding). Both
@@ -1559,6 +1710,117 @@ mod tests {
         assert_eq!(remote.list().expect("list").len(), 0, "an empty advertisement lists no heads");
         let _ = remote.disconnect();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The buyer daemon logged only "error sending request for url (..)" for an HTTPS proxy whose
+    // credential had expired: the 407 lived in reqwest's source chain. Both legs below must name it.
+    #[test]
+    fn http_request_errors_name_their_source_chain() {
+        use std::io::{Read as _, Write as _};
+        // Production leg: nothing listens on this port.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut stream = HttpStream {
+            mint: None,
+            authority: None,
+            lifetime: None,
+            short: true,
+            read_budget: None,
+            url: format!("http://{closed}/git/o/r.git/info/refs?service=git-upload-pack"),
+            destination: String::new(),
+            service: "git-upload-pack",
+            is_post: false,
+            sent: false,
+            request_body: vec![],
+            streaming_body: None,
+            response: None,
+            timeout_override: None,
+        };
+        let refused = stream.send().unwrap_err().to_string();
+        assert!(refused.contains("error sending request"), "{refused}");
+        assert!(
+            refused.to_ascii_lowercase().contains("connect"),
+            "{refused}"
+        );
+        assert!(refused.contains("refused"), "{refused}");
+        // The incident: an explicit proxy answering CONNECT with 407.
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = proxy.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let error = reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap()
+            .get("https://relay.example/git/o/r.git/info/refs?service=git-upload-pack")
+            .send()
+            .unwrap_err();
+        server.join().unwrap();
+        let message = http_request_error(error).to_string();
+        assert!(message.contains("error sending request"), "{message}");
+        assert!(
+            message.contains("proxy authorization required"),
+            "{message}"
+        );
+    }
+
+    // A body cut off mid-stream: reqwest's io error Display is its top line only; the read must
+    // name the cause too, with the same kind.
+    #[test]
+    fn http_body_read_errors_name_their_source_chain() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
+                .unwrap();
+        });
+        let mut stream = HttpStream {
+            mint: None,
+            authority: None,
+            lifetime: None,
+            short: true,
+            read_budget: None,
+            url: format!("http://{addr}/git/o/r.git/info/refs?service=git-upload-pack"),
+            destination: String::new(),
+            service: "git-upload-pack",
+            is_post: false,
+            sent: false,
+            request_body: vec![],
+            streaming_body: None,
+            response: None,
+            timeout_override: None,
+        };
+        let mut body = Vec::new();
+        let error = stream.read_to_end(&mut body).unwrap_err();
+        server.join().unwrap();
+        let message = error.to_string();
+        // reqwest's own Display is "request or response body error"; hyper's cause follows it.
+        assert!(
+            message.starts_with("request or response body error: "),
+            "{message}"
+        );
+        assert!(
+            message.contains("error reading a body from connection"),
+            "{message}"
+        );
+        // `pack_forward::response` maps its body read through the same helper.
+        let os = io::Error::from(io::ErrorKind::ConnectionReset);
+        assert_eq!(body_read_error(os).kind(), io::ErrorKind::ConnectionReset);
     }
 
     #[test]
@@ -2304,6 +2566,45 @@ mod tests {
             .is_err()
         );
         drop((target, limited, expired, tree, builder));
+        drop(source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A team commit is fetched by id. The local transport refuses shallow fetches, as a v0
+    /// upload-pack may, so this also takes the full-fetch fallback; a merge brings both parents,
+    /// a root none, and the byte cap still holds.
+    #[test]
+    fn team_commit_fetch_by_id_falls_back_to_a_full_fetch() {
+        let root = temp_root("team-commit-fetch");
+        let source = Repository::init_bare(root.join("source")).unwrap();
+        let sig = git2::Signature::now("test", "test@example.test").unwrap();
+        let commit = |name: &str, parents: &[git2::Oid]| {
+            let blob = source.blob(name.as_bytes()).unwrap();
+            let mut builder = source.treebuilder(None).unwrap();
+            builder.insert(name, blob, 0o100644).unwrap();
+            let tree = source.find_tree(builder.write().unwrap()).unwrap();
+            let parents: Vec<_> = parents.iter().map(|p| source.find_commit(*p).unwrap()).collect();
+            source.commit(None, &sig, &sig, name, &tree, &parents.iter().collect::<Vec<_>>()).unwrap()
+        };
+        let base = commit("base", &[]);
+        let left = commit("left", &[base]);
+        let right = commit("right", &[base]);
+        let merge = commit("merge", &[left, right]);
+        source.reference("refs/heads/main", merge, true, "tip").unwrap();
+        let url = url::Url::from_directory_path(source.path()).unwrap().to_string();
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for (n, (tip, parents)) in [(merge, vec![left, right]), (base, vec![])].into_iter().enumerate() {
+            let target = Repository::init_bare(root.join(format!("t{n}"))).unwrap();
+            fetch_review_commit_inner(&target, &url, &tip.to_string(), None, 1024 * 1024, deadline()).unwrap();
+            assert_eq!(target.refname_to_id("refs/review/delivery").unwrap(), tip);
+            let got = target.find_commit(tip).unwrap();
+            assert_eq!(got.parent_ids().collect::<Vec<_>>(), parents);
+            for p in parents {
+                assert!(target.find_commit(p).is_ok(), "parent {p} fetched");
+            }
+        }
+        let capped = Repository::init_bare(root.join("capped")).unwrap();
+        assert!(fetch_review_commit_inner(&capped, &url, &merge.to_string(), None, 1, deadline()).is_err());
         drop(source);
         std::fs::remove_dir_all(root).unwrap();
     }

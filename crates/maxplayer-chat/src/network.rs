@@ -131,7 +131,7 @@ fn retry_delay(failures: u32, unit: Duration) -> Duration {
         .min(Duration::from_secs(60))
 }
 fn client(keys: &Keys) -> Client {
-    Client::builder()
+    maxplayer_core::relay_transport::builder()
         .signer(keys.clone())
         .opts(ClientOptions::new().automatic_authentication(true))
         .build()

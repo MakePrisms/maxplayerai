@@ -24,11 +24,16 @@ api_key_file = "/var/lib/secrets/maxplayer-registration-resend-key"           # 
 webhook_secret_file = "/var/lib/secrets/maxplayer-registration-resend-webhook" # whsec_..., 0600
 
 [legal]
-terms_versions = ["20261029"]
-privacy_versions = ["20261029"]
+terms_versions = ["20261029", "20261123"]     # every version a released CLI may send
+privacy_versions = ["20261029", "20261123"]
 marketing_notice_versions = ["v1"]
 terms_url = "https://www.maxplayer.ai/terms/{version}"
 privacy_url = "https://www.maxplayer.ai/privacy/{version}"
+# Dated versions missing above are accepted when the site's manifest lists them (stored once
+# seen). "" = the lists above only.
+versions_url = "https://www.maxplayer.ai/legal/versions.json"
+versions_refresh_secs = 60
+versions_timeout_secs = 5
 
 [limits]                                           # defaults shown
 code_ttl_secs = 600
@@ -40,6 +45,9 @@ sends_per_ip_per_hour = 20
 confirms_per_pubkey_per_hour = 30
 confirms_per_ip_per_hour = 60
 nip98_max_skew_secs = 60
+invite_links_per_pubkey_per_hour = 30
+team_joins_per_pubkey_per_hour = 30
+team_revokes_per_pubkey_per_hour = 30
 
 [sync]
 outbox_interval_secs = 30
@@ -47,3 +55,9 @@ reconcile_interval_secs = 300
 reconcile_removals = false     # true = also remove unregistered `member` keys this service did not add
 keep_members = []              # e.g. the deploy probe's npub
 cleanup_interval_secs = 3600
+
+[teams]                        # team invite links; unset invite_key_file = off (503)
+invite_key_file = "/var/lib/secrets/maxplayer-team-invite-key"   # 64-hex or nsec, 0600; must be a relay member
+join_url = "https://www.maxplayer.ai/join"
+link_ttl_secs = 259200         # 72 h
+max_link_ttl_secs = 2592000    # 30 days

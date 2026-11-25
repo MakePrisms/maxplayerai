@@ -126,7 +126,8 @@ A reader MUST ignore a follow-up whose author is not the buyer that authored the
 
 `["session", "1"]` on CLAIM (3402), 0..1, **absent ⇒ no session support**. Absent is the fail-closed
 direction: every claim on the wire today reads as single-turn. A seat emits it only when
-`[sessions] enabled = true` **and** it is a docker seat on the container-delivery path (§5.1). Protocol
+`[sessions] enabled` is on (unset reads as on since sessions became the default; `false` turns it
+off) **and** it is a docker seat on the container-delivery path (§5.1). Protocol
 §6.2 says a claim carries the three filterable tags "and no others" (`docs/protocol-v1.md:607
 @e0262420`); that sentence gains `session`. It is **not** an award filter: every job stays awardable to
 every seller (input 1); it only decides whether `reply` works after turn 1.
@@ -147,6 +148,10 @@ plus content (git), §7.2.
 `["status","refusal"]`, `["reason_code","session_expired"]`, `["e", followup_id, "", "reply"]`; it does
 not count against the seller. Protocol §7.1 already makes the reason vocabulary extensible
 (`docs/protocol-v1.md:807 @e0262420`).
+
+`turn_too_large` (#1349) has the same shape and the same `refusal` class: a private follow-up whose
+minimal review request does not fit one NIP-59 seal (§9). Nothing ran or was charged, and the session
+stays parked.
 
 ### 2.4 Accept — binds a turn
 
@@ -187,7 +192,8 @@ is a new kind or a new optional tag. Protocol §2.1 lists the maxplayer-owned ki
    - `3403` allowed (`:353`): add `"reply"`, `"turn_status"`, `"context"`, `"creq"` (the existing
      16 KiB creq bound at `:440` applies).
    - `3406` (`:344`): add `"reply"`.
-   - Feedback reasons (`ppp/wire.rs:170 @e0262420`): add `"session_expired"`.
+   - Feedback reasons (`ppp/wire.rs:170 @e0262420`): add `"session_expired"` (and `"turn_too_large"`,
+     #1349).
    - `3404` allowed (`:345`): add `"reply"` — §2.3's `session_expired` FEEDBACK carries
      `["e", followup_id, "", "reply"]`, which the private allowlist would otherwise refuse.
      (Found while implementing; the list above omitted it.)
@@ -224,7 +230,8 @@ Public events are not run through `validate_private`, so a public-only deploymen
 - **Everything counts:** slot wait, review, `docker start` and `session/load` are inside the deadline.
   If a slot frees with less than `wrap_up_secs + PUSH_MARGIN_SECS + 120` left
   (`PUSH_MARGIN_SECS` = 300, `core/delivery_orchestrator.rs:998 @e0262420`), the seller does not start;
-  it publishes FEEDBACK `at_capacity` and the session stays parked. Nothing is charged.
+  it publishes FEEDBACK `at_capacity` and the session stays parked. Nothing is charged. Turn 1 with
+  less than that left at launch runs single-turn (no wrap-up, no session prompt section).
 - **Out of time:** at `deadline − wrap_up_secs` (default **300**, unmeasured, input 7) the orchestrator
   sends `session/cancel` (`core/driver/acp_driver.rs:443 @e0262420`), waits for the turn to end, then
   snapshots and delivers with `["turn_status","out_of_time"]`. A cancelled turn with no file change and an
@@ -315,7 +322,8 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
   (`run_expiry_sweep`, `core/seller_node/run.rs:5051 @e0262420`): a parked session past
   `last_turn_at + lifetime_secs` is expired — `docker rm --force` the container and the holder, remove
   the workdir and the resolver file, `state = expired`.
-- `[sessions] disk_budget_bytes` (default §0 item 12). After each park, measure the session
+- `[sessions] disk_budget_bytes` (default §0 item 12: 20 GiB with `enabled = true`; 5 GiB when
+  `enabled` is unset and sessions are on only by default). After each park, measure the session
   (`docker container inspect --size` → `SizeRw`, plus `du` of the workdir) into `disk_bytes`; while the
   sum over parked sessions exceeds the budget, expire the oldest `last_turn_at` first. A running session
   is never evicted.
@@ -344,7 +352,7 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
 A parked container is resumed with `docker start` (§5.2). Under gVisor's default
 `--overlay2=root:self` the rootfs overlay is sandbox-private and discarded at stop, so the agent's
 transcript (`~/.claude`, `~/.codex` under `HOME=/home/agent`), its installed tools and caches are gone
-at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker"` and
+at the next turn. On a seat with sessions on, `[sandbox] mode = "docker"` with container delivery and
 `runtime = "runsc"`, session support is therefore gated on docker's runtime named `runsc` carrying
 `--overlay2=none` in `runtimeArgs` (last setting wins; `--overlay2 none` and one leading dash accepted).
 
@@ -370,8 +378,11 @@ at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker
 - **Doctor** reports the same verdict as `sandbox runsc sessions`: PASS when open; **FAIL** with the fix
   when docker answered and shows the seat cannot keep a session (`runsc` without the flag, another
   overlay value, or no `runsc` registered: `Closed { misconfigured: true }`); WARN when docker could not
-  confirm (unreadable, timed out, unparseable: `misconfigured: false`). FAIL is part of the seller boot
-  gate, so a runsc seat with `[sessions] enabled` and no flag **does not start** until the operator sets
+  confirm (unreadable, timed out, unparseable: `misconfigured: false`). The FAIL applies only when the
+  operator wrote `[sessions] enabled = true`; a seat on by default (`enabled` unset) gets a WARN for the
+  same verdict and runs single-turn, so the default-on upgrade never stops a runsc seat from booting.
+  FAIL is part of the seller boot
+  gate, so a runsc seat with `[sessions] enabled = true` and no flag **does not start** until the operator sets
   the flag (and restarts docker) or turns `[sessions]` off — operator intent the seat cannot honour is
   surfaced, not silently degraded (Petar, 2026-11-07). WARN keeps a daemon hiccup at boot from blocking
   the seat; it starts single-turn and the heartbeat re-probes. A gate that closes at runtime (heartbeat)
@@ -625,7 +636,8 @@ clears it. It never closes a session.
   *Found while implementing:* the encrypted (private) review lane's `Request` carried only an offer or
   a delivery. It now has an optional `followup` evidence block: the selected claim and award plus the
   buyer's signed 3412 carriers with their encrypted `FollowUp` bodies, oldest first (the last is the
-  subject), trimmed oldest-first to the 60 KiB message bound. The reviewer re-authenticates every
+  subject), trimmed oldest-first to what still fits one NIP-59 seal (#1349: measured on the sealed
+  size; the largest sealable rumor is 40,960 bytes, about 36 KB of request JSON). The reviewer re-authenticates every
   carrier and body against the signed offer/claim/award chain (buyer-authored, `bind_content`),
   admits the buyer and the selected seller as requesters, and builds the context from those bodies
   only.
@@ -637,7 +649,7 @@ clears it. It never closes a session.
   earlier than the follow-up under review, and reduces each to one line from the signed public tags only
   (`turn n: <turn_status>, commit <oid|inline>`); it never decrypts a delivery body. The context is
   rendered by the same function as the public lane (follow-ups labelled by their own turn number), so
-  both lanes give the same text for the same facts. Under the 60 KiB message bound buyer follow-ups are
+  both lanes give the same text for the same facts. Under that seal bound buyer follow-ups are
   kept first (newest first), deliveries take what is left (newest first); the current follow-up is never
   cut. Neither party authors any line: the seller only forwards signed events, and a forged, misattributed
   or misordered one fails the whole request. `deliveries` is omitted when empty, and every non-follow-up
@@ -672,9 +684,9 @@ routing `:422 @e0262420`; `AGENTS.md:41` says "exactly the four-tool buyer trade
   (collect, then send close); that is now a deprecated daemon alias kept for one release. The MCP
   schema no longer lists it, and `reply close: true` is the one documented way to close.
 
-*Found while implementing:* `reply` and the `collect` params are listed (and `reply` routed) only
-when the buyer runs with `[sessions] enabled = true`; with the flag off the tool list is
-byte-identical. `max_session_sats` is accepted on `post_job` too (22 Oct, Josip): it is local session
+*Found while implementing:* `reply` and the `collect` params are listed (and `reply` routed)
+unless the buyer runs with `[sessions] enabled = false` (sessions are on by default); with the flag
+off the tool list is byte-identical. `max_session_sats` is accepted on `post_job` too (22 Oct, Josip): it is local session
 state, stored in the buyer `sessions` row right after the offer is published and never put on the offer,
 so the offer bytes are unchanged. It is listed on the `post_job` schema and accepted by the daemon only
 with `[sessions] enabled` (off: the schema is byte-identical and the daemon refuses the parameter). The
@@ -688,8 +700,8 @@ point at `reply`.
 
 ## 11. Implementation — ONE PR behind `[sessions] enabled = false`
 
-`[sessions]` (both roles): `enabled = false`, `lifetime_secs = 21600`, `disk_budget_bytes`,
-`wrap_up_secs = 300`, buyer `session_cap_sats`. With `enabled = false` no claim carries `session`, no
+`[sessions]` (both roles): `enabled` (unset reads as on; `false` turns sessions off),
+`lifetime_secs = 21600`, `disk_budget_bytes`, `wrap_up_secs = 300`, buyer `session_cap_sats`. With `enabled = false` no claim carries `session`, no
 follow-up is sent or accepted, and every code path is today's.
 
 | # | File | Change |

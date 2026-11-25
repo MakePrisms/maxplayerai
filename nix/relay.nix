@@ -65,6 +65,7 @@ let
     BUZZ_REQUIRE_RELAY_MEMBERSHIP = lib.boolToString cfg.requireRelayMembership;
     BUZZ_OPEN_READ = lib.boolToString cfg.openRead;
     BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS = toString cfg.scopedTokenMaxLifetimeSecs;
+    MAXPLAYER_TEAM_REPOS = lib.boolToString cfg.teamRepos;
   }
   // lib.optionalAttrs (cfg.ownerPubkey != null) { RELAY_OWNER_PUBKEY = cfg.ownerPubkey; };
 in
@@ -214,6 +215,18 @@ in
         public marketplace whose events are meant to be readable by anyone without an account. Wires
         BUZZ_OPEN_READ (config.rs treats only "true"/"1" as on). READ-only: writes stay gated by
         requireRelayMembership / NIP-42; this opens the read path only.
+      '';
+    };
+
+    teamRepos = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Serve Maxplayer Team repositories (docs/specs/maxplayer-team.md §4): a repo named
+        `<channel uuid hex><32 zeros>` follows membership of that Buzz private channel (members
+        read and create/fast-forward branches, the private service key reads only, everyone else
+        is refused). Off refuses every team-shaped name; it never makes one public either way.
+        Wires MAXPLAYER_TEAM_REPOS.
       '';
     };
 
