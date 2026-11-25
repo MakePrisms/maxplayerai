@@ -103,11 +103,9 @@ html.sw .copy button::after{content:"Copied";height:0;overflow:hidden;visibility
 .c-sellers a.c-who:hover{text-decoration:underline;text-decoration-color:rgba(255,255,255,.5);text-underline-offset:3px}
 .c-sellers .c-state{order:1}
 .c-sellers .c-mins{order:2}
-.c-sellers .c-reported{order:3}
 .c-sellers .c-mins{font-size:14px;color:var(--ink2);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}
 .c-sellers .c-state{font-size:13px;color:var(--mut);text-align:right}
 .c-sellers li.off .c-who,.c-sellers li.off .c-mins{color:var(--mut)}
-.c-sellers .c-reported{grid-column:1 / -1;font-size:12.5px;color:var(--dim)}
 .c-sellers .c-skel-used{width:2ch}
 .c-sellers .c-skel-state{width:84px}
 .c-note{margin-top:10px;font-size:12.5px;color:var(--dim)}

@@ -88,14 +88,8 @@ export function sellerLine(s: Snapshot,a: Seller,now: number): string {
   if(privateTasks(s)){const m=a.reported?.minutesToday;return `${m===null||m===undefined?'–':Math.floor(m)} / ${a.minutesOffered} min`;}
   return `${Math.floor(sellerMinutes(s,a,now))} / ${a.minutesOffered} min`;
 }
-// The private-swarm line under a member's row: the tally's task count, labelled as the buyer's report.
-// tasks_done is per swarm job (the one shown), minutes per swarm per UTC day, as on public swarms.
-export function reportedLine(s: Snapshot,a: Seller): string|null {
-  if(!privateTasks(s))return null;
-  const r=a.reported;
-  if(!r)return 'No report from the buyer yet';
-  return `${r.tasksDone} ${r.tasksDone===1?'task':'tasks'} in this job · reported by the buyer`;
-}
+// A private swarm's row shows the tally's minutes (sellerLine) and no line under the name: the task-count
+// line ("3 tasks in this job · reported by the buyer") was dropped (bob, 2026-11-25).
 const running=(s: Snapshot,a: Seller,now: number)=>s.jobs.some(j=>j.seller===a.pubkey&&j.running&&now<j.deadline);
 export function sellerState(s: Snapshot,a: Seller,now: number): string {
   if(a.state==='left')return 'Left';
@@ -218,7 +212,7 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
   const roster=mode==='roster';
   const shown=listedSellers(s,roster);
   const key=JSON.stringify([mode,privateTasks(s),shown.map(a=>roster?[a.pubkey,a.name,a.npub,a.minutesOffered,a.state]
-    :[a.pubkey,a.name,a.npub,sellerLine(s,a,now),sellerState(s,a,now),reportedLine(s,a)]),s.applicants??[],!!s.relay?.applicantsIncomplete]);
+    :[a.pubkey,a.name,a.npub,sellerLine(s,a,now),sellerState(s,a,now)]),s.applicants??[],!!s.relay?.applicantsIncomplete]);
   if(rosterShown.get(list)===key)return;
   rosterShown.set(list,key);
   const fragment=doc.createDocumentFragment();
@@ -234,8 +228,6 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
     const st=doc.createElement('span');st.className='c-state';
     if(state===null)st.append(skel(doc,'c-skel-state'));else st.textContent=state;
     row.append(name,mins,st);
-    const reported=roster?null:reportedLine(s,a);
-    if(reported!==null){const r=doc.createElement('span');r.className='c-reported';r.textContent=reported;row.append(r);}
     fragment.append(row);
   }
   // Waiting for approval: an untrusted, capped sample. Never counted as agents in the swarm.
