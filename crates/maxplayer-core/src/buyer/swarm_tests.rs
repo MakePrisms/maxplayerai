@@ -1002,3 +1002,50 @@ async fn default_off_daemon_starts_no_engine_and_knows_no_swarm_method() {
         assert!(context.store.swarm_jobs(None, false).unwrap().is_empty());
     }
 }
+
+/// `swarm_job_status` says where a running task stands and how old each seller's announcement is,
+/// so a check-in can tell "no claim yet" (and a seat that has gone quiet) from "awarded, working".
+#[tokio::test]
+async fn status_shows_each_running_task_stage_and_each_seller_announcement_age() {
+    let fx = Fx::math(1, 10, 10_000, "public");
+    let e = fx.engine(false);
+    let id = fx.queue(&e, "math-1", "t1", false);
+    fx.at(T0);
+    e.tick(&fx.stub).await.unwrap();
+    let posted = task(&e, id);
+    assert_eq!(posted.state, "posted");
+    assert_eq!(
+        posted.awarded_at_unix, None,
+        "harness check: the award is read on the next tick"
+    );
+    let view = running_view(&posted, T0 + 40);
+    assert_eq!(view["stage"], "awaiting_claim", "{view}");
+    assert_eq!(view["stage_secs"], 40, "{view}");
+
+    let members = e.store.swarm_job("math-1").unwrap().unwrap().members_json;
+    let members = members_view(&members, T0 + 45);
+    assert_eq!(
+        members[0]["heartbeat"]["announced_at_unix"], T0,
+        "{members}"
+    );
+    assert_eq!(
+        members[0]["heartbeat"]["announced_secs_ago"], 45,
+        "{members}"
+    );
+
+    fx.at(T0 + 60);
+    e.tick(&fx.stub).await.unwrap();
+    let awarded = task(&e, id);
+    let view = running_view(&awarded, T0 + 90);
+    assert_eq!(view["stage"], "awarded", "{view}");
+    assert_eq!(
+        view["stage_secs"], 90,
+        "the stub awards at the post: {view}"
+    );
+    // A snapshot from a build without the field is shown as it is.
+    let old = members_view(r#"[{"seller":"s","heartbeat":{"accepting":true}}]"#, T0);
+    assert!(
+        old[0]["heartbeat"].get("announced_secs_ago").is_none(),
+        "{old}"
+    );
+}

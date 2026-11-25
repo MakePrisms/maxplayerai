@@ -298,7 +298,7 @@ it off) on a docker seat with container delivery.
 | `swarm_list {}` / `swarm_members {swarm?}` | The buyer's swarms; applicants and members with minutes. |
 | `swarm_decide {seller, accept, swarm?}` | Buyer-wide decision, or per swarm when `swarm` is given. |
 | `swarm_job_create {swarm, goal, title?, starts?, ends?, budget_sats, tasks?[]}` | Publishes a 30341 swarm job (default: now → +24 h). Optional tasks are queued (fan-out without a planner). Says whether a planner is configured. |
-| `swarm_job_status {swarm_job, results_page?}` | Status, members with minutes, queue, running tasks, results (paged), budget, planner state, last idle reason. |
+| `swarm_job_status {swarm_job, results_page?}` | Status, members with minutes (and each seat announcement's age, `heartbeat.announced_secs_ago`), queue, running tasks (each with its `stage`: `posting`, `awaiting_claim`, `awarded`, `turn_pending` or `turn_sent`, and `stage_secs`), results (paged), budget, planner state, last idle reason. |
 | `swarm_job_tasks {swarm_job, add?[], drop?[], replace?[]}` | Edit the queue. |
 | `swarm_job_steer {swarm_job, note}` | Note the planner sees on every call. |
 | `swarm_job_close {swarm_job, result?, status: completed\|cancelled}` | Stop posting; in-flight tasks still settle and pay. |

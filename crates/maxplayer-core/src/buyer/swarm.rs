@@ -895,7 +895,7 @@ impl Engine {
                     "minutes_left": left / 60,
                     "busy": busy,
                     "seats_left": seats.get(&m.seller),
-                    "heartbeat": hb.map(|h| json!({"accepting": h.accepting, "rate_sats": h.rate_sats, "takes_no_payment": h.takes_no_payment, "slots": h.slots.map(|s| s.total), "free_slots": h.slots.map(|s| s.free)})),
+                    "heartbeat": hb.map(|h| json!({"accepting": h.accepting, "rate_sats": h.rate_sats, "takes_no_payment": h.takes_no_payment, "slots": h.slots.map(|s| s.total), "free_slots": h.slots.map(|s| s.free), "announced_at_unix": world.beat_at.get(&m.seller)})),
                 }));
                 if busy {
                     why.busy += 1;
@@ -1746,6 +1746,37 @@ fn queued_view(t: &TaskRow) -> Value {
         "note": t.outcome})
 }
 
+/// Where a running task stands, so a check-in can tell a task no seller has claimed yet from one
+/// that was awarded and is being worked on or settled (an award parked for lack of funds ends the
+/// task as failed, with the reason). A one-off task's award is copied from the buyer store on each
+/// engine tick; a session turn needs no award.
+fn running_view(t: &TaskRow, now: u64) -> Value {
+    let session_turn = t.turn.is_some_and(|n| n >= 2);
+    let (stage, since) = match (session_turn, t.awarded_at_unix) {
+        (true, _) if t.followup_id.is_none() => ("turn_pending", None),
+        (true, _) => ("turn_sent", t.posted_at_unix),
+        (false, Some(at)) => ("awarded", Some(at)),
+        (false, None) if t.job_id.is_none() => ("posting", t.posted_at_unix),
+        (false, None) => ("awaiting_claim", t.posted_at_unix),
+    };
+    json!({"id": t.id, "seller": t.seller, "job_id": t.job_id.as_ref().or(t.session_job_id.as_ref()),
+        "turn": t.turn.unwrap_or(1), "followup_id": t.followup_id, "price_sats": t.price_sats,
+        "deadline_unix": t.deadline_unix, "awarded_at_unix": t.awarded_at_unix, "stage": stage,
+        "stage_secs": since.map(|at| now.saturating_sub(at)), "note": t.outcome})
+}
+
+/// The members snapshot of the last tick, with each seller's announcement age as of `now`: a seat
+/// whose announcement is minutes old is likely to claim late or not at all.
+fn members_view(members_json: &str, now: u64) -> Value {
+    let mut members: Value = serde_json::from_str(members_json).unwrap_or(json!([]));
+    for m in members.as_array_mut().into_iter().flatten() {
+        if let Some(at) = m["heartbeat"]["announced_at_unix"].as_u64() {
+            m["heartbeat"]["announced_secs_ago"] = json!(now.saturating_sub(at));
+        }
+    }
+    members
+}
+
 fn job_status(context: &BuyerContext, me: &str, d: &str, page: usize) -> Result<Value, String> {
     let store = &context.store;
     let j = store
@@ -1768,12 +1799,11 @@ fn job_status(context: &BuyerContext, me: &str, d: &str, page: usize) -> Result<
         .filter(|t| t.state == "queued")
         .map(queued_view)
         .collect();
+    let now = now_unix().max(0) as u64;
     let running: Vec<Value> = tasks
         .iter()
         .filter(|t| t.state == "posted")
-        .map(|t| json!({"id": t.id, "seller": t.seller, "job_id": t.job_id.as_ref().or(t.session_job_id.as_ref()),
-            "turn": t.turn.unwrap_or(1), "followup_id": t.followup_id, "price_sats": t.price_sats,
-            "deadline_unix": t.deadline_unix, "awarded_at_unix": t.awarded_at_unix, "note": t.outcome}))
+        .map(|t| running_view(t, now))
         .collect();
     let mut done: Vec<&TaskRow> = tasks
         .iter()
@@ -1790,7 +1820,7 @@ fn job_status(context: &BuyerContext, me: &str, d: &str, page: usize) -> Result<
             "price_sats": t.price_sats, "collected_at_unix": t.collected_at_unix}))
         .collect();
     let sessions = store.swarm_sessions(d).map_err(es)?;
-    let members: Value = serde_json::from_str(&j.members_json).unwrap_or(json!([]));
+    let members = members_view(&j.members_json, now);
     Ok(json!({
         "swarm_job": d,
         "address": format!("{SWARM_JOB_KIND}:{me}:{d}"),
