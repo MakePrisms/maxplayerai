@@ -1213,17 +1213,30 @@ fn resolve_backfill_since(
     last_complete: Result<Option<i64>, super::store::StoreError>,
     now_unix: i64,
 ) -> Result<u64, super::store::StoreError> {
-    let receipt_floor = last_receipt?
-        .map(|at| at.saturating_sub(WRAP_BACKFILL_MARGIN_SECS))
+    let last_receipt = last_receipt?;
+    let oldest_unsettled = oldest_unsettled?;
+    // Neither stored time is trusted past the clock: both come from the wall clock of the pass or
+    // collection that wrote them, which may have run ahead.
+    let mark = last_complete?.map(|at| at.min(now_unix));
+    let mut receipt_floor = last_receipt
+        .map(|at| at.min(now_unix).saturating_sub(WRAP_BACKFILL_MARGIN_SECS))
         .unwrap_or(0);
-    let complete_floor = last_complete?
-        .map(|at| at.min(now_unix).saturating_sub(WRAP_COMPLETE_LOOKBACK_SECS))
+    // A receipt is not evidence that the wraps before it were read; a complete pass is. Once a
+    // complete pass exists, the receipt floor cannot step past it.
+    if let Some(mark) = mark {
+        receipt_floor = receipt_floor.min(mark);
+    }
+    let complete_floor = mark
+        .map(|at| at.saturating_sub(WRAP_COMPLETE_LOOKBACK_SECS))
         .unwrap_or(0);
     let floor = receipt_floor.max(complete_floor);
-    let cursor = match oldest_unsettled? {
+    let cursor = match oldest_unsettled {
         Some(oldest) => floor.min(oldest.saturating_sub(WRAP_BACKFILL_MARGIN_SECS)),
         None => floor,
     };
+    // Never a window that starts in the future (the boot live REQ uses this too, and a relay
+    // applies `since` to live fan-out).
+    let cursor = cursor.min(now_unix.saturating_sub(WRAP_BACKFILL_MARGIN_SECS));
     Ok(cursor.max(0) as u64)
 }
 
@@ -7378,7 +7391,17 @@ impl SellerNodeRunner {
                 // by the next stored-history backfill, which re-reads exactly those windows.
                 recv = notifications.recv(), if queue.has_room() => {
                     match recv {
-                        Ok(RelayPoolNotification::Event { event, .. }) => {
+                        Ok(RelayPoolNotification::Event { subscription_id, event, .. }) => {
+                            // The SDK also emits every not-yet-seen event of a TRANSIENT read
+                            // (the wrap and private-content backfills' `read_stored`). Those
+                            // backfills handle their own kind-1059s; queueing them here too would
+                            // process each one twice and, on the boot re-read of a long history,
+                            // fill this queue. Only our own live subscriptions feed the lane 1059s.
+                            if event.kind == Kind::GiftWrap
+                                && !is_our_subscription(subscription_id.as_str())
+                            {
+                                continue;
+                            }
                             if handled_event_kind(event.kind) {
                                 queue.push_event(event);
                                 if !queue.has_room() && !queue_full_logged {
@@ -7924,17 +7947,21 @@ impl SellerNodeRunner {
                 return false;
             }
         };
-        // A relay answers one page per REQ (newest first), and EOSE ends the page, not the history:
-        // a page that brought anything new may have stopped short of `since`, so ask again for what
-        // is older than its oldest event. Only a page with nothing new proves the window is done.
-        // `until` is inclusive, so the boundary second is re-read and the seen-set drops the repeats;
-        // a relay that ignores `until` just answers the same page again, which also ends the loop.
+        // A relay answers one page per REQ (newest first, as buzz does), and EOSE ends the page, not
+        // the history: a page that brought anything new may have stopped short of `since`, so ask
+        // again for what is at or before its oldest event (`until` is inclusive, so the boundary
+        // second is re-read and the seen-set drops the repeats). A non-empty page with nothing new
+        // means that second is exhausted or saturated: step one second below it. Only an EMPTY page
+        // ends the window. This relies on newest-first order and on `until` being honoured; a relay
+        // that ignores `until` or answers oldest-first ends the loop early and is reported complete
+        // after one page (not buzz).
         let mut seen = std::collections::HashSet::new();
         let mut until: Option<nostr_sdk::Timestamp> = None;
         let mut pages = 0usize;
         let mut returned = 0usize;
         let mut complete = true;
         let mut capped = false;
+        let mut saturated_logged = false;
         loop {
             let mut filter = Filter::new()
                 .kind(Kind::GiftWrap)
@@ -7970,10 +7997,28 @@ impl SellerNodeRunner {
                 complete = false;
                 break;
             }
-            if !any_fresh {
+            let Some(oldest) = oldest else {
                 break;
+            };
+            if !any_fresh {
+                // NIP-01 has no cursor inside one second, so wraps of a second that held a full
+                // page cannot all be listed; step past it and say so once.
+                if !saturated_logged && pages > 1 {
+                    saturated_logged = true;
+                    opline_verbose!(
+                        "seller node wrap backfill: second ts={} re-read with nothing new; stepping below it",
+                        oldest.as_secs()
+                    );
+                }
+                if oldest.as_secs() <= since {
+                    break;
+                }
+                until = Some(nostr_sdk::Timestamp::from(oldest.as_secs() - 1));
+                if pages >= WRAP_BACKFILL_MAX_PAGES {
+                    capped = true;
+                }
             }
-            if pages >= WRAP_BACKFILL_MAX_PAGES {
+            if capped || pages >= WRAP_BACKFILL_MAX_PAGES {
                 opline!(
                     "seller node WARN: wrap backfill stopped after {pages} pages since ts={since}; \
                      older stored kind-1059(s) were not read this pass"
@@ -7982,7 +8027,9 @@ impl SellerNodeRunner {
                 capped = true;
                 break;
             }
-            until = oldest;
+            if any_fresh {
+                until = Some(oldest);
+            }
         }
         if complete {
             opline!(
@@ -20900,8 +20947,14 @@ esac"#,
         assert_eq!(
             resolve_backfill_since(Ok(Some(done_at)), Ok(None), Ok(Some(done_at - 5 * day)), NOW)
                 .expect("receipt newer"),
+            (done_at - 5 * day) as u64,
+            "a receipt newer than the last complete read moves the cursor only as far as that read"
+        );
+        assert_eq!(
+            resolve_backfill_since(Ok(Some(done_at)), Ok(None), Ok(Some(done_at)), NOW)
+                .expect("receipt and mark together"),
             (done_at - WRAP_BACKFILL_MARGIN_SECS) as u64,
-            "a newer receipt still moves the cursor, less the skew margin"
+            "with a fresh complete read, a receipt moves the cursor, less the skew margin"
         );
         // The in-repo relay accepts a created_at up to 900 s off its own clock (buzz ingest), on top
         // of the buyer's backdating tweak: the lookback and the margin must both dwarf that.
@@ -20923,6 +20976,14 @@ esac"#,
             resolve_backfill_since(Ok(None), Ok(None), Ok(Some(future_mark)), now).expect("future"),
             (now - day) as u64,
             "a mark ahead of the clock reads as now"
+        );
+        // A receipt stamped ahead of the clock: the window (and the boot live REQ that uses it)
+        // never starts in the future.
+        let cursor = resolve_backfill_since(Ok(Some(future_mark)), Ok(None), Ok(None), now)
+            .expect("future receipt");
+        assert!(
+            cursor <= (now - WRAP_BACKFILL_MARGIN_SECS) as u64,
+            "RED ON REVERT: a future receipt put the window at {cursor}, past now={now}"
         );
     }
 
@@ -25380,6 +25441,102 @@ esac"#,
         );
         fixture.withhold_eose_for(&[]);
         assert!(runner.run_wrap_backfill().await, "complete again once the relay answers");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A runner booted against `fixture` with only the payment-wrap leg live, plus a recorder of
+    /// every kind-1059 backfill REQ's `until` and a signer of throwaway wraps to this seat.
+    async fn paging_runner(fixture: &PGateRelay, label: &str) -> (std::path::PathBuf, SellerNodeRunner) {
+        let root = throwaway_root(label);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.privacy.private_content_v2 = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        (root, runner)
+    }
+
+    fn throwaway_wrap(to: nostr_sdk::PublicKey, created_at: u64) -> nostr_sdk::Event {
+        nostr_sdk::prelude::EventBuilder::new(Kind::GiftWrap, "not a payment")
+            .tag(nostr_sdk::prelude::Tag::public_key(to))
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from(created_at))
+            .sign_with_keys(&nostr_sdk::prelude::Keys::generate())
+            .expect("sign wrap")
+    }
+
+    fn script_wrap_pages(
+        fixture: &PGateRelay,
+        pages: Vec<Vec<crate::seller_node::p_gate_relay_fixture::ScriptedFrame>>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<Option<u64>>>> {
+        let untils = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<u64>>::new()));
+        let seen = untils.clone();
+        fixture.script(
+            move |filter: &serde_json::Value| {
+                let wraps = filter
+                    .get("kinds")
+                    .and_then(|k| k.as_array())
+                    .is_some_and(|k| k.iter().any(|v| v.as_u64() == Some(1059)));
+                if wraps {
+                    seen.lock().unwrap().push(filter.get("until").and_then(|u| u.as_u64()));
+                }
+                wraps
+            },
+            pages,
+        );
+        untils
+    }
+
+    /// The wrap backfill pages backwards through a relay that caps a page (here at 3), re-reading
+    /// each boundary second, and only an empty page ends the window. (Shape from io-fable's round-2
+    /// review of #1418, appendix A.)
+    ///
+    /// RED ON REVERT: read one page per pass and only the newest 3 wraps are asked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrap_backfill_pages_through_a_capped_relay() {
+        use crate::seller_node::p_gate_relay_fixture::ScriptedFrame;
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (root, runner) = paging_runner(&fixture, "wrap-paging").await;
+        let base = now_unix() as u64 - 10_000;
+        // e[0] oldest … e[6] newest, one per second.
+        let e: Vec<_> = (1..=7).map(|i| throwaway_wrap(runner.seller_pubkey, base + i)).collect();
+        let page = |idx: &[usize]| idx.iter().map(|i| ScriptedFrame::event(&e[*i])).collect::<Vec<_>>();
+        let untils = script_wrap_pages(
+            &fixture,
+            vec![page(&[6, 5, 4]), page(&[4, 3, 2]), page(&[2, 1, 0]), page(&[0]), vec![]],
+        );
+        assert!(runner.run_wrap_backfill().await, "every page answered with EOSE");
+        assert_eq!(
+            *untils.lock().unwrap(),
+            vec![None, Some(base + 5), Some(base + 3), Some(base + 1), Some(base)],
+            "each page asks for what is at or before the previous page's oldest wrap, and a page \
+             with nothing new steps one second below it until a page comes back empty"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A second holding a full page of wraps does not end the read: the pass steps below it and
+    /// still reaches the older wrap.
+    ///
+    /// RED ON REVERT: end the pass on a page with nothing new and the older wrap is never asked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrap_backfill_steps_past_a_saturated_second() {
+        use crate::seller_node::p_gate_relay_fixture::ScriptedFrame;
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (root, runner) = paging_runner(&fixture, "wrap-saturated").await;
+        let second = now_unix() as u64 - 10_000;
+        let same: Vec<_> = (0..3).map(|_| throwaway_wrap(runner.seller_pubkey, second)).collect();
+        let older = throwaway_wrap(runner.seller_pubkey, second - 50);
+        let full = || same.iter().map(ScriptedFrame::event).collect::<Vec<_>>();
+        let untils = script_wrap_pages(
+            &fixture,
+            vec![full(), full(), vec![ScriptedFrame::event(&older)], vec![ScriptedFrame::event(&older)], vec![]],
+        );
+        assert!(runner.run_wrap_backfill().await, "every page answered with EOSE");
+        assert_eq!(
+            *untils.lock().unwrap(),
+            vec![None, Some(second), Some(second - 1), Some(second - 50), Some(second - 51)],
+            "the saturated second is re-read once, then the pass steps below it to the older wrap"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

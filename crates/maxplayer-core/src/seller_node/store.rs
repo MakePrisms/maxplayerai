@@ -2274,7 +2274,7 @@ impl SellerStore {
                   AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = d.job_id)
                UNION ALL
                SELECT st.updated_at_unix AS t FROM session_turns st
-                 JOIN deliveries d ON d.job_id = st.job_id
+                 LEFT JOIN deliveries d ON d.job_id = st.job_id
                 WHERE st.state = 'delivered'
                   AND COALESCE(d.payment, 'sat') <> 'none'
                   AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = st.followup_id))",
