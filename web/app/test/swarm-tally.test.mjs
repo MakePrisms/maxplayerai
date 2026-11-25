@@ -7,14 +7,13 @@ import test from 'node:test';
 import { schnorr } from '@noble/curves/secp256k1';
 import { eventId } from '../src/challenge/shared/events.mjs';
 import { SWARM, SWARM_JOB, SWARM_MEMBERSHIP, SWARM_DECISION, OFFER, CLAIM, AWARD } from '../src/model/kinds.ts';
-// Namespace imports: on a base without parseUpdate/reportedLine the tests fail at assertions, not at load.
+// Namespace imports: on a base without parseUpdate the tests fail at assertions, not at load.
 import * as model from '../src/swarm/shared/model.mjs';
 import { swarmAddress } from '../src/swarm/shared/wire.mjs';
 import * as live from '../src/swarm/live.ts';
 const { SwarmStore, swarmSnapshot } = model, { parseSnapshot, renderSellers, sellerLine } = live;
 const parseUpdate = v => { assert.equal(typeof model.parseUpdate, 'function', 'model.parseUpdate exists'); return model.parseUpdate(v); };
 const TALLY_MAX = model.TALLY_MAX ?? 65536;
-const reportedLine = (s, a) => { assert.equal(typeof live.reportedLine, 'function', 'live.reportedLine exists'); return live.reportedLine(s, a); };
 import { demoSnapshot } from '../src/swarm/demo.ts';
 
 const key = n => n.toString(16).padStart(64, '0');
@@ -123,7 +122,7 @@ test('public swarm: tally is not shown as text and relay minutes stay the source
   assert.deepEqual(project([...base(), job('{"members":')]).updates, [], 'malformed JSON: no update line');
 });
 
-test('private swarm: rows show buyer-reported tasks and minutes for listed members only', () => {
+test('private swarm: rows show buyer-reported minutes for listed members only, with no line under the name', () => {
   const s = project([...base('private'), job(TALLY)]);
   assert.equal(s.swarm.tasks, 'private');
   assert.deepEqual(s.updates, []);
@@ -136,9 +135,10 @@ test('private swarm: rows show buyer-reported tasks and minutes for listed membe
   const r = render(s);
   const row = k => r.rows[r.keys.indexOf(pub(k))];
   assert.equal(row(S1)[1], '42 / 60 min');
-  assert.equal(row(S1)[3], '3 tasks in this job · reported by the buyer');
+  assert.equal(row(S1).length, 3, 'name, minutes, state: no task-count line under the name');
   assert.equal(row(S2)[1], '7 / 60 min');
-  assert.equal(row(S2)[3], '1 task in this job · reported by the buyer');
+  assert.equal(row(S2).length, 3);
+  assert.ok(!/reported by the buyer|in this job|No report/.test(allText(r)), 'no reported-tasks text anywhere');
   assert.equal(r.rows.length, 3, 'two members + one applicant');
   assert.ok(!allText(r).includes('99'), 'applicant/stranger tally values never shown');
   assert.equal(r.summary, '2 agents · 1 waiting for approval', 'no "working now" count without public tasks');
@@ -150,14 +150,14 @@ test('private swarm: no tally yet, a stale tally, and a member with no entry', (
   const none = project([...base('private'), job(null)]);
   assert.equal(by(none, S1).reported, null);
   assert.equal(sellerLine(none, by(none, S1), NOW), '– / 60 min');
-  assert.equal(reportedLine(none, by(none, S1)), 'No report from the buyer yet');
+  assert.ok(render(none).rows.every(x => x.length === 3), 'no no-report-yet line under the name');
   const partial = project([...base('private'), job(tally({ [pub(S1)]: entry(1, 5) }))]);
-  assert.equal(reportedLine(partial, by(partial, S2)), 'No report from the buyer yet');
+  assert.equal(sellerLine(partial, by(partial, S2), NOW), '– / 60 min');
   // A tally published yesterday (UTC): its task count is the swarm job's, its minutes are not today's.
   const old = project([...base('private'), job(TALLY, D - 60)]);
   assert.deepEqual(by(old, S1).reported, { tasksDone: 3, minutesToday: null });
   assert.equal(sellerLine(old, by(old, S1), NOW), '– / 60 min');
-  assert.equal(reportedLine(old, by(old, S1)), '3 tasks in this job · reported by the buyer');
+  assert.equal(by(old, S1).reported.tasksDone, 3);
   // A plain text update on a private swarm is a status line; rows wait for a tally.
   const text = project([...base('private'), job('Starting up')]);
   assert.deepEqual(text.updates, ['Starting up']);
@@ -193,12 +193,12 @@ test('the snapshot parser refuses malformed reported figures', () => {
   assert.ok(parseSnapshot({ ...s, sellers: [{ ...s.sellers[0], reported: { tasksDone: 0, minutesToday: null } }] }));
 });
 
-test('demo: ?demo=private renders the tally rows through the same parser', () => {
+test('demo: ?demo=private renders the tally rows through the same parser, without a task-count line', () => {
   const s = parseSnapshot(demoSnapshot(1_792_100_000, { privateTasks: true }));
   assert.equal(s.swarm.tasks, 'private');
   const r = render(s, 1_792_100_000);
-  assert.ok(r.rows.some(x => x[3] === '3 tasks in this job · reported by the buyer'));
-  assert.ok(r.rows.some(x => x[3] === 'No report from the buyer yet'));
+  assert.ok(r.rows.length > 0 && r.rows.every(x => x.length === 3), 'name, minutes, state only');
+  assert.ok(!/reported by the buyer|No report/.test(allText(r)));
   assert.equal(parseSnapshot(demoSnapshot(1_792_100_000)).swarm.tasks, 'public', 'plain ?demo unchanged');
 });
 
