@@ -2257,12 +2257,36 @@ impl SellerStore {
     pub fn oldest_unsettled_delivery_unix(&self) -> Result<Option<i64>, StoreError> {
         let conn = self.lock()?;
         let oldest = conn.query_row(
+            // A FREE job (payment = 'none') is settled at delivery and never gets a receipt, so it
+            // must not count: otherwise one free delivery pins the cursor behind it forever and
+            // every pass re-reads the seat's whole wrap history. NULL is a legacy priced row.
             "SELECT MIN(d.delivered_at_unix) FROM deliveries d
-             WHERE NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = d.job_id)",
+             WHERE COALESCE(d.payment, 'sat') <> 'none'
+               AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = d.job_id)",
             [],
             |row| row.get::<_, Option<i64>>(0),
         )?;
         Ok(oldest)
+    }
+
+    /// Start time of the last wrap backfill whose relay read was COMPLETE (EOSE), or `None` before
+    /// the first one. Lets the wrap cursor move forward on a seat that has no receipts yet, so it
+    /// does not re-read its whole history every pass (see `resolve_backfill_since`).
+    pub fn wrap_backfill_complete_unix(&self) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        read_meta_i64(&conn, "wrap_backfill_complete_unix")
+    }
+
+    /// Record the start time of a wrap backfill whose read was complete. Only ever moves forward.
+    pub fn record_wrap_backfill_complete(&self, started_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO seller_meta (key, value) VALUES ('wrap_backfill_complete_unix', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE CAST(seller_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+            [started_unix.to_string()],
+        )?;
+        Ok(())
     }
 
     // ---- Session jobs (docs/specs/session-jobs.md §5.4) ------------------------------------------
@@ -7163,6 +7187,49 @@ mod free_lane_tests {
         // A free job's terminal state stays 'delivered' — it never advances to 'paid', and the
         // deliveries.payment column is the fact that says so.
         assert_eq!(store.job_state("free-job").expect("state"), Some(JobState::Delivered));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A free delivery never gets a receipt, so it must not hold the wrap-backfill cursor back
+    /// forever; a priced one still does until it is paid.
+    ///
+    /// RED ON REVERT: drop the `payment <> 'none'` filter and the free-only store reports Some(3).
+    #[test]
+    fn a_free_delivery_never_counts_as_unsettled_but_a_priced_one_does() {
+        let path = temp_db("unsettled-free");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let deliver = |job: &str, mode: PaymentMode, at: i64| {
+            store.record_offer(&offer_row(job, mode), 1).expect("record offer");
+            store
+                .claim_and_enqueue(job, job, if mode.is_free() { None } else { Some("creqA") }, &wire_draft(crate::gateway::JOB_CLAIM_KIND), 1, 9_999, 1)
+                .expect("claim");
+            store.record_award(&format!("award-{job}"), job, &"b".repeat(64), 2).expect("award");
+            store
+                .deliver_and_enqueue(job, "ref", mode, &wire_draft(crate::gateway::JOB_RESULT_KIND), at, 9_999, at)
+                .expect("deliver");
+        };
+        deliver("free-job", PaymentMode::None, 3);
+        assert_eq!(store.oldest_unsettled_delivery_unix().expect("read"), None, "free is settled");
+        deliver("paid-job", PaymentMode::Sat, 7);
+        assert_eq!(store.oldest_unsettled_delivery_unix().expect("read"), Some(7), "priced, unpaid");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The complete-read mark starts absent and only ever moves forward.
+    #[test]
+    fn the_wrap_backfill_complete_mark_only_moves_forward() {
+        let path = temp_db("wrap-complete-mark");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        assert_eq!(store.wrap_backfill_complete_unix().expect("read"), None);
+        store.record_wrap_backfill_complete(500).expect("write");
+        store.record_wrap_backfill_complete(200).expect("older write");
+        assert_eq!(store.wrap_backfill_complete_unix().expect("read"), Some(500));
+        store.record_wrap_backfill_complete(900).expect("newer write");
+        assert_eq!(store.wrap_backfill_complete_unix().expect("read"), Some(900));
         drop(store);
         let _ = std::fs::remove_file(&path);
     }

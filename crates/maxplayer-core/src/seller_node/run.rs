@@ -1154,20 +1154,37 @@ fn resolve_wrap_backfill_interval_secs() -> u64 {
 /// wrap in range; the per-job idempotency guards (`has_receipt` skip, mint already-spent refuse) make
 /// the wider re-scan safe.
 ///
+/// A seat with NO receipt (new, free-only, or long idle) used to stay at `since = 0` forever and
+/// re-read its whole kind-1059 history every pass. The last COMPLETE backfill read also moves the
+/// floor: anything published before it was already read once, so the window only needs to reach
+/// [`WRAP_COMPLETE_LOOKBACK_SECS`] behind it — far more than the 3-minute wrap timestamp tweak, and
+/// long enough that a wrap a transient error made us skip is still retried for a day. The
+/// unsettled-delivery clamp below still pulls the cursor back over any job we delivered and were
+/// not paid for, whatever either floor says.
+///
 /// A journal/store READ ERROR must abort the cycle, never fall back to `since = 0` — that would turn a
 /// transient read failure into a full-history backfill. Absent data (nothing collected, nothing
-/// unsettled) is legitimately `0`; a failure to read is not.
+/// unsettled, no complete pass yet) is legitimately `0`; a failure to read is not.
 fn resolve_backfill_since(
     last_receipt: Result<Option<i64>, super::store::StoreError>,
     oldest_unsettled: Result<Option<i64>, super::store::StoreError>,
+    last_complete: Result<Option<i64>, super::store::StoreError>,
 ) -> Result<u64, super::store::StoreError> {
     let last_receipt = last_receipt?.unwrap_or(0);
+    let complete_floor = last_complete?
+        .map(|at| at.saturating_sub(WRAP_COMPLETE_LOOKBACK_SECS))
+        .unwrap_or(0);
+    let floor = last_receipt.max(complete_floor);
     let cursor = match oldest_unsettled? {
-        Some(oldest) => last_receipt.min(oldest.saturating_sub(WRAP_BACKFILL_MARGIN_SECS)),
-        None => last_receipt,
+        Some(oldest) => floor.min(oldest.saturating_sub(WRAP_BACKFILL_MARGIN_SECS)),
+        None => floor,
     };
     Ok(cursor.max(0) as u64)
 }
+
+/// How far behind the last complete wrap backfill the next one still reads (see
+/// [`resolve_backfill_since`]). A day: a bounded window instead of all history, with room to retry.
+const WRAP_COMPLETE_LOOKBACK_SECS: i64 = 86_400;
 
 /// Upper bound on stored open-pool offers a backfilling REQ may return.
 const OFFER_BACKFILL_LIMIT: usize = 500;
@@ -6394,9 +6411,26 @@ impl SellerNodeRunner {
                 self.claim_open_pool(),
                 self.node.home().config.sessions.enabled(),
             ),
-            WRAP_SUB_ID => Filter::new()
-                .kind(Kind::GiftWrap)
-                .pubkey(self.seller_pubkey),
+            WRAP_SUB_ID => {
+                // At boot (`since = None`) start the live REQ at the backfill cursor instead of
+                // asking the relay to replay every wrap ever sent to this key; the first backfill
+                // reads the same window anyway. A cursor read error falls back to no `since`
+                // (the old full replay), never to a narrower window.
+                let filter = Filter::new().kind(Kind::GiftWrap).pubkey(self.seller_pubkey);
+                let boot_cursor = since.is_none().then(|| {
+                    resolve_backfill_since(
+                        self.node.store().last_receipt_unix(),
+                        self.node.store().oldest_unsettled_delivery_unix(),
+                        self.node.store().wrap_backfill_complete_unix(),
+                    )
+                    .ok()
+                    .filter(|cursor| *cursor > 0)
+                });
+                match boot_cursor.flatten() {
+                    Some(cursor) => filter.since(nostr_sdk::Timestamp::from(cursor)),
+                    None => filter,
+                }
+            }
             other => {
                 return Err(NodeError::Relay(format!(
                     "subscribe {other}: not one of ours"
@@ -7785,9 +7819,13 @@ impl SellerNodeRunner {
     /// (receipts/deliveries), so an incomplete read cannot move it past an unread payment.
     async fn run_wrap_backfill(&self) -> bool {
         let private_complete = self.backfill_private_content().await;
+        // Taken BEFORE the read: a wrap published while the read runs is newer than this, so the
+        // next pass's window (which reaches a day behind it) still covers it.
+        let started_unix = now_unix() as i64;
         let since = match resolve_backfill_since(
             self.node.store().last_receipt_unix(),
             self.node.store().oldest_unsettled_delivery_unix(),
+            self.node.store().wrap_backfill_complete_unix(),
         ) {
             Ok(since) => since,
             Err(error) => {
@@ -7833,6 +7871,12 @@ impl SellerNodeRunner {
         // Every wrap goes through the normal pay-once guards; a partial read is safe to ingest.
         for event in events {
             self.on_gift_wrap(&event).await;
+        }
+        // Only a COMPLETE read moves the floor: an incomplete one may have missed a payment.
+        if complete
+            && let Err(error) = self.node.store().record_wrap_backfill_complete(started_unix)
+        {
+            opline!("seller node wrap backfill: cursor write failed (next pass re-reads more): {error}");
         }
         complete && private_complete
     }
@@ -20641,17 +20685,18 @@ esac"#,
         use super::super::store::StoreError;
 
         // Nothing collected, nothing unsettled ⇒ 0 is legitimate (first boot), not an error.
-        assert_eq!(resolve_backfill_since(Ok(None), Ok(None)).expect("fresh"), 0);
+        assert_eq!(resolve_backfill_since(Ok(None), Ok(None), Ok(None)).expect("fresh"), 0);
 
         // A receipt at t=10_000 with NO unsettled delivery ⇒ cursor is the receipt.
         assert_eq!(
-            resolve_backfill_since(Ok(Some(10_000)), Ok(None)).expect("settled"),
+            resolve_backfill_since(Ok(Some(10_000)), Ok(None), Ok(None)).expect("settled"),
             10_000
         );
 
         // cursor_stays_behind_an_unsettled_delivery: a NEWER receipt must not step over an OLDER
         // delivered-but-unpaid job — the cursor clamps to that job's delivery minus the skew margin.
-        let cursor = resolve_backfill_since(Ok(Some(10_000)), Ok(Some(6_000))).expect("clamped");
+        let cursor =
+            resolve_backfill_since(Ok(Some(10_000)), Ok(Some(6_000)), Ok(None)).expect("clamped");
         assert_eq!(cursor, (6_000 - WRAP_BACKFILL_MARGIN_SECS) as u64);
         assert!(
             cursor < 6_000,
@@ -20661,12 +20706,49 @@ esac"#,
         // Fail-closed: a store READ ERROR aborts the cycle. Falling back to 0 would turn a transient
         // failure into a full-history rescan.
         assert!(
-            resolve_backfill_since(Err(StoreError("boom".into())), Ok(None)).is_err(),
+            resolve_backfill_since(Err(StoreError("boom".into())), Ok(None), Ok(None)).is_err(),
             "a cursor read failure must abort, never default to since=0"
         );
         assert!(
-            resolve_backfill_since(Ok(Some(1)), Err(StoreError("boom".into()))).is_err(),
+            resolve_backfill_since(Ok(Some(1)), Err(StoreError("boom".into())), Ok(None)).is_err(),
             "an unsettled-delivery read failure must abort too"
+        );
+        assert!(
+            resolve_backfill_since(Ok(None), Ok(None), Err(StoreError("boom".into()))).is_err(),
+            "a complete-mark read failure must abort too"
+        );
+    }
+
+    /// A seat with no receipt moves forward with its complete reads instead of re-reading all
+    /// history; an unsettled delivery still pulls the cursor back over its payment.
+    ///
+    /// RED ON REVERT: drop `complete_floor` and the first assertion reads 0 (the field flood);
+    /// apply the floor after the clamp and the second reads past the unsettled delivery.
+    #[test]
+    fn wrap_backfill_cursor_moves_with_complete_reads_but_never_past_an_unpaid_delivery() {
+        let day = WRAP_COMPLETE_LOOKBACK_SECS;
+        let done_at = 10 * day;
+        assert_eq!(
+            resolve_backfill_since(Ok(None), Ok(None), Ok(Some(done_at))).expect("no receipts"),
+            (done_at - day) as u64,
+            "no receipt, nothing unpaid: a day behind the last complete read, not 0"
+        );
+        let unpaid = done_at - 3 * day;
+        assert_eq!(
+            resolve_backfill_since(Ok(None), Ok(Some(unpaid)), Ok(Some(done_at))).expect("unpaid"),
+            (unpaid - WRAP_BACKFILL_MARGIN_SECS) as u64,
+            "an older delivered-but-unpaid job still wins"
+        );
+        assert_eq!(
+            resolve_backfill_since(Ok(Some(done_at)), Ok(None), Ok(Some(done_at - 5 * day)))
+                .expect("receipt newer"),
+            done_at as u64,
+            "a newer receipt still moves the cursor as before"
+        );
+        assert!(
+            WRAP_COMPLETE_LOOKBACK_SECS
+                > crate::private_content::transport::TIMESTAMP_TWEAK_SECS as i64 * 10,
+            "the lookback must dwarf the wrap timestamp tweak"
         );
     }
 
