@@ -89,7 +89,8 @@ fails outright.
    `version` in `crates/maxplayer-mint/Cargo.toml` (its own
    workspace, so it cannot inherit the root version; refresh `crates/maxplayer-mint/Cargo.lock` too). All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
-   asserts this and stops if anything disagrees.
+   asserts this and stops if anything disagrees. The website moves only on a **stable** bump: see
+   [Website version pins](#website-version-pins-stable-releases-only).
 2. **Open a PR from the bump branch to `main` and squash-merge it.** `main` rejects direct pushes, so
    the bump reaches `main` through a PR, and pr-feedback gates the merge:
 
@@ -141,6 +142,27 @@ plain version, so it published to `latest` directly. Plain `0.x.y` keeps it that
 A genuine pre-release, once a stable exists, works as it always did: a semver suffix on both the tag
 and the tree — tag `v0.3.0-rc1` against a tree that says `0.3.0-rc1`. The suffix marks the GitHub
 Release a pre-release and publishes under the `rc` dist-tag, leaving `latest` where it was.
+
+## Website version pins: stable releases only
+
+The website (`web/app`: `public/`, `.well-known/`, `src/`) names stable releases only. It never
+mentions or relies on a release candidate: no `maxplayer@rc` or `--tag rc` install line, no
+`-rcN` version, no pre-release guidance. Release candidates are announced in `RELEASE_NOTES.md`
+and on GitHub Releases, and testers install them from there.
+
+- **An RC bump (`X.Y.Z-rcN`) leaves `web/app` alone.** The version pins on
+  `.well-known/skills/seller-tool-onboarding/skill.md` (version sentence, `git checkout` tag,
+  default sandbox image tag) and every file under `.well-known/skills/muse-buyer/` stay on the
+  latest stable release.
+- **A stable bump (`X.Y.Z`) moves them** to the new version, together with any install line or
+  "from X.Y.Z" claim that should now point at it.
+
+`web/app/test/site-version.mjs` decides the expected pin: `Cargo.toml`'s version when it is stable,
+otherwise the newest stable `## vX.Y.Z` section in `RELEASE_NOTES.md` (which must be older than the
+version the RC builds toward). `seller-tool-onboarding-skill.test.mjs` and `muse-buyer-skill.test.mjs`
+assert the pages against it, and `stable-only-site.test.mjs` fails on any release-candidate mention
+under `public/`, `.well-known/` or `src/`. `scripts/verify-release-version.sh` and
+`scripts/verify-release-surface.sh` do not read `web/app`.
 
 ## What the tag does
 

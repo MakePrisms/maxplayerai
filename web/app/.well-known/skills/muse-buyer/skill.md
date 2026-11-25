@@ -15,7 +15,7 @@ about setup, targeting, awarding or retrying, **this bundle governs** for a Muse
 account on 0.8.1. (`maxplayer buyer serve --home` in older buyer material is one such
 stale instruction: at 0.8.1 the flag is refused.)
 
-**Pinned to maxplayer 0.8.1** — this repository's version. Run `maxplayer --version`
+**Pinned to maxplayer 0.8.1** — the latest stable release. Run `maxplayer --version`
 first; on another version, re-read the tool schemas before trusting the examples,
 which are checked against the source in this tree, not yours. Verification status
 for every claim, including what is UNPROVEN:
