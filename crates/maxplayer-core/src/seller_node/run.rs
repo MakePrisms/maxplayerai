@@ -844,6 +844,12 @@ struct QuietTally {
     unknown_closes: std::sync::atomic::AtomicU64,
     /// A follow-up for a session that already ended.
     ended_followups: std::sync::atomic::AtomicU64,
+    /// A kind-1059 to this key that is not a payment (private content, chat, …).
+    wraps_not_payment: std::sync::atomic::AtomicU64,
+    /// A payment wrap for a job already receipted (re-read by backfill).
+    wraps_already_paid: std::sync::atomic::AtomicU64,
+    /// A repeat of a payment wrap for a job this home never recorded (first sight prints).
+    wraps_unknown_job: std::sync::atomic::AtomicU64,
 }
 
 impl QuietTally {
@@ -864,6 +870,9 @@ impl QuietTally {
             ("lapsed or aged offers skipped", take(&self.stale_offers)),
             ("relay CLOSEDs for subscriptions not ours", take(&self.unknown_closes)),
             ("follow-ups to ended sessions", take(&self.ended_followups)),
+            ("wraps that are not payments", take(&self.wraps_not_payment)),
+            ("payments already collected", take(&self.wraps_already_paid)),
+            ("repeat payments for unrecorded jobs", take(&self.wraps_unknown_job)),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -5201,6 +5210,8 @@ pub struct SellerNodeRunner {
     /// the periodic backfill re-reading the same offer does not repeat the line. Same bounded
     /// first-sight set as [`Self::fed_under_rate_offers`].
     announced_stale_offers: FedUnderRateOffers,
+    /// Job ids whose "payment but no offer recorded" line already printed this boot.
+    announced_unknown_payments: FedUnderRateOffers,
     /// #747: how this node is asked to leave the selling role, so it can publish its terminal
     /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
     shutdown: shutdown::ShutdownChannel,
@@ -5706,6 +5717,7 @@ impl SellerNodeRunner {
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             quiet: QuietTally::default(),
             announced_stale_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
+            announced_unknown_payments: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
             drain: shutdown::DrainSignal::new(),
             wrap_backfill_interval_secs: resolve_wrap_backfill_interval_secs(),
@@ -12057,13 +12069,18 @@ impl SellerNodeRunner {
             }
         }
         let event_id = event.id.to_hex();
-        // Log EVERY wrap seen — silence must mean "no wraps", never "lost money".
-        opline!("seller node wrap seen event={event_id}");
+        // Every wrap is still accounted for, just not one line each: the backfill prints how many
+        // it read, routine skips below are counted into the status summary, and every path that
+        // can involve money we are owed (decode failure, unknown job, redeem) still prints.
+        // MAXPLAYER_VERBOSE restores the per-wrap lines.
+        opline_verbose!("seller node wrap seen event={event_id}");
 
         let received = match self.node.signer().unwrap_payment_wrap(event.clone()).await {
             Ok(Ok(Some(received))) => received,
             Ok(Ok(None)) => {
-                opline!("seller node wrap event={event_id}: not a decodable own-payment wrap (skipped)");
+                // Private content, chat or anything else addressed to this key: not money.
+                QuietTally::bump(&self.quiet.wraps_not_payment);
+                opline_verbose!("seller node wrap event={event_id}: not a decodable own-payment wrap (skipped)");
                 return;
             }
             Ok(Err(error)) => {
@@ -12100,7 +12117,8 @@ impl SellerNodeRunner {
         // read error (never read an unreadable journal as "not paid ⇒ safe to redeem again").
         match self.node.store().has_receipt(&receipt_key) {
             Ok(true) => {
-                opline!("seller node wrap event={event_id}: job {job_id} already receipted, skipping");
+                QuietTally::bump(&self.quiet.wraps_already_paid);
+                opline_verbose!("seller node wrap event={event_id}: job {job_id} already receipted, skipping");
                 return;
             }
             Ok(false) => {}
@@ -12115,7 +12133,19 @@ impl SellerNodeRunner {
         let offer = match self.node.store().offer_row(&job_id) {
             Ok(Some(offer)) => offer,
             Ok(None) => {
-                opline!("seller node wrap event={event_id}: no offer recorded for job {job_id} (skipped)");
+                // A payment to this key for a job this home never recorded (a reset or moved home,
+                // or pay that beat its offer here). Possibly money owed, so it prints — but once
+                // per job per boot, not on every backfill pass.
+                if self.announced_unknown_payments.contains(&job_id) {
+                    QuietTally::bump(&self.quiet.wraps_unknown_job);
+                    opline_verbose!("seller node wrap event={event_id}: no offer recorded for job {job_id} (skipped)");
+                } else {
+                    self.announced_unknown_payments.record(&job_id);
+                    opline!(
+                        "seller node wrap event={event_id}: payment for job {job_id}, but this home has \
+                         no offer recorded for it (skipped; was ~/.maxplayer reset or moved?)"
+                    );
+                }
                 return;
             }
             Err(error) => {
@@ -20930,6 +20960,9 @@ esac"#,
             &tally.stale_offers,
             &tally.unknown_closes,
             &tally.ended_followups,
+            &tally.wraps_not_payment,
+            &tally.wraps_already_paid,
+            &tally.wraps_unknown_job,
         ]
         .into_iter()
         .enumerate()
@@ -20945,6 +20978,9 @@ esac"#,
             "lapsed or aged offers skipped: 3",
             "relay CLOSEDs for subscriptions not ours: 4",
             "follow-ups to ended sessions: 5",
+            "wraps that are not payments: 6",
+            "payments already collected: 7",
+            "repeat payments for unrecorded jobs: 8",
         ] {
             assert!(summary.contains(expected), "missing {expected:?} in {summary}");
         }

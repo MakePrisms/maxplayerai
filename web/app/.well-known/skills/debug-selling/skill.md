@@ -267,10 +267,13 @@ is normal and healthy.
 `MAXPLAYER_VERBOSE=1` in the daemon's environment: a re-seen offer already claimed, a duplicate
 award, awards and acceptances for other sellers' jobs, pay-binds for jobs already awarded here,
 lapsed or aged offers re-read from relay history, a relay `CLOSED` for a subscription that is not
-ours, and follow-ups to ended sessions. After a reconnect these can be hundreds of lines, so instead
+ours, follow-ups to ended sessions, and payment gift-wraps re-read by the wrap backfill (not a
+payment, or already collected). After a reconnect these can be hundreds of lines, so instead
 the status tick prints one `seller node routine (since last status): …` line counting them; it is
 informational, not a problem. A lapsed offer aimed at this seat and authored within the last hour
-still prints its `offer skip` line (check the buyer's deadline and this host's clock). Nothing that
+still prints its `offer skip` line (check the buyer's deadline and this host's clock), and a
+payment for a job this home has no offer for prints once per job per boot (usually a reset or moved
+`~/.maxplayer`; the payment may be money you are owed). Nothing that
 reports a state change or a failure is behind that flag.
 
 **Dead end → report it:** if you see `seller node live:` but the periodic `seller node status:`
