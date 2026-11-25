@@ -2251,40 +2251,66 @@ impl SellerStore {
         Ok(latest)
     }
 
-    /// Delivery timestamp of the OLDEST job that has been delivered but never paid, or `None` when
-    /// every delivery has settled. The clamp that stops the wrap-backfill cursor from stepping over
-    /// an older job's still-uncollected payment.
+    /// Delivery timestamp of the OLDEST delivery still owed a payment, or `None` when every
+    /// delivery has settled. The clamp that stops the wrap-backfill cursor from stepping over a
+    /// still-uncollected payment.
+    ///
+    /// Two kinds of delivery are owed money: a job's first delivery (a `deliveries` row, paid by a
+    /// receipt keyed by the job id) and a session follow-up turn (a `session_turns` row in state
+    /// `delivered`, paid by a receipt keyed by the FOLLOW-UP id; turn 1's receipt does not cover
+    /// it). A turn writes no `deliveries` row, so it needs its own arm, or a paid turn 1 would hide
+    /// an unpaid turn 2 and its payment would fall out of the backfill window for good.
     pub fn oldest_unsettled_delivery_unix(&self) -> Result<Option<i64>, StoreError> {
         let conn = self.lock()?;
         let oldest = conn.query_row(
             // A FREE job (payment = 'none') is settled at delivery and never gets a receipt, so it
             // must not count: otherwise one free delivery pins the cursor behind it forever and
-            // every pass re-reads the seat's whole wrap history. NULL is a legacy priced row.
-            "SELECT MIN(d.delivered_at_unix) FROM deliveries d
-             WHERE COALESCE(d.payment, 'sat') <> 'none'
-               AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = d.job_id)",
+            // every pass re-reads the seat's whole wrap history. NULL is a legacy priced row. A
+            // turn is priced like its job, so the turn arm takes the payment mode from the job's
+            // own delivery row (which also keeps free sessions out).
+            "SELECT MIN(t) FROM (
+               SELECT d.delivered_at_unix AS t FROM deliveries d
+                WHERE COALESCE(d.payment, 'sat') <> 'none'
+                  AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = d.job_id)
+               UNION ALL
+               SELECT st.updated_at_unix AS t FROM session_turns st
+                 JOIN deliveries d ON d.job_id = st.job_id
+                WHERE st.state = 'delivered'
+                  AND COALESCE(d.payment, 'sat') <> 'none'
+                  AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = st.followup_id))",
             [],
             |row| row.get::<_, Option<i64>>(0),
         )?;
         Ok(oldest)
     }
 
-    /// Start time of the last wrap backfill whose relay read was COMPLETE (EOSE), or `None` before
-    /// the first one. Lets the wrap cursor move forward on a seat that has no receipts yet, so it
-    /// does not re-read its whole history every pass (see `resolve_backfill_since`).
-    pub fn wrap_backfill_complete_unix(&self) -> Result<Option<i64>, StoreError> {
+    /// Start time of the last wrap backfill whose read of `relay_url` was COMPLETE, or `None`
+    /// before the first one. Lets the wrap cursor move forward on a seat that has no receipts yet,
+    /// so it does not re-read its whole history every pass (see `resolve_backfill_since`). Kept
+    /// per relay: a seat pointed at a new relay has read nothing there yet.
+    pub fn wrap_backfill_complete_unix(&self, relay_url: &str) -> Result<Option<i64>, StoreError> {
         let conn = self.lock()?;
-        read_meta_i64(&conn, "wrap_backfill_complete_unix")
+        read_meta_i64(&conn, &wrap_backfill_complete_key(relay_url))
     }
 
-    /// Record the start time of a wrap backfill whose read was complete. Only ever moves forward.
-    pub fn record_wrap_backfill_complete(&self, started_unix: i64) -> Result<(), StoreError> {
+    /// Record the start time of a wrap backfill whose read of `relay_url` was complete.
+    ///
+    /// Only moves forward, with one exception: a stored value later than `now_unix` is replaced.
+    /// The mark comes from the wall clock, so one pass under a clock that ran ahead would otherwise
+    /// pin it in the future with nothing to bring it back.
+    pub fn record_wrap_backfill_complete(
+        &self,
+        relay_url: &str,
+        started_unix: i64,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO seller_meta (key, value) VALUES ('wrap_backfill_complete_unix', ?1)
+            "INSERT INTO seller_meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value
-             WHERE CAST(seller_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
-            [started_unix.to_string()],
+             WHERE CAST(seller_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)
+                OR CAST(seller_meta.value AS INTEGER) > ?3",
+            params![wrap_backfill_complete_key(relay_url), started_unix.to_string(), now_unix],
         )?;
         Ok(())
     }
@@ -4126,6 +4152,11 @@ fn claim_state(
 
 fn count(conn: &Connection, sql: &str) -> Result<i64, StoreError> {
     Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0))?)
+}
+
+/// `seller_meta` key of the per-relay wrap backfill mark.
+fn wrap_backfill_complete_key(relay_url: &str) -> String {
+    format!("wrap_backfill_complete_unix@{}", relay_url.trim_end_matches('/'))
 }
 
 fn read_meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>, StoreError> {
@@ -7218,18 +7249,102 @@ mod free_lane_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The complete-read mark starts absent and only ever moves forward.
+    /// A delivered session turn is owed its own payment (keyed by the follow-up id), so it holds the
+    /// wrap-backfill cursor back even after turn 1 is paid; a paid turn, a running turn and a free
+    /// session's turn do not.
+    ///
+    /// RED ON REVERT: drop the `session_turns` arm of the query and the paid-turn-1 /
+    /// unpaid-turn-2 store reports None, so the backfill window walks past turn 2's payment.
+    #[test]
+    fn an_unpaid_delivered_session_turn_counts_as_unsettled() {
+        let path = temp_db("unsettled-turn");
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        let fees = || ReceiptFees { mint_fee_sats: 0, fee_bps: 0, fee_sats: 0 };
+        let deliver = |job: &str, mode: PaymentMode, at: i64| {
+            store.record_offer(&offer_row(job, mode), 1).expect("record offer");
+            store
+                .claim_and_enqueue(job, job, if mode.is_free() { None } else { Some("creqA") }, &wire_draft(crate::gateway::JOB_CLAIM_KIND), 1, 9_999, 1)
+                .expect("claim");
+            store.record_award(&format!("award-{job}"), job, &"b".repeat(64), 2).expect("award");
+            store
+                .deliver_and_enqueue(job, "ref", mode, &wire_draft(crate::gateway::JOB_RESULT_KIND), at, 9_999_999, at)
+                .expect("deliver");
+        };
+        let deliver_turn = |followup: &str, job: &str, turn: u32, at: i64| {
+            store
+                .record_turn(followup, job, turn, 99_999, crate::session::TurnState::Received, (at - 10) as u64)
+                .expect("record turn");
+            assert!(
+                store
+                    .deliver_turn_and_enqueue(followup, job, turn, None, &wire_draft(crate::gateway::JOB_RESULT_KIND), at, 9_999_999, at)
+                    .expect("deliver turn"),
+                "harness check: the turn is delivered"
+            );
+        };
+
+        // Priced session: turn 1 delivered and paid, turn 2 delivered and NOT paid.
+        let job = "a".repeat(64);
+        let turn2 = "f".repeat(64);
+        deliver(&job, PaymentMode::Sat, 1000);
+        store.collect_receipt("wrap-1", &job, 100, fees(), 1100).expect("receipt turn 1");
+        assert_eq!(store.oldest_unsettled_delivery_unix().expect("read"), None, "turn 1 paid");
+        deliver_turn(&turn2, &job, 2, 5000);
+        assert_eq!(
+            store.oldest_unsettled_delivery_unix().expect("read"),
+            Some(5000),
+            "an unpaid turn 2 is owed money even though turn 1 is paid"
+        );
+        // Turn 3 still running (recorded, not delivered): not owed anything yet.
+        store
+            .record_turn(&"e".repeat(64), &job, 3, 99_999, crate::session::TurnState::Running, 6000)
+            .expect("record running turn");
+        assert_eq!(store.oldest_unsettled_delivery_unix().expect("read"), Some(5000));
+        store.collect_receipt("wrap-2", &turn2, 100, fees(), 5100).expect("receipt turn 2");
+        assert_eq!(store.oldest_unsettled_delivery_unix().expect("read"), None, "turn 2 paid");
+
+        // Free session: its delivered turns are settled at delivery.
+        let free_job = "c".repeat(64);
+        deliver(&free_job, PaymentMode::None, 7000);
+        deliver_turn(&"d".repeat(64), &free_job, 2, 8000);
+        assert_eq!(store.oldest_unsettled_delivery_unix().expect("read"), None, "free session turn");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The complete-read mark starts absent, is kept per relay, and only moves forward unless the
+    /// stored value is in the future.
     #[test]
     fn the_wrap_backfill_complete_mark_only_moves_forward() {
         let path = temp_db("wrap-complete-mark");
         let _ = std::fs::remove_file(&path);
         let store = SellerStore::open(&path).expect("open");
-        assert_eq!(store.wrap_backfill_complete_unix().expect("read"), None);
-        store.record_wrap_backfill_complete(500).expect("write");
-        store.record_wrap_backfill_complete(200).expect("older write");
-        assert_eq!(store.wrap_backfill_complete_unix().expect("read"), Some(500));
-        store.record_wrap_backfill_complete(900).expect("newer write");
-        assert_eq!(store.wrap_backfill_complete_unix().expect("read"), Some(900));
+        let relay = "wss://relay.example";
+        let now = 10_000;
+        assert_eq!(store.wrap_backfill_complete_unix(relay).expect("read"), None);
+        store.record_wrap_backfill_complete(relay, 500, now).expect("write");
+        store.record_wrap_backfill_complete(relay, 200, now).expect("older write");
+        assert_eq!(store.wrap_backfill_complete_unix(relay).expect("read"), Some(500));
+        store.record_wrap_backfill_complete(relay, 900, now).expect("newer write");
+        assert_eq!(store.wrap_backfill_complete_unix(relay).expect("read"), Some(900));
+        assert_eq!(
+            store.wrap_backfill_complete_unix(&format!("{relay}/")).expect("read"),
+            Some(900),
+            "a trailing slash is the same relay"
+        );
+        assert_eq!(
+            store.wrap_backfill_complete_unix("wss://other.example").expect("read"),
+            None,
+            "another relay has read nothing yet"
+        );
+        // A mark written under a clock that ran ahead is replaced once the clock is back.
+        store.record_wrap_backfill_complete(relay, 50_000, 50_000).expect("future write");
+        store.record_wrap_backfill_complete(relay, 1_000, now).expect("write after clock fix");
+        assert_eq!(
+            store.wrap_backfill_complete_unix(relay).expect("read"),
+            Some(1_000),
+            "RED ON REVERT: a forward-only upsert keeps the future mark"
+        );
         drop(store);
         let _ = std::fs::remove_file(&path);
     }
