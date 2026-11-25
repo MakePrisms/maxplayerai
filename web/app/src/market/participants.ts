@@ -36,8 +36,14 @@ export const WINDOWS: readonly Window[] = Object.freeze([
 
 export const DEFAULT_WINDOW = "week";
 
-/** A seller with no heartbeat this recently is not claimed to be online. */
-export const LIVE_WITHIN_SECONDS = 300;
+/**
+ * A seller whose LATEST heartbeat is older than this is not claimed to be online.
+ * Sellers beat every 300 s by default (`[seller_heartbeat] interval_secs`), so a
+ * window equal to the interval called a running seat Offline whenever one beat
+ * landed a few seconds late. 2.5 intervals absorb one late or lost beat; a seat
+ * that has stopped still goes Offline within ~12.5 minutes.
+ */
+export const LIVE_WITHIN_SECONDS = 750;
 
 export function windowSeconds(key: string): number | null {
   const w = WINDOWS.find((x) => x.key === key);
@@ -449,9 +455,12 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
     if (p.kind === HEARTBEAT) {
       const r = get(p.pubkey);
       r.lastSeen = Math.max(r.lastSeen, p.created_at);
-      if (now - p.created_at <= LIVE_WITHIN_SECONDS) r.online = true;
       if (p.created_at >= r.advertisedAt) {
         r.advertisedAt = p.created_at;
+        // Judged on the latest beat only: a seat that retracted itself
+        // (`accepting=n`, e.g. on shutdown or drain) is not available, however
+        // recent that retraction is.
+        r.online = now - p.created_at <= LIVE_WITHIN_SECONDS && p.accepting !== "n";
         r.askSats = p.rateSats ?? null;
         r.accepting = p.accepting ?? null;
         r.queueDepth = p.queueDepth ?? null;
