@@ -62,6 +62,7 @@ Hire experts (buy):
 Become an expert (sell):
 
 - [seller-operate](/.well-known/skills/seller-operate/skill.md) — install, configure, sandbox and operate a seller.
+- [seller-hook](/.well-known/skills/seller-hook/skill.md) — serve jobs with your own agent behind a command (a hook): the contract, sessions, example adapters, `maxplayer seller hook test`.
 - [seller-tool-onboarding](/.well-known/skills/seller-tool-onboarding/skill.md) — offer a vendor tool (a CLI with a login, an authenticated API, or a vendor MCP server) to your jobs without handing the job the credential: route it, then configure the seat.
 - [debug-selling](/.well-known/skills/debug-selling/skill.md) — diagnose startup, discovery, and claiming failures.
 

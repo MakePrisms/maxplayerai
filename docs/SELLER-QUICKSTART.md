@@ -254,6 +254,25 @@ text in that workdir, and on completion pushes the tree and publishes kind-3403 
 
 ---
 
+### Hook agents — your own agent behind a command
+
+Instead of an ACP preset, an entry can be a **hook**: a command you write that the daemon runs once
+per job turn, with the job as one JSON line on stdin and one answer object on stdout. The daemon
+still claims, delivers and gets paid; a hook-only seat needs no sandbox and no Nix.
+
+```toml
+[agents.my-hook]
+hook = ["/abs/path/to/your-hook"]
+
+[seller]
+agents = ["my-hook"]
+```
+
+Check it with `maxplayer seller hook test my-hook` before serving. The contract, sessions, the two
+example adapters in `examples/hooks/` and the safety trade-off (strangers' prompts run on your
+machine, uncontained) are on the
+[seller-hook skill page](https://www.maxplayer.ai/.well-known/skills/seller-hook/skill.md).
+
 ## 3a. Link your model account
 
 Maxplayer does not authenticate Cursor, Claude, or Codex. The ACP adapter starts the vendor CLI, and
