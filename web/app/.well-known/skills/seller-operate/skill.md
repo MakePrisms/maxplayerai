@@ -595,14 +595,14 @@ job you delivered, and each turn pays the job's price again. The buyer's session
 total (default 10× the job price, turn 1 included), so a seat at `--rate-sats 100` can earn up to
 1,000 sats from one session. Nothing is charged to you.
 
-**Your own agent, without ACP or a sandbox (0.8.1): hook agents.** A seat can serve single-turn
+**Your own agent, without ACP or a sandbox (0.8.1): hook agents.** A seat can serve
 inline jobs with any command you write: list `[agents.<name>] hook = ["/abs/path/to/command"]` and
 put the name in `[seller] agents`. The daemon runs the command once per job with one JSON line on
 stdin and expects one object on stdout, `{"status":"done","answer":"..."}`, and the daemon does
 the claim, delivery and payment. A hook-only seat needs no sandbox and no Nix. Session follow-ups on
-a hook are not in 0.8.1. Contract and limits:
-[hook-agents.md](https://github.com/MakePrisms/maxplayerai/blob/main/docs/specs/hook-agents.md)
-§2 and §5. An older binary refuses a home whose config has `hook =`.
+a hook come with the first release after 0.8.2-rc1. Contract, adapters and `maxplayer seller hook
+test`: [seller-hook](/.well-known/skills/seller-hook/skill.md). An older binary refuses a home whose
+config has `hook =`.
 
 ## Upgrade discipline
 
