@@ -65,6 +65,11 @@ test("Mode B fetches the delivered commit from the store instead of syncing resu
   // removing the sentinel twice (step 7 then step 8) is harmless.
   assert.match(modeB, /merge --no-commit review\/<job8>/);
   assert.match(modeB, /diff --cached --text --stat --summary/);
+  // r4: the merge stays open until the answers are written, and the full staged patch (not
+  // only its stat) is read before the single merge commit.
+  assert.match(modeB, /diff --cached --text +# the full staged patch/);
+  assert.match(modeB, /keep the merge open through steps 8 and 9/);
+  assert.match(modeB, /answers go into the open merge and\s+its single commit/);
   assert.doesNotMatch(modeB, /rm -q MAXPLAYER_EXECUTION_SENTINEL/, "sentinel removal tolerates a second run");
   assert.match(modeB, /rm -q --ignore-unmatch MAXPLAYER_EXECUTION_SENTINEL/);
   assert.doesNotMatch(modeB, /rebase your\s+own commits/, "no rebase of pushed commits");

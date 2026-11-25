@@ -226,10 +226,17 @@ fn resolve_to(to: &Path, cwd: impl FnOnce() -> std::io::Result<PathBuf>) -> Resu
                     continue;
                 }
                 match std::fs::canonicalize(&out) {
-                    Ok(real) if real.is_dir() => out = real,
-                    Ok(_) => {
-                        return Err(format!("--to {shown}: {} is not a folder", out.display()));
-                    }
+                    // `metadata`, not `is_dir`: a failed lookup is reported as itself, not as
+                    // "not a folder" (codex #1311 r4).
+                    Ok(real) => match std::fs::metadata(&real) {
+                        Ok(meta) if meta.is_dir() => out = real,
+                        Ok(_) => {
+                            return Err(format!("--to {shown}: {} is not a folder", out.display()));
+                        }
+                        Err(error) => {
+                            return Err(format!("--to {shown}: {}: {error}", out.display()));
+                        }
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         // A missing folder (or a dangling symlink): the daemon creates the rest.
                         exists = false;

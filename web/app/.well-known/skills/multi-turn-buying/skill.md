@@ -152,22 +152,28 @@ work already at the tree root.
    commit sits on its own previous commit, not on yours. Then stop. Never run
    `reset --hard`, `--allow-unrelated-histories`, an unreviewed plain merge, a rebase of
    commits you already pushed (step 9) or `push --force`. After reviewing it, merge
-   without committing, settle the conflicts, check the staged result, then commit once:
+   without committing and keep the merge open through steps 8 and 9, so the one merge
+   commit holds the seller's turn, your conflict resolutions and your answers, and you
+   review all of it staged before it exists:
    ```bash
    git -C <clone> merge --no-commit review/<job8>   # expect conflicts; nothing is committed yet
    git -C <clone> rm -q --ignore-unmatch MAXPLAYER_EXECUTION_SENTINEL
-   # resolve QUESTIONS.md (and any other conflict) by hand, then git -C <clone> add it
+   # resolve QUESTIONS.md (and any other conflict) by hand, write your answers (step 9),
+   # then git -C <clone> add each resolved file
    git -C <clone> diff --cached --text --stat --summary
-   git -C <clone> commit
+   git -C <clone> diff --cached --text              # the full staged patch, every file
+   git -C <clone> commit                            # the single merge commit; then push (step 9)
    ```
-   If unsure, ask the human.
+   A hand-resolved conflict is a change nobody reviewed in the incoming branch: read it in
+   the staged patch like any other change to the files listed above. If unsure, ask the human.
    If an older maxplayer settled the turn (`settlement.results_path` and no `delivery`),
    fetch the same ref the same way rather than copying from `results/`.
 8. **Remove `MAXPLAYER_EXECUTION_SENTINEL` before you commit.** It is per-job evidence that
    belongs to you, not repo content: `git -C <clone> rm -q --ignore-unmatch MAXPLAYER_EXECUTION_SENTINEL`.
    Left in, it puts a stale sentinel in every turn's base tree.
 9. **Write the answers into `QUESTIONS.md`, commit, and PUSH — in that order, before you
-   post.** The base commit is fetched from the pinned URL, so an unpushed commit makes
+   post.** After a non-fast-forward turn (step 7) the answers go into the open merge and
+   its single commit, not a second one. The base commit is fetched from the pinned URL, so an unpushed commit makes
    the job refuse.
 10. `post_job` with all four contribution pins: `target_repo_owner`, `target_repo_url`,
     `base_branch` = the branch you just pushed, `base_oid` = the commit you just pushed.
