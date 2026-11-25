@@ -38,6 +38,7 @@ impl SellerNodeRunner {
 
         let invocation = job_id.to_owned();
         let workdir = job_workdir(self.node.home(), job_id);
+        let session_job = self.hook_session_job(job_id);
         // `execute_job` re-delivers a staged answer before dispatch; this re-check covers the window
         // since. An unreadable row is not an absent one: defer rather than run the hook again.
         let staged = match self.node.store().hook_outcome(&invocation) {
@@ -99,29 +100,15 @@ impl SellerNodeRunner {
                     HOOK_ANSWER_MAX_BYTES,
                     job_id,
                     1,
-                    false,
+                    session_job,
                     &offer.task,
                     offer.output.as_deref(),
                     inputs.as_deref(),
                     deadline.saturating_sub(hook::PUBLISH_MARGIN_SECS),
                 );
                 let cutoff = hook::job_cutoff(deadline, now, std::time::Instant::now());
-                let (argv_owned, dir) = (argv.to_vec(), workdir.clone());
-                let (store, inv) = (self.node.store().clone(), invocation.clone());
                 opline!("seller node hook job_id={job_id}: running {label} (attempt {attempt})");
-                let report = match tokio::task::spawn_blocking(move || {
-                    // The group is journaled before the gate releases the hook, and forgotten once
-                    // the runner has killed and reaped it (§5.1).
-                    let report = hook::run_gated(&argv_owned, &event, &dir, cutoff, &mut |started| {
-                        store
-                            .record_hook_group(&inv, started.pgid, started.start.as_deref(), now_unix())
-                            .map_err(|e| e.to_string())
-                    });
-                    let _ = store.clear_hook_group(&inv);
-                    report
-                })
-                .await
-                {
+                let report = match self.run_hook_call(job_id, argv, event, &workdir, cutoff, &invocation).await {
                     Ok(report) => report,
                     Err(error) => {
                         opline!("seller node hook job_id={job_id}: runner task failed ({error})");
@@ -131,15 +118,11 @@ impl SellerNodeRunner {
                         return;
                     }
                 };
-                if !report.stderr_tail.trim().is_empty() {
-                    opline!(
-                        "seller node hook job_id={job_id} stderr tail: {}",
-                        report.stderr_tail.trim().replace('\n', " | ")
-                    );
-                }
                 let wall_ms = u64::try_from(report.wall.as_millis()).unwrap_or(u64::MAX);
                 match hook::classify_job(&report, HOOK_ANSWER_MAX_BYTES) {
-                    JobOutcome::Answer(answer) if answer.status == hook::HookStatus::Done => {
+                    // A session claim delivers `needs_input` / `out_of_time` as the result's
+                    // `turn_status` (§5.1); a single-turn job delivers `done` only.
+                    JobOutcome::Answer(answer) if answer.status == hook::HookStatus::Done || session_job => {
                         let row = crate::seller_node::store::HookOutcomeRow {
                             invocation: invocation.clone(),
                             job_id: job_id.to_owned(),
@@ -209,18 +192,12 @@ impl SellerNodeRunner {
                 }
             }
         };
-        debug_assert_eq!(status, "done");
         let model = match kind {
             crate::seller_agents::AgentKind::Hook { model, .. } => model.as_deref(),
             _ => None,
         };
-        let metadata = hook_exec_metadata(label, model, wall_ms);
-        let seller_pubkey = self.seller_pubkey.to_hex();
-        self.deliver_inline(job_id, offer, &seller_pubkey, stored_creq, &answer, &metadata)
+        self.deliver_hook_answer(job_id, offer, stored_creq, label, model, &status, &answer, wall_ms, session_job)
             .await;
-        // Delivered, or failed by `deliver_inline`: terminal, so the staged answer goes. A failure arm
-        // that leaves the job live (it can still be re-delivered) keeps it (§7.1).
-        self.finish_hook_job(job_id, &workdir);
     }
 
     /// Re-deliver a staged hook answer (§7.1) without consulting the live roster: the claim's pin
@@ -252,11 +229,130 @@ impl SellerNodeRunner {
                 _ => None,
             });
         opline!("seller node hook job_id={job_id}: re-delivering the staged outcome (hook not re-run)");
-        let metadata = hook_exec_metadata(&label, model.as_deref(), row.wall_time_ms);
+        let session_job = self.hook_session_job(job_id);
+        self.deliver_hook_answer(
+            job_id,
+            offer,
+            stored_creq,
+            &label,
+            model.as_deref(),
+            &row.status,
+            &row.answer,
+            row.wall_time_ms,
+            session_job,
+        )
+        .await;
+    }
+
+    /// Whether this hook job is turn 1 of a session (hook-agents §4, §8.1): this seat's claim carried
+    /// `["session","1"]` and sessions are still on. A claim that cannot be read is no session.
+    fn hook_session_job(&self, job_id: &str) -> bool {
+        self.node.home().config.sessions.enabled()
+            && self.node.store().claim_advertised_session(job_id).unwrap_or(false)
+    }
+
+    /// Deliver a hook's (staged) answer for turn 1 (§7 step 8–9). On a session claim the session row
+    /// (`kind = hook`) is written in the delivery's own transaction and the job's hook state stays
+    /// for the next turn; otherwise, or when nothing was delivered, the job's hook state goes.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_hook_answer(
+        &self,
+        job_id: &str,
+        offer: &crate::seller_node::store::Offer,
+        stored_creq: &str,
+        label: &str,
+        model: Option<&str>,
+        status: &str,
+        answer: &str,
+        wall_ms: u64,
+        session_job: bool,
+    ) {
+        let workdir = job_workdir(self.node.home(), job_id);
+        let turn_status = crate::session::TurnStatus::parse(status);
+        // A staged non-`done` status exists only for a session claim; sessions switched off since
+        // leave nothing to ask the question in (§5.0 rule 3).
+        if !session_job && turn_status != Some(crate::session::TurnStatus::Done) {
+            opline!("seller node hook job_id={job_id}: status {status} without a session; nothing delivered");
+            self.hook_refused(job_id, &offer.buyer_pubkey, &workdir).await;
+            return;
+        }
+        let metadata = hook_exec_metadata(label, model, wall_ms);
         let seller_pubkey = self.seller_pubkey.to_hex();
-        self.deliver_inline(job_id, offer, &seller_pubkey, stored_creq, &row.answer, &metadata)
+        let record = session_job.then(|| crate::seller_node::store::SessionRecord {
+            job_id: job_id.to_owned(),
+            buyer_pubkey: offer.buyer_pubkey.clone(),
+            container: String::new(),
+            holder: None,
+            holder_started_at: None,
+            image_id: String::new(),
+            orchestrator_version: String::new(),
+            acp_session_id: None,
+            harness: label.to_owned(),
+            model: model.map(str::to_owned),
+            turn: 1,
+            last_turn_at: u64::try_from(now_unix()).unwrap_or(0),
+            disk_bytes: 0,
+            state: crate::session::SessionState::Parked,
+            proxy_host: None,
+            base_oid: None,
+            holder_egress_dev: None,
+            holder_classifier: None,
+            holder_proxy_ports: None,
+            kind: crate::session::SessionKind::Hook,
+        });
+        let delivered = self
+            .deliver_inline_with(
+                job_id,
+                offer,
+                &seller_pubkey,
+                stored_creq,
+                answer,
+                &metadata,
+                turn_status.filter(|_| session_job),
+                record.as_ref(),
+            )
             .await;
+        if delivered && session_job {
+            opline!("seller node session job_id={job_id}: hook session parked after turn 1 ({label})");
+            return;
+        }
+        // Delivered single-turn, or failed by `deliver_inline_with`: terminal, so the staged answer
+        // goes. A failure arm that leaves the job live (it can still be re-delivered) keeps it (§7.1).
         self.finish_hook_job(job_id, &workdir);
+    }
+
+    /// One gated `job` call of a hook on a blocking task (§5.1): the group is journaled before the
+    /// gate releases the hook, and forgotten once the runner has killed and reaped it. The stderr tail
+    /// goes to the seller log.
+    pub(super) async fn run_hook_call(
+        &self,
+        job_id: &str,
+        argv: &[String],
+        event: Vec<u8>,
+        workdir: &std::path::Path,
+        cutoff: std::time::Instant,
+        invocation: &str,
+    ) -> Result<hook::RunReport, String> {
+        let (argv_owned, dir) = (argv.to_vec(), workdir.to_path_buf());
+        let (store, inv) = (self.node.store().clone(), invocation.to_owned());
+        let report = tokio::task::spawn_blocking(move || {
+            let report = hook::run_gated(&argv_owned, &event, &dir, cutoff, &mut |started| {
+                store
+                    .record_hook_group(&inv, started.pgid, started.start.as_deref(), now_unix())
+                    .map_err(|e| e.to_string())
+            });
+            let _ = store.clear_hook_group(&inv);
+            report
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        if !report.stderr_tail.trim().is_empty() {
+            opline!(
+                "seller node hook job_id={job_id} stderr tail: {}",
+                report.stderr_tail.trim().replace('\n', " | ")
+            );
+        }
+        Ok(report)
     }
 
     /// `delivery_failed`, no strike: the hook answered honestly but nothing deliverable came of it.
@@ -275,7 +371,7 @@ impl SellerNodeRunner {
 
     /// Create the per-job directory (0700) and, for a private job with input files, re-materialize
     /// the pinned, pre-claim-verified baseline into `<dir>/inputs` (§6). Returns the inputs path.
-    fn prepare_hook_dir(
+    pub(super) fn prepare_hook_dir(
         &self,
         job_id: &str,
         workdir: &std::path::Path,
@@ -368,6 +464,13 @@ pub(super) fn clear_terminal_hook_state(
     }
     if !matches!(store.job_state(job_id), Ok(Some(JobState::Delivered | JobState::Paid | JobState::Failed))) {
         return false;
+    }
+    // A delivered turn 1 of a live hook session keeps its directory and staged outcomes for the next
+    // turn; the session's end clears them (§8.3). An unreadable session row keeps them too.
+    match store.session(job_id) {
+        Ok(Some(session)) if session.state.is_live() => return false,
+        Err(_) => return false,
+        _ => {}
     }
     match std::fs::remove_dir_all(job_workdir(home, job_id)) {
         Ok(()) => {}

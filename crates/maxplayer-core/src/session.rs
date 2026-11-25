@@ -444,6 +444,32 @@ impl SessionState {
     }
 }
 
+/// What a session's turns run on (docs/specs/hook-agents.md §8.1): a parked container, or a hook
+/// entry called once per turn. Stored in `sessions.kind`; rows written before the column read as
+/// [`SessionKind::Container`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionKind {
+    #[default]
+    Container,
+    Hook,
+}
+impl SessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::Hook => "hook",
+        }
+    }
+    /// `NULL` (a row from before the column) and any unknown value read as a container session:
+    /// the only kind that existed before hooks.
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("hook") => Self::Hook,
+            _ => Self::Container,
+        }
+    }
+}
+
 /// What `docker inspect` of the netns holder said at resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HolderObservation {

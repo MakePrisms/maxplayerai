@@ -2586,6 +2586,8 @@ fn review_blocked_line(job_id: &str, error: &str) -> String {
 /// #1057 review round 1: how often the drain tick may sweep review state of gone offers. The sweep
 /// reads the store; tickets of offers missing from a reconsider pass are dropped by the pass itself.
 const REVIEW_STATE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// How often parked hook sessions are checked against their lifetime (hook-agents §8.3).
+const HOOK_SESSION_TICK: Duration = Duration::from_secs(60);
 
 /// Reconstruct only requests we actually retained. Legacy rows are unknown, not unconstrained.
 fn capacity_retry_offer(row: &super::store::Offer, seller_pubkey: &str) -> Option<ParsedOffer> {
@@ -6515,6 +6517,12 @@ impl SellerNodeRunner {
         let sweep_enabled = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref())
             .map(|sandbox| sandbox.sandbox_network().is_some())
             .unwrap_or(false);
+        // hook-agents §8.3: hook sessions expire on their own tick whenever sessions are on — the
+        // container sweep above runs only on a seat with a sandbox network, and a hook-only seat has
+        // none. Each pass is a store read plus the ends it finds; no docker.
+        let hook_sessions_enabled = self.node.home().config.sessions.enabled();
+        let mut hook_session_tick = tokio::time::interval(HOOK_SESSION_TICK);
+        hook_session_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let wrap_backfill_interval_secs = self.wrap_backfill_interval_secs;
         let mut wrap_backfill_tick =
             tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
@@ -6678,6 +6686,11 @@ impl SellerNodeRunner {
                 // the previous pass still runs is dropped rather than queued.
                 _ = sweep_tick.tick(), if sweep_enabled => {
                     Self::spawn_expiry_sweep(sweep_seat.clone(), sweep_sessions.clone(), &sweep_in_flight);
+                    continue;
+                }
+                _ = hook_session_tick.tick(), if hook_sessions_enabled => {
+                    let runner = Arc::clone(&self);
+                    tokio::task::spawn_local(async move { runner.expire_hook_sessions().await });
                     continue;
                 }
                 // Housekeeping runs on the lane; the loop only asks for it, and reports a lane that
@@ -8843,8 +8856,16 @@ impl SellerNodeRunner {
         // `[sessions] enabled` AND this is a docker seat on the container-delivery path. With the
         // flag off `advertise_on_claim` is a no-op, so the claim bytes are today's.
         let mut claim = claim;
-        // A hook entry advertises no session in this build (hook sessions are the next stage).
-        if !selected_entry.kind.is_hook() {
+        // hook-agents §4: a selected HOOK entry advertises sessions iff `[sessions] enabled`. The
+        // docker/runsc conditions are about parking containers; a hook session parks nothing.
+        if selected_entry.kind.is_hook() {
+            crate::session::advertise_on_claim(
+                &mut claim,
+                &self.node.home().config.sessions,
+                true,
+                &crate::session::RunscOverlayGate::NotApplicable,
+            );
+        } else {
             let config = &self.node.home().config;
             let docker_container_seat = config.sandbox.as_ref().is_some_and(|sandbox| {
                 sandbox.mode == crate::home::SandboxMode::Docker
@@ -11350,6 +11371,26 @@ impl SellerNodeRunner {
         answer: &str,
         exec_metadata: &[gateway::TagSpec],
     ) {
+        self.deliver_inline_with(job_id, offer, seller_pubkey, stored_creq, answer, exec_metadata, None, None)
+            .await;
+    }
+
+    /// [`Self::deliver_inline`] for a hook job (hook-agents §7 step 8, §8.1): `turn_status` is
+    /// appended to the result when it is not `done` (a session claim only), and `session` is written
+    /// in the delivery's own transaction. `true` once the delivery is journaled (now or by an earlier
+    /// call); `false` when it was not, which the shared path has already reported where it reports it.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn deliver_inline_with(
+        &self,
+        job_id: &str,
+        offer: &super::store::Offer,
+        seller_pubkey: &str,
+        stored_creq: &str,
+        answer: &str,
+        exec_metadata: &[gateway::TagSpec],
+        turn_status: Option<crate::session::TurnStatus>,
+        session: Option<&super::store::SessionRecord>,
+    ) -> bool {
         // REFUSED, never cut. Truncating here would publish half a sentence, co-sign it, and ask
         // the buyer to pay the full price for it — the buyer cannot tell a cut answer from a
         // complete one, because the digest is of whatever the seller sent. So an over-long answer
@@ -11369,7 +11410,7 @@ impl SellerNodeRunner {
                 None,
             )
             .await;
-            return;
+            return false;
         }
         let mut preimage = delivery_receipt_preimage(
             job_id,
@@ -11388,7 +11429,7 @@ impl SellerNodeRunner {
         if let Err(e) = super::privacy::bind_receipt(self.node.home(), &self.seller_pubkey.to_hex(), job_id, &mut preimage, Some(answer)) {
             opline!("seller private receipt preparation refused job_id={job_id}: {e}");
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
-            return;
+            return false;
         }
         let seller_sig = match self
             .node
@@ -11409,7 +11450,7 @@ impl SellerNodeRunner {
                     None,
                 )
                 .await;
-                return;
+                return false;
             }
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
@@ -11421,10 +11462,10 @@ impl SellerNodeRunner {
                     None,
                 )
                 .await;
-                return;
+                return false;
             }
         };
-        let draft = gateway::inline_result_draft(
+        let mut draft = gateway::inline_result_draft(
             job_id,
             &offer.buyer_pubkey,
             result_output(offer),
@@ -11434,15 +11475,19 @@ impl SellerNodeRunner {
             answer,
             exec_metadata,
         );
+        // Session jobs (§2.3): turn 1 carries `turn_status` only when it is not `done`.
+        if let Some(status) = turn_status {
+            crate::session::append_result_tags(&mut draft, None, status, false, None);
+        }
         let now = now_unix();
         // `result_ref` records WHAT was delivered. For git that is the commit; here it is the
         // answer digest the co-signature binds, so the journal names the same artifact the buyer
         // will verify.
         let draft = match super::privacy::project(self.node.home(), &self.seller_pubkey.to_hex(), job_id, draft, None) {
             Ok(draft) => draft,
-            Err(e) => { opline!("seller private result preparation refused job_id={job_id}: {e}"); return; }
+            Err(e) => { opline!("seller private result preparation refused job_id={job_id}: {e}"); return false; }
         };
-        match self.node.store().deliver_and_enqueue(
+        match self.node.store().deliver_and_enqueue_with_session(
             job_id,
             &preimage.delivery_integrity_hash,
             offer.payment_mode,
@@ -11450,6 +11495,7 @@ impl SellerNodeRunner {
             now,
             now + RESULT_PUBLISH_WINDOW_SECS,
             now,
+            session,
         ) {
             Ok(true) => opline!(
                 "seller node delivered job_id={job_id} inline bytes={} result enqueued",
@@ -11470,11 +11516,12 @@ impl SellerNodeRunner {
                     None,
                 )
                 .await;
-                return;
+                return false;
             }
         }
         self.publish_now(&format!("result:{job_id}")).await;
         self.drain(DrainMode::Routine, true).await;
+        true
     }
 
     /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
@@ -19158,6 +19205,398 @@ mod tests {
         event.tags.iter().map(|t| t.as_slice()).find(|t| t.first().map(String::as_str) == Some(name)).and_then(|t| t.get(index).cloned())
     }
 
+    // ── hook sessions (docs/specs/hook-agents.md §4, §8; PR 2) ───────────────────────────────────
+    //
+    // A hook entry whose claim advertised `["session","1"]`: turn 1 is delivered with its session row
+    // in one transaction, turn n runs the same hook with `turn = n` and the follow-up text, and the
+    // session's end sends `close` without any docker call or held slot. The hook script appends every
+    // event it is sent to <root>/events (one JSON line each).
+
+    /// Boot a 1-slot hook-only seller whose hook answers turn 1 with `turn1_status` and turn n ≥ 2
+    /// with "second", and sleeps `close_sleep` seconds on `close`.
+    async fn boot_hook_session_seller(
+        label: &str,
+        relay_url: &str,
+        turn1_status: &str,
+        close_sleep: u32,
+    ) -> (SellerNodeRunner, std::path::PathBuf) {
+        boot_hook_session_seller_with(label, relay_url, turn1_status, close_sleep, true, false).await
+    }
+
+    /// `review`: leave the seller's offer/follow-up review ON. The fixture relay has no reviewer, so
+    /// every review refuses (fail closed).
+    async fn boot_hook_session_seller_with(
+        label: &str,
+        relay_url: &str,
+        turn1_status: &str,
+        close_sleep: u32,
+        sessions: bool,
+        review: bool,
+    ) -> (SellerNodeRunner, std::path::PathBuf) {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay_url.to_string();
+        let mut seller = seller_cfg(1, false);
+        seller.claim_award_timeout_secs = Some(0);
+        seller.offer_backfill_secs = 0;
+        seller.agents = vec!["my-hook".to_owned()];
+        home.config.seller = Some(seller);
+        // No reviewer on the fixture relay: offer and follow-up review are switched off.
+        home.config.review.seller_offer = review;
+        home.config.sessions.enabled = Some(sessions);
+        let events = root.join("events");
+        let script = format!(
+            r#"line=$(cat); printf '%s\n' "$line" >> '{events}'
+case "$line" in
+  *'"event":"close"'*) sleep {close_sleep}; exit 0;;
+  *'"event":"ping"'*) exit 0;;
+  *'"turn":1'*) printf '%s' '{{"status":"{turn1_status}","answer":"first"}}';;
+  *) printf '%s' '{{"status":"done","answer":"second"}}';;
+esac"#,
+            events = events.display()
+        );
+        let mut preset = crate::home::AgentPresetConfig::hook(vec!["sh".into(), "-c".into(), script]);
+        preset.model = Some("my-model".into());
+        home.config.agents.insert("my-hook".to_owned(), preset);
+        let runner = SellerNodeRunner::boot(home).await.expect("boot the hook session seller");
+        (runner, root)
+    }
+
+    /// Every event the hook was sent, parsed, in order (ping events excluded).
+    fn hook_events(root: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(root.join("events"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] != "ping")
+            .collect()
+    }
+
+    /// An awarded FREE inline job whose claim advertised a session, pinned to the hook.
+    fn seed_awarded_hook_session_job(runner: &SellerNodeRunner, job_id: &str, buyer_hex: &str) {
+        let now = now_unix();
+        let store = runner.node.store();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    accepts_delivery: vec![gateway::DELIVERY_MODE_INLINE.to_owned()],
+                    payment_mode: crate::gateway::PaymentMode::None,
+                    offer_id: job_id.to_owned(),
+                    buyer_pubkey: buyer_hex.to_owned(),
+                    amount_sats: 0,
+                    unit: "sat".to_owned(),
+                    task: "answer me".to_owned(),
+                    deadline_unix: now + 3_600,
+                    targeted: true,
+                    capability_request: Some(Default::default()),
+                    requested_agent: None,
+                    output: Some("text/plain".to_owned()),
+                },
+                now,
+            )
+            .expect("record offer");
+        let mut draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), crate::gateway::ClaimPayment::None, &[], &Default::default());
+        crate::session::advertise_on_claim(
+            &mut draft,
+            &runner.node.home().config.sessions,
+            true,
+            &crate::session::RunscOverlayGate::NotApplicable,
+        );
+        assert!(crate::session::claim_supports_sessions(&draft.tags), "premise: the claim advertises a session");
+        store
+            .claim_and_enqueue_pinned(job_id, job_id, None, &draft, now, now + 3_600, now, Some(&hook_pin(runner)))
+            .expect("claim");
+        store.record_award(&Keys::generate().public_key().to_hex(), job_id, buyer_hex, now).expect("award");
+    }
+
+    /// Journal follow-up `fid` as turn `turn` with `text`, as `on_followup` does after admission.
+    fn record_hook_followup(runner: &SellerNodeRunner, fid: &str, job_id: &str, turn: u32, text: &str) {
+        let store = runner.node.store();
+        store
+            .record_turn(fid, job_id, turn, now_secs_for_test() + 3_600, crate::session::TurnState::Received, now_secs_for_test())
+            .expect("record turn");
+        store.set_turn_text(fid, text).expect("turn text");
+    }
+
+    fn now_secs_for_test() -> u64 {
+        u64::try_from(now_unix()).expect("clock")
+    }
+
+    async fn wait_for(mut done: impl FnMut() -> bool, what: &str) {
+        for _ in 0..100 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_session_parks_after_turn_one_and_turn_two_runs_the_hook() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) = boot_hook_session_seller("hook-session-e2e", &relay_url, "done", 0).await;
+        let runner = Arc::new(runner);
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "6".repeat(64);
+        seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
+
+        runner.execute_job(&job_id, None, false).await;
+
+        let store = runner.node.store();
+        let session = store.session(&job_id).expect("read").expect("turn 1 left a session row");
+        assert_eq!(session.kind, crate::session::SessionKind::Hook);
+        assert_eq!(session.state, crate::session::SessionState::Parked);
+        assert_eq!((session.turn, session.harness.as_str(), session.container.as_str()), (1, "my-hook", ""));
+        assert!(store.has_delivery(&job_id).expect("delivery"), "turn 1 was delivered");
+        assert!(!store.hook_job_ids().expect("ids").is_empty(), "a live session keeps the job's hook state");
+        let turn1 = &hook_events(&root)[0];
+        assert_eq!((turn1["turn"].as_u64(), turn1["session"].as_bool()), (Some(1), Some(true)), "turn 1 is told it is a session");
+
+        let fid = "f".repeat(64);
+        record_hook_followup(&runner, &fid, &job_id, 2, "and now the follow-up");
+        tokio::task::LocalSet::new().run_until(runner.run_turn(&fid)).await;
+
+        let turn = store.turn(&fid).expect("read").expect("turn row");
+        assert_eq!(turn.state, crate::session::TurnState::Delivered, "turn 2 was delivered");
+        let events = hook_events(&root);
+        assert_eq!(events.len(), 2, "one call per turn: {events:?}");
+        let turn2 = &events[1];
+        assert_eq!(turn2["turn"].as_u64(), Some(2));
+        assert_eq!(turn2["invocation"].as_str(), Some(fid.as_str()), "turn n's invocation is its follow-up id");
+        assert_eq!(turn2["prompt"].as_str(), Some("and now the follow-up"), "the follow-up text, verbatim");
+        assert_eq!(turn2["session"].as_bool(), Some(true));
+        let session = store.session(&job_id).expect("read").expect("row");
+        assert_eq!((session.turn, session.state), (2, crate::session::SessionState::Parked));
+
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        let turn2_result = results
+            .iter()
+            .find(|r| r.tags.iter().any(|t| t.as_slice() == ["e", fid.as_str(), "", "reply"]))
+            .expect("turn 2's result answers the follow-up");
+        assert_eq!(turn2_result.content, "second");
+        assert_eq!(tag_value(turn2_result, "usage_transport", 1).as_deref(), Some("hook"));
+        assert_eq!(tag_value(turn2_result, "harness", 1).as_deref(), Some("my-hook"));
+
+        // A re-drive of the delivered turn neither runs the hook nor publishes again.
+        tokio::task::LocalSet::new().run_until(runner.run_turn(&fid)).await;
+        assert_eq!(hook_events(&root).len(), 2);
+
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn needs_input_on_a_hook_session_turn_one_is_delivered_as_its_turn_status() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) = boot_hook_session_seller("hook-session-needs-input", &relay_url, "needs_input", 0).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "9".repeat(64);
+        seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
+
+        runner.execute_job(&job_id, None, false).await;
+
+        let observer = connect_observer(&relay_url).await;
+        let results = fetch_results(&observer, &job_id).await;
+        assert_eq!(results.len(), 1, "needs_input on a session claim is delivered");
+        assert_eq!(results[0].content, "first");
+        assert_eq!(tag_value(&results[0], "turn_status", 1).as_deref(), Some("needs_input"));
+        assert_eq!(
+            runner.node.store().session(&job_id).expect("read").map(|s| s.state),
+            Some(crate::session::SessionState::Parked),
+            "and the session waits for the buyer's answer"
+        );
+        observer.disconnect().await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_a_hook_session_sends_close_after_its_state_is_gone_and_holds_no_slot() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        // The hook sleeps 20 s on `close`: the end must not wait for it.
+        let (runner, root) = boot_hook_session_seller("hook-session-close", &relay_url, "done", 20).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "a".repeat(64);
+        seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
+        runner.execute_job(&job_id, None, false).await;
+        let workdir = job_workdir(runner.node.home(), &job_id);
+        assert!(workdir.exists(), "premise: the live session kept its directory");
+        let record = runner.node.store().session(&job_id).expect("read").expect("row");
+
+        let started = std::time::Instant::now();
+        runner.close_session(record).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "a hanging close never holds the caller");
+        assert_eq!(runner.slots.available(), 1, "nor a slot");
+
+        let store = runner.node.store();
+        assert_eq!(
+            store.session(&job_id).expect("read").map(|s| s.state),
+            Some(crate::session::SessionState::Closed)
+        );
+        assert!(!workdir.exists(), "the job directory went with the session");
+        assert!(store.hook_job_ids().expect("ids").is_empty(), "and so did the staged outcomes and run records");
+        wait_for(|| hook_events(&root).iter().any(|e| e["event"] == "close"), "the close event").await;
+        let close = hook_events(&root).into_iter().find(|e| e["event"] == "close").expect("close");
+        assert_eq!(close["job_id"].as_str(), Some(job_id.as_str()));
+
+        // A second ender (the lifetime tick racing the close) changes nothing and sends no second close.
+        let again = store.session(&job_id).expect("read").expect("row");
+        runner.close_session(again).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(hook_events(&root).iter().filter(|e| e["event"] == "close").count(), 1);
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_hook_session_expires_on_the_hook_tick_without_a_sandbox() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) = boot_hook_session_seller("hook-session-expire", &relay_url, "done", 0).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "b".repeat(64);
+        seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
+        runner.execute_job(&job_id, None, false).await;
+        assert!(runner.node.home().config.sandbox.is_none(), "premise: a hook-only seat, no sandbox network");
+
+        runner.expire_hook_sessions().await;
+        assert_eq!(
+            runner.node.store().session(&job_id).expect("read").map(|s| s.state),
+            Some(crate::session::SessionState::Parked),
+            "inside its lifetime the session stays"
+        );
+        runner.node.store().exec_sql_for_test("UPDATE sessions SET last_turn_at = 0");
+        runner.expire_hook_sessions().await;
+        assert_eq!(
+            runner.node.store().session(&job_id).expect("read").map(|s| s.state),
+            Some(crate::session::SessionState::Expired)
+        );
+        assert!(!job_workdir(runner.node.home(), &job_id).exists());
+        wait_for(|| hook_events(&root).iter().any(|e| e["event"] == "close"), "the close event").await;
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// §8.2 step 1: a follow-up whose review does not pass never reaches the hook. Turn 1 is seeded
+    /// as delivered (the offer review would refuse it on this reviewer-less relay too).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_turn_whose_review_refuses_runs_nothing() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_hook_session_seller_with("hook-session-review", &relay_url, "done", 0, true, true).await;
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        let job_id = "d".repeat(64);
+        seed_awarded_hook_session_job(&runner, &job_id, &buyer_hex);
+        let store = runner.node.store();
+        let session = crate::seller_node::store::SessionRecord {
+            job_id: job_id.clone(),
+            buyer_pubkey: buyer_hex.clone(),
+            container: String::new(),
+            holder: None,
+            holder_started_at: None,
+            image_id: String::new(),
+            orchestrator_version: String::new(),
+            acp_session_id: None,
+            harness: "my-hook".into(),
+            model: None,
+            turn: 1,
+            last_turn_at: now_secs_for_test(),
+            disk_bytes: 0,
+            state: crate::session::SessionState::Parked,
+            proxy_host: None,
+            base_oid: None,
+            holder_egress_dev: None,
+            holder_classifier: None,
+            holder_proxy_ports: None,
+            kind: crate::session::SessionKind::Hook,
+        };
+        let draft = gateway::inline_result_draft(&job_id, &buyer_hex, "text/plain", 0, &"h".repeat(64), &"s".repeat(128), "first", &[]);
+        store
+            .deliver_and_enqueue_with_session(&job_id, "ref", crate::gateway::PaymentMode::None, &draft, 1, 2, now_unix(), Some(&session))
+            .expect("seed turn 1");
+        let fid = "e".repeat(64);
+        record_hook_followup(&runner, &fid, &job_id, 2, "please run this");
+
+        tokio::task::LocalSet::new().run_until(runner.run_turn(&fid)).await;
+
+        assert!(hook_events(&root).is_empty(), "the hook never saw the follow-up");
+        assert_eq!(
+            store.turn(&fid).expect("read").map(|t| t.state),
+            Some(crate::session::TurnState::Refused),
+            "refused, unpaid"
+        );
+        assert_eq!(
+            store.session(&job_id).expect("read").map(|s| (s.state, s.turn)),
+            Some((crate::session::SessionState::Parked, 1)),
+            "the session stays parked for the buyer to try again"
+        );
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// §4 through the real claim path: an inline offer claimed by a hook-only seat with no sandbox
+    /// carries `["session","1"]` while sessions are on, and none with them off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_claim_advertises_a_session_iff_sessions_are_enabled() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        for (enabled, label) in [(true, "hook-claim-session-on"), (false, "hook-claim-session-off")] {
+            let (runner, root) = boot_hook_session_seller_with(label, &relay_url, "done", 0, enabled, false).await;
+            assert!(runner.node.home().config.sandbox.is_none(), "premise: no docker, no sandbox");
+            let buyer = Keys::generate();
+            let draft = crate::gateway::OfferDraft::new(
+                &format!("answer me ({label})"),
+                "",
+                100,
+                now_unix() as u64 + 3_600,
+                &runner.seller_pubkey(),
+            )
+            .accepting_delivery([gateway::DELIVERY_MODE_INLINE])
+            .to_event_draft();
+            let offer = crate::gateway::nostr::event_builder(&draft)
+                .expect("offer builder")
+                .sign_with_keys(&buyer)
+                .expect("sign offer");
+            let job_id = offer.id.to_hex();
+            tokio::task::LocalSet::new().run_until(runner.on_offer(&offer)).await;
+            let store = runner.node.store();
+            assert_eq!(store.claim_row_state(&job_id).expect("claim row").as_deref(), Some("claimed"), "premise: the hook claimed it");
+            assert_eq!(
+                store.claim_advertised_session(&job_id).expect("read claim"),
+                enabled,
+                "a hook claim advertises a session iff [sessions] enabled"
+            );
+            runner.client.disconnect().await;
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        relay.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hook_job_runs_once_and_its_exact_answer_is_the_signed_result() {
         use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
@@ -22539,6 +22978,7 @@ mod tests {
                 holder_egress_dev: None,
                 holder_classifier: None,
                 holder_proxy_ports: None,
+                kind: crate::session::SessionKind::Container,
             })
             .expect("park session");
         job_id

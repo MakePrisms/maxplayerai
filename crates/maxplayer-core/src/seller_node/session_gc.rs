@@ -879,6 +879,9 @@ pub fn end_session<D: DockerCli>(
     if record.state == SessionState::Running && state == SessionState::Expired {
         return Ok(vec!["refused: session is running".into()]);
     }
+    if record.kind == crate::session::SessionKind::Hook {
+        return end_hook_session(store, record, paths, state);
+    }
     let mut errors = Vec::new();
     if let Err(error) = cli.run(&force_remove_argv(&record.container)) {
         errors.push(format!("container {}: {error}", record.container));
@@ -894,6 +897,38 @@ pub fn end_session<D: DockerCli>(
     store.set_session_state(&record.job_id, state, now_unix)?;
     Ok(errors)
 }
+
+/// A hook session's end (hook-agents §8.3): no docker call at all. `parked → state` is one
+/// compare-and-set BEFORE anything is removed, so only one ender (buyer close, lifetime tick) runs
+/// the destructive steps; a session that is not parked is left alone and reported. Then the per-job
+/// directory goes and, once it is gone, the staged outcomes and run records (a directory that cannot
+/// be removed keeps them, so the boot reconcile finds it). An invocation whose group is still
+/// journaled keeps everything (§5.1). The caller sends `close` afterwards (§5.3).
+pub fn end_hook_session(
+    store: &SellerStore,
+    record: &SessionRecord,
+    paths: &SessionPaths,
+    state: SessionState,
+) -> Result<Vec<String>, StoreError> {
+    if !store.end_parked_session(&record.job_id, state)? {
+        return Ok(vec![HOOK_SESSION_NOT_PARKED.into()]);
+    }
+    if store.hook_group_journaled(&record.job_id)? {
+        return Ok(vec![
+            "a hook call of this session is still journaled; its directory is kept".into(),
+        ]);
+    }
+    match std::fs::remove_dir_all(&paths.workdir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Ok(vec![format!("job directory: {error}")]),
+    }
+    store.clear_hook_outcomes(&record.job_id)?;
+    Ok(Vec::new())
+}
+
+/// [`end_hook_session`]'s answer when another ender got there first (or a turn is running).
+pub const HOOK_SESSION_NOT_PARKED: &str = "not ended: the hook session is not parked";
 
 /// Configuration a GC pass needs; built by the run loop only when `[sessions] enabled`.
 #[derive(Clone)]
@@ -924,7 +959,14 @@ impl SessionGc {
     /// sessions while the measured total exceeds the disk budget. Never touches a running one.
     pub fn pass<D: DockerCli>(&self, cli: &mut D, now_unix: u64) -> Result<GcReport, StoreError> {
         let mut report = GcReport::default();
-        let sessions = self.store.sessions()?;
+        // Container sessions only: a hook session holds no container and no disk of ours beyond its
+        // bounded input copy, and expires on the runner's own hook-session tick (hook-agents §8.3).
+        let sessions: Vec<SessionRecord> = self
+            .store
+            .sessions()?
+            .into_iter()
+            .filter(|s| s.kind == crate::session::SessionKind::Container)
+            .collect();
         let sizes: Vec<_> = sessions
             .iter()
             .filter(|s| s.state.is_live())
@@ -1017,6 +1059,55 @@ mod tests {
         }
     }
 
+    /// hook-agents §8.3: ending a hook session makes no docker call at all, removes its directory and
+    /// staged outcomes, and only one ender wins; the GC pass never selects a hook session.
+    #[test]
+    fn a_hook_session_ends_without_docker_and_the_gc_pass_skips_it() {
+        let (gc, root) = gc("hook-end");
+        let gc = SessionGc { lifetime_secs: 1, disk_budget_bytes: 0, ..gc };
+        let store = gc.store.clone();
+        let job = "h".repeat(64);
+        let hook = SessionRecord {
+            container: String::new(),
+            holder: None,
+            kind: session::SessionKind::Hook,
+            ..record(&job, 0, 0, SessionState::Parked)
+        };
+        store.put_session(&hook).unwrap();
+        let paths = SessionPaths::for_job(&root, &job);
+        std::fs::create_dir_all(paths.workdir.join("inputs")).unwrap();
+        store
+            .stage_hook_outcome(
+                &crate::seller_node::store::HookOutcomeRow {
+                    invocation: job.clone(),
+                    job_id: job.clone(),
+                    turn: 1,
+                    status: "done".into(),
+                    answer: "a".into(),
+                    wall_time_ms: 1,
+                },
+                1,
+            )
+            .unwrap();
+
+        // Far past any lifetime and over any budget: the container GC still leaves it alone.
+        let mut cli = Recording::new();
+        let report = gc.pass(&mut cli, 1_000_000).unwrap();
+        assert!(report.expired_lifetime.is_empty() && report.evicted_disk.is_empty(), "{report:?}");
+        assert_eq!(store.session(&job).unwrap().unwrap().state, SessionState::Parked);
+
+        let errors = end_session(&mut cli, &store, &hook, &paths, SessionState::Closed, 10).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(cli.calls.is_empty(), "no docker call for a hook session: {:?}", cli.calls);
+        assert!(!paths.workdir.exists());
+        assert!(store.hook_job_ids().unwrap().is_empty());
+        assert_eq!(store.session(&job).unwrap().unwrap().state, SessionState::Closed);
+        let again = end_session(&mut cli, &store, &hook, &paths, SessionState::Expired, 11).unwrap();
+        assert_eq!(again, vec![HOOK_SESSION_NOT_PARKED.to_owned()], "the second ender changes nothing");
+        assert_eq!(store.session(&job).unwrap().unwrap().state, SessionState::Closed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn record(job: &str, at: u64, bytes: u64, state: SessionState) -> SessionRecord {
         SessionRecord {
             job_id: job.into(),
@@ -1038,6 +1129,7 @@ mod tests {
             holder_egress_dev: None,
             holder_classifier: None,
             holder_proxy_ports: None,
+            kind: crate::session::SessionKind::Container,
         }
     }
 
@@ -2116,6 +2208,7 @@ mod tests {
             holder_egress_dev: dev,
             holder_classifier: cls,
             holder_proxy_ports: ports,
+            kind: crate::session::SessionKind::Container,
             ..record("j", 0, 0, SessionState::Parked)
         }
     }
@@ -2167,6 +2260,7 @@ mod tests {
             holder_egress_dev: d,
             holder_classifier: c,
             holder_proxy_ports: p,
+            kind: crate::session::SessionKind::Container,
             ..legacy_session()
         };
         assert_eq!(recorded_installed_egress(&r).unwrap(), Some(none));

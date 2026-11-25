@@ -672,6 +672,8 @@ pub struct SessionRecord {
     pub holder_egress_dev: Option<String>,
     pub holder_classifier: Option<String>,
     pub holder_proxy_ports: Option<String>,
+    /// Container or hook (hook-agents §8.1). A hook session has no container, holder or image.
+    pub kind: crate::session::SessionKind,
 }
 impl SessionRecord {
     pub fn size(&self) -> crate::session::SessionSize {
@@ -699,7 +701,7 @@ pub struct SessionTurnRecord {
 const SESSION_COLUMNS: &str =
     "job_id, buyer_pubkey, container, holder, holder_started_at, image_id,
     orchestrator_version, acp_session_id, harness, model, turn, last_turn_at, disk_bytes, state,
-    proxy_host, base_oid, holder_egress_dev, holder_classifier, holder_proxy_ports";
+    proxy_host, base_oid, holder_egress_dev, holder_classifier, holder_proxy_ports, kind";
 
 fn bad_state(i: usize) -> rusqlite::Error {
     rusqlite::Error::InvalidColumnType(i, "state".into(), rusqlite::types::Type::Text)
@@ -727,6 +729,7 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         holder_egress_dev: r.get(16)?,
         holder_classifier: r.get(17)?,
         holder_proxy_ports: r.get(18)?,
+        kind: crate::session::SessionKind::parse(r.get::<_, Option<String>>(19)?.as_deref()),
     })
 }
 
@@ -2062,6 +2065,33 @@ impl SellerStore {
         expires_at_unix: i64,
         now_unix: i64,
     ) -> Result<bool, StoreError> {
+        self.deliver_and_enqueue_with_session(
+            job_id,
+            result_ref,
+            payment_mode,
+            draft,
+            created_at_unix,
+            expires_at_unix,
+            now_unix,
+            None,
+        )
+    }
+
+    /// [`Self::deliver_and_enqueue`], and with `session` the session row too, in the SAME
+    /// transaction (hook-agents §8.1): a follow-up can never find a delivered turn 1 without its
+    /// session, and a delivery that fails to journal leaves no parked session behind.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deliver_and_enqueue_with_session(
+        &self,
+        job_id: &str,
+        result_ref: &str,
+        payment_mode: crate::gateway::PaymentMode,
+        draft: &EventDraft,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+        now_unix: i64,
+        session: Option<&SessionRecord>,
+    ) -> Result<bool, StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists: bool = tx
@@ -2097,6 +2127,9 @@ impl SellerStore {
             expires_at_unix,
             now_unix,
         )?;
+        if let Some(session) = session {
+            put_session_row(&tx, session)?;
+        }
         tx.commit()?;
         Ok(true)
     }
@@ -2226,12 +2259,30 @@ impl SellerStore {
     /// Insert or replace the session record (written at park, §5.2 step 4).
     pub fn put_session(&self, s: &SessionRecord) -> Result<(), StoreError> {
         let conn = self.lock()?;
+        put_session_row(&conn, s)
+    }
+
+    pub fn session(&self, job_id: &str) -> Result<Option<SessionRecord>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE job_id = ?1"),
+                [job_id],
+                session_row,
+            )
+            .optional()?)
+    }
+}
+
+/// The one `sessions` writer, shared by [`SellerStore::put_session`] and the hook turn-1 delivery
+/// transaction ([`SellerStore::deliver_and_enqueue_with_session`]).
+fn put_session_row(conn: &Connection, s: &SessionRecord) -> Result<(), StoreError> {
         conn.execute(
             "INSERT INTO sessions (job_id, buyer_pubkey, container, holder, holder_started_at,
                  image_id, orchestrator_version, acp_session_id, harness, model, turn,
                  last_turn_at, disk_bytes, state, proxy_host, base_oid, holder_egress_dev,
-                 holder_classifier, holder_proxy_ports)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+                 holder_classifier, holder_proxy_ports, kind)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
              ON CONFLICT(job_id) DO UPDATE SET buyer_pubkey=excluded.buyer_pubkey,
                  container=excluded.container, holder=excluded.holder,
                  holder_started_at=excluded.holder_started_at, image_id=excluded.image_id,
@@ -2242,7 +2293,7 @@ impl SellerStore {
                  proxy_host=excluded.proxy_host, base_oid=excluded.base_oid,
                  holder_egress_dev=excluded.holder_egress_dev,
                  holder_classifier=excluded.holder_classifier,
-                 holder_proxy_ports=excluded.holder_proxy_ports",
+                 holder_proxy_ports=excluded.holder_proxy_ports, kind=excluded.kind",
             params![
                 s.job_id,
                 s.buyer_pubkey,
@@ -2262,22 +2313,14 @@ impl SellerStore {
                 s.base_oid,
                 s.holder_egress_dev,
                 s.holder_classifier,
-                s.holder_proxy_ports
+                s.holder_proxy_ports,
+                s.kind.as_str()
             ],
         )?;
         Ok(())
-    }
+}
 
-    pub fn session(&self, job_id: &str) -> Result<Option<SessionRecord>, StoreError> {
-        let conn = self.lock()?;
-        Ok(conn
-            .query_row(
-                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE job_id = ?1"),
-                [job_id],
-                session_row,
-            )
-            .optional()?)
-    }
+impl SellerStore {
 
     pub fn sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
         let conn = self.lock()?;
@@ -2295,6 +2338,23 @@ impl SellerStore {
             conn.prepare("SELECT job_id FROM sessions WHERE state IN ('running','parked')")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// End a PARKED session (hook-agents §8.3): `parked → state` as one compare-and-set, so of two
+    /// enders (a buyer close and the lifetime tick) exactly one wins and runs the destructive steps.
+    /// `false`: the session was not parked (running, already ended, or absent); nothing changed.
+    pub fn end_parked_session(
+        &self,
+        job_id: &str,
+        state: crate::session::SessionState,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE sessions SET state = ?2
+             WHERE job_id = ?1 AND state = 'parked' AND ?2 IN ('closed','expired')",
+            params![job_id, state.as_str()],
+        )?;
+        Ok(n == 1)
     }
 
     /// Move a session to `state`. A closed or expired session never comes back: returns `false`
@@ -4021,7 +4081,73 @@ mod tests {
             holder_egress_dev: Some("eth0".into()),
             holder_classifier: Some("flower".into()),
             holder_proxy_ports: Some("9320-9325".into()),
+            kind: crate::session::SessionKind::Container,
         }
+    }
+
+    fn hook_session(job: &str) -> SessionRecord {
+        SessionRecord {
+            container: String::new(),
+            holder: None,
+            holder_started_at: None,
+            image_id: String::new(),
+            orchestrator_version: String::new(),
+            acp_session_id: None,
+            harness: "my-hook".into(),
+            proxy_host: None,
+            base_oid: None,
+            holder_egress_dev: None,
+            holder_classifier: None,
+            holder_proxy_ports: None,
+            kind: crate::session::SessionKind::Hook,
+            ..parked(job, 5, 0)
+        }
+    }
+
+    /// hook-agents §8.1: turn 1's delivery, its result draft and the hook session row commit in ONE
+    /// transaction. A session insert that fails takes the delivery and the result with it (nothing
+    /// can be published for a session that does not exist); a successful one reads back as a hook
+    /// session, and a replay writes nothing twice.
+    #[test]
+    fn a_hook_turn_one_delivery_and_its_session_commit_together() {
+        let (store, path) = fresh_store("hook-session-tx");
+        let job = "j".repeat(64);
+        store.claim_and_enqueue(&job, &"o".repeat(64), None, &claim(), 1, 999, 1).expect("claim");
+        store.record_award(&"w".repeat(64), &job, &"b".repeat(64), 2).expect("award");
+        store.exec_sql_for_test(
+            "CREATE TRIGGER fail_session BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        );
+        let failed = store.deliver_and_enqueue_with_session(
+            &job,
+            "ref-1",
+            crate::gateway::PaymentMode::None,
+            &result(),
+            4,
+            999,
+            5,
+            Some(&hook_session(&job)),
+        );
+        assert!(failed.is_err(), "the injected session failure fails the delivery");
+        assert!(!store.has_delivery(&job).expect("read"), "no delivery without its session");
+        assert!(store.outbox_row(&format!("result:{job}")).expect("read").is_none(), "nothing to publish");
+        assert!(store.session(&job).expect("read").is_none());
+
+        store.exec_sql_for_test("DROP TRIGGER fail_session");
+        assert!(store
+            .deliver_and_enqueue_with_session(&job, "ref-1", crate::gateway::PaymentMode::None, &result(), 4, 999, 5, Some(&hook_session(&job)))
+            .expect("deliver"));
+        assert!(store.has_delivery(&job).expect("read"));
+        assert!(store.outbox_row(&format!("result:{job}")).expect("read").is_some());
+        assert_eq!(store.session(&job).expect("read"), Some(hook_session(&job)), "the hook session reads back");
+        assert!(!store
+            .deliver_and_enqueue_with_session(&job, "ref-1", crate::gateway::PaymentMode::None, &result(), 4, 999, 6, Some(&hook_session(&job)))
+            .expect("replay"));
+
+        // Ending: parked → closed once; a second ender changes nothing.
+        assert!(store.end_parked_session(&job, crate::session::SessionState::Closed).expect("end"));
+        assert!(!store.end_parked_session(&job, crate::session::SessionState::Expired).expect("again"));
+        assert_eq!(store.session(&job).expect("read").map(|s| s.state), Some(crate::session::SessionState::Closed));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A sessions table as shipped before the holder's installed containment was recorded gains
@@ -4057,6 +4183,7 @@ mod tests {
             .expect("the old row survives");
         assert_eq!(old.proxy_host.as_deref(), Some("172.18.0.1"));
         assert_eq!(old.state, crate::session::SessionState::Parked);
+        assert_eq!(old.kind, crate::session::SessionKind::Container, "a row from before hooks is a container session");
         assert_eq!(
             (
                 old.holder_egress_dev,

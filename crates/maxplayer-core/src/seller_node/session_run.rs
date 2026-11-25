@@ -166,6 +166,12 @@ fn buyer_sizes(code: ReasonCode, detail: &str) -> Option<&str> {
     (digits(needed) && digits(limit)).then_some(detail)
 }
 
+/// Whether a hook turn can still start (hook-agents §8.3): its answer must be due no earlier than
+/// the publish margin from now, the same cutoff the hook call itself gets.
+fn hook_turn_can_start(now_unix: u64, deadline_unix: u64) -> bool {
+    deadline_unix > now_unix.saturating_add(crate::hook::PUBLISH_MARGIN_SECS)
+}
+
 fn now_secs() -> u64 {
     now_unix().max(0) as u64
 }
@@ -234,6 +240,7 @@ impl SellerNodeRunner {
                 holder_egress_dev: None,
                 holder_classifier: None,
                 holder_proxy_ports: None,
+                kind: crate::session::SessionKind::Container,
             },
             Err(error) => {
                 opline!("seller node follow-up ignore id={fid}: session read failed ({error})");
@@ -448,7 +455,7 @@ impl SellerNodeRunner {
     }
 
     /// `close` from the buyer (§5.5): end now, or at the next park when a turn is running.
-    async fn close_session(&self, record: SessionRecord) {
+    pub(super) async fn close_session(&self, record: SessionRecord) {
         let job_id = record.job_id.clone();
         if record.state == SessionState::Running {
             match self.node.store().request_session_close(&job_id) {
@@ -468,6 +475,7 @@ impl SellerNodeRunner {
         let store = self.node.store().clone();
         let paths = session_gc::SessionPaths::for_job(&self.node.home().root, &record.job_id);
         let job_id = record.job_id.clone();
+        let hook = record.kind == session::SessionKind::Hook;
         let ended = tokio::task::spawn_blocking(move || {
             session_gc::end_session(
                 &mut RealDockerCli,
@@ -479,7 +487,7 @@ impl SellerNodeRunner {
             )
         })
         .await;
-        match ended {
+        match &ended {
             Ok(Ok(errors)) if errors.is_empty() => {
                 opline!(
                     "seller node session job_id={job_id}: ended ({})",
@@ -493,6 +501,13 @@ impl SellerNodeRunner {
             ),
             Ok(Err(error)) => opline!("seller node session job_id={job_id}: end failed ({error})"),
             Err(error) => opline!("seller node session job_id={job_id}: end task failed ({error})"),
+        }
+        // hook-agents §5.3: the session's hook hears `close` once, after its directory is gone,
+        // and only from the ender that won the parked → ended step.
+        if hook
+            && matches!(&ended, Ok(Ok(errors)) if !errors.iter().any(|e| e == session_gc::HOOK_SESSION_NOT_PARKED))
+        {
+            self.send_hook_close(&job_id);
         }
     }
 
@@ -532,7 +547,7 @@ impl SellerNodeRunner {
     /// One follow-up end to end: §8.3 payment gate, slot, §4 start margin, §5.5 holder gate, the
     /// resumed container, then park. A turn that does not deliver is `refused` and unpaid; the
     /// session stays parked and the buyer may send that turn again.
-    async fn run_turn(&self, fid: &str) {
+    pub(super) async fn run_turn(&self, fid: &str) {
         let store = self.node.store();
         let (turn, offer) = loop {
             let turn = match store.turn(fid) {
@@ -602,7 +617,18 @@ impl SellerNodeRunner {
         // §6.2: a follow-up WAITS for a slot; new offers only try.
         let _slot = self.slots.acquire_unreserved().await;
         let wrap_up = self.node.home().config.sessions.wrap_up_secs;
-        if !session::turn_can_start(now_secs(), turn.deadline_unix, wrap_up) {
+        // hook-agents §8.3: a hook turn needs the publish margin only; the container margins are
+        // about starting a container and wrapping it up.
+        let hook_session = matches!(
+            store.session(&job_id),
+            Ok(Some(record)) if record.kind == session::SessionKind::Hook
+        );
+        let can_start = if hook_session {
+            hook_turn_can_start(now_secs(), turn.deadline_unix)
+        } else {
+            session::turn_can_start(now_secs(), turn.deadline_unix, wrap_up)
+        };
+        if !can_start {
             let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
             self.turn_feedback(&job_id, &buyer, fid, ReasonCode::AtCapacity)
                 .await;
@@ -617,6 +643,30 @@ impl SellerNodeRunner {
                 return;
             }
         };
+        // hook-agents §8.2: a hook session has no container, holder or orchestrator to check.
+        if record.kind == session::SessionKind::Hook {
+            let _ = store.set_session_state(&job_id, SessionState::Running, now_secs());
+            let _ = store.set_turn_state(fid, TurnState::Reviewing, None, None, now_secs());
+            let end = self.run_hook_turn(&turn, &offer, &record).await;
+            let _ = store.set_session_state(&job_id, SessionState::Parked, now_secs());
+            if let HookTurnEnd::Refused(code, detail) = end {
+                opline!(
+                    "seller node session job_id={job_id}: turn {} not delivered ({}: {detail})",
+                    turn.turn,
+                    code.as_str()
+                );
+                let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
+                let sizes = buyer_sizes(code, &detail);
+                self.turn_feedback_with(&job_id, &buyer, fid, code, sizes)
+                    .await;
+            }
+            if store.session_close_requested(&job_id).unwrap_or(false)
+                && let Ok(Some(record)) = store.session(&job_id)
+            {
+                self.end_session_now(record, SessionState::Closed).await;
+            }
+            return;
+        }
         // §5.5 holder gate: the container is never started without the firewall it was created
         // into, nor with an orchestrator older than the inputs protocol (failure tests 6, 14).
         let protocol = record.orchestrator_version.parse::<u32>().unwrap_or(0);
@@ -763,6 +813,145 @@ impl SellerNodeRunner {
         ))
     }
 
+    /// The private-lane review request of follow-up `fid` (§9): the signed carriers and encrypted
+    /// bodies of this and the earlier follow-ups plus the earlier deliveries, trimmed to what seals.
+    /// `Ok(None)`: not a private job, or no follow-up review configured. `Err`: too large to review
+    /// even without history (#1349): the turn is refused `turn_too_large` and nothing runs.
+    #[allow(clippy::type_complexity)]
+    fn private_followup_request(
+        &self,
+        job_id: &str,
+        fid: &str,
+        n: u32,
+        buyer: &str,
+        private: bool,
+    ) -> Result<Option<Result<crate::review::private::Request, String>>, (ReasonCode, String)> {
+        let home = self.node.home();
+        let store = self.node.store();
+        let seller_pubkey = self.seller_pubkey.to_hex();
+        Ok(if private
+                && matches!(
+                    self.node.home().config.review.enabled(crate::kinds::SESSION_FOLLOWUP_KIND, buyer),
+                    Ok(true)
+                ) {
+                let turns: Vec<SessionTurnRecord> = store
+                    .turns(job_id)
+                    .map(|turns| {
+                        turns
+                            .into_iter()
+                            .filter(|t| t.turn < n && t.state != TurnState::Refused)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let earlier: Vec<String> = turns.iter().map(|t| t.followup_id.clone()).collect();
+                // Earlier deliveries (§9): turn 1's published RESULT, then each earlier
+                // turn's with the follow-up it answers. The reviewer re-authenticates each
+                // and keeps one line (turn, status, commit); unpublished ones are skipped.
+                let turn_one = store
+                    .outbox_row(&format!("result:{job_id}"))
+                    .ok()
+                    .flatten()
+                    .and_then(|(_, _, id)| id);
+                let deliveries: Vec<(String, Option<String>)> = turn_one
+                    .map(|id| (id, None))
+                    .into_iter()
+                    .chain(turns.iter().filter_map(|t| {
+                        t.result_id
+                            .clone()
+                            .map(|id| (id, Some(t.followup_id.clone())))
+                    }))
+                    .collect();
+                match crate::review::private::followup_request(
+                    home,
+                    &seller_pubkey,
+                    job_id,
+                    &earlier,
+                    fid,
+                    &deliveries,
+                ) {
+                    Err(crate::review::private::FollowUpRequestError::TooLarge { needed, limit }) => {
+                        return Err(too_large(needed, limit));
+                    }
+                    Err(error) => Some(Err(error.to_string())),
+                    Ok(request) => Some(Ok(request)),
+                }
+            } else {
+                None
+            })
+    }
+
+    /// Start the follow-up review of `fid` (§6.1 step 2) on the local set and return where its
+    /// verdict lands: `pass` once it passed (or no review applies), `fail(reason)` otherwise. A
+    /// private follow-up is reviewed only over the encrypted lane; a request that could not be built
+    /// withholds it. Shared by the container turn (overlapped with the start) and the hook turn
+    /// (awaited before anything runs).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn spawn_followup_review<T: 'static>(
+        &self,
+        job_id: &str,
+        fid: &str,
+        buyer: &str,
+        review: crate::review::ReviewConfig,
+        private: bool,
+        private_request: Option<Result<crate::review::private::Request, String>>,
+        pass: T,
+        fail: impl FnOnce(String) -> T + 'static,
+    ) -> tokio::sync::oneshot::Receiver<T> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let home = self.node.home();
+        let buyer = buyer.to_owned();
+        {
+            let (client, relay) = (self.client.clone(), self.relay_url.clone());
+            let subject = crate::review::Subject {
+                offer: job_id.to_owned(),
+                event: fid.to_owned(),
+                kind: crate::kinds::SESSION_FOLLOWUP_KIND,
+                commit: None,
+            };
+            let review_home = home.clone();
+            let review_signer = self.node.signer().clone();
+            tokio::task::spawn_local(async move {
+                let verdict = match review.enabled(subject.kind, &buyer) {
+                    Ok(false) => Ok(None),
+                    // Never the public lane for a private follow-up; a request that cannot be
+                    // built withholds the follow-up (nothing runs, nothing is charged).
+                    Ok(true) if private => match private_request {
+                        Some(Ok(request)) => {
+                            crate::review::private::check(
+                                &review_home,
+                                &client,
+                                crate::review::private::Identity::Seller(&review_signer),
+                                &request,
+                                &buyer,
+                            )
+                            .await
+                        }
+                        Some(Err(error)) => Err(format!(
+                            "private follow-up review request unavailable ({error}); withheld"
+                        )),
+                        None => Err("private follow-up review unavailable; withheld".into()),
+                    },
+                    Ok(true) => {
+                        let transport = crate::review::wire::RelayTransport {
+                            client: &client,
+                            relay: &relay,
+                        };
+                        crate::review::wire::check(
+                            &transport, &review, &relay, &subject, &buyer, false,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = tx.send(match verdict {
+                    Ok(_) => pass,
+                    Err(reason) => fail(reason),
+                });
+            });
+        }
+        rx
+    }
+
     /// The resumed container run and the turn's RESULT (§6.1 steps 2–4, §7, §8.2).
     async fn resume_turn(
         &self,
@@ -811,55 +1000,7 @@ impl SellerNodeRunner {
         // without history is refused with `turn_too_large` and nothing runs (#1349).
         let review = home.config.review.clone();
         let buyer = offer.buyer_pubkey.clone();
-        let private_request = if private
-            && matches!(
-                review.enabled(crate::kinds::SESSION_FOLLOWUP_KIND, &buyer),
-                Ok(true)
-            ) {
-            let turns: Vec<SessionTurnRecord> = store
-                .turns(job_id)
-                .map(|turns| {
-                    turns
-                        .into_iter()
-                        .filter(|t| t.turn < n && t.state != TurnState::Refused)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let earlier: Vec<String> = turns.iter().map(|t| t.followup_id.clone()).collect();
-            // Earlier deliveries (§9): turn 1's published RESULT, then each earlier
-            // turn's with the follow-up it answers. The reviewer re-authenticates each
-            // and keeps one line (turn, status, commit); unpublished ones are skipped.
-            let turn_one = store
-                .outbox_row(&format!("result:{job_id}"))
-                .ok()
-                .flatten()
-                .and_then(|(_, _, id)| id);
-            let deliveries: Vec<(String, Option<String>)> = turn_one
-                .map(|id| (id, None))
-                .into_iter()
-                .chain(turns.iter().filter_map(|t| {
-                    t.result_id
-                        .clone()
-                        .map(|id| (id, Some(t.followup_id.clone())))
-                }))
-                .collect();
-            match crate::review::private::followup_request(
-                home,
-                &seller_pubkey,
-                job_id,
-                &earlier,
-                fid,
-                &deliveries,
-            ) {
-                Err(crate::review::private::FollowUpRequestError::TooLarge { needed, limit }) => {
-                    return Err(too_large(needed, limit));
-                }
-                Err(error) => Some(Err(error.to_string())),
-                Ok(request) => Some(Ok(request)),
-            }
-        } else {
-            None
-        };
+        let private_request = self.private_followup_request(job_id, fid, n, &buyer, private)?;
         let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref()).map_err(setup)?;
         let delivery_policy = sandbox
             .container_delivery()
@@ -982,7 +1123,6 @@ impl SellerNodeRunner {
             .map_err(setup)?;
 
         // §6.1 step 2: the review runs while the container starts and loads the conversation.
-        let (tx, rx) = tokio::sync::oneshot::channel();
         let (prompt, reset_prompt) = turn_prompts(
             &text,
             &session::reset_history(&offer.task, &texts),
@@ -993,55 +1133,16 @@ impl SellerNodeRunner {
             prompt,
             reset_prompt,
         };
-        {
-            let (client, relay) = (self.client.clone(), self.relay_url.clone());
-            let subject = crate::review::Subject {
-                offer: job_id.to_owned(),
-                event: fid.to_owned(),
-                kind: crate::kinds::SESSION_FOLLOWUP_KIND,
-                commit: None,
-            };
-            let review_home = home.clone();
-            let review_signer = self.node.signer().clone();
-            tokio::task::spawn_local(async move {
-                let verdict = match review.enabled(subject.kind, &buyer) {
-                    Ok(false) => Ok(None),
-                    // Never the public lane for a private follow-up; a request that cannot be
-                    // built withholds the follow-up (nothing runs, nothing is charged).
-                    Ok(true) if private => match private_request {
-                        Some(Ok(request)) => {
-                            crate::review::private::check(
-                                &review_home,
-                                &client,
-                                crate::review::private::Identity::Seller(&review_signer),
-                                &request,
-                                &buyer,
-                            )
-                            .await
-                        }
-                        Some(Err(error)) => Err(format!(
-                            "private follow-up review request unavailable ({error}); withheld"
-                        )),
-                        None => Err("private follow-up review unavailable; withheld".into()),
-                    },
-                    Ok(true) => {
-                        let transport = crate::review::wire::RelayTransport {
-                            client: &client,
-                            relay: &relay,
-                        };
-                        crate::review::wire::check(
-                            &transport, &review, &relay, &subject, &buyer, false,
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error),
-                };
-                let _ = tx.send(match verdict {
-                    Ok(_) => Release::Prompt(prompt),
-                    Err(reason) => Release::Abort(reason),
-                });
-            });
-        }
+        let rx = self.spawn_followup_review(
+            job_id,
+            fid,
+            &buyer,
+            review,
+            private,
+            private_request,
+            Release::Prompt(prompt),
+            Release::Abort,
+        );
         let mut gate = ReleaseGate::new(rx);
         let _ = store.set_turn_state(fid, TurnState::Running, None, None, now_secs());
         let argv = crate::seller_exec::docker_start_argv(&record.container);
@@ -1180,6 +1281,7 @@ impl SellerNodeRunner {
             status,
             context_reset,
             delivery,
+            exec_metadata: None,
         })
         .await?;
         if let Err(error) =
@@ -1276,8 +1378,10 @@ impl SellerNodeRunner {
             }
             Err(error) => return Err(delivery_failed(format!("signer actor gone ({error})"))),
         };
-        let exec_metadata =
-            seller_exec_metadata(r.agent_command, r.agent_label, wall_time_ms, usage.as_ref());
+        let exec_metadata = match &r.exec_metadata {
+            Some(metadata) => metadata.clone(),
+            None => seller_exec_metadata(r.agent_command, r.agent_label, wall_time_ms, usage.as_ref()),
+        };
         let mut draft = match (&commit, &answer) {
             (Some(commit), _) => {
                 // A git turn's question is the result content (§7.2).
@@ -1431,6 +1535,7 @@ impl SellerNodeRunner {
             holder_egress_dev,
             holder_classifier,
             holder_proxy_ports,
+            kind: crate::session::SessionKind::Container,
         };
         if let Err(error) = self.node.store().put_session(&record) {
             opline!(
@@ -1448,6 +1553,278 @@ impl SellerNodeRunner {
         }
     }
 
+    /// Turn n ≥ 2 of a HOOK session (hook-agents §8.2): the follow-up review awaited before anything
+    /// runs, dispatch by the claim pin, inputs re-materialized, the staged-outcome check keyed by the
+    /// follow-up id, one hook call with `turn = n` and the follow-up text, then the turn's RESULT
+    /// through [`Self::publish_turn_result`] as an inline delivery. No docker call is made.
+    async fn run_hook_turn(&self, turn: &SessionTurnRecord, offer: &Offer, record: &SessionRecord) -> HookTurnEnd {
+        let (job_id, fid, n, deadline) = (
+            turn.job_id.as_str(),
+            turn.followup_id.as_str(),
+            turn.turn,
+            turn.deadline_unix,
+        );
+        let home = self.node.home();
+        let store = self.node.store();
+        let seller_pubkey = self.seller_pubkey.to_hex();
+        let refuse = |(code, detail): (ReasonCode, String)| HookTurnEnd::Refused(code, detail);
+        let private = match crate::seller_node::privacy::execution(home, &seller_pubkey, job_id) {
+            Ok(execution) => execution.is_some(),
+            Err(error) => return refuse(setup(error)),
+        };
+        let texts = match store.turn_texts(job_id, n) {
+            Ok(texts) => texts,
+            Err(error) => return refuse(setup(error)),
+        };
+        let Some(text) = texts.last().cloned() else {
+            return refuse(setup("follow-up message missing"));
+        };
+        let buyer = offer.buyer_pubkey.clone();
+        // 1. The review, exactly as the container turn builds it, awaited: the buyer's text reaches
+        // the hook only after it passed. A refusal withholds the turn, unpaid.
+        let private_request = match self.private_followup_request(job_id, fid, n, &buyer, private) {
+            Ok(request) => request,
+            Err(failure) => return refuse(failure),
+        };
+        let verdict = self
+            .spawn_followup_review(
+                job_id,
+                fid,
+                &buyer,
+                home.config.review.clone(),
+                private,
+                private_request,
+                Ok(()),
+                Err,
+            )
+            .await
+            .unwrap_or_else(|_| Err("review task ended without a verdict".into()));
+        if let Err(reason) = verdict {
+            return HookTurnEnd::Refused(
+                ReasonCode::ExecutionFailed,
+                format!("{REVIEW_REFUSED_FEEDBACK}: {reason}"),
+            );
+        }
+        let _ = store.set_turn_state(fid, TurnState::Running, None, None, now_secs());
+        // 2. The staged outcome first (§7.1): an answer the hook already gave for this follow-up is
+        // re-delivered, never re-run. An unreadable row defers.
+        let staged = match store.hook_outcome(fid) {
+            Ok(staged) => staged,
+            Err(error) => {
+                opline!("seller node session job_id={job_id}: turn {n} staged hook outcome unreadable ({error}); deferred");
+                return HookTurnEnd::Deferred;
+            }
+        };
+        // 3. Dispatch by the pin. A staged answer does not need the live entry, only its label.
+        let pin = match store.claim_pin(job_id) {
+            Ok(pin) => pin,
+            Err(error) => return refuse(setup(error)),
+        };
+        let label = pin.as_ref().map_or_else(|| record.harness.clone(), |pin| pin.label.clone());
+        let selected = pin.as_ref().and_then(|pin| {
+            self.agents
+                .for_execution(Some((&pin.label, &pin.kind, &pin.fingerprint)), offer.requested_agent.as_deref(), true)
+                .filter(|selected| selected.agent.kind.is_hook())
+                .map(|selected| (selected.index, selected.agent.argv.clone(), selected.agent.kind.clone()))
+        });
+        let model = match selected.as_ref().map(|(_, _, kind)| kind) {
+            Some(crate::seller_agents::AgentKind::Hook { model, .. }) => model.clone(),
+            _ => None,
+        };
+        let (status, answer, wall_ms) = match staged {
+            Some(row) => {
+                opline!("seller node session job_id={job_id}: turn {n} re-delivering the staged hook outcome (hook not re-run)");
+                (row.status, row.answer, row.wall_time_ms)
+            }
+            None => {
+                let Some((harness, argv, _)) = selected else {
+                    return HookTurnEnd::Refused(
+                        ReasonCode::CapabilityMissing,
+                        "the hook this session was claimed with is no longer configured as it was".into(),
+                    );
+                };
+                match self.call_hook_turn(job_id, fid, n, deadline, &text, offer, harness, &argv, &label).await {
+                    Ok(outcome) => outcome,
+                    Err(end) => return end,
+                }
+            }
+        };
+        let Some(status) = TurnStatus::parse(&status) else {
+            return HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("staged status {status} unknown"));
+        };
+        // 4. The turn's RESULT, inline, bound to the follow-up id as every turn's answer is.
+        let metadata = super::hook_run::hook_exec_metadata(&label, model.as_deref(), wall_ms);
+        let published = self
+            .publish_turn_result(TurnResult {
+                job_id,
+                fid,
+                turn: n,
+                offer,
+                git_remote: "",
+                branch: "",
+                agent_command: &[],
+                agent_label: Some(&label),
+                status,
+                context_reset: false,
+                delivery: TurnDelivery::Inline {
+                    answer,
+                    usage: None,
+                    wall_time_ms: wall_ms,
+                },
+                exec_metadata: Some(metadata),
+            })
+            .await;
+        if let Err(failure) = published {
+            return refuse(failure);
+        }
+        if let Err(error) = store.advance_session(job_id, n, None, None, now_secs()) {
+            opline!("seller node session job_id={job_id}: session advance failed ({error})");
+        }
+        HookTurnEnd::Delivered
+    }
+
+    /// Run the hook once for turn `n` (§8.2 step 3) and stage what it gave. `Ok`: the staged
+    /// (status, answer, wall ms); `Err`: how the turn ends without a delivery.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_hook_turn(
+        &self,
+        job_id: &str,
+        fid: &str,
+        n: u32,
+        deadline: u64,
+        text: &str,
+        offer: &Offer,
+        harness: usize,
+        argv: &[String],
+        label: &str,
+    ) -> Result<(String, String, u64), HookTurnEnd> {
+        use crate::hook::{self, JobOutcome};
+        let store = self.node.store();
+        if !super::hook_run::reap_journaled_groups(store, Some(fid)) {
+            opline!("seller node session job_id={job_id}: turn {n}: an earlier hook call is not resolved; deferred");
+            return Err(HookTurnEnd::Deferred);
+        }
+        let attempt = match store.begin_hook_attempt(fid, job_id, now_unix()) {
+            Ok(Some(attempt)) => attempt,
+            Ok(None) => {
+                opline!("seller node session job_id={job_id}: turn {n}: an earlier hook call is still journaled; deferred");
+                return Err(HookTurnEnd::Deferred);
+            }
+            Err(error) => return Err(HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("attempt journal: {error}"))),
+        };
+        let workdir = job_workdir(self.node.home(), job_id);
+        // §6: the inputs are re-materialized from the pinned baseline for every turn, so whatever
+        // an earlier turn changed under `inputs/` is restored.
+        let inputs = self
+            .prepare_hook_dir(job_id, &workdir)
+            .map_err(|error| HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("inputs unavailable ({error})")))?;
+        let event = hook::job_event(
+            fid,
+            attempt,
+            super::hook_run::HOOK_ANSWER_MAX_BYTES,
+            job_id,
+            n,
+            true,
+            text,
+            offer.output.as_deref(),
+            inputs.as_deref(),
+            deadline.saturating_sub(hook::PUBLISH_MARGIN_SECS),
+        );
+        let cutoff = hook::job_cutoff(deadline, now_secs(), Instant::now());
+        opline!("seller node session job_id={job_id}: turn {n} running {label} (attempt {attempt})");
+        let report = self
+            .run_hook_call(job_id, argv, event, &workdir, cutoff, fid)
+            .await
+            .map_err(|error| HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("runner task failed ({error})")))?;
+        let wall_ms = u64::try_from(report.wall.as_millis()).unwrap_or(u64::MAX);
+        match hook::classify_job(&report, super::hook_run::HOOK_ANSWER_MAX_BYTES) {
+            JobOutcome::Answer(answer) => {
+                let row = crate::seller_node::store::HookOutcomeRow {
+                    invocation: fid.to_owned(),
+                    job_id: job_id.to_owned(),
+                    turn: n,
+                    status: answer.status.as_str().to_owned(),
+                    answer: answer.answer,
+                    wall_time_ms: wall_ms,
+                };
+                let row = store
+                    .stage_hook_outcome(&row, now_unix())
+                    .map_err(|error| HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("outcome stage failed ({error})")))?;
+                Ok((row.status, row.answer, row.wall_time_ms))
+            }
+            JobOutcome::TooLarge { bytes, cap } => Err(HookTurnEnd::Refused(
+                ReasonCode::DeliveryFailed,
+                format!("answer is {bytes} bytes, over the {cap}-byte limit"),
+            )),
+            JobOutcome::CannotDeliver(reason) => {
+                Err(HookTurnEnd::Refused(ReasonCode::DeliveryFailed, format!("hook declined to deliver ({reason})")))
+            }
+            JobOutcome::Interrupted => {
+                opline!("seller node session job_id={job_id}: turn {n} interrupted by daemon shutdown; re-driven at the next start");
+                Err(HookTurnEnd::Deferred)
+            }
+            JobOutcome::OutOfTime { started } => {
+                self.drop_harness(harness, Some(ExecutionFailure::DeadlineExceeded));
+                Err(HookTurnEnd::Refused(
+                    ReasonCode::ExecutionFailed,
+                    format!("{} the deadline cutoff", if started { "killed at" } else { "not started: past" }),
+                ))
+            }
+            JobOutcome::Broken(why) => {
+                self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
+                Err(HookTurnEnd::Refused(ReasonCode::ExecutionFailed, format!("hook broke the contract ({why})")))
+            }
+        }
+    }
+
+    /// Send `close` to the hook a session was claimed with (hook-agents §5.3), detached: it never
+    /// holds a slot or the caller, at most [`HOOK_CLOSES_AT_ONCE`] run at a time, and its exit status
+    /// is ignored. cwd is the seller home (the job directory is already gone). A session whose hook
+    /// is no longer configured as claimed gets none.
+    pub(super) fn send_hook_close(&self, job_id: &str) {
+        let pin = self.node.store().claim_pin(job_id).ok().flatten();
+        let argv = pin.as_ref().and_then(|pin| {
+            self.agents
+                .for_execution(Some((&pin.label, &pin.kind, &pin.fingerprint)), None, true)
+                .filter(|selected| selected.agent.kind.is_hook())
+                .map(|selected| selected.agent.argv.clone())
+        });
+        let Some(argv) = argv else {
+            opline!("seller node session job_id={job_id}: no close sent (the session's hook is no longer configured as claimed)");
+            return;
+        };
+        let (cwd, job) = (self.node.home().root.clone(), job_id.to_owned());
+        tokio::spawn(async move {
+            let Ok(_permit) = HOOK_CLOSES.acquire().await else {
+                return;
+            };
+            let _ = tokio::task::spawn_blocking(move || crate::hook::close(&argv, &cwd, &job)).await;
+        });
+    }
+
+    /// Hook sessions past their lifetime end here (hook-agents §8.3), on the runner's own tick
+    /// whenever `[sessions] enabled`: the container GC runs only on a seat with a sandbox network,
+    /// and a hook-only seat has none. Only parked sessions are judged; a running turn parks first.
+    pub(super) async fn expire_hook_sessions(&self) {
+        let lifetime = self.node.home().config.sessions.lifetime_secs;
+        let now = now_secs();
+        let parked: Vec<SessionRecord> = self
+            .node
+            .store()
+            .sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.kind == session::SessionKind::Hook && s.state == SessionState::Parked)
+            .collect();
+        let sizes: Vec<_> = parked.iter().map(SessionRecord::size).collect();
+        for job in session::expired_by_lifetime(&sizes, now, lifetime) {
+            if let Some(record) = parked.iter().find(|s| s.job_id == job) {
+                opline!("seller node: session job_id={job} expired (parked past its lifetime)");
+                self.end_session_now(record.clone(), SessionState::Expired).await;
+            }
+        }
+    }
+
     /// Seller restart (§5.5): a session left `running` is stopped and parked; each unfinished
     /// follow-up is re-driven while its deadline is live, else answered `execution_failed`.
     pub(super) async fn recover_sessions(self: &Arc<Self>) {
@@ -1457,11 +1834,14 @@ impl SellerNodeRunner {
         let store = self.node.store();
         for record in store.sessions().unwrap_or_default() {
             if record.state == SessionState::Running {
-                let name = record.container.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    RealDockerCli.run(&session_gc::stop_argv(&name))
-                })
-                .await;
+                // A hook session has no container to stop (hook-agents §8.3).
+                if record.kind == session::SessionKind::Container {
+                    let name = record.container.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        RealDockerCli.run(&session_gc::stop_argv(&name))
+                    })
+                    .await;
+                }
                 let _ = store.set_session_state(&record.job_id, SessionState::Parked, now_secs());
                 opline!(
                     "seller node session resume: job_id={} stopped and parked",
@@ -1500,6 +1880,20 @@ impl SellerNodeRunner {
         }
     }
 }
+
+/// How a hook follow-up turn ended (hook-agents §8.2).
+enum HookTurnEnd {
+    Delivered,
+    /// Refused with this reason; the session stays parked and the buyer may send the turn again.
+    Refused(ReasonCode, String),
+    /// Nothing decided (an earlier call not resolved, an unreadable staged row, a shutdown): the
+    /// turn row is left as it is, and the next start's `recover_sessions` re-drives it.
+    Deferred,
+}
+
+/// At most this many hook `close` calls run at once (hook-agents §8.3).
+const HOOK_CLOSES_AT_ONCE: usize = 4;
+static HOOK_CLOSES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HOOK_CLOSES_AT_ONCE);
 
 enum TurnDelivery {
     Git(ContainerDelivery),
@@ -1549,6 +1943,8 @@ struct TurnResult<'a> {
     status: TurnStatus,
     context_reset: bool,
     delivery: TurnDelivery,
+    /// The result's exec metadata when it is not the container's (a hook turn's, §7 step 8).
+    exec_metadata: Option<Vec<gateway::TagSpec>>,
 }
 
 /// The session block of a follow-up turn's inputs file (§6.1). Bug 2 (§6.3): only a runsc seat sets
@@ -1603,6 +1999,7 @@ mod tests {
             holder_egress_dev: None,
             holder_classifier: None,
             holder_proxy_ports: None,
+            kind: crate::session::SessionKind::Container,
         };
         let mut config = crate::home::MaxplayerConfig::default();
         config.sessions.enabled = Some(true);
