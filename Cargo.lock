@@ -2776,7 +2776,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "maxplayer"
-version = "0.8.1"
+version = "0.8.2-rc1"
 dependencies = [
  "cashu",
  "cdk",
@@ -2807,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-chat"
-version = "0.8.1"
+version = "0.8.2-rc1"
 dependencies = [
  "futures-util",
  "libc",
@@ -2824,7 +2824,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-core"
-version = "0.8.1"
+version = "0.8.2-rc1"
 dependencies = [
  "async-trait",
  "async-wsocket",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-desktop"
-version = "0.8.1"
+version = "0.8.2-rc1"
 dependencies = [
  "eframe",
  "maxplayer-core",
@@ -2880,7 +2880,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-evals"
-version = "0.8.1"
+version = "0.8.2-rc1"
 dependencies = [
  "maxplayer-core",
  "serde",
@@ -2889,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-mint"
-version = "0.8.1"
+version = "0.8.2-rc1"
 dependencies = [
  "anyhow",
  "bip39",
@@ -2922,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-relay-write-policy"
-version = "0.8.1"
+version = "0.8.2-rc1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2930,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-team"
-version = "0.8.1"
+version = "0.8.2-rc1"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -2955,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "maxplayer-trade"
-version = "0.8.1"
+version = "0.8.2-rc1"
 dependencies = [
  "anyhow",
  "axum",
