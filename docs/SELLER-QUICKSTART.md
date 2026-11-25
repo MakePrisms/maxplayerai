@@ -1634,6 +1634,9 @@ Lines worth knowing when something is slow:
 | `buyer feedback publish not acknowledged within 5s` | The relay did not confirm an advisory feedback event in time. Work continues; a private copy is retried with the private-content flush. |
 | `RELAY-STALL detected: relay unconfirmed for Ns (threshold Ts; last confirmed ts=…; this tick probe=… heartbeat=…)` | The watchdog tripped; a reconnect and resubscribe follows. |
 | `RELAY-STALL recovery SUCCEEDED (attempts=…, recovery=Ns, outage=Ns since last confirmation)` | `recovery` is how long the reconnect took; `outage` is how long the relay had gone unconfirmed. |
+| `seat announcement OVERDUE: no relay-confirmed kind-30340 for Ns (interval Ts); …` | No heartbeat has landed for 1.5 intervals, so buyers and the market board may show this seat offline. The rest of the line says whether a heartbeat attempt is still running or the last ones got no relay OK. Printed once per gap. |
+| `seat announcement renewed: relay confirmed kind-30340 after Ns without one` | The gap above ended. |
+| `heartbeat publish did not finish within 30s (continuing; counts as unconfirmed)` | One heartbeat publish was cut off. Other publish failures print their own reason. |
 | `shutdown: abandoned in-flight work after Ns` | Stopping did not wait for slow relay work. Nothing is lost: pending publications are retried and jobs are resumed on the next start. An `INCIDENT` suffix means a payment redeem was still running after 60 s; the next start re-checks it. |
 
 Routine no-ops are hidden by default: a re-seen offer already claimed, a duplicate award, awards

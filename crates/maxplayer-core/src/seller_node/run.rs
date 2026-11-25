@@ -6599,6 +6599,10 @@ impl SellerNodeRunner {
         let mut drain_beat_fired = false;
         // When a `free_slots` change last fired a beat (debounce, see SEAT_CHANGE_BEAT_DEBOUNCE).
         let mut last_seat_change_beat: Option<tokio::time::Instant> = None;
+        // How long the seat announcement has gone unconfirmed, and when the in-flight supervision
+        // started: an announcement that falls behind is logged even if a supervision never returns.
+        let mut announcement_gap = schedule::AnnouncementGap::new(tokio::time::Instant::now());
+        let mut supervision_started: Option<tokio::time::Instant> = None;
         let mut drain_private_only_since: Option<tokio::time::Instant> = None;
         // The serialized work lane and what feeds it. Events queue (bounded: when full, relay reads
         // pause until it drains); ticks and backfills coalesce to one pending pass each and take
@@ -6720,6 +6724,15 @@ impl SellerNodeRunner {
                         opline_verbose!("seller node draining: {left}");
                     }
                     queue.request_tick();
+                    if heartbeat_enabled
+                        && let Some(line) = announcement_gap.check(
+                            tokio::time::Instant::now(),
+                            heartbeat_interval,
+                            supervision_started.map(|at| at.elapsed()),
+                        )
+                    {
+                        opline!("{line}");
+                    }
                     // R3-2: a harness dropped or came back since the last beat. Fire the heartbeat
                     // supervision NOW (its single-flight arm below) rather than an interval later, so
                     // buyers stop targeting a seat that cannot work within seconds, and resume as
@@ -6901,6 +6914,7 @@ impl SellerNodeRunner {
                         threshold: stall_threshold_duration,
                         interval: heartbeat_interval,
                     };
+                    supervision_started = Some(tokio::time::Instant::now());
                     supervision = Some(Box::pin(Arc::clone(&self).supervise(
                         relay.clone(),
                         input,
@@ -6911,6 +6925,12 @@ impl SellerNodeRunner {
                 report = async { supervision.as_mut().expect("polled only while armed").await },
                     if supervision.is_some() => {
                     supervision = None;
+                    supervision_started = None;
+                    if let Some(line) =
+                        announcement_gap.on_publish(report.publish_ok, tokio::time::Instant::now())
+                    {
+                        opline!("{line}");
+                    }
                     if report.probe_ok && stalled_since_recovery {
                         if manual_recovery_succeeded {
                             opline!(
@@ -12398,7 +12418,7 @@ impl SellerNodeRunner {
         let stalled =
             !confirmed && schedule::watchdog_tripped(unconfirmed, input.threshold, input.interval);
         if !stalled && input.forced.is_none() {
-            return SupervisionDone { clock, probe_ok, recovered: None };
+            return SupervisionDone { clock, probe_ok, publish_ok, recovered: None };
         }
         let overlap_since = nostr_sdk::Timestamp::from(
             clock
@@ -12438,6 +12458,7 @@ impl SellerNodeRunner {
         let result = self.recover_stall(&relay, overlap_since).await;
         drop(guard);
         let took = recovery_started.elapsed().as_secs();
+        let mut republished = false;
         let recovered = match result {
             Ok(attempts) => {
                 let outage = now_unix().saturating_sub(clock.confirmed_unix());
@@ -12450,7 +12471,7 @@ impl SellerNodeRunner {
                     overlap_since.as_secs()
                 );
                 // Announce the seat on the new socket now, not an interval later.
-                self.publish_heartbeat_bounded().await;
+                republished = self.publish_heartbeat_bounded().await;
                 true
             }
             Err(error) => {
@@ -12461,13 +12482,22 @@ impl SellerNodeRunner {
                 false
             }
         };
-        SupervisionDone { clock, probe_ok, recovered: Some(recovered) }
+        SupervisionDone { clock, probe_ok, publish_ok: publish_ok || republished, recovered: Some(recovered) }
     }
 
     async fn publish_heartbeat_bounded(&self) -> bool {
-        tokio::time::timeout(HEARTBEAT_PUBLISH_BUDGET, self.publish_heartbeat())
-            .await
-            .unwrap_or(false)
+        match tokio::time::timeout(HEARTBEAT_PUBLISH_BUDGET, self.publish_heartbeat()).await {
+            Ok(confirmed) => confirmed,
+            // Every other failure inside the publish logs its own line; a cut-off one did not.
+            Err(_) => {
+                opline!(
+                    "seller node heartbeat publish did not finish within {}s (continuing; counts as \
+                     unconfirmed)",
+                    HEARTBEAT_PUBLISH_BUDGET.as_secs()
+                );
+                false
+            }
+        }
     }
 }
 
@@ -12511,6 +12541,8 @@ struct SupervisionInput {
 struct SupervisionDone {
     clock: schedule::LivenessClock,
     probe_ok: bool,
+    /// Whether the relay confirmed a seat announcement this supervision published.
+    publish_ok: bool,
     /// `Some(ok)` when a recovery ran.
     recovered: Option<bool>,
 }

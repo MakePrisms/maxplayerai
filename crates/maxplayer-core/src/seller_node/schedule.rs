@@ -361,6 +361,63 @@ pub(crate) fn watchdog_tripped(unconfirmed: Duration, threshold: Duration, inter
     unconfirmed.saturating_add(interval / 2) >= threshold
 }
 
+/// How long the seat announcement (kind-30340) has gone without a relay-confirmed publish, so the
+/// operator log says so once it falls behind its cadence. Buyers and the market board judge a seat
+/// by the announcement's age: a seat whose beats stop landing looks offline while the process runs,
+/// and nothing said so until the relay-stall watchdog tripped, which also needs the READ probe to
+/// fail. Checked from the drain tick, so a supervision that never returns is reported too.
+pub(crate) struct AnnouncementGap {
+    last_landed: Instant,
+    warned: bool,
+}
+
+impl AnnouncementGap {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self { last_landed: now, warned: false }
+    }
+
+    /// A supervision finished; `landed` = the relay confirmed one of its beats. Returns the line to
+    /// log when that ends a gap [`Self::check`] reported.
+    pub(crate) fn on_publish(&mut self, landed: bool, now: Instant) -> Option<String> {
+        if !landed {
+            return None;
+        }
+        let gap = now.saturating_duration_since(self.last_landed);
+        self.last_landed = now;
+        std::mem::take(&mut self.warned).then(|| {
+            format!(
+                "seller node seat announcement renewed: relay confirmed kind-30340 after {}s without one",
+                gap.as_secs()
+            )
+        })
+    }
+
+    /// ONE line per gap, once no beat has landed for 1.5 intervals. `supervision_running_for` is
+    /// how long the in-flight heartbeat supervision has run, if one is in flight.
+    pub(crate) fn check(
+        &mut self,
+        now: Instant,
+        interval: Duration,
+        supervision_running_for: Option<Duration>,
+    ) -> Option<String> {
+        let since = now.saturating_duration_since(self.last_landed);
+        if self.warned || since < interval.saturating_mul(3) / 2 {
+            return None;
+        }
+        self.warned = true;
+        let why = match supervision_running_for {
+            Some(running) => format!("a heartbeat supervision has been running for {}s", running.as_secs()),
+            None => "no supervision is running; the last beats got no relay OK".to_owned(),
+        };
+        Some(format!(
+            "seller node seat announcement OVERDUE: no relay-confirmed kind-30340 for {}s (interval \
+             {}s); {why}. Buyers and the market board may show this seat offline",
+            since.as_secs(),
+            interval.as_secs()
+        ))
+    }
+}
+
 /// How long shutdown waits for ordinary lane work to finish. Everything it does is retried after a
 /// restart: offers and awards are re-delivered, outbox rows stay pending, history is re-read.
 pub(crate) const LANE_SETTLE_GRACE: Duration = Duration::from_secs(3);
@@ -451,6 +508,50 @@ impl Drop for InFlight<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn announcement_gap_warns_once_at_one_and_a_half_intervals_and_reports_the_renewal() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(300);
+        let mut gap = AnnouncementGap::new(t0);
+        assert_eq!(gap.check(t0 + Duration::from_secs(449), interval, None), None, "inside 1.5 intervals");
+        let line = gap
+            .check(t0 + Duration::from_secs(450), interval, None)
+            .expect("warns at 1.5 intervals");
+        assert!(line.contains("OVERDUE") && line.contains("for 450s") && line.contains("interval 300s"), "{line}");
+        assert!(line.contains("no supervision is running"), "{line}");
+        assert_eq!(gap.check(t0 + Duration::from_secs(900), interval, None), None, "one line per gap");
+        // A failed beat neither clears the warning nor logs a renewal.
+        assert_eq!(gap.on_publish(false, t0 + Duration::from_secs(901)), None);
+        assert_eq!(gap.check(t0 + Duration::from_secs(902), interval, None), None);
+        let renewed = gap.on_publish(true, t0 + Duration::from_secs(1000)).expect("renewal ends the gap");
+        assert!(renewed.contains("after 1000s"), "{renewed}");
+        // The clock restarted at the renewal: the next gap is measured from it and warns again.
+        assert_eq!(gap.check(t0 + Duration::from_secs(1449), interval, None), None);
+        assert!(gap.check(t0 + Duration::from_secs(1450), interval, None).is_some(), "a new gap warns again");
+    }
+
+    #[test]
+    fn announcement_gap_names_a_supervision_that_has_not_returned() {
+        let t0 = Instant::now();
+        let mut gap = AnnouncementGap::new(t0);
+        let line = gap
+            .check(t0 + Duration::from_secs(3), Duration::from_secs(2), Some(Duration::from_secs(3)))
+            .expect("overdue");
+        assert!(line.contains("a heartbeat supervision has been running for 3s"), "{line}");
+    }
+
+    #[test]
+    fn announcement_gap_landed_beats_never_warn() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(300);
+        let mut gap = AnnouncementGap::new(t0);
+        for n in 1..=10u64 {
+            let at = t0 + Duration::from_secs(300 * n);
+            assert_eq!(gap.check(at, interval, None), None, "beat {n} is on time");
+            assert_eq!(gap.on_publish(true, at), None, "no renewal line without a warning");
+        }
+    }
 
     fn drain_all(queue: &mut WorkQueue<u32>, backfill_allowed: bool) -> Vec<String> {
         let mut order = Vec::new();

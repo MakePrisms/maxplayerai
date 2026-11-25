@@ -306,7 +306,7 @@ seller node heartbeat+watchdog enabled: kind-30340 every <n>s; …
 ```
 
 A successful beat is silent; only failures print (`seller node heartbeat publish failed
-(continuing): …`).
+(continuing): …`, and `seat announcement OVERDUE …` once no beat has landed for 1.5 intervals).
 
 **Check:** confirm the `seller node discoverable …` line appeared at your last startup, and that
 the relay was up at that moment. Then read your latest kind-30340 — resolve it by `(pubkey, d)`,
