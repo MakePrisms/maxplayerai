@@ -812,6 +812,21 @@ impl FedUnderRateOffersInner {
     }
 }
 
+/// A first-sight key of bounded size for an id taken from a payload: ids up to 64 bytes (a job id
+/// is 64 hex) are kept as they are; a longer one keeps its first 64 bytes plus its length. Two
+/// long ids that collide only share one log line.
+fn bounded_announce_key(id: &str) -> String {
+    const KEEP: usize = 64;
+    if id.len() <= KEEP {
+        return id.to_owned();
+    }
+    let mut cut = KEEP;
+    while !id.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…{}", &id[..cut], id.len())
+}
+
 /// Whether a lapsed/aged offer skip is worth a default-output line rather than a count.
 ///
 /// Only an offer AIMED AT THIS SEAT and authored within the admit window
@@ -850,6 +865,8 @@ struct QuietTally {
     wraps_already_paid: std::sync::atomic::AtomicU64,
     /// A repeat of a payment wrap for a job this home never recorded (first sight prints).
     wraps_unknown_job: std::sync::atomic::AtomicU64,
+    /// A repeat of a payment wrap that does not parse (first sight of each wrap prints).
+    wraps_payment_repeat: std::sync::atomic::AtomicU64,
 }
 
 impl QuietTally {
@@ -873,6 +890,7 @@ impl QuietTally {
             ("wraps that are not payments", take(&self.wraps_not_payment)),
             ("payments already collected", take(&self.wraps_already_paid)),
             ("repeat payments for unrecorded jobs", take(&self.wraps_unknown_job)),
+            ("repeat unreadable payments", take(&self.wraps_payment_repeat)),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -5230,6 +5248,8 @@ pub struct SellerNodeRunner {
     announced_stale_offers: FedUnderRateOffers,
     /// Job ids whose "payment but no offer recorded" line already printed this boot.
     announced_unknown_payments: FedUnderRateOffers,
+    /// Wrap ids whose "payment does not parse" line already printed this boot.
+    announced_payment_wraps: FedUnderRateOffers,
     /// #747: how this node is asked to leave the selling role, so it can publish its terminal
     /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
     shutdown: shutdown::ShutdownChannel,
@@ -5739,6 +5759,7 @@ impl SellerNodeRunner {
             quiet: QuietTally::default(),
             announced_stale_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             announced_unknown_payments: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
+            announced_payment_wraps: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
             drain: shutdown::DrainSignal::new(),
             wrap_backfill_interval_secs: resolve_wrap_backfill_interval_secs(),
@@ -12177,7 +12198,15 @@ impl SellerNodeRunner {
                 return;
             }
             Ok(Err(error)) => {
-                opline!("seller node wrap event={event_id}: decode failed ({error})");
+                // Looks like a payment but this build cannot read it: possibly money owed. Prints
+                // once per wrap per boot; the backfill re-reads are counted.
+                if self.announced_payment_wraps.contains(&event_id) {
+                    QuietTally::bump(&self.quiet.wraps_payment_repeat);
+                    opline_verbose!("seller node wrap event={event_id}: decode failed ({error})");
+                } else {
+                    self.announced_payment_wraps.record(&event_id);
+                    opline!("seller node wrap event={event_id}: decode failed ({error})");
+                }
                 return;
             }
             Err(error) => {
@@ -12229,11 +12258,14 @@ impl SellerNodeRunner {
                 // A payment to this key for a job this home never recorded (a reset or moved home,
                 // or pay that beat its offer here). Possibly money owed, so it prints — but once
                 // per job per boot, not on every backfill pass.
-                if self.announced_unknown_payments.contains(&job_id) {
+                // Keyed by a bounded form of the id: it comes from the payment payload, so its
+                // length is the sender's choice.
+                let announce_key = bounded_announce_key(&job_id);
+                if self.announced_unknown_payments.contains(&announce_key) {
                     QuietTally::bump(&self.quiet.wraps_unknown_job);
                     opline_verbose!("seller node wrap event={event_id}: no offer recorded for job {job_id} (skipped)");
                 } else {
-                    self.announced_unknown_payments.record(&job_id);
+                    self.announced_unknown_payments.record(&announce_key);
                     opline!(
                         "seller node wrap event={event_id}: payment for job {job_id}, but this home has \
                          no offer recorded for it (skipped; was ~/.maxplayer reset or moved?)"
@@ -21043,6 +21075,19 @@ esac"#,
         f.record("offerX");
         assert_eq!(f.len(), 1, "one id however many re-ingests");
         assert!(f.contains("offerX"));
+    }
+
+    /// A first-sight key built from a payment payload id stays small whatever the sender put there.
+    #[test]
+    fn a_payload_id_announce_key_is_bounded() {
+        let job = "a".repeat(64);
+        assert_eq!(bounded_announce_key(&job), job, "a job id is kept as is");
+        let long = "b".repeat(10_000);
+        let key = bounded_announce_key(&long);
+        assert!(key.len() < 80, "a long payload id is cut: {} bytes", key.len());
+        assert_ne!(key, bounded_announce_key(&"b".repeat(9_999)), "the length tells long ids apart");
+        let multibyte = "é".repeat(100);
+        assert!(bounded_announce_key(&multibyte).starts_with("éé"), "cut on a char boundary");
     }
 
     /// An idle seat prints no summary; a busy one prints one line naming only the non-zero counts,

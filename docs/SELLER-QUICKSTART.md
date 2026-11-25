@@ -1670,7 +1670,10 @@ aimed at this seat and authored within the last hour still prints its `offer ski
 Payment gift-wraps re-read by the periodic wrap backfill are summarised the same way (`wraps that are
 not payments`, `payments already collected`); the backfill still prints how many it read. A payment
 to this key for a job this home has no offer for prints once per job per boot — that usually means
-`~/.maxplayer` was reset or moved, and the money is worth checking.
+`~/.maxplayer` was reset or moved, and the money is worth checking. A payment this build cannot
+read (`decode failed`) prints once per payment per boot. Each start re-reads the seat's whole
+payment history once (`wrap backfill (boot, full re-read)`); after that the periodic backfill reads
+only a recent window, so restarting the seller is how to make it look at old payments again.
 Set `MAXPLAYER_VERBOSE=1` in the daemon's environment to see each one. Nothing that reports a state change
 or a failure is behind that flag — you never have to enable it to see something go wrong.
 
