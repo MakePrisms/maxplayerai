@@ -1,3 +1,47 @@
+## v0.8.2-rc1
+
+Release candidate for 0.8.2, built from main after #1414. The only binary changes since v0.8.1
+are new seller log lines for a seat announcement that stops landing on the relay, plus three
+help-text and CLI-message corrections. After publication, install with
+`npm install -g maxplayer@0.8.2-rc1` (or `install.sh --version 0.8.2-rc1`). Publish as a GitHub
+prerelease on npm `rc`; leave stable `latest` (0.8.1) unchanged.
+
+**Relay and registration service: nothing to deploy for this RC.** No wire change and no store
+schema change: the buyer and seller stores are unchanged from v0.8.1. The sandbox image is
+rebuilt and tagged `maxplayer-sandbox:v0.8.2-rc1`. Website pages keep naming the latest stable
+release (0.8.1).
+
+### Changes
+
+- **Seller: say when the seat announcement stops landing** (#1414). A seller logged nothing when
+  its kind-30340 announcement stopped reaching the relay, unless the relay-stall watchdog tripped,
+  and the watchdog also needs the read probe to fail. Buyers and the market board judge a seat by
+  that announcement's age, so a running seat could look offline while its log stayed quiet.
+  - `seller node heartbeat publish did not finish within 30s (continuing; counts as unconfirmed)`
+    when the publish budget cuts a heartbeat off. Every other publish failure already printed its
+    reason.
+  - `seller node seat announcement OVERDUE: no relay-confirmed kind-30340 for Ns (interval Ts); …`,
+    once per gap, when no beat has been confirmed for 1.5 intervals. It says whether a heartbeat
+    supervision is still running (and for how long) or the last beats got no relay OK. It is
+    checked on the 5 s housekeeping tick, so a supervision that never returns is reported too.
+  - `seller node seat announcement renewed: relay confirmed kind-30340 after Ns without one` when
+    a beat lands again.
+  - Nothing changes on the wire or in the watchdog's behaviour. The lines are listed in
+    `docs/SELLER-QUICKSTART.md`.
+- **CLI text:** `account link` no longer tells you to turn product news off when it is on (every
+  product-news email has an unsubscribe link) (#1411); `maxplayer --help` lists the `trade`
+  subcommands this build has (#1405); `team --help` lists every team MCP tool (#1410).
+
+### Website and docs (live on merge, not part of the binary)
+
+- **Market board: one late heartbeat no longer marks a seat Offline** (#1413). A seat counts as
+  online for 750 s after its latest heartbeat (was 300 s, equal to the default heartbeat interval),
+  and a latest `accepting=n` heartbeat (shutdown or drain) reads Offline at once.
+- Skill pages and docs lead with teams and fix stale references (#1405, #1410); agents stop raising
+  product news at setup (#1411); `/chat` redirects to Teams and mint/tokens are marked Early
+  preview (#1408); the swarm setup step installs the stable release (#1407); the Codex avatar is
+  centred (#1409).
+
 ## v0.8.1
 
 Stable release following v0.8.1-rc2, incorporating the 0.8.1 release-candidate series. The
