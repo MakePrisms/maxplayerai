@@ -47,7 +47,8 @@ are described after the list:
 3. `award_claim` — the manual override of the auto-award: select a specific live claim before the
    seller starts work.
 4. `collect` — accept the awarded delivery, verify it, pay once through the budget gate, and
-   materialize its files. The daemon's delivery watcher runs the same settle on its own, so this
+   settle it: a git delivery stays in the buyer store (read it with `read_delivery` /
+   `extract_delivery`), an inline answer is written to `results/<job_id>/answer.txt`. The daemon's delivery watcher runs the same settle on its own, so this
    is the manual trigger: for a `failed` settle, a delivery review that did not finish, or
    `collect_required`. It never overrides a review refusal, and `get_job.settlement` already
    reads back what it returns.
@@ -70,8 +71,9 @@ without `--overlay2=none` FAIL doctor and gives a 20 GiB parked-session budget, 
 5 GiB): with the flag on, the MCP adds `reply`, which continues an awarded
 session job with the same seller and agent conversation (turn n ≥ 2; `reply close: true` closes it),
 and `collect` gains `turn`. (`collect close_session` is a deprecated daemon alias, no longer listed.) A turn is priced like the job, reserved under the per-job and session caps, keyed by
-the follow-up id, settled by the delivery watcher like turn 1 (or `collect turn=<n>`), and
-materialized into `results/<job_id>-t<n>`. With the flag off the surface above
+the follow-up id, and settled by the delivery watcher like turn 1 (or `collect turn=<n>`): a git
+turn stays in the buyer store (`read_delivery turn=<n>`), an inline answer goes to
+`results/<job_id>-t<n>/answer.txt`. With the flag off the surface above
 is unchanged.
 
 Swarms ([`docs/specs/swarm.md`](docs/specs/swarm.md) §7–§8, behind `[swarm] enabled`, default

@@ -148,22 +148,13 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Action::Extract { to } => {
             // Resolved here: the daemon's working directory is not the caller's.
             let to = match to.map(PathBuf::from) {
-                Some(to) => {
-                    let cwd = match std::env::current_dir() {
-                        Ok(cwd) => cwd,
-                        Err(error) => {
-                            let _ = writeln!(err, "current dir: {error}");
-                            return RUNTIME_ERROR;
-                        }
-                    };
-                    match resolve_to(&cwd, &to) {
-                        Ok(path) => Some(path.display().to_string()),
-                        Err(message) => {
-                            let _ = writeln!(err, "{message}");
-                            return USAGE_ERROR;
-                        }
+                Some(to) => match resolve_to(&to, std::env::current_dir) {
+                    Ok(path) => Some(path),
+                    Err(message) => {
+                        let _ = writeln!(err, "{message}");
+                        return USAGE_ERROR;
                     }
-                }
+                },
                 None => None,
             };
             (
@@ -195,23 +186,35 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 
-/// The `--to` folder as an absolute path without `.` or `..` (#1311 fable r2 N3). The daemon
-/// refuses any `..` component, so `--to ../out` is resolved here: each existing prefix is
-/// canonicalised, so a `..` steps to its real parent. A `..` after a component that does not
-/// exist (or is a dangling symlink) cannot be resolved and is refused. The daemon still runs every
-/// check on the result (outside the maxplayer home, new or empty, no symlinked ancestor).
-fn resolve_to(cwd: &Path, to: &Path) -> Result<PathBuf, String> {
+/// The `--to` folder as an absolute path without `.` or `..`, as the daemon requires (#1311 fable
+/// r2 N3; codex r3). Every folder the path goes THROUGH (a component followed by more) must be an
+/// existing directory, and is canonicalised, so a `..` steps to its real parent and `file/..` is
+/// refused. The final component is kept as written: a symlink there reaches the daemon, which
+/// refuses it. After a missing component, later names are appended and `..` is refused. The
+/// daemon still runs every check on the result (outside the maxplayer home, new or empty, final
+/// component not a symlink). `cwd` is only consulted for a relative `to`; its components are
+/// walked separately so a Windows verbatim base cannot swallow a `..` of `to`.
+fn resolve_to(to: &Path, cwd: impl FnOnce() -> std::io::Result<PathBuf>) -> Result<String, String> {
+    let shown = to.display();
+    let base = if to.is_absolute() {
+        PathBuf::new()
+    } else {
+        cwd().map_err(|error| format!("--to {shown}: current dir: {error}"))?
+    };
+    let parts: Vec<Component> = base.components().chain(to.components()).collect();
+    let last_name = parts
+        .iter()
+        .rposition(|c| matches!(c, Component::Normal(_) | Component::ParentDir));
     let mut out = PathBuf::new();
     let mut exists = true;
-    for component in cwd.join(to).components() {
+    for (index, component) in parts.iter().enumerate() {
         match component {
             Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
                 if !exists {
                     return Err(format!(
-                        "--to {}: `..` follows {}, which does not exist",
-                        to.display(),
+                        "--to {shown}: `..` follows {}, which does not exist",
                         out.display()
                     ));
                 }
@@ -219,16 +222,29 @@ fn resolve_to(cwd: &Path, to: &Path) -> Result<PathBuf, String> {
             }
             Component::Normal(name) => {
                 out.push(name);
-                if exists {
-                    match std::fs::canonicalize(&out) {
-                        Ok(real) => out = real,
-                        Err(_) => exists = false,
+                if !exists || Some(index) == last_name {
+                    continue;
+                }
+                match std::fs::canonicalize(&out) {
+                    Ok(real) if real.is_dir() => out = real,
+                    Ok(_) => {
+                        return Err(format!("--to {shown}: {} is not a folder", out.display()));
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // A missing folder (or a dangling symlink): the daemon creates the rest.
+                        exists = false;
+                    }
+                    Err(error) => return Err(format!("--to {shown}: {}: {error}", out.display())),
                 }
             }
         }
     }
-    Ok(out)
+    out.into_os_string().into_string().map_err(|path| {
+        format!(
+            "--to {shown}: {} is not valid UTF-8",
+            path.to_string_lossy()
+        )
+    })
 }
 
 /// Seller text with control characters escaped (`\x1b` → `\u{1b}`), so a delivered file cannot
@@ -278,48 +294,55 @@ mod tests {
         let root_real = std::fs::canonicalize(root.path()).unwrap();
         let cwd = root_real.join("work");
         std::fs::create_dir(&cwd).unwrap();
+        let at = |to: &str| resolve_to(Path::new(to), || Ok(cwd.clone()));
+        let s = |p: PathBuf| p.into_os_string().into_string().unwrap();
         // The N3 case: a relative `..` the daemon would refuse is resolved to a plain path.
-        assert_eq!(
-            resolve_to(&cwd, Path::new("../out")).unwrap(),
-            root_real.join("out")
+        assert_eq!(at("../out").unwrap(), s(root_real.join("out")));
+        assert_eq!(at("./out").unwrap(), s(cwd.join("out")));
+        assert_eq!(at("out/new").unwrap(), s(cwd.join("out/new")));
+        assert_eq!(at("out/.").unwrap(), s(cwd.join("out")));
+        // An absolute `to` never asks for the current dir.
+        let absolute = format!("{}/work/../abs", root_real.display());
+        let resolved = resolve_to(Path::new(&absolute), || panic!("cwd not needed")).unwrap();
+        assert_eq!(resolved, s(root_real.join("abs")));
+        assert!(
+            !resolved.contains("/../") && !resolved.contains("/./"),
+            "{resolved}"
         );
-        assert_eq!(
-            resolve_to(&cwd, Path::new("./out")).unwrap(),
-            cwd.join("out")
-        );
-        assert_eq!(
-            resolve_to(&cwd, Path::new("out/new")).unwrap(),
-            cwd.join("out/new")
-        );
-        let absolute = root_real.join("work/../abs");
-        assert_eq!(resolve_to(&cwd, &absolute).unwrap(), root_real.join("abs"));
-        for path in [
-            resolve_to(&cwd, Path::new("../out")).unwrap(),
-            resolve_to(&cwd, &absolute).unwrap(),
-        ] {
-            assert!(
-                !path
-                    .components()
-                    .any(|c| matches!(c, Component::ParentDir | Component::CurDir)),
-                "{path:?}"
-            );
-        }
         // Nothing to resolve `..` against: refused here, not guessed.
-        let missing = resolve_to(&cwd, Path::new("missing/../out")).unwrap_err();
+        let missing = at("missing/../out").unwrap_err();
         assert!(missing.contains("does not exist"), "{missing}");
+        // A file is not a folder to go through (codex r3).
+        std::fs::write(cwd.join("file"), b"x").unwrap();
+        let file = at("file/../out").unwrap_err();
+        assert!(file.contains("is not a folder"), "{file}");
+        assert!(at("file/sub").unwrap_err().contains("is not a folder"));
+        // A current dir that cannot be read is reported, not mistaken for an absent folder.
+        let failing =
+            resolve_to(Path::new("out"), || Err(std::io::Error::other("gone"))).unwrap_err();
+        assert!(failing.contains("current dir: gone"), "{failing}");
         #[cfg(unix)]
         {
-            // A symlinked folder resolves to its target, so the daemon checks the real path.
             let real = root_real.join("real");
             std::fs::create_dir(&real).unwrap();
             std::os::unix::fs::symlink(&real, cwd.join("link")).unwrap();
-            assert_eq!(
-                resolve_to(&cwd, Path::new("link/out")).unwrap(),
-                real.join("out")
-            );
+            // A symlinked folder on the way resolves to its target, so the daemon checks the real path.
+            assert_eq!(at("link/out").unwrap(), s(real.join("out")));
+            assert_eq!(at("link/../out").unwrap(), s(root_real.join("out")));
+            // A symlink as the FINAL component is sent as written, so the daemon's refusal of a
+            // symlinked destination still applies (codex r3 Medium).
+            assert_eq!(at("link").unwrap(), s(cwd.join("link")));
+            assert_eq!(at("./link/.").unwrap(), s(cwd.join("link")));
             // A dangling symlink is not a folder to step out of.
             std::os::unix::fs::symlink(root_real.join("gone"), cwd.join("dangling")).unwrap();
-            assert!(resolve_to(&cwd, Path::new("dangling/../out")).is_err());
+            assert!(at("dangling/../out").is_err());
+            assert_eq!(at("dangling").unwrap(), s(cwd.join("dangling")));
+            // A path that is not UTF-8 cannot be sent over JSON: refused, never replaced.
+            use std::os::unix::ffi::OsStrExt;
+            let odd = std::ffi::OsStr::from_bytes(b"bad\xff");
+            std::fs::create_dir(cwd.join(odd)).unwrap();
+            let non_utf8 = resolve_to(&Path::new(odd).join("out"), || Ok(cwd.clone())).unwrap_err();
+            assert!(non_utf8.contains("not valid UTF-8"), "{non_utf8}");
         }
     }
 

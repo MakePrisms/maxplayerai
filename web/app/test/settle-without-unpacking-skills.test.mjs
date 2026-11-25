@@ -23,6 +23,7 @@ const WORDING = [
   "web/app/.well-known/skills/muse-buyer/references/verification.md",
   "docs/BUYER-QUICKSTART.md",
   "web/app/.well-known/skills/swarm-buyer/skill.md",
+  "AGENTS.md",
   "crates/maxplayer/src/mcp.rs",
 ];
 
@@ -60,7 +61,12 @@ test("Mode B fetches the delivered commit from the store instead of syncing resu
   // after review, never rebased over pushed commits.
   assert.match(modeB, /embedded repository/);
   assert.match(modeB, /`\.hg\/`/);
-  assert.match(modeB, /merge review\/<job8>`: expect a conflict on `MAXPLAYER_EXECUTION_SENTINEL`/);
+  // r3: a divergent session turn is merged with --no-commit and checked before one commit, and
+  // removing the sentinel twice (step 7 then step 8) is harmless.
+  assert.match(modeB, /merge --no-commit review\/<job8>/);
+  assert.match(modeB, /diff --cached --text --stat --summary/);
+  assert.doesNotMatch(modeB, /rm -q MAXPLAYER_EXECUTION_SENTINEL/, "sentinel removal tolerates a second run");
+  assert.match(modeB, /rm -q --ignore-unmatch MAXPLAYER_EXECUTION_SENTINEL/);
   assert.doesNotMatch(modeB, /rebase your\s+own commits/, "no rebase of pushed commits");
   assert.doesNotMatch(modeB, /rsync/, "no file sync out of results/");
   assert.doesNotMatch(modeB, /results\/<job_id>\//, "Mode B never reads results/<job_id>/");

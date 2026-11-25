@@ -151,14 +151,20 @@ work already at the tree root.
    does not once you committed on top of the previous turn (steps 8–9): the seller's next
    commit sits on its own previous commit, not on yours. Then stop. Never run
    `reset --hard`, `--allow-unrelated-histories`, an unreviewed plain merge, a rebase of
-   commits you already pushed (step 9) or `push --force`. After reviewing it, run
-   `git -C <clone> merge review/<job8>`: expect a conflict on `MAXPLAYER_EXECUTION_SENTINEL`
-   (resolve it with `git rm`, as in step 8) and resolve `QUESTIONS.md` by hand. If unsure,
-   ask the human.
+   commits you already pushed (step 9) or `push --force`. After reviewing it, merge
+   without committing, settle the conflicts, check the staged result, then commit once:
+   ```bash
+   git -C <clone> merge --no-commit review/<job8>   # expect conflicts; nothing is committed yet
+   git -C <clone> rm -q --ignore-unmatch MAXPLAYER_EXECUTION_SENTINEL
+   # resolve QUESTIONS.md (and any other conflict) by hand, then git -C <clone> add it
+   git -C <clone> diff --cached --text --stat --summary
+   git -C <clone> commit
+   ```
+   If unsure, ask the human.
    If an older maxplayer settled the turn (`settlement.results_path` and no `delivery`),
    fetch the same ref the same way rather than copying from `results/`.
 8. **Remove `MAXPLAYER_EXECUTION_SENTINEL` before you commit.** It is per-job evidence that
-   belongs to you, not repo content: `git -C <clone> rm -q MAXPLAYER_EXECUTION_SENTINEL`.
+   belongs to you, not repo content: `git -C <clone> rm -q --ignore-unmatch MAXPLAYER_EXECUTION_SENTINEL`.
    Left in, it puts a stale sentinel in every turn's base tree.
 9. **Write the answers into `QUESTIONS.md`, commit, and PUSH — in that order, before you
    post.** The base commit is fetched from the pinned URL, so an unpushed commit makes
