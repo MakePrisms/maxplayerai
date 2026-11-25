@@ -1672,8 +1672,10 @@ not payments`, `payments already collected`); the backfill still prints how many
 to this key for a job this home has no offer for prints once per job per boot — that usually means
 `~/.maxplayer` was reset or moved, and the money is worth checking. A payment this build cannot
 read (`decode failed`) prints once per payment per boot. Each start re-reads the seat's whole
-payment history once (`wrap backfill (boot, full re-read)`); after that the periodic backfill reads
-only a recent window, so restarting the seller is how to make it look at old payments again.
+payment history once (the backfill's `fetching` line ends in `(boot: full re-read)`); payments for
+unknown jobs and unreadable payments older than the regular window are summed up in one
+`wrap backfill (boot re-read): …` line instead of one line each. After that the periodic backfill
+reads only a recent window, so restarting the seller is how to make it look at old payments again.
 Set `MAXPLAYER_VERBOSE=1` in the daemon's environment to see each one. Nothing that reports a state change
 or a failure is behind that flag — you never have to enable it to see something go wrong.
 

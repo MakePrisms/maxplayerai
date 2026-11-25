@@ -274,9 +274,10 @@ informational, not a problem. A lapsed offer aimed at this seat and authored wit
 still prints its `offer skip` line (check the buyer's deadline and this host's clock), and a
 payment for a job this home has no offer for prints once per job per boot (usually a reset or moved
 `~/.maxplayer`; the payment may be money you are owed), as does a payment this build cannot read
-(`decode failed`). Each start re-reads the whole payment history once (`wrap backfill (boot, full
-re-read)`); later passes read only a recent window, so a restart is how to make the seller look at
-an old payment again. Nothing that
+(`decode failed`). Each start re-reads the whole payment history once (the `fetching` line ends in
+`(boot: full re-read)`, and anything of that kind older than the regular window is summed up in one
+`wrap backfill (boot re-read): …` line); later passes read only a recent window, so a restart is how
+to make the seller look at an old payment again. Nothing that
 reports a state change or a failure is behind that flag.
 
 **Dead end → report it:** if you see `seller node live:` but the periodic `seller node status:`
