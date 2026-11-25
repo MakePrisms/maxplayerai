@@ -162,7 +162,7 @@ async fn a_free_inline_collect_materializes_the_answer_and_records_it() {
     .expect("a free inline collect must succeed");
 
     assert_eq!(outcome.files, vec!["answer.txt".to_owned()]);
-    let written = fs::read_to_string(PathBuf::from(&outcome.path).join("answer.txt"))
+    let written = fs::read_to_string(PathBuf::from(outcome.path.as_deref().expect("an inline answer names its folder")).join("answer.txt"))
         .expect("answer.txt must exist");
     assert_eq!(written, answer, "the answer is written verbatim");
 

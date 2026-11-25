@@ -11,6 +11,7 @@ mod cli;
 mod collect_cli;
 // Container-side delivery orchestrator entrypoint (`maxplayer __deliver …`, Track B). INTERNAL.
 mod deliver_cli;
+mod delivery_cli;
 #[cfg(feature = "wallet")]
 mod daemon;
 mod doctor;

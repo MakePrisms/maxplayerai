@@ -199,8 +199,12 @@ ones. They are closed when the swarm job closes, once their running turn settled
 Returns `status`, `members` (minutes offered, used today and left, `busy`, heartbeat — filled in
 once the job is `in_progress`), `queue`, `running`, `results` (newest first, 10 per page, each with
 `state`, `outcome`, `answer` and `price_sats`), `budget`, `sessions`, `steering`, `planner` and
-`idle_reason`. An answer delivered as files instead of inline reads
-`collected (no inline answer; files under results/<job_id>)`.
+`idle_reason`. Each result also carries `job_id` and `turn`. A `collected` result with
+`answer: null` was delivered as files (a git delivery), which stay in the buyer store: read it
+with `read_delivery` (or `extract_delivery`, buyer-operate) using that result's `job_id` AND
+`turn`, e.g. `{"tool": "read_delivery", "arguments": {"job_id": "<job_id>", "turn": 3}}` for a
+session's third turn. The job id alone reads turn 1. A first-turn file delivery's outcome reads
+`collected (no inline answer; git delivery in the buyer store, read_delivery <job_id>)`.
 
 - `swarm_job_tasks {swarm_job, add?, drop?, replace?}` edits the queue. Only queued tasks change
   (by `id`); a posted task is already a job. Adding to a closed swarm job is refused.

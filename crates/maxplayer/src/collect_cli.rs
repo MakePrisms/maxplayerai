@@ -1,4 +1,4 @@
-//! `maxplayer collect` — single-call buyer collect: verify integrity + pay + materialize.
+//! `maxplayer collect` — single-call buyer collect: verify integrity + pay; a git delivery stays in the buyer store.
 //!
 //! Thin adapter over [`maxplayer_core::collect`]. The money authority (spend gate, budget,
 //! single-redeem, mint-compat) lives in the core path; this only parses args and renders the
@@ -66,10 +66,12 @@ fn usage(err: &mut dyn Write) {
          \n\
          Accepts the delivered claim if no bind exists yet, verifies the delivery integrity\n\
          (delivered branch must tip at the accepted commit), settles under the payment mode the\n\
-         offer and the claim agreed on, then materializes the files under <home>/results/<job_id>.\n\
+         offer and the claim agreed on. A git delivery stays in the buyer store (nothing is written;\n\
+         read it with `maxplayer delivery show`, extract it with `maxplayer delivery extract`); an\n\
+         inline answer is written to <home>/results/<job_id>/answer.txt (--out names that folder).\n\
          A priced job (payment=sat) pays the seller through the sealed money path; a free job\n\
          (payment=none) pays nothing and opens no wallet. Idempotent: re-collecting\n\
-         re-materializes without a second payment. The buyer daemon runs this settle on its own;\n\
+         never pays twice. The buyer daemon runs this settle on its own;\n\
          this command is the manual trigger (a failed settle, an unfinished delivery review).\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
     );
