@@ -1656,6 +1656,9 @@ Lines worth knowing when something is slow:
 | `seat announcement OVERDUE: no relay-confirmed kind-30340 for Ns (interval Ts); …` | No heartbeat has landed for 1.5 intervals, so buyers and the market board may show this seat offline. The rest of the line says whether a heartbeat attempt is still running or the last ones got no relay OK. Printed once per gap. |
 | `seat announcement renewed: relay confirmed kind-30340 after Ns without one` | The gap above ended. |
 | `heartbeat publish did not finish within 30s (continuing; counts as unconfirmed)` | One heartbeat publish was cut off. Other publish failures print their own reason. |
+| `RESUMED after the host slept for about Ns: …` | The machine was asleep, so the seller announced nothing and claimed nothing meanwhile. It re-announces the seat and re-reads offers at once; after 2 minutes or more it also reconnects to the relay. To keep a seat online, stop the host from sleeping while it sells. |
+| `event loop did not run for Ns (the process was stopped or the loop was blocked): …` | The same, but the clock shows the machine was awake: the process was paused (for example by its supervisor or a `SIGSTOP`), or something blocked the seller's loop. Same recovery as above. |
+| `event loop BLOCKED: it has not turned for Ns while the process runs; …` | Printed while the process runs but its loop is stuck. That is a bug: please report it with the log lines before it. |
 | `shutdown: abandoned in-flight work after Ns` | Stopping did not wait for slow relay work. Nothing is lost: pending publications are retried and jobs are resumed on the next start. An `INCIDENT` suffix means a payment redeem was still running after 60 s; the next start re-checks it. |
 
 Routine no-ops are hidden by default: a re-seen offer already claimed, a duplicate award, awards

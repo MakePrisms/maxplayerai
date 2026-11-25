@@ -418,6 +418,208 @@ impl AnnouncementGap {
     }
 }
 
+/// A drain-tick gap this long is reported: the loop turns every 5 s, so a minute without a turn means
+/// the process did not run (the host slept, or the process was stopped) or the loop was blocked.
+pub(crate) const LOOP_GAP_REPORT: Duration = Duration::from_secs(60);
+/// A gap this long also forces a relay recovery on the next heartbeat: the sockets are presumed dead,
+/// and the watchdog's own clock cannot see a host sleep (it is monotonic, which stops while asleep).
+pub(crate) const LOOP_GAP_RECONNECT: Duration = Duration::from_secs(120);
+/// Wall time that ran this far ahead of monotonic time over one gap means the host was asleep.
+const HOST_SLEEP_SLACK: Duration = Duration::from_secs(30);
+
+/// Milliseconds since the Unix epoch (0 before it), for [`LoopTurns`].
+pub(crate) fn wall_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// A stretch in which the seller loop did not turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoopGap {
+    pub(crate) secs: u64,
+    /// Wall time ran ahead of monotonic time: the host was asleep for most of it.
+    pub(crate) host_slept: bool,
+}
+
+impl LoopGap {
+    /// The operator line for this gap. `reconnect`: a relay recovery was forced for it.
+    pub(crate) fn line(&self, reconnect: bool) -> String {
+        let what = if self.host_slept {
+            format!(
+                "seller node RESUMED after the host slept for about {}s",
+                self.secs
+            )
+        } else {
+            format!(
+                "seller node event loop did not run for {}s (the process was stopped or the loop was \
+                 blocked)",
+                self.secs
+            )
+        };
+        format!(
+            "{what}: no seat announcement, offer read or claim happened meanwhile; re-announcing the \
+             seat and re-reading offers now{}",
+            if reconnect {
+                ", and reconnecting to the relay"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+/// When the drain tick last ran, on both clocks. Tokio's timers and the heartbeat watchdog use the
+/// monotonic clock, which stops while the host sleeps (Linux, macOS), so after a sleep the next beat
+/// comes up to a whole interval later and nothing logs the gap. Wall time keeps counting, so the
+/// first tick after a sleep, a SIGSTOP or a blocked loop sees the gap here.
+pub(crate) struct LoopTurns {
+    last_mono: std::time::Instant,
+    last_wall_ms: i64,
+    report_after: Duration,
+}
+
+impl LoopTurns {
+    pub(crate) fn new(mono: std::time::Instant, wall_ms: i64, report_after: Duration) -> Self {
+        Self {
+            last_mono: mono,
+            last_wall_ms: wall_ms,
+            report_after,
+        }
+    }
+
+    /// The drain tick ran at (`mono`, `wall_ms`). Returns the gap since the previous tick once it
+    /// reaches the report threshold. A wall clock stepped backwards counts as no wall time.
+    pub(crate) fn turn(&mut self, mono: std::time::Instant, wall_ms: i64) -> Option<LoopGap> {
+        let mono_gap = mono.saturating_duration_since(self.last_mono);
+        let wall_gap = Duration::from_millis(
+            u64::try_from(wall_ms.saturating_sub(self.last_wall_ms)).unwrap_or(0),
+        );
+        self.last_mono = mono;
+        self.last_wall_ms = wall_ms;
+        let gap = mono_gap.max(wall_gap);
+        (gap >= self.report_after).then(|| LoopGap {
+            secs: gap.as_secs(),
+            host_slept: wall_gap.saturating_sub(mono_gap) >= HOST_SLEEP_SLACK,
+        })
+    }
+}
+
+/// How often the loop watchdog thread looks at the loop's pulse.
+const LOOP_WATCH_EVERY: Duration = Duration::from_secs(10);
+
+/// What the loop watchdog thread decides on one wake-up: report a loop that stopped turning while
+/// this process kept running. The loop's own [`LoopTurns`] reports the gap once it turns again; this
+/// says so WHILE it is stuck, which a loop-side check never can.
+#[derive(Debug, Default)]
+pub(crate) struct LoopWatch {
+    warned: bool,
+}
+
+impl LoopWatch {
+    /// `since_turn`: how long since the loop last turned. `overslept`: how much later than asked this
+    /// thread woke. A late wake means the whole process was not running (host asleep, SIGSTOP), which
+    /// is not a blocked loop; the loop reports that gap itself.
+    pub(crate) fn check(
+        &mut self,
+        since_turn: Duration,
+        overslept: Duration,
+        warn_after: Duration,
+    ) -> Option<String> {
+        if since_turn < warn_after {
+            self.warned = false;
+            return None;
+        }
+        if self.warned || overslept >= HOST_SLEEP_SLACK {
+            return None;
+        }
+        self.warned = true;
+        Some(format!(
+            "seller node event loop BLOCKED: it has not turned for {}s while the process runs; no \
+             seat announcement, offer read, claim or status line happens until it does",
+            since_turn.as_secs()
+        ))
+    }
+}
+
+/// The loop's pulse for [`spawn_loop_watchdog`]: monotonic time of its last turn.
+pub(crate) struct LoopPulse {
+    base: std::time::Instant,
+    last_turn_ms: std::sync::atomic::AtomicU64,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl LoopPulse {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            base: std::time::Instant::now(),
+            last_turn_ms: std::sync::atomic::AtomicU64::new(0),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The loop turned now.
+    pub(crate) fn beat(&self) {
+        self.last_turn_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn since_turn(&self) -> Duration {
+        Duration::from_millis(
+            self.elapsed_ms()
+                .saturating_sub(self.last_turn_ms.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+/// Stops the loop watchdog thread when the loop that owns it ends, on every exit path.
+pub(crate) struct LoopWatchdog(std::sync::Arc<LoopPulse>);
+
+impl Drop for LoopWatchdog {
+    fn drop(&mut self) {
+        self.0.stopped.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Watch `pulse` from an OS thread, which keeps running while the loop's thread is blocked, and log
+/// once per stall. Returns the guard that stops the thread; a thread that cannot start is logged and
+/// the loop runs without it.
+pub(crate) fn spawn_loop_watchdog(
+    pulse: std::sync::Arc<LoopPulse>,
+    warn_after: Duration,
+) -> LoopWatchdog {
+    let watched = std::sync::Arc::clone(&pulse);
+    let spawned = std::thread::Builder::new()
+        .name("seller-loop-watch".into())
+        .spawn(move || {
+            let mut watch = LoopWatch::default();
+            loop {
+                let asked = std::time::Instant::now();
+                std::thread::sleep(LOOP_WATCH_EVERY);
+                if watched.stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                let overslept = asked.elapsed().saturating_sub(LOOP_WATCH_EVERY);
+                if let Some(line) = watch.check(watched.since_turn(), overslept, warn_after) {
+                    crate::opline!("{line}");
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        crate::opline!(
+            "seller node: the event-loop watchdog thread could not start ({error}); continuing \
+             without it"
+        );
+    }
+    LoopWatchdog(pulse)
+}
+
 /// How long shutdown waits for ordinary lane work to finish. Everything it does is retried after a
 /// restart: offers and awards are re-delivered, outbox rows stay pending, history is re-read.
 pub(crate) const LANE_SETTLE_GRACE: Duration = Duration::from_secs(3);
@@ -508,6 +710,125 @@ impl Drop for InFlight<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loop_turns_report_nothing_on_a_loop_that_keeps_turning() {
+        let t0 = std::time::Instant::now();
+        let mut turns = LoopTurns::new(t0, 1_000_000, LOOP_GAP_REPORT);
+        for tick in 1..=30u64 {
+            let at = t0 + Duration::from_secs(5 * tick);
+            assert_eq!(
+                turns.turn(at, 1_000_000 + 5_000 * tick as i64),
+                None,
+                "tick {tick}"
+            );
+        }
+        // Just under the threshold on both clocks: still quiet.
+        let at = t0 + Duration::from_secs(150 + 59);
+        assert_eq!(turns.turn(at, 1_000_000 + 209_000), None);
+    }
+
+    #[test]
+    fn loop_turns_report_a_host_sleep_that_only_the_wall_clock_saw() {
+        let t0 = std::time::Instant::now();
+        let mut turns = LoopTurns::new(t0, 0, LOOP_GAP_REPORT);
+        // Monotonic time stood still while asleep: 5 s of it against 20 minutes of wall time.
+        let gap = turns
+            .turn(t0 + Duration::from_secs(5), 1_205_000)
+            .expect("a 20-minute sleep is reported");
+        assert_eq!(
+            gap,
+            LoopGap {
+                secs: 1205,
+                host_slept: true
+            }
+        );
+        let line = gap.line(true);
+        assert!(
+            line.contains("RESUMED after the host slept for about 1205s"),
+            "{line}"
+        );
+        assert!(
+            line.contains("re-announcing the seat and re-reading offers now, and reconnecting"),
+            "{line}"
+        );
+        // The next on-time tick is quiet again: one line per gap.
+        assert_eq!(turns.turn(t0 + Duration::from_secs(10), 1_210_000), None);
+    }
+
+    #[test]
+    fn loop_turns_report_a_stopped_process_or_blocked_loop_on_both_clocks() {
+        let t0 = std::time::Instant::now();
+        let mut turns = LoopTurns::new(t0, 0, LOOP_GAP_REPORT);
+        let gap = turns
+            .turn(t0 + Duration::from_secs(600), 600_000)
+            .expect("ten minutes without a turn is reported");
+        assert_eq!(
+            gap,
+            LoopGap {
+                secs: 600,
+                host_slept: false
+            }
+        );
+        let line = gap.line(false);
+        assert!(line.contains("event loop did not run for 600s"), "{line}");
+        assert!(!line.contains("reconnecting"), "{line}");
+    }
+
+    #[test]
+    fn loop_turns_survive_a_wall_clock_stepped_backwards() {
+        let t0 = std::time::Instant::now();
+        let mut turns = LoopTurns::new(t0, 10_000_000, LOOP_GAP_REPORT);
+        assert_eq!(
+            turns.turn(t0 + Duration::from_secs(5), 9_000_000),
+            None,
+            "a backwards step is no gap"
+        );
+        assert_eq!(
+            turns.turn(t0 + Duration::from_secs(10), 9_005_000),
+            None,
+            "and re-anchors on it"
+        );
+    }
+
+    #[test]
+    fn loop_watch_warns_once_per_stall_and_not_for_a_paused_process() {
+        let warn = Duration::from_secs(60);
+        let mut watch = LoopWatch::default();
+        assert_eq!(
+            watch.check(Duration::from_secs(59), Duration::ZERO, warn),
+            None
+        );
+        let line = watch
+            .check(Duration::from_secs(61), Duration::ZERO, warn)
+            .expect("a blocked loop is reported");
+        assert!(
+            line.contains("event loop BLOCKED") && line.contains("for 61s"),
+            "{line}"
+        );
+        assert_eq!(
+            watch.check(Duration::from_secs(120), Duration::ZERO, warn),
+            None,
+            "once per stall"
+        );
+        // The loop turned again: a later stall is a new one.
+        assert_eq!(
+            watch.check(Duration::from_secs(1), Duration::ZERO, warn),
+            None
+        );
+        assert!(
+            watch
+                .check(Duration::from_secs(70), Duration::ZERO, warn)
+                .is_some(),
+            "a new stall warns"
+        );
+        // This thread woke a long time late: the whole process was not running, not a blocked loop.
+        let mut watch = LoopWatch::default();
+        assert_eq!(
+            watch.check(Duration::from_secs(900), Duration::from_secs(890), warn),
+            None
+        );
+    }
 
     #[test]
     fn announcement_gap_warns_once_at_one_and_a_half_intervals_and_reports_the_renewal() {

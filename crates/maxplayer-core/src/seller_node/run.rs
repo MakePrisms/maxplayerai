@@ -5064,6 +5064,11 @@ pub struct SellerNodeRunner {
     drain: shutdown::DrainSignal,
     /// Backfill cadence, resolved once at boot (tests shorten it per runner, never via the env).
     wrap_backfill_interval_secs: u64,
+    /// How long the loop may go without turning before that is reported, and before it also forces
+    /// a relay recovery ([`schedule::LOOP_GAP_REPORT`], [`schedule::LOOP_GAP_RECONNECT`]; tests
+    /// shorten them per runner).
+    loop_gap_report: Duration,
+    loop_gap_reconnect: Duration,
     /// Mint redeems between the intent-to-receive breadcrumb and the receipt write. Graceful
     /// shutdown waits (bounded, [`schedule::LANE_SETTLE_MONEY_BOUND`]) while this is non-zero
     /// instead of cutting a swap off mid-flight.
@@ -5558,6 +5563,8 @@ impl SellerNodeRunner {
             shutdown: shutdown::ShutdownChannel::new(),
             drain: shutdown::DrainSignal::new(),
             wrap_backfill_interval_secs: resolve_wrap_backfill_interval_secs(),
+            loop_gap_report: schedule::LOOP_GAP_REPORT,
+            loop_gap_reconnect: schedule::LOOP_GAP_RECONNECT,
             redeems_in_flight: std::sync::atomic::AtomicUsize::new(0),
             remit_flight: crate::fee_remit::RemitFlight::new(),
             remit_pacing: Arc::new(Mutex::new(crate::fee_remit::RemitBackoff::new())),
@@ -6640,6 +6647,19 @@ impl SellerNodeRunner {
             BACKFILL_RETRY_MIN,
             Duration::from_secs(wrap_backfill_interval_secs),
         );
+        // A loop that stops turning is reported: by an OS thread while it is stuck (a blocked loop),
+        // and by the first drain tick after it turns again (host asleep, process stopped, or the
+        // block ended), which also re-announces the seat and re-reads offers at once. Without this a
+        // seat whose host slept went stale on the relay with nothing in its log.
+        let loop_pulse = schedule::LoopPulse::new();
+        loop_pulse.beat();
+        let _loop_watchdog =
+            schedule::spawn_loop_watchdog(Arc::clone(&loop_pulse), self.loop_gap_report);
+        let mut loop_turns = schedule::LoopTurns::new(
+            std::time::Instant::now(),
+            schedule::wall_ms(),
+            self.loop_gap_report,
+        );
         loop {
             if lane.is_none() {
                 let now = tokio::time::Instant::now();
@@ -6701,6 +6721,22 @@ impl SellerNodeRunner {
                 // Housekeeping runs on the lane; the loop only asks for it, and reports a lane that
                 // has stayed busy (30s, then 60s, 120s, ...).
                 _ = drain_tick.tick() => {
+                    loop_pulse.beat();
+                    if let Some(gap) = loop_turns.turn(std::time::Instant::now(), schedule::wall_ms()) {
+                        // The sockets are presumed dead after a long gap; the watchdog's monotonic
+                        // clock cannot see a host sleep, so it would not reconnect for intervals.
+                        let reconnect = heartbeat_enabled
+                            && Duration::from_secs(gap.secs) >= self.loop_gap_reconnect;
+                        if reconnect && forced_recovery.is_none() {
+                            forced_recovery =
+                                Some(format!("the event loop did not run for {}s", gap.secs));
+                        }
+                        opline!("{}", gap.line(reconnect));
+                        queue.request_backfill();
+                        if heartbeat_enabled && supervision.is_none() {
+                            heartbeat_tick.reset_immediately();
+                        }
+                    }
                     // #1299: a requested drain. First tick: say so and re-announce now
                     // (`accepting=n`) rather than an interval later. Every tick: leave through the
                     // ordinary exit path once nothing is held — same retraction, same lane settle,
@@ -25138,6 +25174,77 @@ esac"#,
             self.wrap_backfill_interval_secs = TEST_BACKFILL_SECS;
             self
         }
+
+        /// Shorten THIS runner's loop-gap thresholds (report, forced reconnect).
+        fn with_loop_gap_thresholds(mut self, report: Duration, reconnect: Duration) -> Self {
+            self.loop_gap_report = report;
+            self.loop_gap_reconnect = reconnect;
+            self
+        }
+    }
+
+    /// A loop that did not turn for a while (here: its thread blocked for 12 s, the shape of a host
+    /// sleep or a SIGSTOP as the loop sees it) re-announces the seat and reconnects as soon as it
+    /// turns again, instead of waiting out the heartbeat interval with a stale announcement.
+    ///
+    /// RED ON REVERT: drop the drain tick's `heartbeat_tick.reset_immediately()` and no beat lands
+    /// before the 3600 s interval; drop the forced recovery and the connection count stays put.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_loop_that_stopped_turning_reannounces_and_reconnects_when_it_resumes() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("loop-gap-reannounce");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.seller_heartbeat.enabled = true;
+        home.config.seller_heartbeat.interval_secs = 3600;
+        let runner = SellerNodeRunner::boot(home)
+            .await
+            .expect("boot runner")
+            .with_loop_gap_thresholds(Duration::from_secs(8), Duration::from_secs(9));
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| !seat_announcements(events).is_empty())
+                        .await,
+                    "harness check: the boot beat lands"
+                );
+                // Let the first drain ticks pass, then take the baseline.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let beats_before = seat_announcements(&fixture.events().await).len();
+                let connections_before = fixture.connections();
+                // Block the loop's thread: nothing on this LocalSet runs for 12 s.
+                tokio::task::spawn_local(async { std::thread::sleep(Duration::from_secs(12)) })
+                    .await
+                    .expect("blocking task");
+                let beat_again = fixture
+                    .wait_until_published(Duration::from_secs(10), |events| {
+                        seat_announcements(events).len() > beats_before
+                    })
+                    .await;
+                assert!(
+                    beat_again,
+                    "the seat must be re-announced right after the gap, not an interval (3600 s) later"
+                );
+                // Same bound as the watchdog's own reconnect test: the SDK's reconnect has backoff.
+                let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+                while fixture.connections() <= connections_before {
+                    assert!(
+                        tokio::time::Instant::now() < reconnect_deadline,
+                        "a gap past the reconnect threshold must force a relay recovery (connections \
+                         stayed at {connections_before})"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                shutdown.request("test stop");
+                let _ = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Offer REQs that carried the un-pinned open-pool filter — i.e. the grouped shape, armed.
