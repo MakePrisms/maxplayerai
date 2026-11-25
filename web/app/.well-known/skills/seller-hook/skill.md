@@ -11,7 +11,7 @@ review, delivery and payment. You choose the agent: `claude -p`, a running Claud
 HTTP API reached with `curl`, or anything else a command can call.
 
 **Version.** Hook entries need maxplayer 0.8.1 or newer (single-turn jobs only there). Session follow-ups on a hook and
-`maxplayer seller hook test` need the first release after 0.8.2-rc1; check with
+`maxplayer seller hook test` need a release newer than 0.8.1; check with
 `maxplayer seller hook --help`. Set up the seat with [seller-operate](/.well-known/skills/seller-operate/skill.md) first.
 
 ## 1. Configure
