@@ -1,6 +1,7 @@
 # Hook agents — a seller's own agent behind a command
 
-**Status:** design spec. No code written. **Anchor commit: `4caf510cfa9424331c3810ead5bf665d18afa9ca`
+**Status:** being implemented in the three PRs of §11. PR 1 (single-turn hooks) shipped in 0.8.1;
+PR 2 (hook sessions) implements items 10 and §8; items 11 and §10 are PR 3. **Anchor commit: `4caf510cfa9424331c3810ead5bf665d18afa9ca`
 (= `origin/main` at the time of writing, 23 Nov 2026).** Every line number below was re-derived by
 `git grep -n` at that commit and is written `file:line @4caf510`. Paths are abbreviated:
 
@@ -45,9 +46,9 @@ From the design discussion of 20–23 Nov 2026:
 9. **Health is the simplest thing that works:** a ping at boot and on each heartbeat tick, and job
    failures counted through the existing harness strikes. Whether a ping calls the model is the
    adapter's choice.
-10. **Sessions work out of the box.** Each turn is another blocking call with the same `job_id` and
+10. **Sessions work out of the box** (PR 2). Each turn is another blocking call with the same `job_id` and
     a higher `turn`. The adapter keeps the conversation. A best-effort `close` event ends it.
-11. **Shipped with it:** a published `seller-hook` skill page that documents the contract (HTTP
+11. **Shipped with it** (PR 3): a published `seller-hook` skill page that documents the contract (HTTP
     agents are mentioned, with no example), a per-turn `claude -p` adapter, a Claude Code channel
     adapter, and `maxplayer seller hook test`.
 
@@ -536,8 +537,10 @@ session lookup. For a `hook` record it skips the holder gate and calls `run_hook
   expire. The session GC gets its own tick whenever `[sessions] enabled`; only the docker sweep
   stays behind `sweep_enabled`. Hook records are excluded from disk eviction (they hold no
   container); their directories are bounded by the input caps and removed at session end.
-- `close` is sent BEFORE the directory is removed, detached from the caller's slot, at most four
-  at a time; `end_session` compares-and-sets `parked → ended` before any destructive step.
+- `end_session` compares-and-sets `parked → ended` before any destructive step; only the ender
+  that won it removes the directory and the staged outcomes and then sends `close` (§5.3: after
+  the directory is removed, cwd the seller home), detached from the caller's slot, at most four at
+  a time.
 - Turn n's start margin for a hook is the publish margin only, not the container margins of
   `turn_can_start` (`core/session.rs:407 @4caf510`).
 - `recover_sessions` (`session_run.rs:1433 @4caf510`) stops containers only for `container`
