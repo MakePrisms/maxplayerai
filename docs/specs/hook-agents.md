@@ -1,6 +1,6 @@
 # Hook agents — a seller's own agent behind a command
 
-**Status:** being implemented in the three PRs of §11. PR 1 (single-turn hooks) is in 0.8.2-rc1;
+**Status:** being implemented in the three PRs of §11. PR 1 (single-turn hooks) shipped in 0.8.1;
 PR 2 (hook sessions) implements items 10 and §8; items 11 and §10 are PR 3. **Anchor commit: `4caf510cfa9424331c3810ead5bf665d18afa9ca`
 (= `origin/main` at the time of writing, 23 Nov 2026).** Every line number below was re-derived by
 `git grep -n` at that commit and is written `file:line @4caf510`. Paths are abbreviated:
