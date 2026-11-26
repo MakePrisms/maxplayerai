@@ -6919,7 +6919,7 @@ impl SellerNodeRunner {
         // reads a recovery cut off is re-run, not reported as a failed read (finding 1).
         let mut lane_started_at = tokio::time::Instant::now();
         let mut last_recovery_end: Option<tokio::time::Instant> = None;
-        let mut queue_full_logged = false;
+        let mut queue_full = schedule::QueueFullEpisode::default();
         // Heartbeat supervision (probe + publish + watchdog + recovery), single-flight.
         let mut supervision: Option<SupervisionFuture> = None;
         // Set while a recovery is reconnecting: nothing on the loop may issue a long-lived REQ then
@@ -7000,8 +7000,14 @@ impl SellerNodeRunner {
                     lane = Some(Box::pin(Arc::clone(&self).lane_work(work, drain, flush_private)));
                 }
             }
-            if queue.has_room() {
-                queue_full_logged = false;
+            if let Some((fills, took)) =
+                queue_full.after_take(queue.queued_events(), tokio::time::Instant::now())
+            {
+                opline!(
+                    "seller node WORK-LANE queue empty again after {}s (it filled {fills} time(s) \
+                     meanwhile)",
+                    took.as_secs()
+                );
             }
             tokio::select! {
                 // #747: leave the selling role. Breaking here — rather than exiting the process
@@ -7444,8 +7450,9 @@ impl SellerNodeRunner {
                             }
                             if handled_event_kind(event.kind) {
                                 queue.push_event(event);
-                                if !queue.has_room() && !queue_full_logged {
-                                    queue_full_logged = true;
+                                if queue_full
+                                    .after_push(queue.has_room(), tokio::time::Instant::now())
+                                {
                                     opline!(
                                         "seller node WORK-LANE queue full ({EVENT_QUEUE_CAP} events): \
                                          relay reads pause until it drains"
