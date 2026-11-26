@@ -75,8 +75,15 @@ pub fn read_status(root: &Path) -> Result<WatchStatus> {
     };
     // A new watcher holds the lock briefly before replacing the previous process's file;
     // a status written by a dead pid must never read as this watcher's health.
-    // SAFETY: signal 0 only checks that the pid exists.
-    let writer_alive = status.pid != 0 && unsafe { libc::kill(status.pid as libc::pid_t, 0) } == 0;
+    // SAFETY: signal 0 only checks that the pid exists. EPERM means it exists but belongs to
+    // another user (`status` run as a different user than the watch, or under a supervisor): that
+    // is a live writer, not a previous one.
+    // A pid that does not fit pid_t would wrap negative and name a process group: not a writer.
+    let writer_alive = libc::pid_t::try_from(status.pid).is_ok_and(|pid| {
+        pid > 0
+            && (unsafe { libc::kill(pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+    });
     if !running {
         status.state = "unhealthy".into();
         status.last_error = Some("watch not running (lock not held)".into());
@@ -370,6 +377,9 @@ pub async fn watch_with_options(
         attempt += 1;
         let client = client(&home.keys);
         let mut phase = "connect/auth";
+        // Setup can take the whole cycle_timeout (60 s by default) against a slow relay: keep
+        // the status file fresh through it, as the steady state, probe and backoff do, so the
+        // file never goes stale (>90 s) while the watch is alive.
         let setup = tokio::time::timeout(options.cycle_timeout, async {
             let (relay, mut notifications) = connect(&client, url).await?;
             phase = "subscribe/matching EOSE";
@@ -398,8 +408,22 @@ pub async fn watch_with_options(
                 since,
                 count,
             ))
-        })
-        .await;
+        });
+        let setup = {
+            tokio::pin!(setup);
+            let mut refresh = tokio::time::interval_at(
+                Instant::now() + options.refresh_interval,
+                options.refresh_interval,
+            );
+            loop {
+                tokio::select! {
+                    result = &mut setup => break result,
+                    _ = refresh.tick() => {
+                        let _ = home.save_status(&mut status);
+                    }
+                }
+            }
+        };
         let error = match setup {
             Ok(Ok((relay, mut notifications, live, since, count))) => {
                 // Only a fully authenticated, EOSE-verified history resets the backoff.
@@ -440,32 +464,50 @@ pub async fn watch_with_options(
                         _ = refresh.tick() => home.save_status(&mut status),
                         _ = probe.tick() => {
                             let at = Timestamp::now().as_secs();
-                            let check = async {
-                                let id = relay.subscribe(filter(home, at).limit(0), SubscribeOptions::default()).await?;
-                                matching_eose(home, &mut notifications, &id, &live, &mut notifier).await?;
-                                relay.unsubscribe(&id).await?;
-                                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-                            };
-                            let alive = match tokio::time::timeout(options.liveness_timeout, check).await {
-                                Ok(result) => result,
-                                Err(_) => Err("subscribe: liveness EOSE timeout".into()),
-                            };
-                            match alive {
+                            let work = async {
+                                let check = async {
+                                    let id = relay.subscribe(filter(home, at).limit(0), SubscribeOptions::default()).await?;
+                                    matching_eose(home, &mut notifications, &id, &live, &mut notifier).await?;
+                                    relay.unsubscribe(&id).await?;
+                                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+                                };
+                                match tokio::time::timeout(options.liveness_timeout, check).await {
+                                    Ok(result) => result?,
+                                    Err(_) => return Err("subscribe: liveness EOSE timeout".into()),
+                                }
                                 // The liveness EOSE proves the relay answers, not that the live
                                 // subscription delivered everything. Only a paged, EOSE-verified
                                 // re-read of history since the last checkpoint may advance it.
-                                Ok(()) => {
-                                    let verified = async {
-                                        let since = home.history_since()?;
-                                        catch_up(home, &relay, &mut notifications, &live, &mut notifier, since, at).await?;
-                                        home.checkpoint(at)?;
-                                        status.last_healthy_at = Some(at);
-                                        home.save_status(&mut status)
-                                    };
-                                    match tokio::time::timeout(options.cycle_timeout, verified).await {
-                                        Ok(result) => result,
-                                        Err(_) => Err("subscribe: history check deadline exceeded".into()),
+                                let verified = async {
+                                    let since = home.history_since()?;
+                                    catch_up(home, &relay, &mut notifications, &live, &mut notifier, since, at).await?;
+                                    home.checkpoint(at)
+                                };
+                                match tokio::time::timeout(options.cycle_timeout, verified).await {
+                                    Ok(result) => result,
+                                    Err(_) => Err("subscribe: history check deadline exceeded".into()),
+                                }
+                            };
+                            // The probe and its history re-read may legitimately run for up to
+                            // liveness_timeout + cycle_timeout (75 s by default). Keep refreshing
+                            // the status file meanwhile: a watch that is alive and probing must not
+                            // read as a stale file (>90 s) to `status`, which it did whenever a
+                            // probe ran long after a refresh had been skipped for it.
+                            tokio::pin!(work);
+                            let outcome = loop {
+                                tokio::select! {
+                                    result = &mut work => break result,
+                                    _ = refresh.tick() => {
+                                        if let Err(error) = home.save_status(&mut status) {
+                                            break Err(error);
+                                        }
                                     }
+                                }
+                            };
+                            match outcome {
+                                Ok(()) => {
+                                    status.last_healthy_at = Some(at);
+                                    home.save_status(&mut status)
                                 }
                                 Err(error) => Err(error),
                             }
@@ -490,6 +532,8 @@ pub async fn watch_with_options(
         .into();
         status.last_error = Some(display_text(&error));
         home.save_status(&mut status)?;
+        // The backoff's refresh clock starts at this save, not after the shutdown below.
+        let mut saved = Instant::now();
         shutdown(client).await;
         let exiting =
             options.max_failures > 0 && status.consecutive_failures >= options.max_failures;
@@ -509,6 +553,12 @@ pub async fn watch_with_options(
         let until = Instant::now() + delay;
         while Instant::now() < until {
             tick(&mut notifier);
+            // The backoff can reach 60 s: keep the (reconnecting) status fresh through it, so
+            // `status` reports the real last error rather than a stale file.
+            if saved.elapsed() >= options.refresh_interval {
+                let _ = home.save_status(&mut status);
+                saved = Instant::now();
+            }
             tokio::time::sleep_until(until.min(Instant::now() + Duration::from_millis(100))).await;
         }
     }
