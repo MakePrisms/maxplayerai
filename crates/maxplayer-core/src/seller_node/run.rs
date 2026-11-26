@@ -6544,6 +6544,8 @@ impl SellerNodeRunner {
         let wrap_backfill_interval_secs = self.wrap_backfill_interval_secs;
         let mut wrap_backfill_tick =
             tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
+        // As `drain_tick`: one tick after a blocked loop or a stopped process, not a burst.
+        wrap_backfill_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let heartbeat_interval = Duration::from_secs(heartbeat_interval_secs.max(1));
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
         // One supervision at a time: ticks that land while one runs are skipped, not queued.
@@ -6676,7 +6678,10 @@ impl SellerNodeRunner {
         loop {
             if lane.is_none() {
                 let now = tokio::time::Instant::now();
-                if let Some(work) = queue.next(!recovering.get()) {
+                // A backfill also waits while a reconnect gap's recovery is owed: on the dead socket
+                // it would only fail and back off.
+                let backfill_ok = !recovering.get() && !recovery_debt.backfill_held();
+                if let Some(work) = queue.next(backfill_ok) {
                     if matches!(work, schedule::Work::Backfill) {
                         last_backfill_at = now;
                     }
@@ -6949,11 +6954,8 @@ impl SellerNodeRunner {
                         && let Some(state) = open_pool.as_mut()
                         && state.on_tick() == RearmStep::Attempt
                     {
-                        let overlap = nostr_sdk::Timestamp::from(
-                            liveness.confirmed_unix()
-                                .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
-                                .max(0) as u64,
-                        );
+                        let overlap =
+                            nostr_sdk::Timestamp::from(recovery_overlap_since(liveness.confirmed_unix()));
                         match self.subscribe_offers(Some(overlap), true).await {
                             Ok(()) => opline!(
                                 "seller node RELAY-CLOSED RE-ARM: retrying the open-pool half of \
@@ -7280,11 +7282,8 @@ impl SellerNodeRunner {
                                 && subscription_pins_only_our_pubkey(&id, offer_req_carries_unpinned)
                                 && restricted_retry_used.insert(id.clone())
                             {
-                                let overlap = nostr_sdk::Timestamp::from(
-                                    liveness.confirmed_unix()
-                                        .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
-                                        .max(0) as u64,
-                                );
+                                let overlap =
+                                    nostr_sdk::Timestamp::from(recovery_overlap_since(liveness.confirmed_unix()));
                                 match self.subscribe_one(&id, Some(overlap)).await {
                                     Ok(()) => {
                                         opline!(
@@ -7381,11 +7380,8 @@ impl SellerNodeRunner {
                                 );
                                 continue;
                             }
-                            let overlap = nostr_sdk::Timestamp::from(
-                                liveness.confirmed_unix()
-                                    .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
-                                    .max(0) as u64,
-                            );
+                            let overlap =
+                                nostr_sdk::Timestamp::from(recovery_overlap_since(liveness.confirmed_unix()));
                             match self.subscribe_all(Some(overlap)).await {
                                 Ok(()) => opline!(
                                     "seller node RELAY-AUTH RESUBSCRIBE: re-issued offers+awards+\
@@ -12538,7 +12534,9 @@ impl SellerNodeRunner {
         // had already replaced, and confirming first would move the cursor past the whole gap.
         let confirmed_before_tick = clock.confirmed_unix();
         let confirmed = relay_liveness_confirmed(probe_ok, publish_ok);
-        if confirmed {
+        // A tick that runs a forced recovery confirms only if that recovery succeeds (below): a
+        // FAILED one must hand its retry, and any AUTH resubscribe meanwhile, the pre-gap cursor.
+        if confirmed && input.forced.is_none() {
             clock.confirm(started, started_unix);
         }
         // Measured to this tick's START: the tick that completes N missed intervals trips, not
@@ -25284,10 +25282,11 @@ esac"#,
                     })
                     .await;
                 assert!(resubscribed, "harness check: the recovery re-issued the award REQ");
+                // The FIRST re-issued award REQ is the recovery's; a later AUTH resubscribe on the
+                // new socket may legitimately start from the post-recovery confirmation.
                 let newest_since = fixture.reqs_for(AWARD_SUB_ID).await[award_reqs_before..]
                     .iter()
-                    .filter_map(|record| record.since)
-                    .max()
+                    .find_map(|record| record.since)
                     .expect("the re-issued award REQ carries a since");
                 let bound = u64::try_from(gap_started_unix).unwrap() - STALL_OVERLAP_MARGIN_SECS;
                 assert!(

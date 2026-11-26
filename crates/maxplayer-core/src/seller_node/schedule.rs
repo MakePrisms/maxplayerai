@@ -491,8 +491,9 @@ impl LoopGap {
 /// - A gap seen while a supervision runs cannot re-announce at once (the heartbeat tick is not armed
 ///   then), so the beat is owed until that supervision ends; without this the re-announce, and any
 ///   forced recovery, waited a whole heartbeat interval.
-/// - A gap that forces a reconnect holds its offer/wrap re-read until the recovery has run: a read
-///   on the dead socket fails, backs off and is retried late.
+/// - A gap that forces a reconnect holds every offer/wrap backfill until a forced recovery that
+///   started after it has SUCCEEDED: a read on the dead socket fails, backs off and is retried
+///   late. A later reconnect gap supersedes a recovery already running.
 /// - A forced recovery that FAILED is re-armed for the next heartbeat tick. The watchdog cannot take
 ///   over: its clock is monotonic and did not count the gap, so it would not trip for intervals.
 #[derive(Debug, Default)]
@@ -524,8 +525,15 @@ impl RecoveryDebt {
         }
         if reconnect {
             self.backfill_owed = true;
+            // A recovery already running predates this gap; it cannot release this backfill.
+            self.running_releases_backfill = false;
         }
-        (!supervision_running, !reconnect)
+        (!supervision_running, !self.backfill_owed)
+    }
+
+    /// Hold backfills: a reconnect gap's recovery has not succeeded yet.
+    pub(crate) fn backfill_held(&self) -> bool {
+        self.backfill_owed
     }
 
     /// A heartbeat supervision starts, carrying `forced` (a recovery it will run).
@@ -537,7 +545,8 @@ impl RecoveryDebt {
     /// The running supervision ended. `recovered`: `Some(ok)` when it ran a recovery.
     pub(crate) fn supervision_done(&mut self, recovered: Option<bool>) -> DebtDue {
         let forced = self.running_forced.take();
-        let backfill = std::mem::take(&mut self.running_releases_backfill);
+        let releases = std::mem::take(&mut self.running_releases_backfill);
+        let backfill = releases && recovered == Some(true);
         if backfill {
             self.backfill_owed = false;
         }
@@ -664,11 +673,12 @@ pub(crate) struct LoopWatchdog {
 }
 
 impl Drop for LoopWatchdog {
+    /// Stops and wakes the thread without waiting for it: this runs on the async loop's thread, and
+    /// a join could block it behind the watchdog's own log write.
     fn drop(&mut self) {
-        self.pulse.stopped.store(true, Ordering::Relaxed);
+        self.pulse.stopped.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             thread.thread().unpark();
-            let _ = thread.join();
         }
     }
 }
@@ -690,7 +700,7 @@ pub(crate) fn spawn_loop_watchdog(
                 // Parked rather than slept, so the guard's drop wakes it at once. A spurious wake only
                 // checks early (no oversleep), which is harmless.
                 std::thread::park_timeout(LOOP_WATCH_EVERY);
-                if watched.stopped.load(Ordering::Relaxed) {
+                if watched.stopped.load(Ordering::Acquire) {
                     return;
                 }
                 let overslept = asked.elapsed().saturating_sub(LOOP_WATCH_EVERY);
@@ -920,13 +930,42 @@ mod tests {
         debt.supervision_started(Some(reason));
         let due = debt.supervision_done(Some(false));
         assert_eq!(due.rearm_forced.as_deref(), Some(reason), "a failed forced recovery is re-armed");
-        assert!(due.backfill, "the read waited for the recovery attempt, not for its success");
-        // The re-armed attempt succeeds: nothing more.
+        assert!(!due.backfill, "no re-read on the still-dead socket");
+        assert!(debt.backfill_held(), "backfills stay held until a recovery succeeds");
+        // The re-armed attempt succeeds: now the re-read runs, once.
         debt.supervision_started(due.rearm_forced.as_deref());
-        assert_eq!(debt.supervision_done(Some(true)), DebtDue::default());
+        assert_eq!(
+            debt.supervision_done(Some(true)),
+            DebtDue { beat: false, backfill: true, rearm_forced: None }
+        );
+        assert!(!debt.backfill_held());
         // A failed STALL recovery (not forced) is the watchdog's to retry, not re-armed here.
         debt.supervision_started(None);
         assert_eq!(debt.supervision_done(Some(false)), DebtDue::default());
+    }
+
+    #[test]
+    fn recovery_debt_a_second_reconnect_gap_supersedes_the_recovery_already_running() {
+        let mut debt = RecoveryDebt::default();
+        assert_eq!(debt.gap(false, true), (true, false));
+        assert!(debt.backfill_held());
+        debt.supervision_started(Some("gap 1"));
+        // A second reconnect gap while gap 1's recovery runs: that recovery cannot release it.
+        assert_eq!(debt.gap(true, true), (false, false));
+        // A short gap meanwhile does not sneak a backfill in either.
+        assert_eq!(debt.gap(true, false), (false, false));
+        assert_eq!(
+            debt.supervision_done(Some(true)),
+            DebtDue { beat: true, backfill: false, rearm_forced: None }
+        );
+        assert!(debt.backfill_held(), "gap 2's recovery has not run yet");
+        // The beat that fired carries gap 2's forced recovery; its success releases the read.
+        debt.supervision_started(Some("gap 2"));
+        assert_eq!(
+            debt.supervision_done(Some(true)),
+            DebtDue { beat: false, backfill: true, rearm_forced: None }
+        );
+        assert!(!debt.backfill_held());
     }
 
     #[test]
@@ -937,12 +976,16 @@ mod tests {
         assert!(guard.thread.is_some(), "harness check: the watchdog thread started");
         let started = std::time::Instant::now();
         drop(guard);
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "dropping the guard wakes and joins the thread, not a {}s sleep later",
-            LOOP_WATCH_EVERY.as_secs()
-        );
-        assert_eq!(std::sync::Arc::strong_count(&pulse), 1, "the thread ended and released the pulse");
+        assert!(started.elapsed() < Duration::from_millis(500), "the drop itself never waits");
+        // The thread is woken, not left to finish its sleep: it releases the pulse at once.
+        while std::sync::Arc::strong_count(&pulse) > 1 {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the woken thread ends, not a {}s sleep later",
+                LOOP_WATCH_EVERY.as_secs()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
