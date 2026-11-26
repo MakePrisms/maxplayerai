@@ -1,3 +1,55 @@
+## v0.8.2-rc3
+
+Release candidate for 0.8.2, built from main after #1426. It fixes sellers whose seat announcement
+stopped renewing after the host slept or the process was paused (the seat showed offline with no
+explanation in its log), adds task stages and announcement ages to `swarm_job_status`, and reports
+an over-long inline answer as `delivery_failed` instead of `no_sentinel`. After publication,
+install with `npm install -g maxplayer@0.8.2-rc3` (or `install.sh --version 0.8.2-rc3`). Publish
+as a GitHub prerelease on npm `rc`; leave stable `latest` (0.8.1) unchanged.
+
+**Relay and registration service: nothing to deploy for this RC.** No wire change and no store
+schema change: the seller store stays at 16 and the buyer store at 10. Nothing in `crates/buzz`,
+the registration service or the reviewer changed since v0.8.2-rc2. The sandbox image is rebuilt
+and tagged `maxplayer-sandbox:v0.8.2-rc3`. Website pages keep naming the latest stable release
+(0.8.1). Restart seller daemons to pick up the heartbeat fix.
+
+### Changes
+
+- **Seller: re-announce and reconnect after the event loop stopped turning** (#1424). This is the
+  fix for sellers whose heartbeat / seat announcement stopped renewing, so buyers and the market
+  board showed the seat offline. The heartbeat, the watchdog, the `seat announcement OVERDUE` line
+  (#1414) and the status line all run on the seller's event loop, and its timers use the monotonic
+  clock, which does not count a host sleep. After a sleep or a paused process the next beat could
+  be a full interval away, and the relay-stall watchdog did not count the gap.
+  - The 5 s drain tick now compares wall and monotonic time. After a gap of 60 s or more it prints
+    `seller node RESUMED after the host slept for about Ns: …` (wall clock ran ahead) or
+    `seller node event loop did not run for Ns (the process was stopped or the loop was blocked): …`,
+    re-reads offers, sends the heartbeat at once, and for a gap of 120 s or more forces a relay
+    reconnect on that heartbeat.
+  - A watchdog thread prints `seller node event loop BLOCKED: it has not turned for Ns while the
+    process runs; …` once per stall when the process runs but its loop is stuck (a bug: report it).
+  - A forward wall-clock step (NTP) of a minute or more prints the RESUMED line once; harmless.
+  - Nothing changes on the wire. The lines are listed in `docs/SELLER-QUICKSTART.md`.
+- **Buyer: `swarm_job_status` shows each running task's stage and each seat's announcement age**
+  (#1425). `running[]` entries carry `stage` (`posting`, `awaiting_claim`, `awarding`,
+  `awarded`, `turn_pending`, `turn_sent`) and `stage_secs`; `members[].heartbeat` carries
+  `announced_at_unix`, and status adds `announced_secs_ago` and `checked_secs_ago`. A task no
+  seller has claimed yet no longer reads like one stuck after its award. Snapshots stored by older
+  builds are shown unchanged. The MCP tool description and `docs/specs/swarm.md` name the fields.
+- **Seller: an inline answer over the limit fails as `delivery_failed`, not `no_sentinel`**
+  (#1426). A container seat cut a marked answer longer than the 4,076-byte inline limit and then
+  refused it as `no_sentinel` ("no execution was observed"), which reads like a dead harness. It
+  now refuses it with `delivery_failed` and a buyer-facing reason naming the limit and the fix
+  (accept a git delivery, or ask for a shorter answer), for one-shot jobs and session turns; the
+  host path uses the same text. A cut unmarked message stays `no_sentinel`. The harness is still
+  not struck, and the buyer still releases the reservation. `docs/protocol-v1.md` §6.4 states the
+  rule; the inline limit itself is unchanged.
+
+### Website and docs (live on merge, not part of the binary)
+
+- debug-selling mentions the RESUMED / "did not run" lines (#1424); swarm-buyer describes the new
+  `swarm_job_status` fields (#1425).
+
 ## v0.8.2-rc2
 
 Release candidate for 0.8.2, built from main after #1417. It adds hook sessions and the tooling to
