@@ -745,7 +745,13 @@ contribution-class when it carries `["job-class","contribution"]`; it pins its t
 
 The marker is the inline counterpart of §8.2, and §8.3 states it. Without it the seller MUST refuse
 with `no_sentinel` (§7.1). An empty tree with unmarked text is the shape of an exhausted plan, an
-unreachable model host and a declined task alike, and none of those is a deliverable.
+unreachable model host and a declined task alike, and none of those is a deliverable. On a job or
+session turn that could deliver inline (from-scratch, and the offer accepts `inline`), a marked
+answer — or a session's other inline shapes above — longer than the seller's inline limit MUST NOT
+be cut and delivered, and the seller MUST refuse it with `delivery_failed`: the agent ran and
+answered. (The reference seller tells the agent the answer limit, 4076 bytes after the marker and
+any decoration are stripped; a containerized seat also caps the agent's whole raw message at 4096
+bytes, so a heavily decorated answer near the limit can be refused there.)
 
 The execution metadata block is what the seller reports about its own run. Nothing verifies it. A
 reader MUST NOT treat it as proof that a given harness or model ran.
@@ -1006,8 +1012,8 @@ routinely formats it, and refusing a decorated marker refuses a correct answer, 
 its fee, and strikes a healthy harness. Decoration cannot make an unmarked message marked.
 
 An inline answer is bounded. A seller MUST refuse to deliver an answer above its own limit rather
-than truncate one: a reader cannot tell a cut answer from a whole one, because the digest covers
-whatever was sent.
+than truncate one, with `delivery_failed` (§6.4): a reader cannot tell a cut answer from a whole
+one, because the digest covers whatever was sent.
 
 The marker answers the question §8.2 answers for a tree: **did this job's work actually happen?**
 A completed turn does not answer it. An exhausted plan, an unreachable model host and an idle model

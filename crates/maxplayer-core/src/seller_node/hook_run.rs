@@ -161,7 +161,10 @@ impl SellerNodeRunner {
                         opline!(
                             "seller node hook job_id={job_id}: answer is {bytes} bytes, over the {cap}-byte limit — refusing rather than delivering a cut answer"
                         );
-                        self.hook_refused(job_id, &buyer, &workdir).await;
+                        // The buyer reads the limit, as on every other seat (#1426 review M1): a
+                        // generic refusal reads as a broken seller and the same job is reposted.
+                        self.hook_refused_with(job_id, &buyer, &workdir, INLINE_ANSWER_TOO_LONG_FEEDBACK)
+                            .await;
                         return;
                     }
                     JobOutcome::CannotDeliver(reason) => {
@@ -371,7 +374,19 @@ impl SellerNodeRunner {
 
     /// `delivery_failed`, no strike: the hook answered honestly but nothing deliverable came of it.
     async fn hook_refused(&self, job_id: &str, buyer: &str, workdir: &std::path::Path) {
-        self.fail_job_with_feedback(job_id, buyer, ReasonCode::DeliveryFailed, HOOK_DELIVERY_REFUSED_FEEDBACK, None)
+        self.hook_refused_with(job_id, buyer, workdir, HOOK_DELIVERY_REFUSED_FEEDBACK)
+            .await;
+    }
+
+    /// [`Self::hook_refused`] with a specific static reason (an over-long answer names the limit).
+    async fn hook_refused_with(
+        &self,
+        job_id: &str,
+        buyer: &str,
+        workdir: &std::path::Path,
+        feedback: &'static str,
+    ) {
+        self.fail_job_with_feedback(job_id, buyer, ReasonCode::DeliveryFailed, feedback, None)
             .await;
         self.finish_hook_job(job_id, workdir);
     }

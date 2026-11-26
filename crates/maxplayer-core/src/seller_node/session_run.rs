@@ -110,16 +110,103 @@ impl ReleaseGate {
     }
 }
 
+/// Buyer-facing reason for a follow-up whose reply ran past [`INLINE_ANSWER_MAX_BYTES`]: the agent
+/// replied, the reply is not deliverable cut, and the session is still open for a shorter one. The
+/// number is pinned to the constant by a test.
+const TURN_REPLY_TOO_LONG_FEEDBACK: &str = "seller's agent replied but the reply was longer than the \
+    4076-byte inline limit, so it was not delivered (a cut reply is never sent); the session stays \
+    open: ask for a shorter reply, or for the answer written to a file";
+
+/// The same for a HOOK seat's follow-up: a hook delivers inline or not at all (files its agent writes
+/// are never delivered, protocol §6.4), so it does not suggest a file.
+const HOOK_TURN_REPLY_TOO_LONG_FEEDBACK: &str = "seller's agent replied but the reply was longer \
+    than the 4076-byte inline limit, so it was not delivered (a cut reply is never sent); the session \
+    stays open: ask for a shorter reply";
+
+/// A failed turn: its reason code, a log-only `detail`, and the static text the buyer reads.
+///
+/// The buyer text is carried as a value, chosen where the failure is built, never recovered from
+/// `detail` afterwards: a detail can hold container-written text (an outcome's `detail`), and no
+/// such string may pick what the buyer reads (#1426 review r2 M1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnFailure {
+    code: ReasonCode,
+    detail: String,
+    feedback: &'static str,
+}
+
+impl From<(ReasonCode, String)> for TurnFailure {
+    /// Every ordinary failure: the code's own text.
+    fn from((code, detail): (ReasonCode, String)) -> Self {
+        Self {
+            code,
+            detail,
+            feedback: feedback_text(code),
+        }
+    }
+}
+
+impl TurnFailure {
+    /// The same failure as a hook seat reports it: an over-long reply suggests no file.
+    fn on_hook_seat(mut self) -> Self {
+        if self.feedback == TURN_REPLY_TOO_LONG_FEEDBACK {
+            self.feedback = HOOK_TURN_REPLY_TOO_LONG_FEEDBACK;
+        }
+        self
+    }
+}
+
+/// The one constructor of an over-long-reply failure (#1426 review H2).
+fn reply_too_long() -> TurnFailure {
+    TurnFailure {
+        code: ReasonCode::DeliveryFailed,
+        detail: format!("reply over the {INLINE_ANSWER_MAX_BYTES}-byte inline limit"),
+        feedback: TURN_REPLY_TOO_LONG_FEEDBACK,
+    }
+}
+
 /// Feedback reason and text for a failed turn. Never fails the JOB row: turn 1 stays delivered.
-fn turn_failure(failure: ContainerDeliveryFailure) -> (ReasonCode, String) {
+///
+/// `status` and `inline_allowed` are what the follow-up inline arm (`resume_turn`) decides with:
+/// a reply the container cut is over-long only if, whole, that arm would have delivered it.
+fn turn_failure(
+    failure: ContainerDeliveryFailure,
+    status: TurnStatus,
+    inline_allowed: bool,
+) -> TurnFailure {
     use ContainerDeliveryFailure as F;
     match failure {
-        F::NoSentinel { detail, .. } => (ReasonCode::NoSentinel, detail),
-        F::Delivery(detail) => (ReasonCode::DeliveryFailed, detail),
-        F::Setup(detail) | F::Snapshot(detail) | F::Timeout(detail) => {
-            (ReasonCode::ExecutionFailed, detail)
+        // A deliverable reply the container cut is an over-long reply, not a dead harness: the
+        // same `delivery_failed` the one-shot path reports (`container_no_sentinel_feedback`).
+        // Every session inline shape counts — a marked answer, a NEEDS-INPUT question, an
+        // out-of-time partial reply (`session_delivery_content`) — and the cut keeps each shape's
+        // lead (the marker is first; an out-of-time reply only needs to be non-empty).
+        F::NoSentinel {
+            detail,
+            last_agent_message,
+            message_truncated,
+            outcome_authentic,
+            from_scratch,
+            ..
+        } => {
+            let cut_reply = message_truncated
+                && outcome_authentic
+                && from_scratch
+                && inline_allowed
+                && last_agent_message
+                    .as_deref()
+                    .is_some_and(|m| session::session_delivery_content(false, status, m).is_some());
+            if cut_reply {
+                reply_too_long()
+            } else {
+                (ReasonCode::NoSentinel, detail).into()
+            }
         }
-        F::Agent(error) => (ReasonCode::ExecutionFailed, error.to_string()),
+        F::Delivery(detail) => (ReasonCode::DeliveryFailed, detail).into(),
+        F::Setup(detail) | F::Snapshot(detail) | F::Timeout(detail) => {
+            (ReasonCode::ExecutionFailed, detail).into()
+        }
+        F::Agent(error) => (ReasonCode::ExecutionFailed, error.to_string()).into(),
     }
 }
 
@@ -513,23 +600,25 @@ impl SellerNodeRunner {
 
     /// Whether it went out (see [`SellerNodeRunner::publish_buyer_feedback`]).
     async fn turn_feedback(&self, job_id: &str, buyer: &str, fid: &str, code: ReasonCode) -> bool {
-        self.turn_feedback_with(job_id, buyer, fid, code, None)
+        self.turn_feedback_with(job_id, buyer, fid, code, feedback_text(code), None)
             .await
     }
 
-    /// `sizes`: a seller-computed, buyer-text-free detail appended for `turn_too_large` (#1349).
+    /// `text`: a static buyer-facing reason (`feedback_text` / `TurnFailure::feedback`). `sizes`: a
+    /// seller-computed, buyer-text-free detail appended for `turn_too_large` (#1349).
     async fn turn_feedback_with(
         &self,
         job_id: &str,
         buyer: &str,
         fid: &str,
         code: ReasonCode,
+        text: &'static str,
         sizes: Option<&str>,
     ) -> bool {
         // The follow-up id makes each turn's encrypted feedback a distinct content intent.
         let reason = match sizes {
-            Some(sizes) => format!("{} ({sizes}; follow-up {fid})", feedback_text(code)),
-            None => format!("{} (follow-up {fid})", feedback_text(code)),
+            Some(sizes) => format!("{text} ({sizes}; follow-up {fid})"),
+            None => format!("{text} (follow-up {fid})"),
         };
         let status = refusal_status(code);
         self.publish_buyer_feedback_tagged(
@@ -657,7 +746,8 @@ impl SellerNodeRunner {
             let _ = store.set_turn_state(fid, TurnState::Reviewing, None, None, now_secs());
             let end = self.run_hook_turn(&turn, &offer, &record).await;
             let _ = store.set_session_state(&job_id, SessionState::Parked, now_secs());
-            if let HookTurnEnd::Refused(code, detail) = end {
+            if let HookTurnEnd::Refused(failure) = end {
+                let TurnFailure { code, detail, feedback } = failure;
                 opline!(
                     "seller node session job_id={job_id}: turn {} not delivered ({}: {detail})",
                     turn.turn,
@@ -665,7 +755,7 @@ impl SellerNodeRunner {
                 );
                 let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
                 let sizes = buyer_sizes(code, &detail);
-                self.turn_feedback_with(&job_id, &buyer, fid, code, sizes)
+                self.turn_feedback_with(&job_id, &buyer, fid, code, feedback, sizes)
                     .await;
             }
             if store.session_close_requested(&job_id).unwrap_or(false)
@@ -775,7 +865,8 @@ impl SellerNodeRunner {
                     .await;
                 }
             }
-            Err((code, detail)) => {
+            Err(failure) => {
+                let TurnFailure { code, detail, feedback } = failure;
                 opline!(
                     "seller node session job_id={job_id}: turn {} not delivered ({}: {detail})",
                     turn.turn,
@@ -783,7 +874,7 @@ impl SellerNodeRunner {
                 );
                 let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
                 let sizes = buyer_sizes(code, &detail);
-                self.turn_feedback_with(&job_id, &buyer, fid, code, sizes)
+                self.turn_feedback_with(&job_id, &buyer, fid, code, feedback, sizes)
                     .await;
             }
         }
@@ -976,7 +1067,7 @@ impl SellerNodeRunner {
         turn: &SessionTurnRecord,
         offer: &Offer,
         record: &SessionRecord,
-    ) -> Result<(), (ReasonCode, String)> {
+    ) -> Result<(), TurnFailure> {
         let (job_id, fid, n, deadline) = (
             turn.job_id.as_str(),
             turn.followup_id.as_str(),
@@ -1100,7 +1191,8 @@ impl SellerNodeRunner {
                     let header = self
                         .mint_push_header(&seller.git_remote, &push_ref, Some(expiry))
                         .await
-                        .map_err(turn_failure)?;
+                        // A push-header failure is never a reply: no inline shape to weigh.
+                        .map_err(|failure| turn_failure(failure, TurnStatus::Done, false))?;
                     orch::PushTokenSource::LongLived { header }
                 }
             }
@@ -1247,10 +1339,10 @@ impl SellerNodeRunner {
         drop(prepared);
 
         if let Some(Release::Abort(reason)) = &gate.verdict {
-            return Err((
+            return Err(TurnFailure::from((
                 ReasonCode::ExecutionFailed,
                 format!("{REVIEW_REFUSED_FEEDBACK}: {reason}"),
-            ));
+            )));
         }
         let status = turn_session
             .as_ref()
@@ -1284,7 +1376,7 @@ impl SellerNodeRunner {
                 if let ContainerDeliveryFailure::Agent(error) = &failure {
                     self.drop_harness(harness, harness_fault_for(error));
                 }
-                return Err(turn_failure(failure));
+                return Err(turn_failure(failure, status, inline_allowed));
             }
         };
         self.publish_turn_result(TurnResult {
@@ -1312,12 +1404,12 @@ impl SellerNodeRunner {
 
     /// Co-sign, project and enqueue turn n's RESULT (§2.3, §7, §8.2): the per-turn tags, and on a
     /// priced job a fresh `creq` whose payment id is the follow-up id.
-    async fn publish_turn_result(&self, r: TurnResult<'_>) -> Result<(), (ReasonCode, String)> {
+    async fn publish_turn_result(&self, r: TurnResult<'_>) -> Result<(), TurnFailure> {
         let home = self.node.home();
         let store = self.node.store();
         let seller_pubkey = self.seller_pubkey.to_hex();
         let offer = r.offer;
-        let delivery_failed = |detail: String| (ReasonCode::DeliveryFailed, detail);
+        let delivery_failed = |detail: String| TurnFailure::from((ReasonCode::DeliveryFailed, detail));
         let turn_creq = if offer.payment_mode.is_free() {
             None
         } else {
@@ -1352,7 +1444,14 @@ impl SellerNodeRunner {
                 wall_time_ms,
             } => {
                 if answer.len() > INLINE_ANSWER_MAX_BYTES {
-                    return Err(delivery_failed("inline answer over the size limit".into()));
+                    opline!(
+                        "seller node session job_id={}: turn {} reply is {} bytes, over the \
+                         {INLINE_ANSWER_MAX_BYTES}-byte inline limit",
+                        r.job_id,
+                        r.turn,
+                        answer.len()
+                    );
+                    return Err(reply_too_long());
                 }
                 (
                     crate::receipt::result_content_hash_hex(answer),
@@ -1592,7 +1691,7 @@ impl SellerNodeRunner {
         let home = self.node.home();
         let store = self.node.store();
         let seller_pubkey = self.seller_pubkey.to_hex();
-        let refuse = |(code, detail): (ReasonCode, String)| HookTurnEnd::Refused(code, detail);
+        let refuse = |failure: (ReasonCode, String)| HookTurnEnd::Refused(failure.into());
         let private = match crate::seller_node::privacy::execution(home, &seller_pubkey, job_id) {
             Ok(execution) => execution.is_some(),
             Err(error) => return refuse(setup(error)),
@@ -1626,7 +1725,7 @@ impl SellerNodeRunner {
             .await
             .unwrap_or_else(|_| Err("review task ended without a verdict".into()));
         if let Err(reason) = verdict {
-            return HookTurnEnd::Refused(
+            return HookTurnEnd::refused(
                 ReasonCode::ExecutionFailed,
                 format!("{REVIEW_REFUSED_FEEDBACK}: {reason}"),
             );
@@ -1680,7 +1779,7 @@ impl SellerNodeRunner {
             }
             None => {
                 let Some((harness, argv, _)) = selected else {
-                    return HookTurnEnd::Refused(
+                    return HookTurnEnd::refused(
                         ReasonCode::CapabilityMissing,
                         "the hook this session was claimed with is no longer configured as it was"
                             .into(),
@@ -1698,7 +1797,7 @@ impl SellerNodeRunner {
             }
         };
         let Some(status) = TurnStatus::parse(&status) else {
-            return HookTurnEnd::Refused(
+            return HookTurnEnd::refused(
                 ReasonCode::ExecutionFailed,
                 format!("staged status {status} unknown"),
             );
@@ -1726,7 +1825,7 @@ impl SellerNodeRunner {
             })
             .await;
         if let Err(failure) = published {
-            return refuse(failure);
+            return HookTurnEnd::Refused(failure.on_hook_seat());
         }
         if let Err(error) = store.advance_session(job_id, n, None, None, now_secs()) {
             opline!("seller node session job_id={job_id}: session advance failed ({error})");
@@ -1768,7 +1867,7 @@ impl SellerNodeRunner {
                 return Err(HookTurnEnd::Deferred);
             }
             Err(error) => {
-                return Err(HookTurnEnd::Refused(
+                return Err(HookTurnEnd::refused(
                     ReasonCode::ExecutionFailed,
                     format!("attempt journal: {error}"),
                 ));
@@ -1778,7 +1877,7 @@ impl SellerNodeRunner {
         // §6: the inputs are re-materialized from the pinned baseline for every turn, so whatever
         // an earlier turn changed under `inputs/` is restored.
         let inputs = self.prepare_hook_dir(job_id, &workdir).map_err(|error| {
-            HookTurnEnd::Refused(
+            HookTurnEnd::refused(
                 ReasonCode::ExecutionFailed,
                 format!("inputs unavailable ({error})"),
             )
@@ -1803,7 +1902,7 @@ impl SellerNodeRunner {
             .run_hook_call(job_id, argv, event, &workdir, cutoff, fid)
             .await
             .map_err(|error| {
-                HookTurnEnd::Refused(
+                HookTurnEnd::refused(
                     ReasonCode::ExecutionFailed,
                     format!("runner task failed ({error})"),
                 )
@@ -1822,18 +1921,20 @@ impl SellerNodeRunner {
                 let row = store
                     .stage_hook_outcome(&row, now_unix())
                     .map_err(|error| {
-                        HookTurnEnd::Refused(
+                        HookTurnEnd::refused(
                             ReasonCode::ExecutionFailed,
                             format!("outcome stage failed ({error})"),
                         )
                     })?;
                 Ok((row.status, row.answer, row.wall_time_ms))
             }
-            JobOutcome::TooLarge { bytes, cap } => Err(HookTurnEnd::Refused(
-                ReasonCode::DeliveryFailed,
-                format!("answer is {bytes} bytes, over the {cap}-byte limit"),
-            )),
-            JobOutcome::CannotDeliver(reason) => Err(HookTurnEnd::Refused(
+            JobOutcome::TooLarge { bytes, cap } => {
+                opline!(
+                    "seller node session job_id={job_id}: turn {n} answer is {bytes} bytes, over the {cap}-byte limit"
+                );
+                Err(HookTurnEnd::Refused(reply_too_long().on_hook_seat()))
+            }
+            JobOutcome::CannotDeliver(reason) => Err(HookTurnEnd::refused(
                 ReasonCode::DeliveryFailed,
                 format!("hook declined to deliver ({reason})"),
             )),
@@ -1845,7 +1946,7 @@ impl SellerNodeRunner {
             }
             JobOutcome::OutOfTime { started } => {
                 self.drop_harness(harness, Some(ExecutionFailure::DeadlineExceeded));
-                Err(HookTurnEnd::Refused(
+                Err(HookTurnEnd::refused(
                     ReasonCode::ExecutionFailed,
                     format!(
                         "{} the deadline cutoff",
@@ -1859,7 +1960,7 @@ impl SellerNodeRunner {
             }
             JobOutcome::Broken(why) => {
                 self.drop_harness(harness, Some(ExecutionFailure::Harness(Fault::Unproven)));
-                Err(HookTurnEnd::Refused(
+                Err(HookTurnEnd::refused(
                     ReasonCode::ExecutionFailed,
                     format!("hook broke the contract ({why})"),
                 ))
@@ -1987,10 +2088,17 @@ impl SellerNodeRunner {
 enum HookTurnEnd {
     Delivered,
     /// Refused with this reason; the session stays parked and the buyer may send the turn again.
-    Refused(ReasonCode, String),
+    Refused(TurnFailure),
     /// Nothing decided (an earlier call not resolved, an unreadable staged row, a shutdown): the
     /// turn row is left as it is, and the next start's `recover_sessions` re-drives it.
     Deferred,
+}
+
+impl HookTurnEnd {
+    /// An ordinary refusal: the code's own buyer text.
+    fn refused(code: ReasonCode, detail: String) -> Self {
+        Self::Refused((code, detail).into())
+    }
 }
 
 /// At most this many hook `close` calls run at once (hook-agents §8.3).
@@ -2074,6 +2182,127 @@ fn followup_session_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn_no_sentinel(
+        message: Option<String>,
+        message_truncated: bool,
+        outcome_authentic: bool,
+        from_scratch: bool,
+    ) -> ContainerDeliveryFailure {
+        ContainerDeliveryFailure::NoSentinel {
+            detail: "no execution observed".into(),
+            last_agent_message: message,
+            usage: None,
+            wall_time_ms: 0,
+            message_truncated,
+            outcome_authentic,
+            from_scratch,
+        }
+    }
+
+    /// A reply cut the way the container cuts it: through the real `Phase1Outcome` bound.
+    fn cut(message: String) -> String {
+        let (cut, truncated) = super::container_delivery_tests::container_cut(&message);
+        assert!(truncated, "harness check: the reply is over the outcome cap");
+        cut
+    }
+
+    #[test]
+    fn a_turn_whose_reply_was_cut_fails_delivery_not_no_sentinel() {
+        let long = "é".repeat(3000);
+        let replies = [
+            (format!("{}\n{long}", crate::engine::INLINE_ANSWER_MARKER), TurnStatus::Done),
+            (format!("{}\n{long}", session::NEEDS_INPUT_MARKER), TurnStatus::NeedsInput),
+            (format!("partial work so far: {long}"), TurnStatus::OutOfTime),
+        ];
+        for (reply, status) in replies {
+            let reply = cut(reply);
+            assert_eq!(
+                turn_failure(turn_no_sentinel(Some(reply.clone()), true, true, true), status, true),
+                reply_too_long(),
+                "{status:?}"
+            );
+            // Uncut and still refused: the gate refused its shape — unchanged.
+            assert_eq!(
+                turn_failure(turn_no_sentinel(Some(reply), false, true, true), status, true).code,
+                ReasonCode::NoSentinel,
+                "{status:?}"
+            );
+        }
+        // An unmarked reply on a finished turn was never deliverable inline, cut or not.
+        let unmarked = cut(format!("quota exceeded {long}"));
+        assert_eq!(
+            turn_failure(turn_no_sentinel(Some(unmarked), true, true, true), TurnStatus::Done, true).code,
+            ReasonCode::NoSentinel
+        );
+        assert_eq!(
+            turn_failure(turn_no_sentinel(None, true, true, true), TurnStatus::Done, true).code,
+            ReasonCode::NoSentinel
+        );
+    }
+
+    /// #1426 review H1/H2: only a turn the inline arm could have delivered is over-long; a planted
+    /// outcome, a non-empty base, or a session that may not deliver inline keeps `no_sentinel`.
+    #[test]
+    fn a_cut_reply_on_a_turn_that_cannot_deliver_inline_stays_no_sentinel() {
+        let reply = cut(format!("{}\n{}", crate::engine::INLINE_ANSWER_MARKER, "x".repeat(5000)));
+        let refused = |authentic, from_scratch, inline_allowed| {
+            turn_failure(
+                turn_no_sentinel(Some(reply.clone()), true, authentic, from_scratch),
+                TurnStatus::Done,
+                inline_allowed,
+            )
+            .code
+        };
+        assert_eq!(refused(false, true, true), ReasonCode::NoSentinel, "planted outcome");
+        assert_eq!(refused(true, false, true), ReasonCode::NoSentinel, "not from scratch");
+        assert_eq!(refused(true, true, false), ReasonCode::NoSentinel, "inline not allowed");
+        assert_eq!(refused(true, true, true), ReasonCode::DeliveryFailed);
+    }
+
+    /// #1426 review H2 / r2 M1: what the BUYER reads. An over-long reply names the limit; any other
+    /// failure keeps its code's text, whatever its detail says — a container-written detail that
+    /// copies the over-long wording cannot pick the buyer's text.
+    #[test]
+    fn the_buyer_reads_the_inline_limit_for_an_over_long_reply_and_only_for_one() {
+        let too_long = reply_too_long();
+        assert_eq!(too_long.code, ReasonCode::DeliveryFailed);
+        assert_eq!(too_long.feedback, TURN_REPLY_TOO_LONG_FEEDBACK);
+        for text in [TURN_REPLY_TOO_LONG_FEEDBACK, HOOK_TURN_REPLY_TOO_LONG_FEEDBACK] {
+            assert!(text.contains(&format!("{INLINE_ANSWER_MAX_BYTES}-byte")), "{text}");
+        }
+        // A planted outcome (`push_failed`, `tampered`, ...) whose detail copies the wording.
+        let spoofed = turn_failure(
+            ContainerDeliveryFailure::Delivery(too_long.detail.clone()),
+            TurnStatus::Done,
+            false,
+        );
+        assert_eq!(spoofed.code, ReasonCode::DeliveryFailed);
+        assert_eq!(spoofed.feedback, DELIVERY_FAILURE_FEEDBACK);
+        let spoofed = turn_failure(
+            ContainerDeliveryFailure::Delivery(TURN_REPLY_TOO_LONG_FEEDBACK.into()),
+            TurnStatus::Done,
+            true,
+        );
+        assert_eq!(spoofed.feedback, DELIVERY_FAILURE_FEEDBACK);
+        // Every ordinary failure carries its code's own text.
+        for code in [ReasonCode::ExecutionFailed, ReasonCode::NoSentinel, ReasonCode::TurnTooLarge] {
+            assert_eq!(TurnFailure::from((code, too_long.detail.clone())).feedback, feedback_text(code));
+        }
+    }
+
+    /// #1426 review r2 L1: a hook delivers inline or not at all, so its over-long follow-up does not
+    /// suggest a file; nothing else changes on a hook seat.
+    #[test]
+    fn a_hook_seats_over_long_reply_suggests_no_file() {
+        let hook = reply_too_long().on_hook_seat();
+        assert_eq!(hook.feedback, HOOK_TURN_REPLY_TOO_LONG_FEEDBACK);
+        assert_eq!(hook.code, ReasonCode::DeliveryFailed);
+        assert!(!HOOK_TURN_REPLY_TOO_LONG_FEEDBACK.contains("file"));
+        assert!(TURN_REPLY_TOO_LONG_FEEDBACK.contains("file"));
+        let other = TurnFailure::from((ReasonCode::DeliveryFailed, "x".into()));
+        assert_eq!(other.clone().on_hook_seat(), other);
+    }
 
     /// Bug 2 (Petar 15:33): the empty-reload reset is requested ONLY by a runsc seat. Every other seat
     /// writes `reset_on_empty_reload = false`, which is not serialized: its follow-up inputs JSON
