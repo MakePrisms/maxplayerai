@@ -127,6 +127,42 @@ impl<E> WorkQueue<E> {
 /// How long one piece of lane work may run before the loop reports the lane as busy. Later reports
 /// come at double the previous wait (60 s, 120 s, ...), so a lane held for an hour costs a handful of
 /// lines rather than one per tick.
+/// One "WORK-LANE queue full" episode. On a boot re-read the lane frees a slot and the relay stream
+/// refills it at once, so a log line latched on "has room again" fired dozens of times in two
+/// seconds. The episode instead starts at the first fill, counts every refill, and ends only when
+/// the queue is empty again, with one summary line.
+#[derive(Debug, Default)]
+pub(crate) struct QueueFullEpisode {
+    started: Option<Instant>,
+    fills: u32,
+}
+
+impl QueueFullEpisode {
+    /// After an event was queued. `true` exactly once per episode: log the "queue full" line.
+    pub(crate) fn after_push(&mut self, has_room: bool, now: Instant) -> bool {
+        if has_room {
+            return false;
+        }
+        self.fills = self.fills.saturating_add(1);
+        if self.started.is_some() {
+            return false;
+        }
+        self.started = Some(now);
+        true
+    }
+
+    /// With `queued` events left in the queue. When an episode is open and the queue is empty, it
+    /// ends: returns how many times the queue filled and how long the episode lasted.
+    pub(crate) fn after_take(&mut self, queued: usize, now: Instant) -> Option<(u32, Duration)> {
+        if queued != 0 {
+            return None;
+        }
+        let started = self.started.take()?;
+        let fills = std::mem::take(&mut self.fills);
+        Some((fills, now.saturating_duration_since(started)))
+    }
+}
+
 pub(crate) const LANE_BUSY_WARN_AFTER: Duration = Duration::from_secs(30);
 
 /// Watches how long the lane has been on its current piece of work.
@@ -813,6 +849,43 @@ impl Drop for InFlight<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// A boot flood: the lane takes one event, the relay stream refills the slot, 56 times. The
+    /// "queue full" line is logged once, and one summary with the count closes the episode when
+    /// the queue empties; the next flood is a new episode.
+    #[test]
+    fn queue_full_is_logged_once_per_episode_with_a_count() {
+        let t0 = Instant::now();
+        let mut queue: WorkQueue<u32> = WorkQueue::new(4);
+        let mut episode = QueueFullEpisode::default();
+        let mut logged = 0;
+        let mut ended = Vec::new();
+        let mut push = |queue: &mut WorkQueue<u32>, episode: &mut QueueFullEpisode, at| {
+            queue.push_event(0);
+            u32::from(episode.after_push(queue.has_room(), at))
+        };
+        while queue.has_room() {
+            logged += push(&mut queue, &mut episode, t0);
+        }
+        for i in 1..56u64 {
+            let at = t0 + Duration::from_millis(30 * i);
+            assert!(matches!(queue.next(true), Some(Work::Event(_))));
+            ended.extend(episode.after_take(queue.queued_events(), at));
+            logged += push(&mut queue, &mut episode, at);
+        }
+        assert_eq!(logged, 1, "one queue-full line per episode");
+        assert!(ended.is_empty(), "no summary while the queue still holds events");
+        let at = t0 + Duration::from_secs(5);
+        while queue.next(true).is_some() {
+            ended.extend(episode.after_take(queue.queued_events(), at));
+        }
+        assert_eq!(ended, vec![(56, Duration::from_secs(5))]);
+        // A later flood is a new episode, logged again.
+        while queue.has_room() {
+            logged += push(&mut queue, &mut episode, at);
+        }
+        assert_eq!(logged, 2);
+    }
+
     use super::*;
 
     #[test]
