@@ -266,8 +266,8 @@ is normal and healthy.
 **Quieter or noisier:** routine no-ops are hidden by default and print only with
 `MAXPLAYER_VERBOSE=1` in the daemon's environment: a re-seen offer already claimed, a duplicate
 award, awards and acceptances for other sellers' jobs, pay-binds for jobs already awarded here,
-lapsed or aged offers re-read from relay history, a relay `CLOSED` for a subscription that is not
-ours, follow-ups to ended sessions, and payment gift-wraps re-read by the wrap backfill (not a
+lapsed or aged offers re-read from relay history, settled or taken offers after their first skip
+line this boot, a relay `CLOSED` for a subscription that is not ours, follow-ups to ended sessions, and payment gift-wraps re-read by the wrap backfill (not a
 payment, or already collected). After a reconnect these can be hundreds of lines, so instead
 the status tick prints one `seller node routine (since last status): …` line counting them; it is
 informational, not a problem. A lapsed offer aimed at this seat and authored within the last hour

@@ -5305,7 +5305,7 @@ pub struct SellerNodeRunner {
     /// Offer ids (per terminal reason) whose "already settled" / "awarded to another seller" skip
     /// already printed this boot. The offer backfill re-feeds every stored offer each tick (~300 s),
     /// and a terminal offer never stops being terminal, so without this the same line repeated for
-    /// every such offer on every pass, forever. Same bounded first-sight set as
+    /// every such offer on every pass for the rest of its backfill window. Same bounded first-sight set as
     /// [`Self::fed_under_rate_offers`].
     announced_terminal_offers: FedUnderRateOffers,
     /// Job ids whose "payment but no offer recorded" line already printed this boot.
@@ -21385,10 +21385,13 @@ esac"#,
 
     /// A settled offer re-read by every backfill pass prints its skip once, then is only counted.
     /// Before, "offer already settled" printed on every pass (~300 s) for every settled offer in the
-    /// lookback, forever. A later receipt for an offer first seen taken elsewhere prints once more.
+    /// lookback, for the rest of its backfill window. A later receipt for an offer first seen taken
+    /// elsewhere prints once more.
     ///
     /// RED ON REVERT: drop the `announced_terminal_offers` check in `claim_offer` and nothing is
-    /// counted (every repeat prints instead): the tally reads 0, not 2.
+    /// counted (every repeat prints instead): the tally reads 0, not 2. That a repeat is not
+    /// printed by default rests on the call site using `opline_verbose!`; nothing here captures
+    /// stderr.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_settled_offer_skip_prints_once_then_is_counted() {
         let relay = start_quiet_test_relay().await;
