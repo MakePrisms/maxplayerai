@@ -51,6 +51,8 @@ pub(crate) struct ReqRecord {
     pub filter_count: usize,
     /// Whether at least one filter carried NO `#p` — i.e. the un-pinned open-pool half is present.
     pub has_unpinned_filter: bool,
+    /// The smallest `since` any filter carried (a resubscribe's overlap cursor), if any did.
+    pub since: Option<u64>,
     pub verdict: Verdict,
 }
 
@@ -685,6 +687,10 @@ async fn serve_connection(
                     p_pinned: pinned.iter().any(Option::is_some),
                     filter_count: filters.len(),
                     has_unpinned_filter: pinned.iter().any(Option::is_none),
+                    since: filters
+                        .iter()
+                        .filter_map(|filter| filter.get("since").and_then(Value::as_u64))
+                        .min(),
                     verdict: verdict.clone(),
                 });
 

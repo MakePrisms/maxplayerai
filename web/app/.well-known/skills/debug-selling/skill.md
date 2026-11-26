@@ -307,6 +307,10 @@ seller node heartbeat+watchdog enabled: kind-30340 every <n>s; …
 
 A successful beat is silent; only failures print (`seller node heartbeat publish failed
 (continuing): …`, and `seat announcement OVERDUE …` once no beat has landed for 1.5 intervals).
+After the host slept or the process was paused for 60 s or more, the first line back is `seller
+node RESUMED after the host slept …` or `seller node event loop did not run for Ns …`: the seat
+was offline for that long, and (heartbeat on) it re-announces at once. A forward NTP step of a
+minute or more prints the same line once; it is harmless.
 
 **Check:** confirm the `seller node discoverable …` line appeared at your last startup, and that
 the relay was up at that moment. Then read your latest kind-30340 — resolve it by `(pubkey, d)`,

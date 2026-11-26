@@ -1064,6 +1064,21 @@ fn relay_liveness_confirmed(probe_ok: bool, publish_ok: bool) -> bool {
 /// idempotent handlers (offer dedup, award match against still-parked claims, wrap pay-once via the
 /// receipt dedup) absorb the overlap re-delivery.
 const STALL_OVERLAP_MARGIN_SECS: u64 = 60;
+
+/// Whether a supervision tick confirms the relay clock at its own start. A tick that runs a forced
+/// recovery confirms only if that recovery succeeds (after it): a FAILED one must hand its retry,
+/// and any AUTH resubscribe meanwhile, the pre-gap cursor (#1424 advisor r2 M1).
+fn confirms_before_recovery(probe_and_publish_ok: bool, forced: Option<&str>) -> bool {
+    probe_and_publish_ok && forced.is_none()
+}
+
+/// The `since` a relay recovery resubscribes with: the last confirmation before the tick that
+/// recovers, minus [`STALL_OVERLAP_MARGIN_SECS`], floored at 0.
+fn recovery_overlap_since(confirmed_unix: i64) -> u64 {
+    confirmed_unix
+        .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
+        .max(0) as u64
+}
 /// Bounded connect-phase recovery attempts within ONE stall recovery before yielding to the next
 /// heartbeat tick (#162): a relay that drops the socket before completing NIP-42 is retried with a
 /// short backoff rather than waiting a whole stall interval.
@@ -5064,6 +5079,11 @@ pub struct SellerNodeRunner {
     drain: shutdown::DrainSignal,
     /// Backfill cadence, resolved once at boot (tests shorten it per runner, never via the env).
     wrap_backfill_interval_secs: u64,
+    /// How long the loop may go without turning before that is reported, and before it also forces
+    /// a relay recovery ([`schedule::LOOP_GAP_REPORT`], [`schedule::LOOP_GAP_RECONNECT`]; tests
+    /// shorten them per runner).
+    loop_gap_report: Duration,
+    loop_gap_reconnect: Duration,
     /// Mint redeems between the intent-to-receive breadcrumb and the receipt write. Graceful
     /// shutdown waits (bounded, [`schedule::LANE_SETTLE_MONEY_BOUND`]) while this is non-zero
     /// instead of cutting a swap off mid-flight.
@@ -5558,6 +5578,8 @@ impl SellerNodeRunner {
             shutdown: shutdown::ShutdownChannel::new(),
             drain: shutdown::DrainSignal::new(),
             wrap_backfill_interval_secs: resolve_wrap_backfill_interval_secs(),
+            loop_gap_report: schedule::LOOP_GAP_REPORT,
+            loop_gap_reconnect: schedule::LOOP_GAP_RECONNECT,
             redeems_in_flight: std::sync::atomic::AtomicUsize::new(0),
             remit_flight: crate::fee_remit::RemitFlight::new(),
             remit_pacing: Arc::new(Mutex::new(crate::fee_remit::RemitBackoff::new())),
@@ -6495,6 +6517,9 @@ impl SellerNodeRunner {
         self.recover_sessions().await;
 
         let mut drain_tick = tokio::time::interval(DRAIN_INTERVAL);
+        // After a blocked loop or a stopped process, one tick, not a burst of every missed one: the
+        // first tick reports the gap and re-requests the work; the rest would only repeat it.
+        drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The container expiry sweep rides THIS loop, for the same reason the heartbeat does: a
         // side-thread would need its own shutdown, its own clock and its own reason to exist, and
         // this loop already stops when the node stops.
@@ -6526,6 +6551,8 @@ impl SellerNodeRunner {
         let wrap_backfill_interval_secs = self.wrap_backfill_interval_secs;
         let mut wrap_backfill_tick =
             tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
+        // As `drain_tick`: one tick after a blocked loop or a stopped process, not a burst.
+        wrap_backfill_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let heartbeat_interval = Duration::from_secs(heartbeat_interval_secs.max(1));
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
         // One supervision at a time: ticks that land while one runs are skipped, not queued.
@@ -6640,10 +6667,59 @@ impl SellerNodeRunner {
             BACKFILL_RETRY_MIN,
             Duration::from_secs(wrap_backfill_interval_secs),
         );
+        // A loop that stops turning is reported: by an OS thread while it is stuck (a blocked loop),
+        // and by the first drain tick after it turns again (host asleep, process stopped, or the
+        // block ended), which also re-announces the seat and re-reads offers at once. Without this a
+        // seat whose host slept went stale on the relay with nothing in its log.
+        let loop_pulse = schedule::LoopPulse::new();
+        loop_pulse.beat();
+        let _loop_watchdog =
+            schedule::spawn_loop_watchdog(Arc::clone(&loop_pulse), self.loop_gap_report);
+        let mut loop_turns = schedule::LoopTurns::new(
+            std::time::Instant::now(),
+            schedule::wall_ms(),
+            self.loop_gap_report,
+        );
+        // What a gap still owes across the supervision that may be in flight when it is seen.
+        let mut recovery_debt = schedule::RecoveryDebt::default();
+        // Notice a loop gap (host sleep, SIGSTOP, blocked loop) BEFORE anything acts on the relay.
+        // Run first in every arm that touches it and before the lane takes work: after a wake the
+        // heartbeat or backfill timer can fire ahead of the drain tick, and an unforced heartbeat
+        // would confirm the clock past the gap (its resubscribe would skip the gap's awards) while
+        // a backfill would go out on the dead socket (#1424 advisor r3 M1). Cheap and idempotent:
+        // a gap is reported by whichever call sees it first; the next call sees none.
+        // `$firing_heartbeat`: the caller IS the heartbeat tick, so it takes the forced recovery
+        // itself rather than re-arming the tick it is running in.
+        macro_rules! notice_loop_gap {
+            ($firing_heartbeat:expr) => {
+                if let Some(gap) = loop_turns.turn(std::time::Instant::now(), schedule::wall_ms()) {
+                    // The sockets are presumed dead after a long gap; the watchdog's monotonic
+                    // clock cannot see a host sleep, so it would not reconnect for intervals.
+                    let reconnect = heartbeat_enabled
+                        && Duration::from_secs(gap.secs) >= self.loop_gap_reconnect;
+                    if reconnect && forced_recovery.is_none() {
+                        forced_recovery = Some(gap.recovery_reason());
+                    }
+                    opline!("{}", gap.line(heartbeat_enabled, reconnect));
+                    let (beat_now, backfill_now) =
+                        recovery_debt.gap(heartbeat_enabled && supervision.is_some(), reconnect);
+                    if backfill_now {
+                        queue.request_backfill();
+                    }
+                    if heartbeat_enabled && beat_now && !$firing_heartbeat {
+                        heartbeat_tick.reset_immediately();
+                    }
+                }
+            };
+        }
         loop {
+            notice_loop_gap!(false);
             if lane.is_none() {
                 let now = tokio::time::Instant::now();
-                if let Some(work) = queue.next(!recovering.get()) {
+                // A backfill also waits while a reconnect gap's recovery is owed: on the dead socket
+                // it would only fail and back off.
+                let backfill_ok = !recovering.get() && !recovery_debt.backfill_held();
+                if let Some(work) = queue.next(backfill_ok) {
                     if matches!(work, schedule::Work::Backfill) {
                         last_backfill_at = now;
                     }
@@ -6701,6 +6777,8 @@ impl SellerNodeRunner {
                 // Housekeeping runs on the lane; the loop only asks for it, and reports a lane that
                 // has stayed busy (30s, then 60s, 120s, ...).
                 _ = drain_tick.tick() => {
+                    loop_pulse.beat();
+                    notice_loop_gap!(false);
                     // #1299: a requested drain. First tick: say so and re-announce now
                     // (`accepting=n`) rather than an interval later. Every tick: leave through the
                     // ordinary exit path once nothing is held — same retraction, same lane settle,
@@ -6847,6 +6925,7 @@ impl SellerNodeRunner {
                 // or offer subscription recovers without a restart (#560). Also the node's only
                 // periodic log lines, and therefore the positive signal external supervision watches.
                 _ = wrap_backfill_tick.tick() => {
+                    notice_loop_gap!(false);
                     // The status line comes from the LOOP, so it keeps its cadence — and says so —
                     // while the lane is stuck on a slow relay.
                     let now = tokio::time::Instant::now();
@@ -6893,15 +6972,15 @@ impl SellerNodeRunner {
                     // heartbeat is disableable by config, and a repair must not depend on a tick that
                     // may never fire. Acceptance is the relay's EOSE below — a response the protocol
                     // owes us — never the fact that we managed to send the REQ.
+                    // Not while a reconnect gap's recovery is owed either: the REQ would go out on
+                    // the dead socket and count as a rejection (#1424 advisor r3 L2).
                     if !recovering.get()
+                        && !recovery_debt.backfill_held()
                         && let Some(state) = open_pool.as_mut()
                         && state.on_tick() == RearmStep::Attempt
                     {
-                        let overlap = nostr_sdk::Timestamp::from(
-                            liveness.confirmed_unix()
-                                .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
-                                .max(0) as u64,
-                        );
+                        let overlap =
+                            nostr_sdk::Timestamp::from(recovery_overlap_since(liveness.confirmed_unix()));
                         match self.subscribe_offers(Some(overlap), true).await {
                             Ok(()) => opline!(
                                 "seller node RELAY-CLOSED RE-ARM: retrying the open-pool half of \
@@ -6926,9 +7005,13 @@ impl SellerNodeRunner {
                 // recovery, as ONE future beside the lane — never behind it. #509: the clock moves
                 // only when both legs confirmed.
                 _ = heartbeat_tick.tick(), if heartbeat_enabled && supervision.is_none() => {
+                    // A heartbeat that wakes first after a gap must BE the forced recovery.
+                    notice_loop_gap!(true);
+                    let forced = forced_recovery.take();
+                    recovery_debt.supervision_started(forced.as_deref());
                     let input = SupervisionInput {
                         clock: liveness,
-                        forced: forced_recovery.take(),
+                        forced,
                         threshold: stall_threshold_duration,
                         interval: heartbeat_interval,
                     };
@@ -6982,6 +7065,17 @@ impl SellerNodeRunner {
                         }
                         Some(false) => stalled_since_recovery = true,
                         None => {}
+                    }
+                    let due = recovery_debt.supervision_done(report.recovered);
+                    if let Some(reason) = due.rearm_forced {
+                        // A newer forced reason (a CLOSED since) wins; either way one recovery runs.
+                        forced_recovery.get_or_insert(reason);
+                    }
+                    if due.backfill {
+                        queue.request_backfill();
+                    }
+                    if due.beat {
+                        heartbeat_tick.reset_immediately();
                     }
                     continue;
                 }
@@ -7215,11 +7309,8 @@ impl SellerNodeRunner {
                                 && subscription_pins_only_our_pubkey(&id, offer_req_carries_unpinned)
                                 && restricted_retry_used.insert(id.clone())
                             {
-                                let overlap = nostr_sdk::Timestamp::from(
-                                    liveness.confirmed_unix()
-                                        .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
-                                        .max(0) as u64,
-                                );
+                                let overlap =
+                                    nostr_sdk::Timestamp::from(recovery_overlap_since(liveness.confirmed_unix()));
                                 match self.subscribe_one(&id, Some(overlap)).await {
                                     Ok(()) => {
                                         opline!(
@@ -7316,11 +7407,8 @@ impl SellerNodeRunner {
                                 );
                                 continue;
                             }
-                            let overlap = nostr_sdk::Timestamp::from(
-                                liveness.confirmed_unix()
-                                    .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
-                                    .max(0) as u64,
-                            );
+                            let overlap =
+                                nostr_sdk::Timestamp::from(recovery_overlap_since(liveness.confirmed_unix()));
                             match self.subscribe_all(Some(overlap)).await {
                                 Ok(()) => opline!(
                                     "seller node RELAY-AUTH RESUBSCRIBE: re-issued offers+awards+\
@@ -12468,8 +12556,12 @@ impl SellerNodeRunner {
         // its removal) takes effect without a seat restart. One `docker info`, bounded.
         self.refresh_runsc_gate().await;
         let mut clock = input.clock;
+        // The resubscribe overlap is measured from the last confirmation BEFORE this tick: a forced
+        // recovery (after a host sleep, say) may follow a probe that succeeded on a socket the SDK
+        // had already replaced, and confirming first would move the cursor past the whole gap.
+        let confirmed_before_tick = clock.confirmed_unix();
         let confirmed = relay_liveness_confirmed(probe_ok, publish_ok);
-        if confirmed {
+        if confirms_before_recovery(confirmed, input.forced.as_deref()) {
             clock.confirm(started, started_unix);
         }
         // Measured to this tick's START: the tick that completes N missed intervals trips, not
@@ -12480,12 +12572,8 @@ impl SellerNodeRunner {
         if !stalled && input.forced.is_none() {
             return SupervisionDone { clock, probe_ok, publish_ok, recovered: None };
         }
-        let overlap_since = nostr_sdk::Timestamp::from(
-            clock
-                .confirmed_unix()
-                .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
-                .max(0) as u64,
-        );
+        let overlap_since =
+            nostr_sdk::Timestamp::from(recovery_overlap_since(confirmed_before_tick));
         if stalled {
             opline!(
                 "seller node RELAY-STALL detected: relay unconfirmed for {}s (threshold {}s; last \
@@ -12521,7 +12609,7 @@ impl SellerNodeRunner {
         let mut republished = false;
         let recovered = match result {
             Ok(attempts) => {
-                let outage = now_unix().saturating_sub(clock.confirmed_unix());
+                let outage = now_unix().saturating_sub(confirmed_before_tick);
                 // Grace: the watchdog does not re-fire before the next tick's probe can answer.
                 clock.confirm(tokio::time::Instant::now(), now_unix());
                 opline!(
@@ -25138,6 +25226,140 @@ esac"#,
             self.wrap_backfill_interval_secs = TEST_BACKFILL_SECS;
             self
         }
+
+        /// Shorten THIS runner's loop-gap thresholds (report, forced reconnect).
+        fn with_loop_gap_thresholds(mut self, report: Duration, reconnect: Duration) -> Self {
+            self.loop_gap_report = report;
+            self.loop_gap_reconnect = reconnect;
+            self
+        }
+    }
+
+    /// A loop that did not turn for a while (here: its thread blocked for 12 s, the shape of a host
+    /// sleep or a SIGSTOP as the loop sees it) re-announces the seat and reconnects as soon as it
+    /// turns again, instead of waiting out the heartbeat interval with a stale announcement.
+    ///
+    /// RED ON REVERT: drop the drain tick's `heartbeat_tick.reset_immediately()` and no beat lands
+    /// before the 3600 s interval; drop the forced recovery and the connection count stays put.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_loop_that_stopped_turning_reannounces_and_reconnects_when_it_resumes() {
+        loop_gap_reannounces_and_rereads_from_before_the_gap("loop-gap-reannounce", 3600).await;
+    }
+
+    /// The same gap with a heartbeat (and backfill) interval SHORTER than the gap: on resume the
+    /// heartbeat tick is ready together with the drain tick, and `select!` picks among ready arms
+    /// at random. Whichever runs first must see the gap (#1424 advisor r3 M1): a heartbeat that ran
+    /// unforced would confirm the clock past the gap, and the recovery after it would re-read awards
+    /// from AFTER the gap.
+    ///
+    /// RED ON REVERT (in about half of runs, when the heartbeat wins the race): drop
+    /// `notice_loop_gap!(true)` from the heartbeat arm and the award re-read's `since` lands after
+    /// the gap's start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_gap_seen_first_by_the_heartbeat_tick_still_rereads_from_before_the_gap() {
+        loop_gap_reannounces_and_rereads_from_before_the_gap("loop-gap-heartbeat-first", 5).await;
+    }
+
+    async fn loop_gap_reannounces_and_rereads_from_before_the_gap(label: &str, interval_secs: u64) {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root(label);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.seller_heartbeat.enabled = true;
+        home.config.seller_heartbeat.interval_secs = interval_secs;
+        let runner = SellerNodeRunner::boot(home)
+            .await
+            .expect("boot runner")
+            .with_loop_gap_thresholds(Duration::from_secs(8), Duration::from_secs(9));
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| !seat_announcements(events).is_empty())
+                        .await,
+                    "harness check: the boot beat lands"
+                );
+                // Let the first drain ticks pass, then take the baseline.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let beats_before = seat_announcements(&fixture.events().await).len();
+                let connections_before = fixture.connections();
+                let award_reqs_before = fixture.reqs_for(AWARD_SUB_ID).await.len();
+                // The relay was last confirmed at boot, before this instant.
+                let gap_started_unix = now_unix();
+                // Block the loop's thread: nothing on this LocalSet runs for 12 s.
+                tokio::task::spawn_local(async { std::thread::sleep(Duration::from_secs(12)) })
+                    .await
+                    .expect("blocking task");
+                let beat_again = fixture
+                    .wait_until_published(Duration::from_secs(10), |events| {
+                        seat_announcements(events).len() > beats_before
+                    })
+                    .await;
+                assert!(
+                    beat_again,
+                    "the seat must be re-announced right after the gap, not an interval \
+                     ({interval_secs} s) later"
+                );
+                // Same bound as the watchdog's own reconnect test: the SDK's reconnect has backoff.
+                let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+                while fixture.connections() <= connections_before {
+                    assert!(
+                        tokio::time::Instant::now() < reconnect_deadline,
+                        "a gap past the reconnect threshold must force a relay recovery (connections \
+                         stayed at {connections_before})"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                // The recovery re-reads awards from BEFORE the gap: its overlap is measured from the
+                // last confirmation ahead of the recovering tick, not from that tick's own probe
+                // (which succeeded here on the still-open socket).
+                let resubscribed = fixture
+                    .wait_until(Duration::from_secs(10), |reqs| {
+                        reqs.iter()
+                            .filter(|record| record.subscription_id == AWARD_SUB_ID)
+                            .count()
+                            > award_reqs_before
+                    })
+                    .await;
+                assert!(resubscribed, "harness check: the recovery re-issued the award REQ");
+                // The FIRST re-issued award REQ is the recovery's; a later AUTH resubscribe on the
+                // new socket may legitimately start from the post-recovery confirmation.
+                let recovery_since = fixture.reqs_for(AWARD_SUB_ID).await[award_reqs_before..]
+                    .iter()
+                    .find_map(|record| record.since)
+                    .expect("the re-issued award REQ carries a since");
+                let bound = u64::try_from(gap_started_unix).unwrap() - STALL_OVERLAP_MARGIN_SECS;
+                assert!(
+                    recovery_since <= bound,
+                    "the award re-read must start before the gap (since {recovery_since} > {bound})"
+                );
+                shutdown.request("test stop");
+                let _ = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RED ON REVERT: drop `&& forced.is_none()` and a forced tick whose probe passed on the old
+    /// socket confirms past the gap before its recovery runs; if that recovery fails, the retry
+    /// resubscribes from after the gap.
+    #[test]
+    fn a_forced_recovery_tick_does_not_confirm_the_clock_before_its_recovery() {
+        assert!(confirms_before_recovery(true, None));
+        assert!(!confirms_before_recovery(true, Some("host slept 900s")));
+        assert!(!confirms_before_recovery(false, None));
+        assert!(!confirms_before_recovery(false, Some("host slept 900s")));
+    }
+
+    #[test]
+    fn recovery_overlap_since_steps_back_the_margin_and_floors_at_zero() {
+        assert_eq!(recovery_overlap_since(1_000), 1_000 - STALL_OVERLAP_MARGIN_SECS);
+        assert_eq!(recovery_overlap_since(10), 0);
+        assert_eq!(recovery_overlap_since(-5), 0);
     }
 
     /// Offer REQs that carried the un-pinned open-pool filter — i.e. the grouped shape, armed.
