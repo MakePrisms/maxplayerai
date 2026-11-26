@@ -1018,34 +1018,120 @@ async fn status_shows_each_running_task_stage_and_each_seller_announcement_age()
         posted.awarded_at_unix, None,
         "harness check: the award is read on the next tick"
     );
-    let view = running_view(&posted, T0 + 40);
+    assert_eq!(local_award(&e.store, &posted), LocalAward::default());
+    let view = running_view(&posted, LocalAward::default(), T0 + 40);
     assert_eq!(view["stage"], "awaiting_claim", "{view}");
     assert_eq!(view["stage_secs"], 40, "{view}");
 
     let members = e.store.swarm_job("math-1").unwrap().unwrap().members_json;
     let members = members_view(&members, T0 + 45);
-    assert_eq!(
-        members[0]["heartbeat"]["announced_at_unix"], T0,
-        "{members}"
-    );
-    assert_eq!(
-        members[0]["heartbeat"]["announced_secs_ago"], 45,
-        "{members}"
-    );
+    let hb = &members[0]["heartbeat"];
+    assert_eq!(hb["announced_at_unix"], T0, "{members}");
+    assert_eq!(hb["observed_at_unix"], T0, "the tick at T0 took the snapshot: {members}");
+    assert_eq!(hb["announced_secs_ago"], 0, "aged as of the snapshot: {members}");
+    assert_eq!(hb["checked_secs_ago"], 45, "{members}");
 
-    fx.at(T0 + 60);
-    e.tick(&fx.stub).await.unwrap();
-    let awarded = task(&e, id);
-    let view = running_view(&awarded, T0 + 90);
+    // Before the engine copies the award over, the buyer's own tables already know: a pinned
+    // award attempt reads "awarding", the committed award row reads "awarded" from its own time.
+    let job_id = posted.job_id.clone().expect("harness check: posted with a job id");
+    let attempt = crate::buyer::store::AwardAttempt {
+        job_id: job_id.clone(),
+        claim_id: "c".repeat(64),
+        seller_pubkey: "s".repeat(64),
+        award_event_id: "a".repeat(64),
+        event_json: "{}".into(),
+        amount_sats: 10,
+        quoted_mints_json: "[]".into(),
+        offer_deadline_unix: (T0 + 600) as i64,
+        send_count: 0,
+        relay_url: "wss://relay.invalid".into(),
+        state: crate::buyer::store::AttemptState::Pending,
+        detail: None,
+    };
+    e.store.begin_award_attempt(&attempt, (T0 + 10) as i64).unwrap();
+    let local = local_award(&e.store, &posted);
+    assert_eq!(local, LocalAward { awarded_at: None, awarding: true });
+    let view = running_view(&posted, local, T0 + 40);
+    assert_eq!(view["stage"], "awarding", "{view}");
+    e.store
+        .record_award(&job_id, &attempt.claim_id, &attempt.award_event_id, &attempt.seller_pubkey, 10, (T0 + 20) as i64)
+        .unwrap();
+    let local = local_award(&e.store, &posted);
+    assert_eq!(local.awarded_at, Some(T0 + 20));
+    let view = running_view(&posted, local, T0 + 90);
     assert_eq!(view["stage"], "awarded", "{view}");
-    assert_eq!(
-        view["stage_secs"], 90,
-        "the stub awards at the post: {view}"
+    assert_eq!(view["stage_secs"], 70, "from the award row's time: {view}");
+    assert_eq!(view["awarded_at_unix"], T0 + 20, "{view}");
+
+    // Once the task row carries the award, it wins, and the stage is timed from it — not from the
+    // post (T0) — so a wrong timestamp would show here.
+    e.store.set_swarm_task_awarded(id, T0 + 30).unwrap();
+    let awarded = task(&e, id);
+    assert_eq!(local_award(&e.store, &awarded), LocalAward::default(), "no store read once synced");
+    let view = running_view(&awarded, LocalAward::default(), T0 + 90);
+    assert_eq!(view["stage"], "awarded", "{view}");
+    assert_eq!(view["stage_secs"], 60, "{view}");
+}
+
+/// Every stage, the timestamp each is measured from, and the edges (no timestamp, a clock behind).
+#[tokio::test]
+async fn running_view_names_every_stage_from_the_right_timestamp() {
+    let fx = Fx::math(1, 10, 10_000, "public");
+    let e = fx.engine(false);
+    let id = fx.queue(&e, "math-1", "t1", false);
+    fx.at(T0);
+    e.tick(&fx.stub).await.unwrap();
+    let base = TaskRow { awarded_at_unix: None, posted_at_unix: Some(T0), ..task(&e, id) };
+    let none = LocalAward::default();
+    let at = |t: &TaskRow, now: u64| running_view(t, none, now);
+
+    let posting = TaskRow { job_id: None, ..base.clone() };
+    assert_eq!(at(&posting, T0 + 7)["stage"], "posting");
+    assert_eq!(at(&posting, T0 + 7)["stage_secs"], 7);
+
+    let pending = TaskRow {
+        turn: Some(2),
+        session_job_id: Some("j".repeat(64)),
+        followup_id: None,
+        ..base.clone()
+    };
+    assert_eq!(at(&pending, T0 + 35)["stage"], "turn_pending");
+    assert_eq!(at(&pending, T0 + 35)["stage_secs"], 35, "timed from the claim, not null");
+    let sent = TaskRow { followup_id: Some("f".repeat(64)), ..pending.clone() };
+    assert_eq!(at(&sent, T0 + 50)["stage"], "turn_sent");
+    assert_eq!(at(&sent, T0 + 50)["stage_secs"], 50);
+    // A session turn ignores any award fields.
+    let sent_awarded = TaskRow { awarded_at_unix: Some(T0 + 1), ..sent.clone() };
+    assert_eq!(at(&sent_awarded, T0 + 50)["stage"], "turn_sent");
+    // A turn number without a session job is not a session turn (as in settle_one).
+    let malformed = TaskRow { session_job_id: None, ..pending.clone() };
+    assert_eq!(at(&malformed, T0 + 5)["stage"], "awaiting_claim");
+
+    // No timestamp: no duration. A clock behind the stamp: zero, never an underflow.
+    let unstamped = TaskRow { posted_at_unix: None, ..base.clone() };
+    assert!(at(&unstamped, T0 + 5)["stage_secs"].is_null());
+    assert_eq!(at(&base, T0 - 30)["stage_secs"], 0);
+}
+
+/// The members snapshot is aged as of when it was taken, so a snapshot that stopped updating (job
+/// closed, relay unreadable) never makes a healthy seller look quiet.
+#[test]
+fn members_view_ages_announcements_as_of_the_snapshot() {
+    let snapshot = format!(
+        r#"[{{"seller":"a","heartbeat":{{"accepting":true,"announced_at_unix":{a},"observed_at_unix":{o}}}}},
+            {{"seller":"b","heartbeat":null}},
+            {{"seller":"c","heartbeat":{{"accepting":true,"announced_at_unix":{f},"observed_at_unix":{o}}}}}]"#,
+        a = T0 - 120,
+        f = T0 + 60,
+        o = T0
     );
-    // A snapshot from a build without the field is shown as it is.
-    let old = members_view(r#"[{"seller":"s","heartbeat":{"accepting":true}}]"#, T0);
-    assert!(
-        old[0]["heartbeat"].get("announced_secs_ago").is_none(),
-        "{old}"
-    );
+    // An hour after the last snapshot: the ad was 120 s old when seen; the snapshot is an hour old.
+    let view = members_view(&snapshot, T0 + 3_600);
+    assert_eq!(view[0]["heartbeat"]["announced_secs_ago"], 120, "{view}");
+    assert_eq!(view[0]["heartbeat"]["checked_secs_ago"], 3_600, "{view}");
+    assert!(view[1]["heartbeat"].is_null(), "no announcement stays null: {view}");
+    assert_eq!(view[2]["heartbeat"]["announced_secs_ago"], 0, "future-dated: zero, no underflow");
+    // A snapshot from a build without the fields is shown as it is.
+    let old = members_view(r#"[{"seller":"s","heartbeat":{"accepting":true,"announced_at_unix":5}}]"#, T0);
+    assert!(old[0]["heartbeat"].get("announced_secs_ago").is_none(), "{old}");
 }

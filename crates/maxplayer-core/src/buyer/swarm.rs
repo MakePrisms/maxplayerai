@@ -388,7 +388,9 @@ impl Engine {
         {
             let at = e.created_at.as_secs();
             let seller = e.pubkey.to_hex();
-            if at + HEARTBEAT_FRESH_SECS < now || newest.get(&seller).is_some_and(|n| *n >= at) {
+            if at.saturating_add(HEARTBEAT_FRESH_SECS) < now
+                || newest.get(&seller).is_some_and(|n| *n >= at)
+            {
                 continue;
             }
             if let Some(hb) = heartbeat_of(e) {
@@ -895,7 +897,10 @@ impl Engine {
                     "minutes_left": left / 60,
                     "busy": busy,
                     "seats_left": seats.get(&m.seller),
-                    "heartbeat": hb.map(|h| json!({"accepting": h.accepting, "rate_sats": h.rate_sats, "takes_no_payment": h.takes_no_payment, "slots": h.slots.map(|s| s.total), "free_slots": h.slots.map(|s| s.free), "announced_at_unix": world.beat_at.get(&m.seller)})),
+                    // `observed_at_unix`: when this snapshot read the announcement. The snapshot is
+                    // rewritten only on a tick that read the relay for a running job, so status ages
+                    // the announcement as of THIS instant, never against a later clock.
+                    "heartbeat": hb.map(|h| json!({"accepting": h.accepting, "rate_sats": h.rate_sats, "takes_no_payment": h.takes_no_payment, "slots": h.slots.map(|s| s.total), "free_slots": h.slots.map(|s| s.free), "announced_at_unix": world.beat_at.get(&m.seller), "observed_at_unix": now})),
                 }));
                 if busy {
                     why.busy += 1;
@@ -1746,33 +1751,70 @@ fn queued_view(t: &TaskRow) -> Value {
         "note": t.outcome})
 }
 
+/// What the buyer's own award tables say about a one-off task, read when the engine has not copied
+/// the award onto the task yet (it does so on its next tick, and only after a relay read succeeds).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LocalAward {
+    /// The committed award (`awards` row).
+    awarded_at: Option<u64>,
+    /// A signed award is pinned and not refused (`award_attempts` pending or confirmed): a seller
+    /// claimed and its price is reserved, but the award row is not written yet.
+    awarding: bool,
+}
+
+fn local_award(store: &BuyerStore, t: &TaskRow) -> LocalAward {
+    let session_turn = t.turn.is_some_and(|n| n >= 2);
+    let (false, None, Some(job_id)) = (session_turn, t.awarded_at_unix, t.job_id.as_deref()) else {
+        return LocalAward::default();
+    };
+    if let Ok(Some(award)) = store.award_record(job_id) {
+        return LocalAward { awarded_at: u64::try_from(award.awarded_at_unix).ok(), awarding: false };
+    }
+    let awarding = matches!(
+        store.award_attempt(job_id),
+        Ok(Some(attempt)) if attempt.state != super::store::AttemptState::Refused
+    );
+    LocalAward { awarded_at: None, awarding }
+}
+
 /// Where a running task stands, so a check-in can tell a task no seller has claimed yet from one
 /// that was awarded and is being worked on or settled (an award parked for lack of funds ends the
-/// task as failed, with the reason). A one-off task's award is copied from the buyer store on each
-/// engine tick; a session turn needs no award.
-fn running_view(t: &TaskRow, now: u64) -> Value {
-    let session_turn = t.turn.is_some_and(|n| n >= 2);
-    let (stage, since) = match (session_turn, t.awarded_at_unix) {
-        (true, _) if t.followup_id.is_none() => ("turn_pending", None),
+/// task as failed, with the reason). A one-off task's award comes from the task row, or from the
+/// buyer store (`local`) before the engine has copied it over; a session turn needs no award.
+fn running_view(t: &TaskRow, local: LocalAward, now: u64) -> Value {
+    // The same test `settle_one` uses, so view and settlement never disagree on a malformed row.
+    let session_turn = t.turn.is_some_and(|n| n >= 2) && t.session_job_id.is_some();
+    let awarded_at = t.awarded_at_unix.or(local.awarded_at);
+    let (stage, since) = match (session_turn, awarded_at) {
+        (true, _) if t.followup_id.is_none() => ("turn_pending", t.posted_at_unix),
         (true, _) => ("turn_sent", t.posted_at_unix),
         (false, Some(at)) => ("awarded", Some(at)),
         (false, None) if t.job_id.is_none() => ("posting", t.posted_at_unix),
+        (false, None) if local.awarding => ("awarding", t.posted_at_unix),
         (false, None) => ("awaiting_claim", t.posted_at_unix),
     };
     json!({"id": t.id, "seller": t.seller, "job_id": t.job_id.as_ref().or(t.session_job_id.as_ref()),
         "turn": t.turn.unwrap_or(1), "followup_id": t.followup_id, "price_sats": t.price_sats,
-        "deadline_unix": t.deadline_unix, "awarded_at_unix": t.awarded_at_unix, "stage": stage,
+        "deadline_unix": t.deadline_unix, "awarded_at_unix": awarded_at, "stage": stage,
         "stage_secs": since.map(|at| now.saturating_sub(at)), "note": t.outcome})
 }
 
-/// The members snapshot of the last tick, with each seller's announcement age as of `now`: a seat
-/// whose announcement is minutes old is likely to claim late or not at all.
+/// The members snapshot of the last tick. Each fresh announcement gets its age AS OF THAT SNAPSHOT
+/// (`announced_secs_ago`: a seat whose announcement was minutes old is likely to claim late or not
+/// at all) and the snapshot's own age (`checked_secs_ago`). The snapshot stops updating once the
+/// job is no longer running or the buyer cannot read the relay, so aging the announcement against
+/// `now` would blame a healthy seller for the buyer's stale view.
 fn members_view(members_json: &str, now: u64) -> Value {
     let mut members: Value = serde_json::from_str(members_json).unwrap_or(json!([]));
     for m in members.as_array_mut().into_iter().flatten() {
-        if let Some(at) = m["heartbeat"]["announced_at_unix"].as_u64() {
-            m["heartbeat"]["announced_secs_ago"] = json!(now.saturating_sub(at));
-        }
+        let hb = &mut m["heartbeat"];
+        let (Some(at), Some(checked)) =
+            (hb["announced_at_unix"].as_u64(), hb["observed_at_unix"].as_u64())
+        else {
+            continue;
+        };
+        hb["announced_secs_ago"] = json!(checked.saturating_sub(at));
+        hb["checked_secs_ago"] = json!(now.saturating_sub(checked));
     }
     members
 }
@@ -1803,7 +1845,7 @@ fn job_status(context: &BuyerContext, me: &str, d: &str, page: usize) -> Result<
     let running: Vec<Value> = tasks
         .iter()
         .filter(|t| t.state == "posted")
-        .map(|t| running_view(t, now))
+        .map(|t| running_view(t, local_award(store, t), now))
         .collect();
     let mut done: Vec<&TaskRow> = tasks
         .iter()

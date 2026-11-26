@@ -197,7 +197,11 @@ ones. They are closed when the swarm job closes, once their running turn settled
 ```
 
 Returns `status`, `members` (minutes offered, used today and left, `busy`, heartbeat — filled in
-once the job is `in_progress`), `queue`, `running`, `results` (newest first, 10 per page, each with
+once the job is `in_progress`; `heartbeat.announced_secs_ago` is how old the seat's announcement
+was at the last snapshot, `checked_secs_ago` how old that snapshot is), `queue`, `running` (each
+task's `stage` — `posting`, `awaiting_claim`, `awarding`, `awarded`, `turn_pending`, `turn_sent` —
+and `stage_secs` in it: an `awaiting_claim` task with only stale announcements is unlikely to be
+claimed), `results` (newest first, 10 per page, each with
 `state`, `outcome`, `answer` and `price_sats`), `budget`, `sessions`, `steering`, `planner` and
 `idle_reason`. Each result also carries `job_id` and `turn`. A `collected` result with
 `answer: null` was delivered as files (a git delivery), which stay in the buyer store: read it
