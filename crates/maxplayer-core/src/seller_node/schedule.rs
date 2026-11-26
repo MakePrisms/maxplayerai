@@ -163,6 +163,85 @@ impl QueueFullEpisode {
     }
 }
 
+/// The relay half of the periodic status line: whether this socket completed NIP-42, when the relay
+/// last confirmed a seat announcement (heartbeat), and how the last relay drop ended. Fed by the
+/// loop from the same supervision reports the individual RELAY-* lines come from, so an operator
+/// reading only the status line still sees an interruption and its recovery.
+#[derive(Debug, Default)]
+pub(crate) struct RelayHealth {
+    beat_landed: Option<Instant>,
+    last_drop: Option<LastDrop>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastDrop {
+    /// When the recovery attempt finished.
+    at: Instant,
+    /// How long the relay had gone unconfirmed when the recovery finished.
+    outage: Duration,
+    recovered: bool,
+}
+
+impl RelayHealth {
+    /// A heartbeat supervision finished; `landed` = the relay confirmed its seat announcement.
+    pub(crate) fn beat(&mut self, landed: bool, now: Instant) {
+        if landed {
+            self.beat_landed = Some(now);
+        }
+    }
+
+    /// A relay recovery finished, `outage` after the last confirmation.
+    pub(crate) fn recovery(&mut self, recovered: bool, outage: Duration, now: Instant) {
+        self.last_drop = Some(LastDrop {
+            at: now,
+            outage,
+            recovered,
+        });
+    }
+
+    /// `relay confirmed Ns ago` (or `relay RECOVERING …`) plus sign-in, heartbeat and last-drop
+    /// state. The leading phrase is unchanged, since scripts and docs key on it.
+    pub(crate) fn line(
+        &self,
+        signed_in: bool,
+        recovering: bool,
+        unconfirmed: Duration,
+        now: Instant,
+    ) -> String {
+        let ago = |at: Instant| now.saturating_duration_since(at).as_secs();
+        let mut line = if recovering {
+            format!("relay RECOVERING (unconfirmed for {}s)", unconfirmed.as_secs())
+        } else {
+            format!("relay confirmed {}s ago", unconfirmed.as_secs())
+        };
+        line.push_str(if signed_in {
+            " · signed in"
+        } else {
+            " · NOT signed in (no NIP-42 sign-in on this connection)"
+        });
+        match self.beat_landed {
+            Some(at) => line.push_str(&format!(" · heartbeat landed {}s ago", ago(at))),
+            None => line.push_str(" · no heartbeat landed yet"),
+        }
+        if let Some(drop) = self.last_drop {
+            if drop.recovered {
+                line.push_str(&format!(
+                    " · last relay drop recovered {}s ago after {}s",
+                    ago(drop.at),
+                    drop.outage.as_secs()
+                ));
+            } else {
+                line.push_str(&format!(
+                    " · relay reconnect FAILED {}s ago ({}s unconfirmed), retrying",
+                    ago(drop.at),
+                    drop.outage.as_secs()
+                ));
+            }
+        }
+        line
+    }
+}
+
 pub(crate) const LANE_BUSY_WARN_AFTER: Duration = Duration::from_secs(30);
 
 /// Watches how long the lane has been on its current piece of work.
@@ -884,6 +963,41 @@ mod tests {
             logged += push(&mut queue, &mut episode, at);
         }
         assert_eq!(logged, 2);
+    }
+
+    /// The status line's relay half names sign-in, the last heartbeat and how the last relay drop
+    /// ended, after the unchanged leading phrase.
+    #[test]
+    fn relay_health_names_sign_in_heartbeat_and_the_last_drop() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut health = RelayHealth::default();
+        assert_eq!(
+            health.line(false, false, s(3), t0),
+            "relay confirmed 3s ago · NOT signed in (no NIP-42 sign-in on this connection) · no heartbeat landed yet"
+        );
+        health.beat(true, t0);
+        health.beat(false, t0 + s(60));
+        assert_eq!(
+            health.line(true, false, s(5), t0 + s(90)),
+            "relay confirmed 5s ago · signed in · heartbeat landed 90s ago"
+        );
+        assert_eq!(
+            health.line(true, true, s(140), t0 + s(140)),
+            "relay RECOVERING (unconfirmed for 140s) · signed in · heartbeat landed 140s ago"
+        );
+        health.recovery(false, s(150), t0 + s(150));
+        assert!(
+            health
+                .line(false, false, s(160), t0 + s(160))
+                .ends_with(" · relay reconnect FAILED 10s ago (150s unconfirmed), retrying"),
+        );
+        health.recovery(true, s(200), t0 + s(200));
+        health.beat(true, t0 + s(200));
+        assert_eq!(
+            health.line(true, false, s(1), t0 + s(230)),
+            "relay confirmed 1s ago · signed in · heartbeat landed 30s ago · last relay drop recovered 30s ago after 200s"
+        );
     }
 
     use super::*;

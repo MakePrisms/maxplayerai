@@ -228,13 +228,15 @@ tracked as the v0.1 tag-blocker — file/comment on **MakePrisms/maxplayerai** w
 prints its own state, timestamped:
 
 ```
-14:32:07Z seller node status: ADVERTISING, ready for work · harness: claude · 0/1 job slot(s) busy · relay confirmed 41s ago · work idle
+14:32:07Z seller node status: ADVERTISING, ready for work · harness: claude · 0/1 job slot(s) busy · relay confirmed 41s ago · signed in · heartbeat landed 41s ago · work idle
 ```
 
 Read it as: it is alive (the line just arrived), it is advertising, and it has capacity. Newer
 builds end the line with the relay state (`relay confirmed Ns ago` / `relay RECOVERING`) and the
 work lane (`work idle` / `work BUSY Ns on …`); a `relay confirmed` age that keeps growing means the
-relay has stopped answering. The seller quickstart's "Reading the log" lists the related lines. If it
+relay has stopped answering; `NOT signed in`, `heartbeat landed Ns ago` and `last relay drop
+recovered ...` say whether sign-in completed, when the seat last announced itself and how the last
+drop ended. The seller quickstart's "Reading the log" lists the related lines. If it
 says `NOT serving — no live harness`, the seat is up but every harness has faulted out — it will
 take no work until one recovers.
 

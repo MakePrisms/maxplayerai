@@ -6913,6 +6913,7 @@ impl SellerNodeRunner {
         // How long the seat announcement has gone unconfirmed, and when the in-flight supervision
         // started: an announcement that falls behind is logged even if a supervision never returns.
         let mut announcement_gap = schedule::AnnouncementGap::new(tokio::time::Instant::now());
+        let mut relay_health = schedule::RelayHealth::default();
         let mut supervision_started: Option<tokio::time::Instant> = None;
         let mut drain_private_only_since: Option<tokio::time::Instant> = None;
         // The serialized work lane and what feeds it. Events queue (bounded: when full, relay reads
@@ -7217,10 +7218,13 @@ impl SellerNodeRunner {
                         format!("relay REFUSED sign-in ({refusal}){}", hint_suffix(&refusal))
                     } else if !heartbeat_enabled {
                         "relay watchdog off".to_owned()
-                    } else if recovering.get() {
-                        "relay RECOVERING".to_owned()
                     } else {
-                        format!("relay confirmed {}s ago", liveness.unconfirmed_for(now).as_secs())
+                        relay_health.line(
+                            nip42_authed,
+                            recovering.get(),
+                            liveness.unconfirmed_for(now),
+                            now,
+                        )
                     };
                     let work_state = match lane_busy.current(now) {
                         None => "work idle".to_owned(),
@@ -7329,6 +7333,14 @@ impl SellerNodeRunner {
                         }
                         stalled_since_recovery = false;
                         manual_recovery_succeeded = false;
+                    }
+                    let reported_at = tokio::time::Instant::now();
+                    relay_health.beat(report.publish_ok, reported_at);
+                    if let Some(recovered) = report.recovered {
+                        // `liveness` is still the clock from before this supervision: its
+                        // unconfirmed time is the outage the recovery ended (or did not).
+                        let outage = liveness.unconfirmed_for(reported_at);
+                        relay_health.recovery(recovered, outage, reported_at);
                     }
                     liveness = report.clock;
                     if report.recovered.is_some() {
