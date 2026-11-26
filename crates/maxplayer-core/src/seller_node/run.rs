@@ -427,6 +427,29 @@ enum ClaimDecision {
     Skip(SkipReason),
 }
 
+/// Store a finished offer review in `checks`, unless it raced a reconnect: a non-terminal failure
+/// of a request started before a NIP-42 auth that has since completed (`started` < `now`) is
+/// dropped, so the offer's next re-drive requests the review again on the new connection. Returns
+/// whether it was dropped. Everything else (a pass, a terminal outcome, a failure on the same
+/// connection) is cached as before.
+fn settle_review_check(
+    checks: &mut std::collections::BTreeMap<String, Option<Result<Option<String>, String>>>,
+    job: String,
+    result: Result<Option<String>, String>,
+    started: u64,
+    now: u64,
+) -> bool {
+    if now != started
+        && let Err(error) = &result
+        && !crate::review::state::terminal(error)
+    {
+        checks.remove(&job);
+        return true;
+    }
+    checks.insert(job, Some(result));
+    false
+}
+
 /// #1057 review round 2: how far [`SellerNodeRunner::claim_offer`] took an offer. A reconsider
 /// re-drive reads it to decide whether an operator's `review retry` ticket is spent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5247,6 +5270,13 @@ pub struct SellerNodeRunner {
     /// quiet. Cleared with the cached check by an explicit `review retry`; pruned to `review_checks`
     /// and swept against live offers on the drain tick ([`Self::prune_review_state`]).
     review_blocked_logged: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    /// Completed NIP-42 auths so far. A review request started under one generation and failing
+    /// non-terminally after a later auth raced the reconnect: it is dropped, not cached, so the
+    /// re-drive requests it again (the auth's own retry pass could not see it while in flight).
+    review_auth_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Set by a review task that dropped such a raced failure, so the loop re-arms its reconsider
+    /// tick (the task cannot reach the runner's own flags).
+    review_raced_reconnect: Arc<std::sync::atomic::AtomicBool>,
     /// When [`Self::prune_review_state`] last ran from the drain tick (`None` = not yet).
     review_state_swept_at: std::sync::Mutex<Option<Instant>>,
     /// #1057 review round 2: the transient pre-review decline line last logged per offer
@@ -5795,6 +5825,8 @@ impl SellerNodeRunner {
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
             review_checks: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             review_blocked_logged: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            review_auth_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            review_raced_reconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             review_state_swept_at: std::sync::Mutex::new(None),
             offer_deferred_logged: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(test)]
@@ -6319,6 +6351,8 @@ impl SellerNodeRunner {
             return 0;
         }
         self.sweep_review_state_if_due();
+        // A review whose request raced a reconnect was dropped by its task: re-drive it now.
+        self.take_reviews_raced_by_reconnect();
         let retries = self.terminal_review_retries();
         if !retries.is_empty() {
             self.capacity_skip_pending
@@ -7652,6 +7686,10 @@ impl SellerNodeRunner {
                             restricted_retry_used.clear();
                             // Reviews whose request failed while the relay was away get one more try
                             // now that it is back (also during a recovery: it ends in this auth).
+                            // The generation moves first, so a review still in flight across this
+                            // auth drops its failure instead of caching it after this pass.
+                            self.review_auth_generation
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             self.retry_review_errors_after_reconnect();
 
                             // #429 FIX. A completed NIP-42 auth is the only reliable signal that this
@@ -9115,6 +9153,9 @@ impl SellerNodeRunner {
         let status_root = home.root.clone();
         checks.insert(job_id.to_owned(), None);
         let state = self.review_checks.clone();
+        let generation = Arc::clone(&self.review_auth_generation);
+        let started_generation = generation.load(std::sync::atomic::Ordering::SeqCst);
+        let raced = Arc::clone(&self.review_raced_reconnect);
         let client = self.client.clone();
         let relay = self.relay_url.clone();
         let buyer = buyer.to_owned();
@@ -9141,10 +9182,34 @@ impl SellerNodeRunner {
                 Err(e) => Err(e),
             };
             if let Ok(mut checks) = state.lock() {
-                checks.insert(job, Some(result));
+                let now_generation = generation.load(std::sync::atomic::Ordering::SeqCst);
+                if settle_review_check(&mut checks, job, result, started_generation, now_generation) {
+                    raced.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             }
         });
         Ok(false)
+    }
+
+    /// Re-arm the re-drive for reviews [`settle_review_check`] dropped because their request raced a
+    /// reconnect. Called from the loop's reconsider path; returns whether any were dropped.
+    fn take_reviews_raced_by_reconnect(&self) -> bool {
+        if !self.review_raced_reconnect.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        // `review_checks` first and released before `review_blocked_logged` (the order
+        // `offer_review_ready` takes them in).
+        let cached: std::collections::BTreeSet<String> = match self.review_checks.lock() {
+            Ok(checks) => checks.keys().cloned().collect(),
+            Err(_) => return false,
+        };
+        if let Ok(mut logged) = self.review_blocked_logged.lock() {
+            logged.retain(|id, _| cached.contains(id));
+        }
+        self.capacity_skip_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        opline!("seller node relay back (NIP-42 auth): a review request that was in flight across the reconnect failed; requesting it again");
+        true
     }
 
     async fn claim_offer(
@@ -25862,8 +25927,12 @@ esac"#,
         home.config.seller = Some(seller_cfg(1, false));
         let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
         let (down, refused, gone) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
-        record_live_offer(&runner, &down);
-        record_live_offer(&runner, &refused);
+        let (policy, in_flight, passed) = ("e".repeat(64), "f".repeat(64), "0".repeat(64));
+        for id in [&down, &refused, &policy, &in_flight, &passed] {
+            record_live_offer(&runner, id);
+        }
+        let verdict = format!("{}: unsafe", crate::review::VERDICT_REFUSED_PREFIX);
+        assert!(crate::review::state::terminal(&verdict), "harness check: a policy refusal is terminal");
         let permanent = "review: permanent input error (invalid_subject); retrying unchanged input cannot help".to_owned();
         assert!(crate::review::state::terminal(&permanent), "harness check: a terminal outcome");
         {
@@ -25871,6 +25940,9 @@ esac"#,
             checks.insert(down.clone(), Some(Err(RELAY_DOWN_REVIEW_ERROR.to_owned())));
             checks.insert(refused.clone(), Some(Err(permanent.clone())));
             checks.insert(gone.clone(), Some(Err(RELAY_DOWN_REVIEW_ERROR.to_owned())));
+            checks.insert(policy.clone(), Some(Err(verdict.clone())));
+            checks.insert(in_flight.clone(), None);
+            checks.insert(passed.clone(), Some(Ok(None)));
         }
         // The field's stuck state: every re-drive returns the cached failure.
         assert_eq!(
@@ -25881,13 +25953,25 @@ esac"#,
         runner
             .capacity_skip_pending
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        runner
+            .review_blocked_logged
+            .lock()
+            .unwrap()
+            .insert(down.clone(), RELAY_DOWN_REVIEW_ERROR.to_owned());
 
         assert_eq!(runner.retry_review_errors_after_reconnect(), 1);
+        assert!(
+            !runner.review_blocked_logged.lock().unwrap().contains_key(&down),
+            "the retried offer may log its block again"
+        );
 
         let checks = runner.review_checks.lock().unwrap().clone();
         assert!(!checks.contains_key(&down), "the relay-down failure is requested again");
         assert_eq!(checks.get(&refused), Some(&Some(Err(permanent))), "a terminal outcome stays");
         assert!(checks.contains_key(&gone), "an offer no longer awaiting a claim is not re-driven");
+        assert_eq!(checks.get(&policy), Some(&Some(Err(verdict))), "a policy refusal stays");
+        assert_eq!(checks.get(&in_flight), Some(&None), "a review in flight is left to finish");
+        assert_eq!(checks.get(&passed), Some(&Some(Ok(None))), "a passed review stays");
         assert!(
             runner
                 .capacity_skip_pending
@@ -25895,6 +25979,77 @@ esac"#,
             "the reconsider tick is re-armed to re-drive it"
         );
         assert_eq!(runner.retry_review_errors_after_reconnect(), 0, "a second auth finds nothing left to retry");
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// advisor r1 of #1440: a review request in flight across a reconnect is skipped by the auth's
+    /// retry pass (it is still `None`), then fails on the dead socket. That late failure must not be
+    /// cached, or the offer stays stuck until the next auth. RED ON REVERT: cache every result and
+    /// the raced relay-down failure is stored.
+    #[test]
+    fn a_review_failing_after_a_later_auth_is_dropped_not_cached() {
+        let mut checks = std::collections::BTreeMap::new();
+        let job = "a".repeat(64);
+        let down = || Err(RELAY_DOWN_REVIEW_ERROR.to_owned());
+        checks.insert(job.clone(), None);
+        assert!(settle_review_check(&mut checks, job.clone(), down(), 3, 4), "raced: dropped");
+        assert!(!checks.contains_key(&job), "nothing cached, so the re-drive asks again");
+        // Same connection: an availability failure is cached as before (the next auth retries it).
+        checks.insert(job.clone(), None);
+        assert!(!settle_review_check(&mut checks, job.clone(), down(), 4, 4));
+        assert_eq!(checks.get(&job), Some(&Some(down())));
+        // A terminal outcome or a pass is an answer, whatever the connection did meanwhile.
+        let verdict = format!("{}: unsafe", crate::review::VERDICT_REFUSED_PREFIX);
+        assert!(!settle_review_check(&mut checks, job.clone(), Err(verdict.clone()), 3, 4));
+        assert_eq!(checks.get(&job), Some(&Some(Err(verdict))));
+        assert!(!settle_review_check(&mut checks, job.clone(), Ok(None), 3, 4));
+        assert_eq!(checks.get(&job), Some(&Some(Ok(None))));
+    }
+
+    /// advisor r1 of #1440: a dropped raced review re-arms the reconsider tick and lets the offer log
+    /// its block again; with nothing dropped, the pass is a no-op. RED ON REVERT: drop the
+    /// `take_reviews_raced_by_reconnect` call or its re-arm and the offer is never re-driven.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_raced_review_rearms_the_redrive() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let root = throwaway_root("review-raced-reconnect");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay.url().await.to_string();
+        home.config.seller = Some(seller_cfg(1, false));
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let (dropped, blocked) = ("a".repeat(64), "b".repeat(64));
+        runner
+            .review_checks
+            .lock()
+            .unwrap()
+            .insert(blocked.clone(), Some(Err(RELAY_DOWN_REVIEW_ERROR.to_owned())));
+        {
+            let mut logged = runner.review_blocked_logged.lock().unwrap();
+            logged.insert(dropped.clone(), RELAY_DOWN_REVIEW_ERROR.to_owned());
+            logged.insert(blocked.clone(), RELAY_DOWN_REVIEW_ERROR.to_owned());
+        }
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        runner.capacity_skip_pending.store(false, relaxed);
+        assert!(!runner.take_reviews_raced_by_reconnect(), "nothing raced: no-op");
+        assert!(!runner.capacity_skip_pending.load(relaxed));
+
+        runner.review_raced_reconnect.store(true, relaxed);
+        assert!(runner.take_reviews_raced_by_reconnect());
+        assert!(runner.capacity_skip_pending.load(relaxed), "the reconsider tick is re-armed");
+        let logged = runner.review_blocked_logged.lock().unwrap().clone();
+        assert!(!logged.contains_key(&dropped), "the dropped offer may log again");
+        assert!(logged.contains_key(&blocked), "a still-cached block keeps its once-only line");
+        assert!(!runner.take_reviews_raced_by_reconnect(), "taken once");
+
+        // Wired into the reconsider pass: a flag set by a review task is consumed there.
+        runner.capacity_skip_pending.store(false, relaxed);
+        runner.review_raced_reconnect.store(true, relaxed);
+        runner.reconsider_capacity_skips().await;
+        assert!(!runner.review_raced_reconnect.load(relaxed), "the reconsider pass took it");
         runner.client.disconnect().await;
         relay.shutdown();
         let _ = std::fs::remove_dir_all(&root);
@@ -25928,6 +26083,7 @@ esac"#,
                     == Some(&Some(Err(RELAY_DOWN_REVIEW_ERROR.to_owned())))
             }
         };
+        let generation = Arc::clone(&runner.review_auth_generation);
         let local = tokio::task::LocalSet::new();
         let loop_handle = local.spawn_local(async move { runner.run().await });
         local
@@ -25939,6 +26095,7 @@ esac"#,
                     );
                 }
                 assert!(stuck(), "harness check: nothing retried it before the relay came back");
+                let before = generation.load(std::sync::atomic::Ordering::SeqCst);
                 // The relay comes back: the client authenticates again.
                 fixture.roll_challenge(&[]).await;
                 let deadline = tokio::time::Instant::now() + RECHALLENGE_WAIT;
@@ -25946,6 +26103,10 @@ esac"#,
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 assert!(!stuck(), "the completed auth did not retry the relay-down review failure");
+                assert!(
+                    generation.load(std::sync::atomic::Ordering::SeqCst) > before,
+                    "the completed auth advanced the review generation (a review in flight across it is dropped, not cached)"
+                );
             })
             .await;
         loop_handle.abort();
