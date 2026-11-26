@@ -44,33 +44,7 @@ impl std::fmt::Display for LockError {
         match self {
             Self::Open(message) => write!(formatter, "seller lock open error: {message}"),
             Self::Held { path, holder } => {
-                write!(
-                    formatter,
-                    "another maxplayer seller already owns this home (lock held: {}); refusing to start a second owner",
-                    path.display()
-                )?;
-                // A flock is released by the kernel when its holder exits, so a refusal always
-                // means a LIVE process holds it (an old seller still running after an upgrade, a
-                // second terminal, a supervisor's copy). Say which one and how to stop it.
-                let drain = match path.parent() {
-                    Some(home) if !home.as_os_str().is_empty() => {
-                        format!("maxplayer seller drain --home {}", home.display())
-                    }
-                    _ => "maxplayer seller drain".to_owned(),
-                };
-                match holder {
-                    Some(pid) => write!(
-                        formatter,
-                        ". It is held by pid {pid}: stop that seller first, with `{drain}` (finishes \
-                         in-flight jobs, then exits) or `kill {pid}` (stops it now), then start again"
-                    ),
-                    None => write!(
-                        formatter,
-                        ". Its holder could not be identified from here (another OS user or a container); \
-                         find it with `{FIND_HOLDER} {}` and stop it, or run `{drain}` where it runs, then start again",
-                        path.display()
-                    ),
-                }
+                formatter.write_str(&held_message(path, *holder, HOLDER_CONFIRMED))
             }
             Self::Flock(message) => write!(formatter, "seller lock flock error: {message}"),
         }
@@ -78,6 +52,64 @@ impl std::fmt::Display for LockError {
 }
 
 impl std::error::Error for LockError {}
+
+/// Whether [`identify_holder`] proves its pid holds the lock. On Linux it does (`/proc` shows the
+/// pid has the lock file open, or the kernel's lock table names it). Elsewhere it only knows the pid
+/// the holder recorded is alive and ours to signal, which a reused pid also passes, so the refusal
+/// must not tell anyone to `kill` it.
+#[cfg(target_os = "linux")]
+const HOLDER_CONFIRMED: bool = true;
+#[cfg(not(target_os = "linux"))]
+const HOLDER_CONFIRMED: bool = false;
+
+/// A path as one POSIX shell word, so a copied command works for a home with spaces or quotes.
+fn shell_word(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+:,@%=~".contains(&byte));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// The refusal for a held lock. `confirmed` is whether `holder` is proven to hold it
+/// ([`HOLDER_CONFIRMED`]); an unproven pid gets a check-first hint and no `kill`.
+fn held_message(path: &Path, holder: Option<u32>, confirmed: bool) -> String {
+    let mut message = format!(
+        "another maxplayer seller already owns this home (lock held: {}); refusing to start a second owner",
+        path.display()
+    );
+    // A flock is released by the kernel when its holder exits, so a refusal always means a LIVE
+    // process holds it (an old seller still running after an upgrade, a second terminal, a
+    // supervisor's copy). Say which one and how to stop it.
+    let drain = match path.parent() {
+        Some(home) if !home.as_os_str().is_empty() => {
+            format!("maxplayer seller drain --home {}", shell_word(&home.to_string_lossy()))
+        }
+        _ => "maxplayer seller drain".to_owned(),
+    };
+    let lock = shell_word(&path.to_string_lossy());
+    match holder {
+        Some(pid) if confirmed => message.push_str(&format!(
+            ". It is held by pid {pid}: stop that seller first, with `{drain}` (finishes in-flight \
+             jobs, which can take until their deadlines, then exits) or `kill {pid}` (stops it now), then start again"
+        )),
+        Some(pid) => message.push_str(&format!(
+            ". The seller that took it recorded pid {pid}, which is still running, but this platform \
+             cannot confirm that pid holds the lock (a pid can be reused): check with \
+             `{FIND_HOLDER} {lock}`, then stop that seller with `{drain}`, then start again"
+        )),
+        None => message.push_str(&format!(
+            ". Its holder could not be identified from here (another OS user or a container); find \
+             it with `{FIND_HOLDER} {lock}` and stop it, or run `{drain}` where it runs, then start \
+             again"
+        )),
+    }
+    message
+}
 
 impl HomeLock {
     /// Take the exclusive lock at `path`, or fail closed if it is already held.
@@ -480,6 +512,38 @@ mod tests {
         );
         assert_eq!(flock_holder_from_proc_locks(&table, &path), vec![33]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// dot-bot review of #1431: where the holder's pid cannot be proven (no `/proc`), the refusal
+    /// names the recorded pid as unconfirmed, says how to check it, and never suggests `kill`.
+    /// RED ON REVERT: format an unconfirmed pid like a confirmed one and `kill 4242` appears.
+    #[test]
+    fn an_unconfirmed_pid_gets_a_check_and_no_kill_hint() {
+        let path = Path::new("/h/seller.lock");
+        let unconfirmed = held_message(path, Some(4242), false);
+        assert!(!unconfirmed.contains("kill"), "{unconfirmed}");
+        assert!(unconfirmed.contains("recorded pid 4242"), "{unconfirmed}");
+        assert!(unconfirmed.contains("cannot confirm"), "{unconfirmed}");
+        assert!(unconfirmed.contains(&format!("`{FIND_HOLDER} /h/seller.lock`")), "{unconfirmed}");
+        assert!(unconfirmed.contains("`maxplayer seller drain --home /h`"), "{unconfirmed}");
+        let confirmed = held_message(path, Some(4242), true);
+        assert!(confirmed.contains("`kill 4242`"), "{confirmed}");
+    }
+
+    /// dot-bot review of #1431: a home path with a space or a quote is shell-quoted in the copied
+    /// commands, so pasting them works. RED ON REVERT: print `home.display()` raw.
+    #[test]
+    fn copied_commands_quote_a_home_with_spaces() {
+        let message = held_message(Path::new("/srv/my seats/bob's/seller.lock"), None, true);
+        assert!(
+            message.contains("`maxplayer seller drain --home '/srv/my seats/bob'\\''s'`"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("`{FIND_HOLDER} '/srv/my seats/bob'\\''s/seller.lock'`")),
+            "{message}"
+        );
+        assert_eq!(shell_word("/home/a-b/.mp_1"), "/home/a-b/.mp_1");
     }
 
     /// An unidentified holder still gets a next step rather than a bare refusal.
