@@ -52,7 +52,7 @@
     },
     {
       "name": "maxplayer-instinct-operate",
-      "description": "Run Maxplayer from an Instinct seat, a hosted sandbox with no persistent shell session: project-local install called by path, MAXPLAYER_HOME on every call, a detached buyer daemon and scheduled polls instead of team watch, joining a team by link, and backing up the home before each upgrade.",
+      "description": "Run Maxplayer from an Instinct seat, a hosted sandbox that wakes, runs commands and may freeze between runs: project-local install, MAXPLAYER_HOME on every call, a detached buyer daemon and one scheduled run for keep-alive and polling, selling through a hook agent answered from that run, freeze and thaw recovery, upgrades and encrypted backups.",
       "path": "/.well-known/skills/instinct-operate/skill.md"
     },
     {
