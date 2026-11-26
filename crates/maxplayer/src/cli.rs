@@ -44,6 +44,10 @@ where
             SUCCESS
         }
         Some("mcp") if args.len() == 2 => crate::mcp::run(out, err),
+        // INTERNAL: an older `maxplayer mcp` re-exec'ing onto its upgraded binary (mcp/reexec.rs).
+        Some("mcp") if args.len() == 4 && args[2] == crate::mcp::RESUME_FD_ARG => {
+            crate::mcp::run_resumed(&args[3], out, err)
+        }
         Some("buyer") => crate::buyer::run(&args[2..], out, err),
         // Seller advertise surface — compiled in only with `acp` (#360). On a buyer-only build this
         // falls through to `usage`, so `seller` cannot boot or publish a seat it can never deliver on.
