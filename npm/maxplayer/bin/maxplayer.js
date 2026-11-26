@@ -22,6 +22,25 @@ const PLATFORM_PACKAGES = {
 
 const key = `${process.platform}-${process.arch}`;
 const pkg = PLATFORM_PACKAGES[key];
+// The exact payload version the launcher pins (package.json optionalDependencies), for messages.
+let version = null;
+try {
+  version = require("../package.json").version;
+} catch {
+  // Messages fall back to the bare package name.
+}
+// npm runs this file as the package's postinstall: then it only CHECKS that the binary resolves.
+// npm skips a missing optional dependency silently — a payload the registry was not serving yet
+// (0.8.2-rc2's linux-x64 answered 404 for ~23 minutes after its publish) left installs and
+// reinstalls with a launcher and no binary, and nothing said so. Failing the postinstall makes the
+// install itself fail, naming the package; for an upgrade, npm then keeps the previous version.
+// With --ignore-scripts this never runs, and the launcher's own message below still applies.
+// Both conditions, so a user's own postinstall that runs `maxplayer …` still runs the binary.
+const INSTALL_CHECK_ARG = "--npm-postinstall-check";
+const installCheck =
+  process.env.npm_lifecycle_event === "postinstall" &&
+  process.argv.length === 3 &&
+  process.argv[2] === INSTALL_CHECK_ARG;
 
 let binary = null;
 if (pkg) {
@@ -33,13 +52,25 @@ if (pkg) {
 }
 
 if (!binary) {
+  if (installCheck && !pkg) {
+    // Unchanged behaviour for a platform with no payload at all: install, then explain at run time.
+    process.exit(0);
+  }
+  const wanted = version ? `${pkg}@${version}` : pkg;
   console.error(
     `maxplayer: no binary for ${key}. Available: ${Object.keys(PLATFORM_PACKAGES).join(", ")}.\n` +
       (pkg
-        ? `Expected ${pkg} to be installed — if you used --no-optional, reinstall without it.`
+        ? `Expected ${wanted} to be installed, and it is not. If you installed with --no-optional or ` +
+          `--omit=optional, reinstall without it. Otherwise the registry may not be serving ${wanted} ` +
+          `yet (check: npm view ${wanted}); reinstall once it is: npm install -g maxplayer@${version ?? "<version>"}`
         : `That platform is not published yet.`)
   );
   process.exit(1);
+}
+
+if (installCheck) {
+  // The binary resolves: the install is complete. Nothing is executed during install.
+  process.exit(0);
 }
 
 // stdio "inherit" is load-bearing: the buyer MCP server speaks JSON-RPC over stdin/stdout, so the

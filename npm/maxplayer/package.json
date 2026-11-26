@@ -11,6 +11,9 @@
   "bin": {
     "maxplayer": "bin/maxplayer.js"
   },
+  "scripts": {
+    "postinstall": "node bin/maxplayer.js --npm-postinstall-check"
+  },
   "files": ["bin/maxplayer.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "optionalDependencies": {
     "@maxplayerai/linux-x64": "0.8.2-rc3",

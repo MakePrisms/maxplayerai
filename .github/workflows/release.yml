@@ -644,6 +644,12 @@ jobs:
           # Payload packages first. The launcher resolves them by exact version, so publishing it
           # ahead of them leaves a window where `npm i maxplayer` installs a launcher with no binary.
           for platform in $RELEASE_PLATFORMS; do
+            # A re-run after a publish that got this far (e.g. the wait below timed out) must not fail
+            # on a version npm already has: npm never accepts the same version twice.
+            if npm view "@maxplayerai/$platform@$VERSION" version --prefer-online >/dev/null 2>&1; then
+              echo "@maxplayerai/$platform@$VERSION is already on the registry; not publishing it again"
+              continue
+            fi
             # ★ This filename is CONSTRUCTED and must never become a glob. `dist/` holds every
             # platform's archive at once, so a glob here would publish whichever one happened to
             # sort first — an arm64 binary inside the linux-x64 payload package installs fine and
@@ -657,6 +663,14 @@ jobs:
             cp LICENSE-MIT LICENSE-APACHE "npm/cli-$platform/"
 
             ( cd "npm/cli-$platform" && npm publish "${publish_args[@]}" )
+          done
+
+          # ...and published is not yet SERVED. 0.8.2-rc2's @maxplayerai/linux-x64 answered 404 for
+          # about 23 minutes after its publish returned, while the launcher was already live, and npm
+          # skips a missing optional dependency silently: every install in that window got a launcher
+          # with no binary. The launcher goes out only once every payload tarball downloads.
+          for platform in $RELEASE_PLATFORMS; do
+            ./scripts/wait-npm-published.sh "@maxplayerai/$platform" "$VERSION"
           done
 
           cp LICENSE-MIT LICENSE-APACHE npm/maxplayer/

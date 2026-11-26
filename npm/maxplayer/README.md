@@ -49,7 +49,11 @@ Other platforms — Windows among them — are not published, and the shim says 
 obscurely.
 
 Because the binary arrives as a dependency instead of a `postinstall` download, installs work under
-`--ignore-scripts`.
+`--ignore-scripts`. The package's `postinstall` only checks that this platform's payload was installed,
+and fails the install, naming `@maxplayerai/<platform>@<version>`, when it was not: npm skips a missing
+optional dependency silently, so without the check an install could finish with no binary and say
+nothing (for an upgrade, a failed install keeps the previous version). It downloads and runs nothing;
+under `--ignore-scripts` only the check is skipped, and the launcher reports a missing payload on first run.
 
 ## Node version
 

@@ -30,6 +30,13 @@ Until a package's trusted publisher is configured the workflow builds, verifies 
 Releases as normal, and `npm publish` fails loudly for that package. There is no silent skip — an
 unconfigured package fails the job rather than producing a release that looks published.
 
+The `publish` job publishes every payload package, then waits until the registry serves each one
+(`scripts/wait-npm-published.sh`: its metadata names a tarball and that tarball downloads, up to 45
+minutes), and only then publishes the launcher. A publish returning is not the package being
+installable: 0.8.2-rc2's `@maxplayerai/linux-x64` answered 404 for about 23 minutes after its publish
+while the launcher was already live. If the wait times out the job fails before the launcher, and a
+re-run skips the payloads npm already has.
+
 The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
 the `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`, `@maxplayerai/darwin-arm64` and
 `@maxplayerai/darwin-x64` packages, in the npm organization `maxplayerai`. All five need their own
