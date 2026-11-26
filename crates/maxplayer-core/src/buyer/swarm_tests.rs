@@ -859,6 +859,40 @@ async fn a_short_task_skips_the_live_session_and_a_long_one_uses_it() {
     );
 }
 
+/// A task too short to be a session turn goes out as a new job, so it is priced at the member's
+/// CURRENT rate, not the session job's price (which only a real turn carries). RED ON REVERT: price
+/// every non-fresh task with the session's price and this job goes out at the stale 10 sats, which
+/// a seller now asking 25 declines.
+#[tokio::test]
+async fn a_short_task_beside_a_live_session_is_priced_at_the_current_rate() {
+    let fx = Fx::math(1, 10, 10_000, "public");
+    fx.stub.session_claims.store(true, Ordering::SeqCst);
+    let e = fx.engine(true);
+    session_open(&fx, &e).await;
+    for (_, rate) in fx.stub.sellers.lock().unwrap().iter_mut() {
+        *rate = 25;
+    }
+    let short = NewTask {
+        text: "short".into(),
+        duration_secs: 600,
+        max_sats: 100,
+        ..NewTask::default()
+    };
+    let b = e
+        .store
+        .queue_swarm_task("math-1", &short, "agent", T0 as i64)
+        .unwrap();
+    e.tick(&fx.stub).await.unwrap();
+    let posts = fx.stub.posts();
+    assert_eq!(
+        (posts.len(), fx.stub.replies.lock().unwrap().len()),
+        (2, 0),
+        "a one-off job, not a turn"
+    );
+    assert_eq!(posts[1]["amount_sats"].as_u64(), Some(25), "{}", posts[1]);
+    assert_eq!(task(&e, b).price_sats, Some(25));
+}
+
 /// §12, §7.6, §8: closing the swarm job stops posting, lets the in-flight turn settle, then closes
 /// its sessions.
 #[tokio::test]
