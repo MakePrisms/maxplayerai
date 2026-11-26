@@ -172,6 +172,18 @@ fn holds_budget(t: &TaskRow) -> bool {
     }
 }
 
+/// Seconds a task gives its seller when posted at `now` to a member with `left` seconds of its
+/// minutes left today. A task with an explicit `duration_secs` gets exactly that; one without
+/// (`0`) runs until the swarm job's `ends`, capped by the member's minutes, so the offer's deadline
+/// matches the job window the task belongs to instead of a short fixed slot.
+pub(crate) fn task_secs(t: &TaskRow, ends: u64, left: u64, now: u64) -> u64 {
+    if t.duration_secs == 0 {
+        ends.saturating_sub(now).min(left)
+    } else {
+        t.duration_secs
+    }
+}
+
 /// The `post_job` arguments of a one-off task (§7.3; private tasks §7.5).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn post_params(
@@ -920,12 +932,10 @@ impl Engine {
                 let mut first_miss = None;
                 let pick = queued.iter().position(|t| {
                     let price = price_of(t);
+                    let secs = task_secs(t, j.ends, left, now);
                     let miss = if t.seller_pin.as_deref().is_some_and(|p| p != m.seller) {
                         Some(0)
-                    } else if t.duration_secs < MIN_TASK_SECS
-                        || t.duration_secs > left
-                        || now + t.duration_secs > j.ends
-                    {
+                    } else if secs < MIN_TASK_SECS || secs > left || now + secs > j.ends {
                         Some(1)
                     } else if price > t.max_sats {
                         Some(2)
@@ -949,7 +959,8 @@ impl Engine {
                 };
                 let task = queued.remove(i);
                 let price = price_of(&task);
-                match self.send(io, &j, swarm, &task, &m.seller, price, now).await {
+                let secs = task_secs(&task, j.ends, left, now);
+                match self.send(io, &j, swarm, &task, &m.seller, price, secs, now).await {
                     Ok(true) => {
                         in_swarm.insert((j.swarm.clone(), m.seller.clone()));
                         any_running.insert(m.seller.clone());
@@ -1019,12 +1030,13 @@ impl Engine {
         task: &TaskRow,
         seller: &str,
         price: u64,
+        secs: u64,
         now: u64,
     ) -> Result<bool, String> {
-        let deadline = now + task.duration_secs;
+        let deadline = now + secs;
         // Private swarms use session turns too: `reply` encrypts a private job's follow-up like its
         // offer (session-jobs §2.1), proven live on free and paid private jobs (§7.6 last bullet).
-        let session = if self.sessions && !task.fresh && task.duration_secs >= MIN_SESSION_TURN_SECS
+        let session = if self.sessions && !task.fresh && secs >= MIN_SESSION_TURN_SECS
         {
             self.store
                 .swarm_session(&job.d, seller)
@@ -1537,9 +1549,10 @@ fn check_task(t: &NewTask) -> Result<(), String> {
     if t.text.trim().is_empty() {
         return Err("a task needs non-empty text".into());
     }
-    if t.duration_secs < MIN_TASK_SECS {
+    // 0 (omitted) = until the swarm job ends (`task_secs`).
+    if t.duration_secs != 0 && t.duration_secs < MIN_TASK_SECS {
         return Err(format!(
-            "a task's duration_secs must be at least {MIN_TASK_SECS} (5 min)"
+            "a task's duration_secs must be at least {MIN_TASK_SECS} (5 min), or omitted to run until the swarm job ends"
         ));
     }
     if t.seller.as_deref().is_some_and(|s| !valid_hex(s)) {

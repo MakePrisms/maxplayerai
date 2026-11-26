@@ -32,6 +32,8 @@ struct Stub {
     turns: StdMutex<BTreeMap<String, TaskView>>,
     /// `(session job id, follow-up id, turn)`.
     replies: StdMutex<Vec<(String, String, u32)>>,
+    /// The `deadline_secs` each reply asked for, in order.
+    reply_secs: StdMutex<Vec<u64>>,
     closes: StdMutex<Vec<String>>,
     published: StdMutex<Vec<EventDraft>>,
     session_claims: AtomicBool,
@@ -120,9 +122,10 @@ impl SwarmIo for Stub {
         &self,
         job_id: &str,
         _text: &str,
-        _secs: u64,
+        secs: u64,
         _cap: u64,
     ) -> Result<(String, u32), String> {
+        self.reply_secs.lock().unwrap().push(secs);
         if self.refuse_reply.load(Ordering::SeqCst) {
             return Err("seller does not support sessions; post a new job".into());
         }
@@ -1134,4 +1137,94 @@ fn members_view_ages_announcements_as_of_the_snapshot() {
     // A snapshot from a build without the fields is shown as it is.
     let old = members_view(r#"[{"seller":"s","heartbeat":{"accepting":true,"announced_at_unix":5}}]"#, T0);
     assert!(old[0]["heartbeat"].get("announced_secs_ago").is_none(), "{old}");
+}
+
+/// A task queued with no `duration_secs` (as the swarm procedure queues them)
+/// to run until the swarm job ends.
+fn until_end(text: &str) -> NewTask {
+    NewTask {
+        text: text.into(),
+        max_sats: 100,
+        ..NewTask::default()
+    }
+}
+
+/// A task with no `duration_secs` gets an offer deadline at the swarm job's `ends`, so the deadline
+/// a seller reads in the offer matches the job window it is working in (a fixed 900 s slot gave
+/// members ~9 of the ~50 minutes the job still had). The member's minutes left cap it.
+#[tokio::test]
+async fn a_task_without_duration_runs_until_the_job_ends() {
+    // `Fx::job` ends at T0 + 6 h; `Fx::member` offers 120 minutes a day.
+    let ends = T0 + 6 * 3_600;
+    let fx = Fx::math(1, 10, 10_000, "public");
+    let e = fx.engine(false);
+    fx.at(ends - 50 * 60);
+    let a = e
+        .store
+        .queue_swarm_task("math-1", &until_end("round 2"), "agent", T0 as i64)
+        .unwrap();
+    e.tick(&fx.stub).await.unwrap();
+    let posts = fx.stub.posts();
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    assert_eq!(posts[0]["deadline_unix"].as_u64(), Some(ends), "{}", posts[0]);
+    assert_eq!(task(&e, a).deadline_unix, Some(ends));
+
+    // Far from the end, the member's 120 minutes left bind instead.
+    let fx = Fx::math(1, 10, 10_000, "public");
+    let e = fx.engine(false);
+    fx.at(T0);
+    e.store
+        .queue_swarm_task("math-1", &until_end("round 1"), "agent", T0 as i64)
+        .unwrap();
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(fx.stub.posts()[0]["deadline_unix"].as_u64(), Some(T0 + 120 * 60));
+
+    // An explicit duration is still honoured as given.
+    let fx = Fx::math(1, 10, 10_000, "public");
+    let e = fx.engine(false);
+    fx.at(T0);
+    let fixed = NewTask {
+        duration_secs: 900,
+        ..until_end("fixed")
+    };
+    e.store
+        .queue_swarm_task("math-1", &fixed, "agent", T0 as i64)
+        .unwrap();
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(fx.stub.posts()[0]["deadline_unix"].as_u64(), Some(T0 + 900));
+}
+
+/// A later round sent as a session turn gets the same window: its follow-up deadline runs to the
+/// swarm job's end, not a fixed slot.
+#[tokio::test]
+async fn a_session_turn_without_duration_runs_until_the_job_ends() {
+    let ends = T0 + 6 * 3_600;
+    let fx = Fx::math(1, 10, 10_000, "public");
+    fx.stub.session_claims.store(true, Ordering::SeqCst);
+    let e = fx.engine(true);
+    session_open(&fx, &e).await;
+    let now = ends - 50 * 60;
+    fx.at(now);
+    let b = e
+        .store
+        .queue_swarm_task("math-1", &until_end("round 2"), "agent", T0 as i64)
+        .unwrap();
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(fx.stub.posts().len(), 1, "a turn, not a second job");
+    assert_eq!(task(&e, b).turn, Some(2));
+    assert_eq!(task(&e, b).deadline_unix, Some(ends));
+    assert_eq!(*fx.stub.reply_secs.lock().unwrap(), vec![ends - now]);
+}
+
+/// Omitting `duration_secs` is accepted (it means "until the job ends"); a short explicit one is not.
+#[test]
+fn check_task_accepts_an_omitted_duration_and_refuses_a_short_one() {
+    let t: NewTask = serde_json::from_value(json!({"text": "t", "max_sats": 1})).unwrap();
+    assert_eq!(t.duration_secs, 0);
+    check_task(&t).unwrap();
+    let short = NewTask {
+        duration_secs: MIN_TASK_SECS - 1,
+        ..t
+    };
+    assert!(check_task(&short).unwrap_err().contains("omitted"));
 }

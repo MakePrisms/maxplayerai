@@ -228,7 +228,8 @@ Started next to the existing loops (`buyer/mod.rs:352`, `:355`) when `[swarm].en
     republishes within seconds of a seat change (at most once per 15 s), so the next beat catches up.
   - **No seats stated** (older seller): no running task from any of this buyer's swarms.
 - For each free, eligible member, take the first task that fits: pin matches or none; duration
-  ≥ 300 s and ≤ minutes left; price ≥ seller rate and ≤ `max_sats`; reserved + price ≤ budget. Post
+  ≥ 300 s and ≤ minutes left (a task with no `duration_secs` runs until the swarm job's `ends`,
+  capped by the member's minutes left, so the offer deadline matches the job window); price ≥ seller rate and ≤ `max_sats`; reserved + price ≤ budget. Post
   as today (`swarm.mjs:1857`): public, targeted, `text/plain`, inline, prefixed, deterministic
   `request_id`.
 - A task nobody can take stays queued; the planner sees it.
