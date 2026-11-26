@@ -445,8 +445,18 @@ pub(crate) struct LoopGap {
 }
 
 impl LoopGap {
-    /// The operator line for this gap. `reconnect`: a relay recovery was forced for it.
-    pub(crate) fn line(&self, reconnect: bool) -> String {
+    /// Why a relay recovery was forced for this gap (the `RELAY-RECOVERY triggered:` line).
+    pub(crate) fn recovery_reason(&self) -> String {
+        if self.host_slept {
+            format!("the host slept for about {}s", self.secs)
+        } else {
+            format!("the event loop did not run for {}s", self.secs)
+        }
+    }
+
+    /// The operator line for this gap. `reannounce`: the seat heartbeat is on, so the seat is
+    /// re-announced now. `reconnect`: a relay recovery was forced for it.
+    pub(crate) fn line(&self, reannounce: bool, reconnect: bool) -> String {
         let what = if self.host_slept {
             format!(
                 "seller node RESUMED after the host slept for about {}s",
@@ -460,14 +470,82 @@ impl LoopGap {
             )
         };
         format!(
-            "{what}: no seat announcement, offer read or claim happened meanwhile; re-announcing the \
-             seat and re-reading offers now{}",
+            "{what}: no seat announcement, offer read or claim happened meanwhile; {}{}",
+            if reannounce {
+                "re-announcing the seat and re-reading offers now"
+            } else {
+                "re-reading offers now"
+            },
             if reconnect {
                 ", and reconnecting to the relay"
             } else {
                 ""
             }
         )
+    }
+}
+
+/// What the loop still owes after a [`LoopGap`], across the heartbeat supervision that may be in
+/// flight when the gap is seen.
+///
+/// - A gap seen while a supervision runs cannot re-announce at once (the heartbeat tick is not armed
+///   then), so the beat is owed until that supervision ends; without this the re-announce, and any
+///   forced recovery, waited a whole heartbeat interval.
+/// - A gap that forces a reconnect holds its offer/wrap re-read until the recovery has run: a read
+///   on the dead socket fails, backs off and is retried late.
+/// - A forced recovery that FAILED is re-armed for the next heartbeat tick. The watchdog cannot take
+///   over: its clock is monotonic and did not count the gap, so it would not trip for intervals.
+#[derive(Debug, Default)]
+pub(crate) struct RecoveryDebt {
+    beat_owed: bool,
+    backfill_owed: bool,
+    /// The forced reason the running supervision carries, and whether the owed backfill waits on it.
+    running_forced: Option<String>,
+    running_releases_backfill: bool,
+}
+
+/// What [`RecoveryDebt::supervision_done`] tells the loop to do now.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DebtDue {
+    /// Fire the heartbeat tick now.
+    pub(crate) beat: bool,
+    /// Request the offer/wrap backfill now.
+    pub(crate) backfill: bool,
+    /// Force this recovery again on the next heartbeat tick.
+    pub(crate) rearm_forced: Option<String>,
+}
+
+impl RecoveryDebt {
+    /// A gap was reported. `supervision_running`: a heartbeat supervision is in flight.
+    /// `reconnect`: the gap forces a relay recovery. Returns (fire the heartbeat now, backfill now).
+    pub(crate) fn gap(&mut self, supervision_running: bool, reconnect: bool) -> (bool, bool) {
+        if supervision_running {
+            self.beat_owed = true;
+        }
+        if reconnect {
+            self.backfill_owed = true;
+        }
+        (!supervision_running, !reconnect)
+    }
+
+    /// A heartbeat supervision starts, carrying `forced` (a recovery it will run).
+    pub(crate) fn supervision_started(&mut self, forced: Option<&str>) {
+        self.running_forced = forced.map(str::to_owned);
+        self.running_releases_backfill = forced.is_some() && self.backfill_owed;
+    }
+
+    /// The running supervision ended. `recovered`: `Some(ok)` when it ran a recovery.
+    pub(crate) fn supervision_done(&mut self, recovered: Option<bool>) -> DebtDue {
+        let forced = self.running_forced.take();
+        let backfill = std::mem::take(&mut self.running_releases_backfill);
+        if backfill {
+            self.backfill_owed = false;
+        }
+        DebtDue {
+            beat: std::mem::take(&mut self.beat_owed),
+            backfill,
+            rearm_forced: if recovered == Some(false) { forced } else { None },
+        }
     }
 }
 
@@ -578,12 +656,20 @@ impl LoopPulse {
     }
 }
 
-/// Stops the loop watchdog thread when the loop that owns it ends, on every exit path.
-pub(crate) struct LoopWatchdog(std::sync::Arc<LoopPulse>);
+/// Stops the loop watchdog thread when the loop that owns it ends, on every exit path, and waits for
+/// it (woken at once, so the wait is short).
+pub(crate) struct LoopWatchdog {
+    pulse: std::sync::Arc<LoopPulse>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
 
 impl Drop for LoopWatchdog {
     fn drop(&mut self) {
-        self.0.stopped.store(true, Ordering::Relaxed);
+        self.pulse.stopped.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
     }
 }
 
@@ -601,7 +687,9 @@ pub(crate) fn spawn_loop_watchdog(
             let mut watch = LoopWatch::default();
             loop {
                 let asked = std::time::Instant::now();
-                std::thread::sleep(LOOP_WATCH_EVERY);
+                // Parked rather than slept, so the guard's drop wakes it at once. A spurious wake only
+                // checks early (no oversleep), which is harmless.
+                std::thread::park_timeout(LOOP_WATCH_EVERY);
                 if watched.stopped.load(Ordering::Relaxed) {
                     return;
                 }
@@ -611,13 +699,17 @@ pub(crate) fn spawn_loop_watchdog(
                 }
             }
         });
-    if let Err(error) = spawned {
-        crate::opline!(
-            "seller node: the event-loop watchdog thread could not start ({error}); continuing \
-             without it"
-        );
-    }
-    LoopWatchdog(pulse)
+    let thread = match spawned {
+        Ok(thread) => Some(thread),
+        Err(error) => {
+            crate::opline!(
+                "seller node: the event-loop watchdog thread could not start ({error}); continuing \
+                 without it"
+            );
+            None
+        }
+    };
+    LoopWatchdog { pulse, thread }
 }
 
 /// How long shutdown waits for ordinary lane work to finish. Everything it does is retried after a
@@ -743,7 +835,7 @@ mod tests {
                 host_slept: true
             }
         );
-        let line = gap.line(true);
+        let line = gap.line(true, true);
         assert!(
             line.contains("RESUMED after the host slept for about 1205s"),
             "{line}"
@@ -770,9 +862,87 @@ mod tests {
                 host_slept: false
             }
         );
-        let line = gap.line(false);
+        let line = gap.line(true, false);
         assert!(line.contains("event loop did not run for 600s"), "{line}");
         assert!(!line.contains("reconnecting"), "{line}");
+        assert_eq!(gap.recovery_reason(), "the event loop did not run for 600s");
+        // With the seat heartbeat off there is no announcement to renew, and the line says so.
+        let quiet = gap.line(false, false);
+        assert!(quiet.ends_with("happened meanwhile; re-reading offers now"), "{quiet}");
+        let slept = LoopGap { secs: 700, host_slept: true };
+        assert_eq!(slept.recovery_reason(), "the host slept for about 700s");
+    }
+
+    #[test]
+    fn recovery_debt_without_a_running_supervision_beats_now_and_holds_the_read_for_a_reconnect() {
+        let mut debt = RecoveryDebt::default();
+        // A short gap: beat and re-read at once, nothing owed.
+        assert_eq!(debt.gap(false, false), (true, true));
+        debt.supervision_started(None);
+        assert_eq!(debt.supervision_done(None), DebtDue::default());
+        // A reconnect gap: beat at once, but the re-read waits for the forced recovery.
+        assert_eq!(debt.gap(false, true), (true, false));
+        debt.supervision_started(Some("the host slept for about 700s"));
+        assert_eq!(
+            debt.supervision_done(Some(true)),
+            DebtDue { beat: false, backfill: true, rearm_forced: None }
+        );
+        // Released once.
+        debt.supervision_started(None);
+        assert_eq!(debt.supervision_done(None), DebtDue::default());
+    }
+
+    #[test]
+    fn recovery_debt_owes_the_beat_across_a_supervision_that_was_running_at_the_gap() {
+        let mut debt = RecoveryDebt::default();
+        // The supervision in flight when the host slept carries no forced recovery.
+        debt.supervision_started(None);
+        assert_eq!(debt.gap(true, true), (false, false), "the tick is not armed: nothing fires now");
+        // It ends (on the dead socket, no recovery): the beat is due now; the re-read is not, since
+        // this supervision ran no recovery.
+        assert_eq!(
+            debt.supervision_done(None),
+            DebtDue { beat: true, backfill: false, rearm_forced: None }
+        );
+        // The beat it fired carries the gap's forced recovery, and that one releases the re-read.
+        debt.supervision_started(Some("the host slept for about 700s"));
+        assert_eq!(
+            debt.supervision_done(Some(true)),
+            DebtDue { beat: false, backfill: true, rearm_forced: None }
+        );
+    }
+
+    #[test]
+    fn recovery_debt_rearms_a_forced_recovery_that_failed_until_one_succeeds() {
+        let mut debt = RecoveryDebt::default();
+        assert_eq!(debt.gap(false, true), (true, false));
+        let reason = "the host slept for about 700s";
+        debt.supervision_started(Some(reason));
+        let due = debt.supervision_done(Some(false));
+        assert_eq!(due.rearm_forced.as_deref(), Some(reason), "a failed forced recovery is re-armed");
+        assert!(due.backfill, "the read waited for the recovery attempt, not for its success");
+        // The re-armed attempt succeeds: nothing more.
+        debt.supervision_started(due.rearm_forced.as_deref());
+        assert_eq!(debt.supervision_done(Some(true)), DebtDue::default());
+        // A failed STALL recovery (not forced) is the watchdog's to retry, not re-armed here.
+        debt.supervision_started(None);
+        assert_eq!(debt.supervision_done(Some(false)), DebtDue::default());
+    }
+
+    #[test]
+    fn loop_watchdog_stops_promptly_when_its_guard_drops() {
+        let pulse = LoopPulse::new();
+        pulse.beat();
+        let guard = spawn_loop_watchdog(std::sync::Arc::clone(&pulse), LOOP_GAP_REPORT);
+        assert!(guard.thread.is_some(), "harness check: the watchdog thread started");
+        let started = std::time::Instant::now();
+        drop(guard);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "dropping the guard wakes and joins the thread, not a {}s sleep later",
+            LOOP_WATCH_EVERY.as_secs()
+        );
+        assert_eq!(std::sync::Arc::strong_count(&pulse), 1, "the thread ended and released the pulse");
     }
 
     #[test]
