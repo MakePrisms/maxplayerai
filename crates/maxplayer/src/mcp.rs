@@ -230,13 +230,15 @@ fn serve(handover: Vec<u8>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             let _ = out.flush();
             let _ = err.flush();
             let why = reexec::exec_upgrade(&upgrade, &handover, &state.home.root);
-            // Only reached when the exec failed: keep serving this version, and stop watching so a
-            // failing exec is not retried on every request.
+            // Only reached when the exec failed: keep serving this version, and do not retry this
+            // same file on every request; a later change to it is tried again.
             let _ = writeln!(
                 err,
                 "maxplayer mcp: re-exec failed ({why}); still serving this version"
             );
-            binary = None;
+            if let Some(watch) = binary.as_mut() {
+                watch.exec_failed(&upgrade);
+            }
         }
         let response = runtime.block_on(dispatch_async(&state, &request));
         if let Err(error) = write_mcp_response(out, &response) {
