@@ -505,7 +505,10 @@ impl BuyerStore {
         now_unix: u64,
     ) -> Result<(), StoreError> {
         self.lock()?.execute(
-            "UPDATE swarm_tasks SET job_id = ?2, outcome = NULL, updated_at_unix = ?3 WHERE id = ?1",
+            // `posted_at_unix` moves to the instant the offer went out: claiming the task stamped it
+            // before the post, and retries in between are not time a seller had to claim it.
+            "UPDATE swarm_tasks SET job_id = ?2, outcome = NULL, posted_at_unix = ?3,
+                 updated_at_unix = ?3 WHERE id = ?1",
             params![id, job_id, now_unix as i64],
         )?;
         Ok(())
