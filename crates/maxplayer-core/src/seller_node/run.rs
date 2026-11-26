@@ -102,12 +102,12 @@ const NO_SENTINEL_FEEDBACK: &str =
     "seller refused delivery: no execution was observed, so no execution sentinel was produced";
 /// Buyer-facing reason when the agent answered inline but the answer ran past
 /// [`INLINE_ANSWER_MAX_BYTES`]: the job ran, the answer is not deliverable cut, and the buyer's fix is
-/// on its side (accept a git delivery so the agent can write the answer to a file, or ask for a
-/// shorter one). A display-only mirror of the `delivery_failed` reason_code; the number is pinned to
-/// the constant by a test.
-const INLINE_ANSWER_TOO_LONG_FEEDBACK: &str = "seller executed the job but its answer was longer than \
-    the 4076-byte inline limit, so it was not delivered (a cut answer is never sent); post the job \
-    accepting a git delivery so the answer can be written to a file, or ask for a shorter answer";
+/// on its side (ask for a shorter answer, or for one written to a file). Worded for any offer: most
+/// already accept git, and the agent chose an inline reply. A display-only mirror of the
+/// `delivery_failed` reason_code; the number is pinned to the constant by a test.
+pub(super) const INLINE_ANSWER_TOO_LONG_FEEDBACK: &str = "seller executed the job but its answer was \
+    longer than the 4076-byte inline limit, so it was not delivered (a cut answer is never sent); \
+    ask for a shorter answer, or for the answer written to a file in a job that accepts git delivery";
 
 // TODO(multi-slot): this default is a placeholder pending real award-latency measurement — how long
 // a live buyer actually takes between our claim and its award. It is deliberately far below
@@ -3242,21 +3242,27 @@ fn no_sentinel_strikes_harness(last_agent_message: Option<&str>) -> bool {
     !last_agent_message.is_some_and(|m| m.contains(crate::engine::INLINE_ANSWER_MARKER))
 }
 
-/// The feedback for a container `NoSentinel` outcome that is not delivered.
+/// The feedback for a turn-1 container `NoSentinel` outcome that is not delivered.
 ///
 /// A MARKED answer the container cut to fit its outcome file is an answer over
 /// [`INLINE_ANSWER_MAX_BYTES`], not a run that proved nothing: the host path refuses the same answer
 /// as `delivery_failed` (`deliver_inline_with`), and so does this one, with a reason that names the
 /// limit. The marker survives the cut (it is the first line; the cut is at the end). Reported as
 /// `no_sentinel` it read as a dead harness, and buyers reposted the same over-long job.
+///
+/// `inline_eligible`: the outcome is authentic, the job is from-scratch and the offer accepts
+/// `inline` — the three conditions the delivery arm itself requires. Without all three the answer
+/// could never have been delivered inline, whatever its length: the host path reports that case as
+/// `no_sentinel`, and so does this one (#1426 review H1). A planted outcome cannot claim the limit.
 fn container_no_sentinel_feedback(
     last_agent_message: Option<&str>,
     message_truncated: bool,
+    inline_eligible: bool,
 ) -> (ReasonCode, &'static str) {
     let marked = last_agent_message
         .and_then(crate::engine::marked_inline_answer)
         .is_some();
-    if message_truncated && marked {
+    if inline_eligible && message_truncated && marked {
         (ReasonCode::DeliveryFailed, INLINE_ANSWER_TOO_LONG_FEEDBACK)
     } else {
         (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
@@ -3803,27 +3809,69 @@ mod container_delivery_tests {
         );
     }
 
+    /// What the host actually receives for an over-long reply: the container's outcome file, with the
+    /// message cut by `Phase1Outcome::from_result` (multi-byte text, so the cut lands mid-codepoint).
+    fn container_cut(message: &str) -> (String, bool) {
+        let agent = Some(orch_outcome::AgentOutcome {
+            last_agent_message_truncated: false,
+            session: None,
+            usage: None,
+            last_agent_message: Some(message.to_owned()),
+        });
+        let failed: Result<orch_outcome::Phase1Output, orch_outcome::OrchestratorError> =
+            Err(orch_outcome::OrchestratorError::Agent("no execution observed".into()));
+        let outcome = orch_outcome::Phase1Outcome::from_result(&failed, agent, Duration::from_secs(1));
+        let agent = outcome.agent.expect("the agent outcome is kept");
+        (agent.last_agent_message.expect("the message is kept"), agent.last_agent_message_truncated)
+    }
+
     #[test]
     fn a_cut_marked_answer_is_delivery_failed_not_no_sentinel() {
-        let marked = format!("{}\n{}", crate::engine::INLINE_ANSWER_MARKER, "x".repeat(5000));
-        // Cut to fit the outcome file, marker intact: over the inline limit, not a dead harness.
+        let marker = crate::engine::INLINE_ANSWER_MARKER;
+        // Past what the outcome file keeps (4200 bytes of two-byte chars): cut, marker intact.
+        let raw = format!("{marker}\n{}", "é".repeat(2100));
+        let (cut, truncated) = container_cut(&raw);
+        assert!(truncated && cut.len() <= crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES);
         assert_eq!(
-            container_no_sentinel_feedback(Some(&marked), true),
+            container_no_sentinel_feedback(Some(&cut), truncated, true),
             (ReasonCode::DeliveryFailed, INLINE_ANSWER_TOO_LONG_FEEDBACK)
         );
+        // Exactly the cap (marker line + a 4076-byte answer = 4096): not cut, so the gate's own
+        // refusal stands.
+        let (whole, truncated) = container_cut(&format!("{marker}\n{}", "x".repeat(INLINE_ANSWER_MAX_BYTES)));
+        assert!(!truncated);
+        assert_eq!(
+            container_no_sentinel_feedback(Some(&whole), truncated, true),
+            (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+        );
         // A cut vendor error (no marker) is still a run that proved nothing.
-        let vendor = "quota exceeded ".repeat(400);
+        let (vendor, truncated) = container_cut(&"quota exceeded ".repeat(400));
+        assert!(truncated);
         assert_eq!(
-            container_no_sentinel_feedback(Some(&vendor), true),
+            container_no_sentinel_feedback(Some(&vendor), truncated, true),
             (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
         );
-        // Marked but NOT cut and still refused: the gate refused its shape — unchanged.
+        // A marker followed only by blank space is no answer once cut: still no_sentinel.
+        let (blank, truncated) = container_cut(&format!("{marker}\n{}", " ".repeat(5000)));
+        assert!(truncated);
         assert_eq!(
-            container_no_sentinel_feedback(Some(&marked), false),
+            container_no_sentinel_feedback(Some(&blank), truncated, true),
             (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
         );
         assert_eq!(
-            container_no_sentinel_feedback(None, true),
+            container_no_sentinel_feedback(None, true, true),
+            (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+        );
+    }
+
+    /// #1426 review H1: a job that could never deliver inline (a planted outcome, a contribution, an
+    /// offer without `inline`) keeps `no_sentinel`, as on the host path, even for a cut marked reply.
+    #[test]
+    fn a_cut_marked_answer_on_a_job_that_cannot_deliver_inline_stays_no_sentinel() {
+        let raw = format!("{}\n{}", crate::engine::INLINE_ANSWER_MARKER, "x".repeat(5000));
+        let (cut, truncated) = container_cut(&raw);
+        assert_eq!(
+            container_no_sentinel_feedback(Some(&cut), truncated, false),
             (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
         );
     }
@@ -10214,8 +10262,18 @@ impl SellerNodeRunner {
                         .await;
                         return;
                     }
-                    self.fail_container_delivery(job_id, &offer.buyer_pubkey, harness, failure)
-                        .await;
+                    let accepts_inline = offer
+                        .accepts_delivery
+                        .iter()
+                        .any(|mode| mode == gateway::DELIVERY_MODE_INLINE);
+                    self.fail_container_delivery(
+                        job_id,
+                        &offer.buyer_pubkey,
+                        harness,
+                        accepts_inline,
+                        failure,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -11601,11 +11659,14 @@ impl SellerNodeRunner {
 
     /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
     /// host path emits for the equivalent failure, so a buyer cannot tell the two paths apart.
+    /// `accepts_inline`: the offer accepts an inline delivery (an over-long answer is reported as
+    /// such only when it could have been delivered inline at all).
     async fn fail_container_delivery(
         &self,
         job_id: &str,
         buyer_pubkey: &str,
         harness: usize,
+        accepts_inline: bool,
         failure: ContainerDeliveryFailure,
     ) {
         use ContainerDeliveryFailure as Fail;
@@ -11623,6 +11684,8 @@ impl SellerNodeRunner {
                 detail,
                 last_agent_message,
                 message_truncated,
+                outcome_authentic,
+                from_scratch,
                 ..
             } => {
                 // A harness that produced a MARKED answer proved itself, whatever stopped that
@@ -11642,8 +11705,11 @@ impl SellerNodeRunner {
                     .and_then(crate::engine::marked_inline_answer)
                     .is_some()
                     || !no_sentinel_strikes_harness(last_agent_message.as_deref());
-                let (reason_code, feedback) =
-                    container_no_sentinel_feedback(last_agent_message.as_deref(), message_truncated);
+                let (reason_code, feedback) = container_no_sentinel_feedback(
+                    last_agent_message.as_deref(),
+                    message_truncated,
+                    outcome_authentic && from_scratch && accepts_inline,
+                );
                 if reason_code == ReasonCode::DeliveryFailed {
                     opline!(
                         "seller node execute fail job_id={job_id}: inline answer is over the \

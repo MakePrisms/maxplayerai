@@ -110,24 +110,69 @@ impl ReleaseGate {
     }
 }
 
+/// Buyer-facing reason for a follow-up whose reply ran past [`INLINE_ANSWER_MAX_BYTES`]: the agent
+/// replied, the reply is not deliverable cut, and the session is still open for a shorter one. The
+/// number is pinned to the constant by a test.
+const TURN_REPLY_TOO_LONG_FEEDBACK: &str = "seller's agent replied but the reply was longer than the \
+    4076-byte inline limit, so it was not delivered (a cut reply is never sent); the session stays \
+    open: ask for a shorter reply, or for the answer written to a file";
+
+/// The one detail an over-long reply is refused with. [`turn_feedback_text`] matches it EXACTLY, so
+/// only this constant (never an error string that happens to share the code) swaps in
+/// [`TURN_REPLY_TOO_LONG_FEEDBACK`] — the same no-free-text rule [`buyer_sizes`] keeps.
+const TURN_REPLY_TOO_LONG_DETAIL: &str = "reply over the inline limit";
+
+/// The one constructor of an over-long-reply failure (#1426 review H2).
+fn reply_too_long() -> (ReasonCode, String) {
+    (ReasonCode::DeliveryFailed, TURN_REPLY_TOO_LONG_DETAIL.to_owned())
+}
+
+/// The buyer-facing text for a failed turn: the code's, except an over-long reply's names the limit.
+fn turn_feedback_text(code: ReasonCode, detail: &str) -> &'static str {
+    if code == ReasonCode::DeliveryFailed && detail == TURN_REPLY_TOO_LONG_DETAIL {
+        TURN_REPLY_TOO_LONG_FEEDBACK
+    } else {
+        feedback_text(code)
+    }
+}
+
 /// Feedback reason and text for a failed turn. Never fails the JOB row: turn 1 stays delivered.
-fn turn_failure(failure: ContainerDeliveryFailure) -> (ReasonCode, String) {
+///
+/// `status` and `inline_allowed` are what the follow-up inline arm (`resume_turn`) decides with:
+/// a reply the container cut is over-long only if, whole, that arm would have delivered it.
+fn turn_failure(
+    failure: ContainerDeliveryFailure,
+    status: TurnStatus,
+    inline_allowed: bool,
+) -> (ReasonCode, String) {
     use ContainerDeliveryFailure as F;
     match failure {
-        // A marked answer the container cut is an over-long answer, not a dead harness: the same
-        // `delivery_failed` the one-shot path reports (`container_no_sentinel_feedback`).
+        // A deliverable reply the container cut is an over-long reply, not a dead harness: the
+        // same `delivery_failed` the one-shot path reports (`container_no_sentinel_feedback`).
+        // Every session inline shape counts — a marked answer, a NEEDS-INPUT question, an
+        // out-of-time partial reply (`session_delivery_content`) — and the cut keeps each shape's
+        // lead (the marker is first; an out-of-time reply only needs to be non-empty).
         F::NoSentinel {
             detail,
             last_agent_message,
             message_truncated,
+            outcome_authentic,
+            from_scratch,
             ..
-        } => match container_no_sentinel_feedback(last_agent_message.as_deref(), message_truncated) {
-            (ReasonCode::DeliveryFailed, _) => (
-                ReasonCode::DeliveryFailed,
-                format!("inline answer over the {INLINE_ANSWER_MAX_BYTES}-byte limit (cut by the container)"),
-            ),
-            (code, _) => (code, detail),
-        },
+        } => {
+            let cut_reply = message_truncated
+                && outcome_authentic
+                && from_scratch
+                && inline_allowed
+                && last_agent_message
+                    .as_deref()
+                    .is_some_and(|m| session::session_delivery_content(false, status, m).is_some());
+            if cut_reply {
+                reply_too_long()
+            } else {
+                (ReasonCode::NoSentinel, detail)
+            }
+        }
         F::Delivery(detail) => (ReasonCode::DeliveryFailed, detail),
         F::Setup(detail) | F::Snapshot(detail) | F::Timeout(detail) => {
             (ReasonCode::ExecutionFailed, detail)
@@ -526,23 +571,25 @@ impl SellerNodeRunner {
 
     /// Whether it went out (see [`SellerNodeRunner::publish_buyer_feedback`]).
     async fn turn_feedback(&self, job_id: &str, buyer: &str, fid: &str, code: ReasonCode) -> bool {
-        self.turn_feedback_with(job_id, buyer, fid, code, None)
+        self.turn_feedback_with(job_id, buyer, fid, code, feedback_text(code), None)
             .await
     }
 
-    /// `sizes`: a seller-computed, buyer-text-free detail appended for `turn_too_large` (#1349).
+    /// `text`: a static buyer-facing reason (`feedback_text` / `turn_feedback_text`). `sizes`: a
+    /// seller-computed, buyer-text-free detail appended for `turn_too_large` (#1349).
     async fn turn_feedback_with(
         &self,
         job_id: &str,
         buyer: &str,
         fid: &str,
         code: ReasonCode,
+        text: &'static str,
         sizes: Option<&str>,
     ) -> bool {
         // The follow-up id makes each turn's encrypted feedback a distinct content intent.
         let reason = match sizes {
-            Some(sizes) => format!("{} ({sizes}; follow-up {fid})", feedback_text(code)),
-            None => format!("{} (follow-up {fid})", feedback_text(code)),
+            Some(sizes) => format!("{text} ({sizes}; follow-up {fid})"),
+            None => format!("{text} (follow-up {fid})"),
         };
         let status = refusal_status(code);
         self.publish_buyer_feedback_tagged(
@@ -678,7 +725,8 @@ impl SellerNodeRunner {
                 );
                 let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
                 let sizes = buyer_sizes(code, &detail);
-                self.turn_feedback_with(&job_id, &buyer, fid, code, sizes)
+                let text = turn_feedback_text(code, &detail);
+                self.turn_feedback_with(&job_id, &buyer, fid, code, text, sizes)
                     .await;
             }
             if store.session_close_requested(&job_id).unwrap_or(false)
@@ -796,7 +844,8 @@ impl SellerNodeRunner {
                 );
                 let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
                 let sizes = buyer_sizes(code, &detail);
-                self.turn_feedback_with(&job_id, &buyer, fid, code, sizes)
+                let text = turn_feedback_text(code, &detail);
+                self.turn_feedback_with(&job_id, &buyer, fid, code, text, sizes)
                     .await;
             }
         }
@@ -1113,7 +1162,8 @@ impl SellerNodeRunner {
                     let header = self
                         .mint_push_header(&seller.git_remote, &push_ref, Some(expiry))
                         .await
-                        .map_err(turn_failure)?;
+                        // A push-header failure is never a reply: no inline shape to weigh.
+                        .map_err(|failure| turn_failure(failure, TurnStatus::Done, false))?;
                     orch::PushTokenSource::LongLived { header }
                 }
             }
@@ -1297,7 +1347,7 @@ impl SellerNodeRunner {
                 if let ContainerDeliveryFailure::Agent(error) = &failure {
                     self.drop_harness(harness, harness_fault_for(error));
                 }
-                return Err(turn_failure(failure));
+                return Err(turn_failure(failure, status, inline_allowed));
             }
         };
         self.publish_turn_result(TurnResult {
@@ -1365,7 +1415,14 @@ impl SellerNodeRunner {
                 wall_time_ms,
             } => {
                 if answer.len() > INLINE_ANSWER_MAX_BYTES {
-                    return Err(delivery_failed("inline answer over the size limit".into()));
+                    opline!(
+                        "seller node session job_id={}: turn {} reply is {} bytes, over the \
+                         {INLINE_ANSWER_MAX_BYTES}-byte inline limit",
+                        r.job_id,
+                        r.turn,
+                        answer.len()
+                    );
+                    return Err(reply_too_long());
                 }
                 (
                     crate::receipt::result_content_hash_hex(answer),
@@ -1842,10 +1899,13 @@ impl SellerNodeRunner {
                     })?;
                 Ok((row.status, row.answer, row.wall_time_ms))
             }
-            JobOutcome::TooLarge { bytes, cap } => Err(HookTurnEnd::Refused(
-                ReasonCode::DeliveryFailed,
-                format!("answer is {bytes} bytes, over the {cap}-byte limit"),
-            )),
+            JobOutcome::TooLarge { bytes, cap } => {
+                opline!(
+                    "seller node session job_id={job_id}: turn {n} answer is {bytes} bytes, over the {cap}-byte limit"
+                );
+                let (code, detail) = reply_too_long();
+                Err(HookTurnEnd::Refused(code, detail))
+            }
             JobOutcome::CannotDeliver(reason) => Err(HookTurnEnd::Refused(
                 ReasonCode::DeliveryFailed,
                 format!("hook declined to deliver ({reason})"),
@@ -2088,29 +2148,105 @@ fn followup_session_inputs(
 mod tests {
     use super::*;
 
+    fn turn_no_sentinel(
+        message: Option<String>,
+        message_truncated: bool,
+        outcome_authentic: bool,
+        from_scratch: bool,
+    ) -> ContainerDeliveryFailure {
+        ContainerDeliveryFailure::NoSentinel {
+            detail: "no execution observed".into(),
+            last_agent_message: message,
+            usage: None,
+            wall_time_ms: 0,
+            message_truncated,
+            outcome_authentic,
+            from_scratch,
+        }
+    }
+
+    /// A reply cut the way the container cuts it: to the outcome file's cap, on a char boundary.
+    fn cut(mut message: String) -> String {
+        let mut at = crate::delivery_orchestrator::OUTCOME_TEXT_MAX_BYTES;
+        while !message.is_char_boundary(at) {
+            at -= 1;
+        }
+        message.truncate(at);
+        message
+    }
+
     #[test]
-    fn a_turn_whose_marked_answer_was_cut_fails_delivery_not_no_sentinel() {
-        let no_sentinel = |message: Option<String>, message_truncated: bool| {
-            ContainerDeliveryFailure::NoSentinel {
-                detail: "no execution observed".into(),
-                last_agent_message: message,
-                usage: None,
-                wall_time_ms: 0,
-                message_truncated,
-                outcome_authentic: true,
-                from_scratch: true,
-            }
-        };
-        let marked = format!("{}\n{}", crate::engine::INLINE_ANSWER_MARKER, "x".repeat(5000));
-        let (code, detail) = turn_failure(no_sentinel(Some(marked.clone()), true));
-        assert_eq!(code, ReasonCode::DeliveryFailed);
-        assert!(detail.contains(&format!("{INLINE_ANSWER_MAX_BYTES}-byte limit")), "{detail}");
+    fn a_turn_whose_reply_was_cut_fails_delivery_not_no_sentinel() {
+        let long = "é".repeat(3000);
+        let replies = [
+            (format!("{}\n{long}", crate::engine::INLINE_ANSWER_MARKER), TurnStatus::Done),
+            (format!("{}\n{long}", session::NEEDS_INPUT_MARKER), TurnStatus::NeedsInput),
+            (format!("partial work so far: {long}"), TurnStatus::OutOfTime),
+        ];
+        for (reply, status) in replies {
+            let reply = cut(reply);
+            assert_eq!(
+                turn_failure(turn_no_sentinel(Some(reply.clone()), true, true, true), status, true),
+                reply_too_long(),
+                "{status:?}"
+            );
+            // Uncut and still refused: the gate refused its shape — unchanged.
+            assert_eq!(
+                turn_failure(turn_no_sentinel(Some(reply), false, true, true), status, true).0,
+                ReasonCode::NoSentinel,
+                "{status:?}"
+            );
+        }
+        // An unmarked reply on a finished turn was never deliverable inline, cut or not.
+        let unmarked = cut(format!("quota exceeded {long}"));
         assert_eq!(
-            turn_failure(no_sentinel(Some(marked), false)).0,
-            ReasonCode::NoSentinel,
-            "an uncut refusal keeps its code"
+            turn_failure(turn_no_sentinel(Some(unmarked), true, true, true), TurnStatus::Done, true).0,
+            ReasonCode::NoSentinel
         );
-        assert_eq!(turn_failure(no_sentinel(None, true)).0, ReasonCode::NoSentinel);
+        assert_eq!(
+            turn_failure(turn_no_sentinel(None, true, true, true), TurnStatus::Done, true).0,
+            ReasonCode::NoSentinel
+        );
+    }
+
+    /// #1426 review H1/H2: only a turn the inline arm could have delivered is over-long; a planted
+    /// outcome, a non-empty base, or a session that may not deliver inline keeps `no_sentinel`.
+    #[test]
+    fn a_cut_reply_on_a_turn_that_cannot_deliver_inline_stays_no_sentinel() {
+        let reply = cut(format!("{}\n{}", crate::engine::INLINE_ANSWER_MARKER, "x".repeat(5000)));
+        let refused = |authentic, from_scratch, inline_allowed| {
+            turn_failure(
+                turn_no_sentinel(Some(reply.clone()), true, authentic, from_scratch),
+                TurnStatus::Done,
+                inline_allowed,
+            )
+            .0
+        };
+        assert_eq!(refused(false, true, true), ReasonCode::NoSentinel, "planted outcome");
+        assert_eq!(refused(true, false, true), ReasonCode::NoSentinel, "not from scratch");
+        assert_eq!(refused(true, true, false), ReasonCode::NoSentinel, "inline not allowed");
+        assert_eq!(refused(true, true, true), ReasonCode::DeliveryFailed);
+    }
+
+    /// #1426 review H2: what the BUYER reads. An over-long reply names the limit; any other
+    /// `delivery_failed` detail, however worded, keeps the generic text.
+    #[test]
+    fn the_buyer_reads_the_inline_limit_for_an_over_long_reply_and_only_for_one() {
+        let (code, detail) = reply_too_long();
+        assert_eq!(turn_feedback_text(code, &detail), TURN_REPLY_TOO_LONG_FEEDBACK);
+        assert!(
+            TURN_REPLY_TOO_LONG_FEEDBACK.contains(&format!("{INLINE_ANSWER_MAX_BYTES}-byte")),
+            "{TURN_REPLY_TOO_LONG_FEEDBACK}"
+        );
+        assert_eq!(
+            turn_feedback_text(ReasonCode::DeliveryFailed, "reply over the inline limit (and more)"),
+            DELIVERY_FAILURE_FEEDBACK
+        );
+        assert_eq!(
+            turn_feedback_text(ReasonCode::ExecutionFailed, TURN_REPLY_TOO_LONG_DETAIL),
+            EXEC_FAILURE_FEEDBACK
+        );
+        assert_eq!(turn_feedback_text(ReasonCode::NoSentinel, ""), NO_SENTINEL_FEEDBACK);
     }
 
     /// Bug 2 (Petar 15:33): the empty-reload reset is requested ONLY by a runsc seat. Every other seat
