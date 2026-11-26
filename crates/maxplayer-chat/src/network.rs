@@ -78,9 +78,12 @@ pub fn read_status(root: &Path) -> Result<WatchStatus> {
     // SAFETY: signal 0 only checks that the pid exists. EPERM means it exists but belongs to
     // another user (`status` run as a different user than the watch, or under a supervisor): that
     // is a live writer, not a previous one.
-    let writer_alive = status.pid != 0
-        && (unsafe { libc::kill(status.pid as libc::pid_t, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM));
+    // A pid that does not fit pid_t would wrap negative and name a process group: not a writer.
+    let writer_alive = libc::pid_t::try_from(status.pid).is_ok_and(|pid| {
+        pid > 0
+            && (unsafe { libc::kill(pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+    });
     if !running {
         status.state = "unhealthy".into();
         status.last_error = Some("watch not running (lock not held)".into());
@@ -374,6 +377,9 @@ pub async fn watch_with_options(
         attempt += 1;
         let client = client(&home.keys);
         let mut phase = "connect/auth";
+        // Setup can take the whole cycle_timeout (60 s by default) against a slow relay: keep
+        // the status file fresh through it, as the steady state, probe and backoff do, so the
+        // file never goes stale (>90 s) while the watch is alive.
         let setup = tokio::time::timeout(options.cycle_timeout, async {
             let (relay, mut notifications) = connect(&client, url).await?;
             phase = "subscribe/matching EOSE";
@@ -402,8 +408,22 @@ pub async fn watch_with_options(
                 since,
                 count,
             ))
-        })
-        .await;
+        });
+        let setup = {
+            tokio::pin!(setup);
+            let mut refresh = tokio::time::interval_at(
+                Instant::now() + options.refresh_interval,
+                options.refresh_interval,
+            );
+            loop {
+                tokio::select! {
+                    result = &mut setup => break result,
+                    _ = refresh.tick() => {
+                        let _ = home.save_status(&mut status);
+                    }
+                }
+            }
+        };
         let error = match setup {
             Ok(Ok((relay, mut notifications, live, since, count))) => {
                 // Only a fully authenticated, EOSE-verified history resets the backoff.
@@ -512,6 +532,8 @@ pub async fn watch_with_options(
         .into();
         status.last_error = Some(display_text(&error));
         home.save_status(&mut status)?;
+        // The backoff's refresh clock starts at this save, not after the shutdown below.
+        let mut saved = Instant::now();
         shutdown(client).await;
         let exiting =
             options.max_failures > 0 && status.consecutive_failures >= options.max_failures;
@@ -529,7 +551,6 @@ pub async fn watch_with_options(
             .into());
         }
         let until = Instant::now() + delay;
-        let mut saved = Instant::now();
         while Instant::now() < until {
             tick(&mut notifier);
             // The backoff can reach 60 s: keep the (reconnecting) status fresh through it, so

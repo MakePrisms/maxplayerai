@@ -1799,6 +1799,56 @@ async fn health_status_stays_fresh_while_a_slow_probe_runs() {
     task.abort();
 }
 
+/// While setup waits on a relay that never sends EOSE (up to cycle_timeout), and through the
+/// backoff after it, status.json keeps being written. RED ON REVERT: without the setup refresh the
+/// file goes the whole cycle_timeout (2 s here) without a write.
+#[tokio::test]
+async fn health_status_stays_fresh_while_setup_waits_on_a_slow_relay() {
+    let relay = RelayFixture::new().await;
+    relay.faults.omit_eose.store(true, Ordering::SeqCst);
+    let (_d, h) = home();
+    let root = h.root.clone();
+    let url = relay.url.clone();
+    let options = maxplayer_chat::WatchOptions {
+        max_failures: 0,
+        cycle_timeout: Duration::from_secs(2),
+        liveness_interval: Duration::from_millis(200),
+        liveness_timeout: Duration::from_millis(150),
+        refresh_interval: Duration::from_millis(100),
+        backoff_unit: Duration::from_millis(30),
+    };
+    let task = tokio::spawn(async move {
+        maxplayer_chat::watch_with_options(&Home::open(root).unwrap(), &url, vec![], options).await
+    });
+    let path = h.root.join("chat/status.json");
+    let started = std::time::Instant::now();
+    while !path.exists() {
+        assert!(started.elapsed() < Duration::from_secs(5), "no status file");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let modified = || std::fs::metadata(&path).unwrap().modified().unwrap();
+    let mut last = modified();
+    let mut last_change = std::time::Instant::now();
+    let mut widest = Duration::ZERO;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let now = modified();
+        if now != last {
+            widest = widest.max(last_change.elapsed());
+            last = now;
+            last_change = std::time::Instant::now();
+        }
+    }
+    widest = widest.max(last_change.elapsed());
+    assert!(!task.is_finished(), "the watch keeps retrying");
+    task.abort();
+    assert!(
+        widest < Duration::from_millis(700),
+        "status.json went {widest:?} without a write while setup waited on the relay"
+    );
+}
+
 /// `status` run as another user than the watch (or with the watch under a supervisor) sees EPERM
 /// from `kill(pid, 0)`: the writer exists. Before, that read as a previous watcher's file and
 /// `status` exited 1 for a healthy watch. pid 1 always exists; a non-root run gets EPERM for it.
@@ -1807,6 +1857,14 @@ async fn health_status_stays_fresh_while_a_slow_probe_runs() {
 fn health_status_from_another_user_is_not_a_dead_writer() {
     let (_d, h) = home();
     let _guard = h.watch_lock().unwrap();
+    // The point is EPERM: a root run (or a container whose pid 1 is ours) gets 0 from kill and
+    // would pass without the EPERM arm, so there this proves nothing and is skipped.
+    if unsafe { libc::kill(1, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+    {
+        eprintln!("skipped: pid 1 is signalable here, so this run cannot exercise EPERM");
+        return;
+    }
     let path = h.root.join("chat/status.json");
     let value = json!({"state":"healthy", "pid":1, "relay":"ws://127.0.0.1:1", "last_healthy_at":1,
         "consecutive_failures":0,"last_error":null,"updated_at":Timestamp::now().as_secs()});
