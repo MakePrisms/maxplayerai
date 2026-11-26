@@ -67,7 +67,7 @@ impl std::fmt::Display for LockError {
                     None => write!(
                         formatter,
                         ". Its holder could not be identified from here (another OS user or a container); \
-                         find it with `fuser -v {}` and stop it, or run `{drain}` where it runs, then start again",
+                         find it with `{FIND_HOLDER} {}` and stop it, or run `{drain}` where it runs, then start again",
                         path.display()
                     ),
                 }
@@ -111,6 +111,10 @@ impl HomeLock {
             }
             attempts += 1;
             if attempts >= 5 {
+                // Close our own descriptor first: `identify_holder` confirms a pid by its open
+                // descriptor on the lock file, and ours would confirm a recorded pid that happens to
+                // equal our own (two containers' PID 1 sharing a home) as the holder.
+                drop(file);
                 let holder = identify_holder(&path);
                 return Err(LockError::Held { path, holder });
             }
@@ -364,11 +368,21 @@ fn holds_file_open(pid: u32, path: &Path) -> Result<bool, String> {
     }))
 }
 
-/// Elsewhere there is no `/proc`: the held lock plus the pid its holder wrote is the evidence.
+/// Elsewhere there is no `/proc`: the held lock plus a pid its holder wrote that is alive and ours
+/// to signal is the evidence. A dead pid (ESRCH) or one we may not signal (EPERM: another user, or
+/// a pid such as 1 a container wrote) is not named.
 #[cfg(not(target_os = "linux"))]
-fn holds_file_open(_pid: u32, _path: &Path) -> Result<bool, String> {
-    Ok(true)
+fn holds_file_open(pid: u32, _path: &Path) -> Result<bool, String> {
+    // Safety: signal 0 only checks existence and permission; nothing is delivered.
+    Ok(libc::pid_t::try_from(pid).is_ok_and(|raw| unsafe { libc::kill(raw, 0) } == 0))
 }
+
+/// The command that names a lock file's holder: `fuser -v` on Linux; macOS's BSD `fuser` has no
+/// `-v`, so `lsof` there.
+#[cfg(target_os = "linux")]
+const FIND_HOLDER: &str = "fuser -v";
+#[cfg(not(target_os = "linux"))]
+const FIND_HOLDER: &str = "lsof";
 
 #[cfg(test)]
 mod tests {
@@ -477,7 +491,10 @@ mod tests {
         }
         .to_string();
         assert!(message.contains("could not be identified"), "{message}");
-        assert!(message.contains("`fuser -v /h/seller.lock`"), "{message}");
+        assert!(
+            message.contains(&format!("`{FIND_HOLDER} /h/seller.lock`")),
+            "{message}"
+        );
         assert!(
             message.contains("`maxplayer seller drain --home /h`"),
             "{message}"
@@ -599,6 +616,41 @@ mod tests {
         held.record_pid().expect("child record");
         std::thread::sleep(std::time::Duration::from_secs(30));
         std::process::exit(7); // never signalled
+    }
+
+    /// A refused starter whose own pid is the one recorded in the lock file (two containers' PID 1
+    /// sharing a home) must name the real holder, not itself: its own descriptor on the lock file is
+    /// closed before the holder is identified. RED ON REVERT: drop the `drop(file)` in `acquire` and
+    /// the parent names its own pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_starter_whose_pid_is_recorded_does_not_name_itself() {
+        let path = temp_lock("self-pid");
+        let _ = std::fs::remove_file(&path);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "seller_node::lock::tests::drain_child_process", "--test-threads=1"])
+            .env(DRAIN_CHILD_ENV, &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while holder(&path).unwrap() != LockHolder::Pid(child.id()) {
+            assert!(child.try_wait().unwrap().is_none(), "the child exited early");
+            assert!(std::time::Instant::now() < deadline, "the child never took the lock");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let me = std::process::id();
+        std::fs::write(&path, format!("{me}\n")).expect("record our own pid");
+        let refused = HomeLock::acquire(&path).expect_err("the child holds it");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(refused, LockError::Held { holder: Some(pid), .. } if pid == child.id()),
+            "must name the child {}, not ourselves {me}: {refused:?}",
+            child.id()
+        );
     }
 
     /// #1299: `request_drain` finds the real holder in another process through the lock alone and
