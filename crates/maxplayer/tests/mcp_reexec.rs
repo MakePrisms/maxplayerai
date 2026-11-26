@@ -26,6 +26,11 @@ fn install(path: &Path, body: &[u8]) {
     std::fs::rename(&next, path).unwrap(); // what npm, install.sh and package managers do
 }
 
+/// The re-exec itself, not the `mcp --resume-fd 0` probe that checks the new file knows the handover.
+fn is_reexec(line: &str) -> bool {
+    line.starts_with("mcp --resume-fd ") && line != "mcp --resume-fd 0"
+}
+
 /// RED ON REVERT: without the re-exec, the swapped-in binary is never run with `mcp --resume-fd`
 /// and the requests after the swap are answered by the old process.
 #[test]
@@ -97,8 +102,11 @@ fn a_replaced_binary_serves_the_next_request_without_a_restart() {
         "the new file was probed first: {runs:?}"
     );
     assert!(
-        runs.lines()
-            .any(|line| line.starts_with("mcp --resume-fd ")),
+        runs.lines().any(|line| line == "mcp --resume-fd 0"),
+        "the new file was checked for the handover before it was trusted: {runs:?}"
+    );
+    assert!(
+        runs.lines().any(is_reexec),
         "the server re-exec'd the replaced binary: {runs:?}"
     );
     assert_eq!(child.id(), pid, "same process, same stdio");
@@ -121,7 +129,7 @@ fn a_replaced_binary_serves_the_next_request_without_a_restart() {
     let log = std::fs::read_to_string(dir.path().join("stderr")).unwrap();
     assert!(log.contains("binary replaced"), "{log}");
     assert_eq!(
-        runs.lines().filter(|line| line.starts_with("mcp ")).count(),
+        runs.lines().filter(|line| is_reexec(line)).count(),
         1,
         "exactly one re-exec: {runs:?}"
     );
