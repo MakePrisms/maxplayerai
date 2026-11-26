@@ -7650,6 +7650,9 @@ impl SellerNodeRunner {
                             // A newly authenticated session earns a fresh retry budget: the budget
                             // exists to bound retries WITHIN a session, not to spend one forever.
                             restricted_retry_used.clear();
+                            // Reviews whose request failed while the relay was away get one more try
+                            // now that it is back (also during a recovery: it ends in this auth).
+                            self.retry_review_errors_after_reconnect();
 
                             // #429 FIX. A completed NIP-42 auth is the only reliable signal that this
                             // socket can carry our `#p`-gated REQs again — so RE-ISSUE the long-lived
@@ -8835,6 +8838,58 @@ impl SellerNodeRunner {
         self.review_checks.lock().is_ok_and(|checks| {
             matches!(checks.get(job_id), Some(Some(Err(e))) if crate::review::state::terminal(e))
         })
+    }
+
+    /// The relay is back: retry every live offer's review whose REQUEST failed for availability
+    /// while it was away ("relay not connected" right after a thaw, a reviewer timeout meanwhile).
+    /// A cached failure is otherwise returned by every re-drive until an operator's
+    /// `review retry` or the offer's expiry, so a seat that woke a few seconds before its relay
+    /// never claimed the offers that arrived in that window. Called on each completed NIP-42 auth:
+    /// every reconnect ends in exactly one, and an outcome that waiting cannot change (a policy
+    /// refusal, a permanent input error) is left alone. Returns how many were re-armed.
+    fn retry_review_errors_after_reconnect(&self) -> usize {
+        let live: std::collections::BTreeSet<String> =
+            match self.node.store().offers_awaiting_claim(now_unix()) {
+                Ok(rows) => rows.into_iter().map(|row| row.offer_id).collect(),
+                Err(error) => {
+                    opline!("seller node relay back: offer read failed ({error}); errored reviews wait for the next auth or a manual retry");
+                    return 0;
+                }
+            };
+        let retried: Vec<String> = {
+            let Ok(mut checks) = self.review_checks.lock() else {
+                return 0;
+            };
+            let ids: Vec<String> = checks
+                .iter()
+                .filter(|(id, value)| {
+                    live.contains(id.as_str())
+                        && matches!(value, Some(Err(error)) if !crate::review::state::terminal(error))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                checks.remove(id);
+            }
+            ids
+        };
+        if retried.is_empty() {
+            return 0;
+        }
+        // Taken after `review_checks` is released (`offer_review_ready` takes them in that order).
+        if let Ok(mut logged) = self.review_blocked_logged.lock() {
+            for id in &retried {
+                logged.remove(id);
+            }
+        }
+        self.capacity_skip_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        opline!(
+            "seller node relay back (NIP-42 auth): retrying {} offer review(s) that failed while it was unreachable: {}",
+            retried.len(),
+            retried.join(" ")
+        );
+        retried.len()
     }
 
     /// #1057: offers with a queued `review retry` ticket whose cached review is terminal. Only these
@@ -25764,6 +25819,138 @@ esac"#,
     /// and kind-1059 legs (what [`subscribe_all`] carries). The liveness probe is transient — it is
     /// re-issued every heartbeat and self-heals — so it is not in this set.
     const LONG_LIVED_SUBS: [&str; 3] = [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID];
+
+    /// The exact error a seat logged when its private-offer review request went out in the seconds
+    /// after a thaw, before its relay was back.
+    const RELAY_DOWN_REVIEW_ERROR: &str = "review: relay refused the review request: relay not connected";
+
+    fn record_live_offer(runner: &SellerNodeRunner, id: &str) {
+        runner
+            .node
+            .store()
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    accepts_delivery: vec![gateway::DELIVERY_MODE_INLINE.to_owned()],
+                    payment_mode: crate::gateway::PaymentMode::Sat,
+                    offer_id: id.to_owned(),
+                    buyer_pubkey: Keys::generate().public_key().to_hex(),
+                    amount_sats: 100,
+                    unit: "sat".to_owned(),
+                    task: "answer me".to_owned(),
+                    deadline_unix: now_unix() + 3_600,
+                    targeted: true,
+                    capability_request: Some(Default::default()),
+                    requested_agent: None,
+                    output: Some("text/plain".to_owned()),
+                },
+                now_unix(),
+            )
+            .expect("record offer");
+    }
+
+    /// A review request that failed because the relay was down is retried once the relay is back,
+    /// while the offer is still open: the cached error is dropped and the reconsider tick re-armed.
+    /// An outcome waiting cannot change, and an offer no longer awaiting a claim, are left alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_review_that_failed_while_the_relay_was_down_is_retried_when_it_is_back() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let root = throwaway_root("review-retry-reconnect");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay.url().await.to_string();
+        home.config.seller = Some(seller_cfg(1, false));
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let (down, refused, gone) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        record_live_offer(&runner, &down);
+        record_live_offer(&runner, &refused);
+        let permanent = "review: permanent input error (invalid_subject); retrying unchanged input cannot help".to_owned();
+        assert!(crate::review::state::terminal(&permanent), "harness check: a terminal outcome");
+        {
+            let mut checks = runner.review_checks.lock().unwrap();
+            checks.insert(down.clone(), Some(Err(RELAY_DOWN_REVIEW_ERROR.to_owned())));
+            checks.insert(refused.clone(), Some(Err(permanent.clone())));
+            checks.insert(gone.clone(), Some(Err(RELAY_DOWN_REVIEW_ERROR.to_owned())));
+        }
+        // The field's stuck state: every re-drive returns the cached failure.
+        assert_eq!(
+            runner.offer_review_ready(&down, &Keys::generate().public_key().to_hex()),
+            Err(RELAY_DOWN_REVIEW_ERROR.to_owned()),
+            "harness check: the cached failure is what a re-drive gets"
+        );
+        runner
+            .capacity_skip_pending
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(runner.retry_review_errors_after_reconnect(), 1);
+
+        let checks = runner.review_checks.lock().unwrap().clone();
+        assert!(!checks.contains_key(&down), "the relay-down failure is requested again");
+        assert_eq!(checks.get(&refused), Some(&Some(Err(permanent))), "a terminal outcome stays");
+        assert!(checks.contains_key(&gone), "an offer no longer awaiting a claim is not re-driven");
+        assert!(
+            runner
+                .capacity_skip_pending
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the reconsider tick is re-armed to re-drive it"
+        );
+        assert_eq!(runner.retry_review_errors_after_reconnect(), 0, "a second auth finds nothing left to retry");
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Wiring: the relay coming back (a completed NIP-42 auth on the running loop) is what triggers
+    /// the retry. RED ON REVERT: drop the retry call from the `Authenticated` arm and the cached
+    /// relay-down failure is still there after the re-auth.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_relay_coming_back_retries_a_review_that_failed_while_it_was_down() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("review-retry-reauth");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.seller_heartbeat.enabled = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let id = "d".repeat(64);
+        record_live_offer(&runner, &id);
+        runner
+            .review_checks
+            .lock()
+            .unwrap()
+            .insert(id.clone(), Some(Err(RELAY_DOWN_REVIEW_ERROR.to_owned())));
+        let checks = Arc::clone(&runner.review_checks);
+        let stuck = {
+            let checks = Arc::clone(&checks);
+            let id = id.clone();
+            move || {
+                checks.lock().unwrap().get(&id)
+                    == Some(&Some(Err(RELAY_DOWN_REVIEW_ERROR.to_owned())))
+            }
+        };
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                for id in LONG_LIVED_SUBS {
+                    assert!(
+                        fixture.wait_until(FIXTURE_WAIT, |reqs| served_authed(reqs, id) >= 1).await,
+                        "harness check: {id} boots served on an authenticated session"
+                    );
+                }
+                assert!(stuck(), "harness check: nothing retried it before the relay came back");
+                // The relay comes back: the client authenticates again.
+                fixture.roll_challenge(&[]).await;
+                let deadline = tokio::time::Instant::now() + RECHALLENGE_WAIT;
+                while stuck() && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(!stuck(), "the completed auth did not retry the relay-down review failure");
+            })
+            .await;
+        loop_handle.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// TOOTH #429 — a live-socket NIP-42 RE-CHALLENGE must not leave the money leg deaf: the daemon
     /// re-issues the long-lived subscriptions on every COMPLETED auth, re-armed per challenge-roll.
