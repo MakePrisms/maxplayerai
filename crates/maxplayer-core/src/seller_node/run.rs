@@ -907,6 +907,8 @@ struct QuietTally {
     wraps_unknown_job: std::sync::atomic::AtomicU64,
     /// A repeat of a payment wrap that does not parse (first sight of each wrap prints).
     wraps_payment_repeat: std::sync::atomic::AtomicU64,
+    /// A repeat skip of an offer already settled or taken by another seller (first sight prints).
+    terminal_offers: std::sync::atomic::AtomicU64,
 }
 
 impl QuietTally {
@@ -931,6 +933,7 @@ impl QuietTally {
             ("payments already collected", take(&self.wraps_already_paid)),
             ("repeat payments for unrecorded jobs", take(&self.wraps_unknown_job)),
             ("repeat unreadable payments", take(&self.wraps_payment_repeat)),
+            ("settled or taken offers skipped again", take(&self.terminal_offers)),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -5299,6 +5302,12 @@ pub struct SellerNodeRunner {
     /// the periodic backfill re-reading the same offer does not repeat the line. Same bounded
     /// first-sight set as [`Self::fed_under_rate_offers`].
     announced_stale_offers: FedUnderRateOffers,
+    /// Offer ids (per terminal reason) whose "already settled" / "awarded to another seller" skip
+    /// already printed this boot. The offer backfill re-feeds every stored offer each tick (~300 s),
+    /// and a terminal offer never stops being terminal, so without this the same line repeated for
+    /// every such offer on every pass for the rest of its backfill window. Same bounded first-sight set as
+    /// [`Self::fed_under_rate_offers`].
+    announced_terminal_offers: FedUnderRateOffers,
     /// Job ids whose "payment but no offer recorded" line already printed this boot.
     announced_unknown_payments: FedUnderRateOffers,
     /// Wrap ids whose "payment does not parse" line already printed this boot.
@@ -5811,6 +5820,7 @@ impl SellerNodeRunner {
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             quiet: QuietTally::default(),
             announced_stale_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
+            announced_terminal_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             announced_unknown_payments: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             announced_payment_wraps: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
@@ -9144,10 +9154,18 @@ impl SellerNodeRunner {
             .terminal_offers
             .suppressed_by(job_id, buyer_pubkey, now as u64)
         {
-            opline!(
-                "seller node offer skip id={job_id}: {}",
-                suppression.skip_reason().reason()
-            );
+            // A terminal offer is news once per boot (per reason, so a later receipt for an offer
+            // first seen taken elsewhere still prints); every re-read after that is counted for the
+            // routine summary and printed only with MAXPLAYER_VERBOSE.
+            let skip = suppression.skip_reason();
+            let key = format!("{job_id}:{skip:?}");
+            if self.announced_terminal_offers.contains(&key) {
+                QuietTally::bump(&self.quiet.terminal_offers);
+                opline_verbose!("seller node offer skip id={job_id}: {}", skip.reason());
+            } else {
+                self.announced_terminal_offers.record(&key);
+                opline!("seller node offer skip id={job_id}: {}", skip.reason());
+            }
             return ClaimOutcome::Declined;
         }
         // rc2: an offer replay of a job this seat already claimed and that has an award recorded
@@ -21266,6 +21284,7 @@ esac"#,
             &tally.wraps_already_paid,
             &tally.wraps_unknown_job,
             &tally.wraps_payment_repeat,
+            &tally.terminal_offers,
         ]
         .into_iter()
         .enumerate()
@@ -21285,6 +21304,7 @@ esac"#,
             "payments already collected: 7",
             "repeat payments for unrecorded jobs: 8",
             "repeat unreadable payments: 9",
+            "settled or taken offers skipped again: 10",
         ] {
             assert!(summary.contains(expected), "missing {expected:?} in {summary}");
         }
@@ -21367,6 +21387,97 @@ esac"#,
             3,
             "open-pool + repeat + history are counted; the first sight of the recent one is not"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A settled offer re-read by every backfill pass prints its skip once, then is only counted.
+    /// Before, "offer already settled" printed on every pass (~300 s) for every settled offer in the
+    /// lookback, for the rest of its backfill window. A later receipt for an offer first seen taken
+    /// elsewhere prints once more.
+    ///
+    /// RED ON REVERT: drop the `announced_terminal_offers` check in `claim_offer` and nothing is
+    /// counted (every repeat prints instead): the tally reads 0, not 2. That a repeat is not
+    /// printed by default rests on the call site using `opline_verbose!`; nothing here captures
+    /// stderr.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_offer_skip_prints_once_then_is_counted() {
+        let relay = start_quiet_test_relay().await;
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_capacity_skip_seller("quiet-terminal", &relay_url, true, 0, None).await;
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let seller_hex = runner.seller_pubkey.to_hex();
+        let (settled, settled_offer) =
+            offer_1057(&buyer, "settled, re-read", 300, now_unix() as u64 + 600);
+        let (taken, taken_offer) =
+            offer_1057(&buyer, "taken, then settled", 300, now_unix() as u64 + 600);
+        runner.terminal_offers.record_receipt(&settled, &buyer_hex);
+        runner
+            .terminal_offers
+            .record_taken_elsewhere(&taken, &buyer_hex, now_unix() as u64 + 600);
+        macro_rules! claim {
+            ($job:expr, $parsed:expr) => {
+                runner
+                    .claim_offer(
+                        $job,
+                        &buyer_hex,
+                        $parsed,
+                        &seller_hex,
+                        $parsed.deadline_unix,
+                        now_unix(),
+                        None,
+                    )
+                    .await
+            };
+        }
+        let terminal = || {
+            runner
+                .quiet
+                .terminal_offers
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        // First sight prints (not counted); the next two backfill passes are counted.
+        for _ in 0..3 {
+            assert!(matches!(
+                claim!(&settled, &settled_offer),
+                ClaimOutcome::Declined
+            ));
+        }
+        assert_eq!(
+            terminal(),
+            2,
+            "the two re-reads are counted, the first sight is not"
+        );
+
+        // Taken elsewhere prints once; its receipt arriving later is news again, once.
+        assert!(matches!(
+            claim!(&taken, &taken_offer),
+            ClaimOutcome::Declined
+        ));
+        assert!(matches!(
+            claim!(&taken, &taken_offer),
+            ClaimOutcome::Declined
+        ));
+        assert_eq!(terminal(), 3);
+        runner.terminal_offers.record_receipt(&taken, &buyer_hex);
+        assert!(matches!(
+            claim!(&taken, &taken_offer),
+            ClaimOutcome::Declined
+        ));
+        assert_eq!(
+            terminal(),
+            3,
+            "the receipt after an award is printed, not counted"
+        );
+        assert!(matches!(
+            claim!(&taken, &taken_offer),
+            ClaimOutcome::Declined
+        ));
+        assert_eq!(terminal(), 4);
+
+        runner.client.disconnect().await;
         let _ = std::fs::remove_dir_all(&root);
     }
 

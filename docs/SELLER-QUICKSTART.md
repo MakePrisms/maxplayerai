@@ -1664,8 +1664,9 @@ Lines worth knowing when something is slow:
 
 Routine no-ops are hidden by default: a re-seen offer already claimed, a duplicate award, awards
 and acceptances for other sellers' jobs, pay-binds for jobs already awarded here, lapsed or aged
-offers re-read from relay history, a relay `CLOSED` for a subscription that is not ours, and
-follow-ups to ended sessions. All but the first two are counted, and the status tick prints one
+offers re-read from relay history, an offer already settled or awarded to another seller after its
+first skip line this boot, a relay `CLOSED` for a subscription that is not ours, and follow-ups to
+ended sessions. All but the first two are counted, and the status tick prints one
 `seller node routine (since last status): …` line with the counts when any happened. A lapsed offer
 aimed at this seat and authored within the last hour still prints its `offer skip` line, once.
 Payment gift-wraps re-read by the periodic wrap backfill are summarised the same way (`wraps that are
