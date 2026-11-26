@@ -2776,7 +2776,7 @@ fn build_checks(
 #[cfg(all(feature = "wallet", any(feature = "acp", test)))]
 fn environment_checks_for(home: &maxplayer_core::home::MaxplayerHome) -> Vec<Box<dyn FnOnce() -> Check>> {
     if hook_only_seat(home) {
-        vec![Box::new(|| Check::skip("nix", "not applicable", HOOK_ONLY_WHY))]
+        vec![Box::new(hook_only_nix)]
     } else {
         build_environment_checks()
     }
@@ -2797,10 +2797,14 @@ fn build_report_checks(
     home: &maxplayer_core::home::MaxplayerHome,
     nix_probe: impl FnOnce() -> Check + 'static,
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
-    let environment: Vec<Box<dyn FnOnce() -> Check>> = if home.config.seller.is_some() {
-        vec![Box::new(nix_probe)]
-    } else {
+    // A hook-only seat gets the gate's own SKIP row: `seller serve` boots past a missing nix there,
+    // so the report must not call the same box broken.
+    let environment: Vec<Box<dyn FnOnce() -> Check>> = if home.config.seller.is_none() {
         vec![Box::new(move || checks::nix_for_buyer_home(nix_probe()))]
+    } else if hook_only_seat(home) {
+        vec![Box::new(hook_only_nix)]
+    } else {
+        vec![Box::new(nix_probe)]
     };
     // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
     // waive. The containment check is read at its own severity.
@@ -3039,6 +3043,12 @@ fn build_environment_checks() -> Vec<Box<dyn FnOnce() -> Check>> {
 #[cfg(feature = "wallet")]
 fn hook_only_seat(home: &maxplayer_core::home::MaxplayerHome) -> bool {
     maxplayer_core::seller_agents::hook_only_home(home)
+}
+
+/// The nix row of a hook-only seat, shared by the boot gate and `maxplayer doctor`.
+#[cfg(feature = "wallet")]
+fn hook_only_nix() -> Check {
+    Check::skip("nix", "not applicable", HOOK_ONLY_WHY)
 }
 
 #[cfg(feature = "wallet")]
@@ -6995,6 +7005,28 @@ mod tests {
         let seller_nix = nix_line(&seller);
         assert!(seller_nix.starts_with("FAIL nix"), "seller home: {seller_nix}");
         assert_eq!(code, FAILURE, "a seller home without nix must fail doctor: {seller}");
+
+        // A hook-only seat: `seller serve` boots past the missing nix (the gate's SKIP row), so
+        // `doctor` must report the same row, not FAIL. Red-proof: drop the hook-only arm from
+        // `build_report_checks` and this reads "FAIL nix".
+        maxplayer_core::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_for_agents(vec!["my-hook".into()], Vec::new()));
+            let argv = vec!["sh".into(), "-c".into(), "cat >/dev/null".into()];
+            config
+                .agents
+                .insert("my-hook".into(), maxplayer_core::home::AgentPresetConfig::hook(argv));
+        })
+        .expect("write a hook-only [seller]");
+        assert!(hook_only_seat(&home), "precondition: every agent is a hook");
+        let (_, hook) = doctor(&tmp);
+        let hook_nix = nix_line(&hook);
+        assert!(hook_nix.starts_with("SKIP nix"), "hook-only seat: {hook_nix}");
+        let gate_nix = run_checks(environment_checks_for(&home))
+            .iter()
+            .find(|c| c.name == "nix")
+            .map(Check::render)
+            .expect("the gate carries a nix row");
+        assert_eq!(hook_nix, gate_nix, "doctor and the seller boot gate agree on nix");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
