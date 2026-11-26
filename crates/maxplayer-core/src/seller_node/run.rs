@@ -3811,16 +3811,20 @@ mod container_delivery_tests {
 
     /// What the host actually receives for an over-long reply: the container's outcome file, with the
     /// message cut by `Phase1Outcome::from_result` (multi-byte text, so the cut lands mid-codepoint).
-    fn container_cut(message: &str) -> (String, bool) {
+    pub(super) fn container_cut(message: &str) -> (String, bool) {
         let agent = Some(orch_outcome::AgentOutcome {
             last_agent_message_truncated: false,
             session: None,
             usage: None,
             last_agent_message: Some(message.to_owned()),
         });
+        // The gate's own refusal of an empty tree: the outcome this host reads as `no_sentinel`.
         let failed: Result<orch_outcome::Phase1Output, orch_outcome::OrchestratorError> =
-            Err(orch_outcome::OrchestratorError::Agent("no execution observed".into()));
+            Err(orch_outcome::OrchestratorError::Gate(
+                crate::seller_git::SellerGitError::NoExecutionObserved("empty tree".into()),
+            ));
         let outcome = orch_outcome::Phase1Outcome::from_result(&failed, agent, Duration::from_secs(1));
+        assert_eq!(outcome.status, orch_outcome::Phase1Status::NoSentinel);
         let agent = outcome.agent.expect("the agent outcome is kept");
         (agent.last_agent_message.expect("the message is kept"), agent.last_agent_message_truncated)
     }
