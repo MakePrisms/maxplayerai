@@ -20,6 +20,9 @@ use serde_json::{Value, json};
 #[cfg(feature = "wallet")]
 use crate::daemon;
 
+mod reexec;
+pub(crate) use reexec::RESUME_FD_ARG;
+
 // The team tools (docs/specs/maxplayer-team.md): `wallet` builds only, like `maxplayer team`.
 #[cfg(feature = "wallet")]
 mod team;
@@ -135,6 +138,23 @@ fn post_job_guides() -> Value {
 
 /// Run the MCP server on the provided stdio handles until stdin EOF.
 pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    serve(Vec::new(), out, err)
+}
+
+/// `maxplayer mcp --resume-fd <fd>`: this process image was exec'd by an older `maxplayer mcp` that
+/// saw its binary replaced (see [`reexec`]). The descriptor holds the request it had read and every
+/// byte buffered behind it; they are served first, then stdin as usual.
+pub fn run_resumed(fd: &str, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    match reexec::take_handover(fd) {
+        Ok(handover) => serve(handover, out, err),
+        Err(error) => {
+            let _ = writeln!(err, "maxplayer mcp: {error}");
+            RUNTIME_ERROR
+        }
+    }
+}
+
+fn serve(handover: Vec<u8>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     // First stderr line (stdout is the JSON-RPC stream): which build the harness launched, printed
     // before the home bootstrap so even a failed start names its binary.
     let place = match home::default_home_dir() {
@@ -176,8 +196,10 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
     };
 
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
+    let mut input = reexec::McpInput::new(handover);
+    // The file this server was started from. When an upgrade replaces it, the next request is
+    // served by the new binary (exec in place: same pid and stdio), not by this one.
+    let mut binary = reexec::ExeWatch::current();
     loop {
         let request = match read_mcp_request(&mut input) {
             Ok(Some(request)) => request,
@@ -194,6 +216,27 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             }
             let _ = writeln!(err, "ignoring MCP notification {}", request.method);
             continue;
+        }
+        if let Some(upgrade) = binary.as_mut().and_then(|watch| watch.check(err)) {
+            let mut handover = request_line(&request);
+            handover.extend_from_slice(&input.unread());
+            let _ = writeln!(
+                err,
+                "maxplayer mcp: binary replaced ({} -> {}); re-executing it to serve this request. \
+                 The buyer daemon is its own process and keeps its version until it restarts.",
+                crate::build_stamp::version_line(),
+                upgrade.version_line
+            );
+            let _ = out.flush();
+            let _ = err.flush();
+            let why = reexec::exec_upgrade(&upgrade, &handover, &state.home.root);
+            // Only reached when the exec failed: keep serving this version, and stop watching so a
+            // failing exec is not retried on every request.
+            let _ = writeln!(
+                err,
+                "maxplayer mcp: re-exec failed ({why}); still serving this version"
+            );
+            binary = None;
         }
         let response = runtime.block_on(dispatch_async(&state, &request));
         if let Err(error) = write_mcp_response(out, &response) {
@@ -884,6 +927,19 @@ fn tool_error(id: Value, message: String) -> Value {
             "isError": true
         }),
     )
+}
+
+/// A request as one JSON line, as a re-exec'd server reads it back from the handover.
+fn request_line(request: &McpRequest) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": request.id,
+        "method": request.method,
+        "params": request.params,
+    }))
+    .unwrap_or_default();
+    line.push(b'\n');
+    line
 }
 
 fn read_mcp_request(input: &mut dyn BufRead) -> Result<Option<McpRequest>, String> {
