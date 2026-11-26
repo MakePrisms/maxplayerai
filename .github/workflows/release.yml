@@ -646,7 +646,9 @@ jobs:
           for platform in $RELEASE_PLATFORMS; do
             # A re-run after a publish that got this far (e.g. the wait below timed out) must not fail
             # on a version npm already has: npm never accepts the same version twice.
-            if npm view "@maxplayerai/$platform@$VERSION" version --prefer-online >/dev/null 2>&1; then
+            # Compare the answer, not just the exit code: an older npm or another registry can
+            # exit 0 with nothing printed for a version it does not have.
+            if [ "$(npm view "@maxplayerai/$platform@$VERSION" version --prefer-online 2>/dev/null || true)" = "$VERSION" ]; then
               echo "@maxplayerai/$platform@$VERSION is already on the registry; not publishing it again"
               continue
             fi

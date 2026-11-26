@@ -43,11 +43,20 @@ const installCheck =
   process.argv[2] === INSTALL_CHECK_ARG;
 
 let binary = null;
+// A payload of another version: npm skipped the pinned one (not served yet) and resolution walked
+// up to an older copy hoisted in an ancestor node_modules. Running it would be the wrong maxplayer.
+let foundVersion = null;
 if (pkg) {
   try {
     binary = require.resolve(`${pkg}/bin/maxplayer`);
+    if (version) {
+      const payloadDir = require("node:path").dirname(require.resolve(`${pkg}/package.json`));
+      foundVersion = require(`${payloadDir}/package.json`).version;
+      if (foundVersion !== version) binary = null;
+    }
   } catch {
     // Absent because npm skipped it on an os/cpu mismatch, or because of --no-optional.
+    binary = null;
   }
 }
 
@@ -60,7 +69,10 @@ if (!binary) {
   console.error(
     `maxplayer: no binary for ${key}. Available: ${Object.keys(PLATFORM_PACKAGES).join(", ")}.\n` +
       (pkg
-        ? `Expected ${wanted} to be installed, and it is not. If you installed with --no-optional or ` +
+        ? (foundVersion && foundVersion !== version
+            ? `Found ${pkg}@${foundVersion} instead (an older copy elsewhere on the resolution path). `
+            : "") +
+          `Expected ${wanted} to be installed, and it is not. If you installed with --no-optional or ` +
           `--omit=optional, reinstall without it. Otherwise the registry may not be serving ${wanted} ` +
           `yet (check: npm view ${wanted}); reinstall once it is: npm install -g maxplayer@${version ?? "<version>"}`
         : `That platform is not published yet.`)
