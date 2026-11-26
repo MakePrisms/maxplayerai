@@ -664,7 +664,10 @@ jobs:
             chmod 755 "npm/cli-$platform/bin/maxplayer"
             cp LICENSE-MIT LICENSE-APACHE "npm/cli-$platform/"
 
-            ( cd "npm/cli-$platform" && npm publish "${publish_args[@]}" )
+            # A re-run can still get here for a version npm already has (the check above can read a
+            # cached or not-yet-updated answer): the script treats npm's own "cannot publish over"
+            # refusal as already published, so recovery is never blocked on it.
+            ./scripts/npm-publish-once.sh "npm/cli-$platform" "${publish_args[@]}"
           done
 
           # ...and published is not yet SERVED. 0.8.2-rc2's @maxplayerai/linux-x64 answered 404 for
@@ -676,7 +679,7 @@ jobs:
           done
 
           cp LICENSE-MIT LICENSE-APACHE npm/maxplayer/
-          ( cd npm/maxplayer && npm publish "${publish_args[@]}" )
+          ./scripts/npm-publish-once.sh npm/maxplayer "${publish_args[@]}"
 
   npm-probe:
     name: npm credential probe

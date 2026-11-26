@@ -44,9 +44,16 @@ while :; do
     attempt=$((attempt + 1))
     packument="$("$curl_cmd" -fsSL --max-time 30 -H "Accept: $install_accept" "$registry/$encoded" 2>/dev/null || true)"
     tarball="$(printf '%s' "$packument" | VERSION="$version" node -e '
-        let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+        let s = ""; process.stdin.setEncoding("utf8"); process.stdin.on("data", (d) => (s += d)).on("end", () => {
           try { process.stdout.write(JSON.parse(s).versions[process.env.VERSION].dist.tarball || ""); } catch {}
         });' 2>/dev/null || true)"
+    # Only an http(s) URL on one line is fetched: anything else from the registry is not a tarball
+    # location and must never reach curl as an argument.
+    case "$tarball" in
+        *$'\n'*|*$'\r'*) tarball="" ;;
+        http://*|https://*) ;;
+        *) tarball="" ;;
+    esac
     if [ -n "$tarball" ]; then
         if "$curl_cmd" -fsSL --max-time 60 -o /dev/null "$tarball"; then
             echo "ok: $package@$version is served by $registry (attempt $attempt, $(( $(date +%s) - started ))s)"

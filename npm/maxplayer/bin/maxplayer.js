@@ -50,8 +50,10 @@ if (pkg) {
   try {
     binary = require.resolve(`${pkg}/bin/maxplayer`);
     if (version) {
-      const payloadDir = require("node:path").dirname(require.resolve(`${pkg}/package.json`));
-      foundVersion = require(`${payloadDir}/package.json`).version;
+      // The version of the package the binary came FROM: resolving package.json separately could
+      // find a closer, broken copy while the binary resolved to an older one further up.
+      const path = require("node:path");
+      foundVersion = require(path.join(path.dirname(binary), "..", "package.json")).version;
       if (foundVersion !== version) binary = null;
     }
   } catch {
@@ -70,7 +72,7 @@ if (!binary) {
     `maxplayer: no binary for ${key}. Available: ${Object.keys(PLATFORM_PACKAGES).join(", ")}.\n` +
       (pkg
         ? (foundVersion && foundVersion !== version
-            ? `Found ${pkg}@${foundVersion} instead (an older copy elsewhere on the resolution path). `
+            ? `Found ${pkg}@${foundVersion} instead (a different version elsewhere on the resolution path). `
             : "") +
           `Expected ${wanted} to be installed, and it is not. If you installed with --no-optional or ` +
           `--omit=optional, reinstall without it. Otherwise the registry may not be serving ${wanted} ` +

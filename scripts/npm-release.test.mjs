@@ -165,12 +165,68 @@ test("release.yml publishes the launcher only after waiting for every payload (R
   const workflow = fs.readFileSync(path.join(repo, ".github", "workflows", "release.yml"), "utf8");
   const job = workflow.slice(workflow.indexOf("\n  publish:\n"), workflow.indexOf("\n  npm-probe:\n"));
   assert.ok(job.length > 0, "no publish job found");
-  const payloadPublish = job.indexOf('( cd "npm/cli-$platform" && npm publish');
+  const payloadPublish = job.indexOf('./scripts/npm-publish-once.sh "npm/cli-$platform"');
   const waitAll = job.indexOf('./scripts/wait-npm-published.sh "@maxplayerai/$platform" "$VERSION"');
-  const launcherPublish = job.indexOf("( cd npm/maxplayer && npm publish");
+  const launcherPublish = job.indexOf("./scripts/npm-publish-once.sh npm/maxplayer");
   assert.ok(payloadPublish > 0, "payload publish not found");
   assert.ok(launcherPublish > 0, "launcher publish not found");
   assert.ok(waitAll > payloadPublish && waitAll < launcherPublish, "the launcher must be published only after the payload wait");
+  // Every publish goes through the conflict-tolerant script, so a re-run never dies on E403.
+  const commands = job.replace(/^\s*(#|-?\s*name:).*$/gm, "");
+  assert.ok(!/npm publish/.test(commands), "a bare npm publish is left in the publish job");
   // The wait loops over every release platform, not one hard-coded package.
   assert.match(job.slice(payloadPublish, waitAll), /for platform in \$RELEASE_PLATFORMS; do\s*$/);
+});
+
+// ── scripts/npm-publish-once.sh with a fake npm ─────────────────────────────────────────────────
+// A re-run whose `npm view` read a stale cache reaches `npm publish` for a version the registry
+// already has. npm's E403 "cannot publish over" refusal means published, not failed.
+function publishOnce(npmScript) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "publish-once-"));
+  const pkgDir = path.join(dir, "pkg");
+  fs.mkdirSync(pkgDir);
+  fs.writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ name: "@maxplayerai/linux-x64", version: "9.9.9" }));
+  fs.writeFileSync(path.join(dir, "npm"), "#!/bin/sh\n" + npmScript + "\n", { mode: 0o755 });
+  const result = spawnSync("bash", [path.join(repo, "scripts", "npm-publish-once.sh"), pkgDir, "--access", "public"], {
+    env: { ...process.env, NPM: path.join(dir, "npm") },
+    encoding: "utf8",
+  });
+  fs.rmSync(dir, { recursive: true, force: true });
+  return result;
+}
+
+test("npm-publish-once treats npm's already-published refusal as done (RED ON REVERT: E403 fails the re-run)", () => {
+  const conflict = publishOnce(
+    "echo 'npm error code E403' >&2; echo 'npm error 403 403 Forbidden - PUT https://registry.npmjs.org/@maxplayerai%2flinux-x64 - You cannot publish over the previously published versions: 9.9.9.' >&2; exit 1",
+  );
+  assert.equal(conflict.status, 0, conflict.stderr);
+  assert.match(conflict.stdout, /@maxplayerai\/linux-x64@9\.9\.9 is already on the registry/);
+  const legacy = publishOnce("echo 'npm ERR! code EPUBLISHCONFLICT' >&2; exit 1");
+  assert.equal(legacy.status, 0, legacy.stdout);
+});
+
+test("npm-publish-once passes the publish arguments and fails on any other error", () => {
+  const ok = publishOnce('[ "$*" = "publish --access public" ] || { echo "args: $*"; exit 9; }; echo published');
+  assert.equal(ok.status, 0, ok.stdout);
+  assert.match(ok.stdout, /published/);
+  const denied = publishOnce("echo 'npm error code E403' >&2; echo 'npm error 403 Forbidden - You do not have permission to publish' >&2; exit 1");
+  assert.equal(denied.status, 1);
+  assert.match(denied.stdout, /do not have permission/);
+  assert.match(denied.stderr, /publishing @maxplayerai\/linux-x64@9\.9\.9 failed/);
+});
+
+test("wait-npm-published never fetches a tarball location that is not an http(s) URL", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wait-npm-"));
+  const listed = JSON.stringify({ versions: { "9.9.9": { dist: { tarball: "-o/tmp/x file:///etc/passwd" } } } });
+  const fetched = path.join(dir, "fetched");
+  fs.writeFileSync(
+    path.join(dir, "curl"),
+    "#!/bin/sh\ncase \"$*\" in\n*vnd.npm.install-v1+json*) echo '" + listed + "'; exit 0;;\nesac\ntouch '" + fetched + "'; exit 0\n",
+    { mode: 0o755 },
+  );
+  const result = wait(dir, 1);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /does not list it yet/);
+  assert.ok(!fs.existsSync(fetched), "a non-URL tarball was passed to curl");
+  fs.rmSync(dir, { recursive: true, force: true });
 });
