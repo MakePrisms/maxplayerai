@@ -2579,8 +2579,9 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
 const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_HOME",
     // Set by the daemon for a hook agent (docs/specs/hook-agents.md §5.1), so a `maxplayer` command
-    // the seller's agent runs does not refuse it as an unknown config field.
+    // the seller's agent runs does not refuse them as unknown config fields.
     "MAXPLAYER_HOOK_V",
+    "MAXPLAYER_HOOK_RUN",
     "MAXPLAYER_VERBOSE",
     "MAXPLAYER_HEARTBEAT_INTERVAL_SECS",
     "MAXPLAYER_HEARTBEAT_ENABLED",
@@ -4308,6 +4309,16 @@ mod tests {
         // And resolution succeeds precisely because the reserved seams were dropped.
         let resolved = apply_env_layer(&MaxplayerConfig::default(), kept).expect("resolve");
         assert_eq!(resolved.relay_url, "wss://kept");
+    }
+
+    /// A `maxplayer` command run inside a hook inherits what the daemon set for the hook: each of
+    /// those variables must be reserved, or that command refuses to resolve its config.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn every_variable_the_daemon_gives_a_hook_is_reserved() {
+        for name in [crate::hook::HOOK_VERSION_ENV, crate::hook::HOOK_RUN_ENV] {
+            assert!(RESERVED_ENV_VARS.contains(&name), "{name} is not reserved");
+        }
     }
 
     #[test]
