@@ -1065,6 +1065,13 @@ fn relay_liveness_confirmed(probe_ok: bool, publish_ok: bool) -> bool {
 /// receipt dedup) absorb the overlap re-delivery.
 const STALL_OVERLAP_MARGIN_SECS: u64 = 60;
 
+/// Whether a supervision tick confirms the relay clock at its own start. A tick that runs a forced
+/// recovery confirms only if that recovery succeeds (after it): a FAILED one must hand its retry,
+/// and any AUTH resubscribe meanwhile, the pre-gap cursor (#1424 advisor r2 M1).
+fn confirms_before_recovery(probe_and_publish_ok: bool, forced: Option<&str>) -> bool {
+    probe_and_publish_ok && forced.is_none()
+}
+
 /// The `since` a relay recovery resubscribes with: the last confirmation before the tick that
 /// recovers, minus [`STALL_OVERLAP_MARGIN_SECS`], floored at 0.
 fn recovery_overlap_since(confirmed_unix: i64) -> u64 {
@@ -6675,7 +6682,38 @@ impl SellerNodeRunner {
         );
         // What a gap still owes across the supervision that may be in flight when it is seen.
         let mut recovery_debt = schedule::RecoveryDebt::default();
+        // Notice a loop gap (host sleep, SIGSTOP, blocked loop) BEFORE anything acts on the relay.
+        // Run first in every arm that touches it and before the lane takes work: after a wake the
+        // heartbeat or backfill timer can fire ahead of the drain tick, and an unforced heartbeat
+        // would confirm the clock past the gap (its resubscribe would skip the gap's awards) while
+        // a backfill would go out on the dead socket (#1424 advisor r3 M1). Cheap and idempotent:
+        // a gap is reported by whichever call sees it first; the next call sees none.
+        // `$firing_heartbeat`: the caller IS the heartbeat tick, so it takes the forced recovery
+        // itself rather than re-arming the tick it is running in.
+        macro_rules! notice_loop_gap {
+            ($firing_heartbeat:expr) => {
+                if let Some(gap) = loop_turns.turn(std::time::Instant::now(), schedule::wall_ms()) {
+                    // The sockets are presumed dead after a long gap; the watchdog's monotonic
+                    // clock cannot see a host sleep, so it would not reconnect for intervals.
+                    let reconnect = heartbeat_enabled
+                        && Duration::from_secs(gap.secs) >= self.loop_gap_reconnect;
+                    if reconnect && forced_recovery.is_none() {
+                        forced_recovery = Some(gap.recovery_reason());
+                    }
+                    opline!("{}", gap.line(heartbeat_enabled, reconnect));
+                    let (beat_now, backfill_now) =
+                        recovery_debt.gap(heartbeat_enabled && supervision.is_some(), reconnect);
+                    if backfill_now {
+                        queue.request_backfill();
+                    }
+                    if heartbeat_enabled && beat_now && !$firing_heartbeat {
+                        heartbeat_tick.reset_immediately();
+                    }
+                }
+            };
+        }
         loop {
+            notice_loop_gap!(false);
             if lane.is_none() {
                 let now = tokio::time::Instant::now();
                 // A backfill also waits while a reconnect gap's recovery is owed: on the dead socket
@@ -6740,24 +6778,7 @@ impl SellerNodeRunner {
                 // has stayed busy (30s, then 60s, 120s, ...).
                 _ = drain_tick.tick() => {
                     loop_pulse.beat();
-                    if let Some(gap) = loop_turns.turn(std::time::Instant::now(), schedule::wall_ms()) {
-                        // The sockets are presumed dead after a long gap; the watchdog's monotonic
-                        // clock cannot see a host sleep, so it would not reconnect for intervals.
-                        let reconnect = heartbeat_enabled
-                            && Duration::from_secs(gap.secs) >= self.loop_gap_reconnect;
-                        if reconnect && forced_recovery.is_none() {
-                            forced_recovery = Some(gap.recovery_reason());
-                        }
-                        opline!("{}", gap.line(heartbeat_enabled, reconnect));
-                        let (beat_now, backfill_now) =
-                            recovery_debt.gap(heartbeat_enabled && supervision.is_some(), reconnect);
-                        if backfill_now {
-                            queue.request_backfill();
-                        }
-                        if heartbeat_enabled && beat_now {
-                            heartbeat_tick.reset_immediately();
-                        }
-                    }
+                    notice_loop_gap!(false);
                     // #1299: a requested drain. First tick: say so and re-announce now
                     // (`accepting=n`) rather than an interval later. Every tick: leave through the
                     // ordinary exit path once nothing is held — same retraction, same lane settle,
@@ -6904,6 +6925,7 @@ impl SellerNodeRunner {
                 // or offer subscription recovers without a restart (#560). Also the node's only
                 // periodic log lines, and therefore the positive signal external supervision watches.
                 _ = wrap_backfill_tick.tick() => {
+                    notice_loop_gap!(false);
                     // The status line comes from the LOOP, so it keeps its cadence — and says so —
                     // while the lane is stuck on a slow relay.
                     let now = tokio::time::Instant::now();
@@ -6950,7 +6972,10 @@ impl SellerNodeRunner {
                     // heartbeat is disableable by config, and a repair must not depend on a tick that
                     // may never fire. Acceptance is the relay's EOSE below — a response the protocol
                     // owes us — never the fact that we managed to send the REQ.
+                    // Not while a reconnect gap's recovery is owed either: the REQ would go out on
+                    // the dead socket and count as a rejection (#1424 advisor r3 L2).
                     if !recovering.get()
+                        && !recovery_debt.backfill_held()
                         && let Some(state) = open_pool.as_mut()
                         && state.on_tick() == RearmStep::Attempt
                     {
@@ -6980,6 +7005,8 @@ impl SellerNodeRunner {
                 // recovery, as ONE future beside the lane — never behind it. #509: the clock moves
                 // only when both legs confirmed.
                 _ = heartbeat_tick.tick(), if heartbeat_enabled && supervision.is_none() => {
+                    // A heartbeat that wakes first after a gap must BE the forced recovery.
+                    notice_loop_gap!(true);
                     let forced = forced_recovery.take();
                     recovery_debt.supervision_started(forced.as_deref());
                     let input = SupervisionInput {
@@ -12534,9 +12561,7 @@ impl SellerNodeRunner {
         // had already replaced, and confirming first would move the cursor past the whole gap.
         let confirmed_before_tick = clock.confirmed_unix();
         let confirmed = relay_liveness_confirmed(probe_ok, publish_ok);
-        // A tick that runs a forced recovery confirms only if that recovery succeeds (below): a
-        // FAILED one must hand its retry, and any AUTH resubscribe meanwhile, the pre-gap cursor.
-        if confirmed && input.forced.is_none() {
+        if confirms_before_recovery(confirmed, input.forced.as_deref()) {
             clock.confirm(started, started_unix);
         }
         // Measured to this tick's START: the tick that completes N missed intervals trips, not
@@ -25218,13 +25243,31 @@ esac"#,
     /// before the 3600 s interval; drop the forced recovery and the connection count stays put.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_loop_that_stopped_turning_reannounces_and_reconnects_when_it_resumes() {
+        loop_gap_reannounces_and_rereads_from_before_the_gap("loop-gap-reannounce", 3600).await;
+    }
+
+    /// The same gap with a heartbeat (and backfill) interval SHORTER than the gap: on resume the
+    /// heartbeat tick is ready together with the drain tick, and `select!` picks among ready arms
+    /// at random. Whichever runs first must see the gap (#1424 advisor r3 M1): a heartbeat that ran
+    /// unforced would confirm the clock past the gap, and the recovery after it would re-read awards
+    /// from AFTER the gap.
+    ///
+    /// RED ON REVERT (in about half of runs, when the heartbeat wins the race): drop
+    /// `notice_loop_gap!(true)` from the heartbeat arm and the award re-read's `since` lands after
+    /// the gap's start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_gap_seen_first_by_the_heartbeat_tick_still_rereads_from_before_the_gap() {
+        loop_gap_reannounces_and_rereads_from_before_the_gap("loop-gap-heartbeat-first", 5).await;
+    }
+
+    async fn loop_gap_reannounces_and_rereads_from_before_the_gap(label: &str, interval_secs: u64) {
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
-        let root = throwaway_root("loop-gap-reannounce");
+        let root = throwaway_root(label);
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
         home.config.relay_url = fixture.url();
         home.config.seller = Some(seller_cfg(1, false));
         home.config.seller_heartbeat.enabled = true;
-        home.config.seller_heartbeat.interval_secs = 3600;
+        home.config.seller_heartbeat.interval_secs = interval_secs;
         let runner = SellerNodeRunner::boot(home)
             .await
             .expect("boot runner")
@@ -25258,7 +25301,8 @@ esac"#,
                     .await;
                 assert!(
                     beat_again,
-                    "the seat must be re-announced right after the gap, not an interval (3600 s) later"
+                    "the seat must be re-announced right after the gap, not an interval \
+                     ({interval_secs} s) later"
                 );
                 // Same bound as the watchdog's own reconnect test: the SDK's reconnect has backoff.
                 let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
@@ -25284,20 +25328,31 @@ esac"#,
                 assert!(resubscribed, "harness check: the recovery re-issued the award REQ");
                 // The FIRST re-issued award REQ is the recovery's; a later AUTH resubscribe on the
                 // new socket may legitimately start from the post-recovery confirmation.
-                let newest_since = fixture.reqs_for(AWARD_SUB_ID).await[award_reqs_before..]
+                let recovery_since = fixture.reqs_for(AWARD_SUB_ID).await[award_reqs_before..]
                     .iter()
                     .find_map(|record| record.since)
                     .expect("the re-issued award REQ carries a since");
                 let bound = u64::try_from(gap_started_unix).unwrap() - STALL_OVERLAP_MARGIN_SECS;
                 assert!(
-                    newest_since <= bound,
-                    "the award re-read must start before the gap (since {newest_since} > {bound})"
+                    recovery_since <= bound,
+                    "the award re-read must start before the gap (since {recovery_since} > {bound})"
                 );
                 shutdown.request("test stop");
                 let _ = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
             })
             .await;
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RED ON REVERT: drop `&& forced.is_none()` and a forced tick whose probe passed on the old
+    /// socket confirms past the gap before its recovery runs; if that recovery fails, the retry
+    /// resubscribes from after the gap.
+    #[test]
+    fn a_forced_recovery_tick_does_not_confirm_the_clock_before_its_recovery() {
+        assert!(confirms_before_recovery(true, None));
+        assert!(!confirms_before_recovery(true, Some("host slept 900s")));
+        assert!(!confirms_before_recovery(false, None));
+        assert!(!confirms_before_recovery(false, Some("host slept 900s")));
     }
 
     #[test]

@@ -553,7 +553,9 @@ impl RecoveryDebt {
         DebtDue {
             beat: std::mem::take(&mut self.beat_owed),
             backfill,
-            rearm_forced: if recovered == Some(false) { forced } else { None },
+            // Anything but a success re-arms a forced recovery: a supervision that ended without
+            // running it (`None`) must not drop it while its backfill stays held (advisor r3 L3).
+            rearm_forced: if recovered == Some(true) { None } else { forced },
         }
     }
 }
@@ -665,8 +667,8 @@ impl LoopPulse {
     }
 }
 
-/// Stops the loop watchdog thread when the loop that owns it ends, on every exit path, and waits for
-/// it (woken at once, so the wait is short).
+/// Stops and wakes the loop watchdog thread when the loop that owns it ends, on every exit path
+/// (without joining it; see `Drop`).
 pub(crate) struct LoopWatchdog {
     pulse: std::sync::Arc<LoopPulse>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -942,6 +944,9 @@ mod tests {
         // A failed STALL recovery (not forced) is the watchdog's to retry, not re-armed here.
         debt.supervision_started(None);
         assert_eq!(debt.supervision_done(Some(false)), DebtDue::default());
+        // A forced supervision that ended WITHOUT running its recovery keeps it armed (r3 L3).
+        debt.supervision_started(Some(reason));
+        assert_eq!(debt.supervision_done(None).rearm_forced.as_deref(), Some(reason));
     }
 
     #[test]
