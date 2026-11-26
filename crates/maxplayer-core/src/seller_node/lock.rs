@@ -32,8 +32,9 @@ pub struct HomeLock {
 pub enum LockError {
     /// The lock file could not be opened/created.
     Open(String),
-    /// Another live node already holds the lock for this home (fail closed).
-    Held { path: PathBuf },
+    /// Another live node already holds the lock for this home (fail closed). `holder` is the pid of
+    /// the process holding it when it could be identified from here, so the refusal can name it.
+    Held { path: PathBuf, holder: Option<u32> },
     /// The lock syscall itself failed for an unexpected reason.
     Flock(String),
 }
@@ -42,11 +43,35 @@ impl std::fmt::Display for LockError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Open(message) => write!(formatter, "seller lock open error: {message}"),
-            Self::Held { path } => write!(
-                formatter,
-                "another maxplayer seller already owns this home (lock held: {}); refusing to start a second owner",
-                path.display()
-            ),
+            Self::Held { path, holder } => {
+                write!(
+                    formatter,
+                    "another maxplayer seller already owns this home (lock held: {}); refusing to start a second owner",
+                    path.display()
+                )?;
+                // A flock is released by the kernel when its holder exits, so a refusal always
+                // means a LIVE process holds it (an old seller still running after an upgrade, a
+                // second terminal, a supervisor's copy). Say which one and how to stop it.
+                let drain = match path.parent() {
+                    Some(home) if !home.as_os_str().is_empty() => {
+                        format!("maxplayer seller drain --home {}", home.display())
+                    }
+                    _ => "maxplayer seller drain".to_owned(),
+                };
+                match holder {
+                    Some(pid) => write!(
+                        formatter,
+                        ". It is held by pid {pid}: stop that seller first, with `{drain}` (finishes \
+                         in-flight jobs, then exits) or `kill {pid}` (stops it now), then start again"
+                    ),
+                    None => write!(
+                        formatter,
+                        ". Its holder could not be identified from here (another OS user or a container); \
+                         find it with `fuser -v {}` and stop it, or run `{drain}` where it runs, then start again",
+                        path.display()
+                    ),
+                }
+            }
             Self::Flock(message) => write!(formatter, "seller lock flock error: {message}"),
         }
     }
@@ -86,7 +111,8 @@ impl HomeLock {
             }
             attempts += 1;
             if attempts >= 5 {
-                return Err(LockError::Held { path });
+                let holder = identify_holder(&path);
+                return Err(LockError::Held { path, holder });
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -123,6 +149,62 @@ impl Drop for HomeLock {
     fn drop(&mut self) {
         let _ = self._file.set_len(0);
     }
+}
+
+/// The pid of the live process holding the seller lock at `path`, for the refusal message.
+///
+/// Prefers the pid the node recorded (`record_pid`), confirmed on Linux by that pid having the lock
+/// file open. A node still booting, or one older than #1299, records nothing: on Linux the kernel's
+/// lock table (`/proc/locks`) still names the process that took the flock, so that is read next, and
+/// its pid is confirmed the same way. `None` when neither identifies a holder visible from here.
+fn identify_holder(path: &Path) -> Option<u32> {
+    if let Ok(content) = std::fs::read_to_string(path)
+        && let Some(pid) = content
+            .strip_suffix('\n')
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+        && pid > 0
+        && holds_file_open(pid, path).unwrap_or(false)
+    {
+        return Some(pid);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let locks = std::fs::read_to_string("/proc/locks").ok()?;
+        flock_holder_from_proc_locks(&locks, path)
+            .into_iter()
+            .find(|pid| holds_file_open(*pid, path).unwrap_or(false))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The pids of FLOCK entries in a `/proc/locks` table that lock the file at `path` (matched by
+/// device and inode). Entries marked `->` are waiters, not holders, and are skipped.
+#[cfg(target_os = "linux")]
+fn flock_holder_from_proc_locks(table: &str, path: &Path) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    let (major, minor, inode) = (libc::major(meta.dev()), libc::minor(meta.dev()), meta.ino());
+    table
+        .lines()
+        .filter_map(|line| {
+            // "1: FLOCK  ADVISORY  WRITE 4242 fd:01:123456 0 EOF"
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.get(1) != Some(&"FLOCK") {
+                return None;
+            }
+            let pid = fields.get(4)?.parse::<u32>().ok().filter(|pid| *pid > 0)?;
+            let mut location = fields.get(5)?.split(':');
+            let dev_major = u32::from_str_radix(location.next()?, 16).ok()?;
+            let dev_minor = u32::from_str_radix(location.next()?, 16).ok()?;
+            let ino = location.next()?.parse::<u64>().ok()?;
+            (dev_major == major && dev_minor == minor && ino == inode).then_some(pid)
+        })
+        .collect()
 }
 
 /// #1299: who holds a seller home lock, as seen by another process.
@@ -320,6 +402,86 @@ mod tests {
         let third = HomeLock::acquire(&path).expect("acquire after release");
         drop(third);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refused start names the live holder and how to stop it, also when the holder recorded no
+    /// pid (a node still booting, or one older than #1299, as after an upgrade): the kernel's lock
+    /// table names it. RED ON REVERT: make `identify_holder` return `None` and the pid is missing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_start_names_the_holding_pid_and_how_to_stop_it() {
+        let path = temp_lock("names-holder");
+        let _ = std::fs::remove_file(&path);
+        let me = std::process::id();
+
+        // Held, no pid recorded: found through /proc/locks.
+        let held = HomeLock::acquire(&path).expect("first acquire");
+        let refused = HomeLock::acquire(&path).expect_err("second acquire must be refused");
+        assert!(
+            matches!(refused, LockError::Held { holder: Some(pid), .. } if pid == me),
+            "{refused:?}"
+        );
+        let message = refused.to_string();
+        assert!(
+            message.starts_with("another maxplayer seller already owns this home (lock held: "),
+            "the existing line shape is kept: {message}"
+        );
+        assert!(message.contains(&format!("held by pid {me}")), "{message}");
+        assert!(message.contains(&format!("`kill {me}`")), "{message}");
+        let home = path.parent().unwrap().display().to_string();
+        assert!(
+            message.contains(&format!("`maxplayer seller drain --home {home}`")),
+            "{message}"
+        );
+
+        // Held, pid recorded: the recorded pid is used.
+        held.record_pid().expect("record");
+        let refused = HomeLock::acquire(&path).expect_err("still held");
+        assert!(
+            matches!(refused, LockError::Held { holder: Some(pid), .. } if pid == me),
+            "{refused:?}"
+        );
+
+        drop(held);
+        HomeLock::acquire(&path).expect("free again once the holder releases it");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The lock-table parser matches only FLOCK holders of this exact file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_locks_parsing_matches_only_flock_holders_of_this_file() {
+        use std::os::unix::fs::MetadataExt;
+        let path = temp_lock("proc-locks");
+        std::fs::write(&path, "").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let (major, minor) = (libc::major(meta.dev()), libc::minor(meta.dev()));
+        let here = format!("{major:02x}:{minor:02x}:{}", meta.ino());
+        let other = format!("{major:02x}:{minor:02x}:{}", meta.ino() + 1);
+        let table = format!(
+            "1: POSIX  ADVISORY  WRITE 11 {here} 0 EOF\n\
+             2: FLOCK  ADVISORY  WRITE 22 {other} 0 EOF\n\
+             3: FLOCK  ADVISORY  WRITE 33 {here} 0 EOF\n\
+             3: -> FLOCK  ADVISORY  WRITE 44 {here} 0 EOF\n"
+        );
+        assert_eq!(flock_holder_from_proc_locks(&table, &path), vec![33]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An unidentified holder still gets a next step rather than a bare refusal.
+    #[test]
+    fn an_unidentified_holder_still_gets_a_next_step() {
+        let message = LockError::Held {
+            path: PathBuf::from("/h/seller.lock"),
+            holder: None,
+        }
+        .to_string();
+        assert!(message.contains("could not be identified"), "{message}");
+        assert!(message.contains("`fuser -v /h/seller.lock`"), "{message}");
+        assert!(
+            message.contains("`maxplayer seller drain --home /h`"),
+            "{message}"
+        );
     }
 
     /// #1299: taking the lock records NO pid (a booting node must not be signalled); the pid appears
