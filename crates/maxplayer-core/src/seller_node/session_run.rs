@@ -114,7 +114,20 @@ impl ReleaseGate {
 fn turn_failure(failure: ContainerDeliveryFailure) -> (ReasonCode, String) {
     use ContainerDeliveryFailure as F;
     match failure {
-        F::NoSentinel { detail, .. } => (ReasonCode::NoSentinel, detail),
+        // A marked answer the container cut is an over-long answer, not a dead harness: the same
+        // `delivery_failed` the one-shot path reports (`container_no_sentinel_feedback`).
+        F::NoSentinel {
+            detail,
+            last_agent_message,
+            message_truncated,
+            ..
+        } => match container_no_sentinel_feedback(last_agent_message.as_deref(), message_truncated) {
+            (ReasonCode::DeliveryFailed, _) => (
+                ReasonCode::DeliveryFailed,
+                format!("inline answer over the {INLINE_ANSWER_MAX_BYTES}-byte limit (cut by the container)"),
+            ),
+            (code, _) => (code, detail),
+        },
         F::Delivery(detail) => (ReasonCode::DeliveryFailed, detail),
         F::Setup(detail) | F::Snapshot(detail) | F::Timeout(detail) => {
             (ReasonCode::ExecutionFailed, detail)
@@ -2074,6 +2087,31 @@ fn followup_session_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turn_whose_marked_answer_was_cut_fails_delivery_not_no_sentinel() {
+        let no_sentinel = |message: Option<String>, message_truncated: bool| {
+            ContainerDeliveryFailure::NoSentinel {
+                detail: "no execution observed".into(),
+                last_agent_message: message,
+                usage: None,
+                wall_time_ms: 0,
+                message_truncated,
+                outcome_authentic: true,
+                from_scratch: true,
+            }
+        };
+        let marked = format!("{}\n{}", crate::engine::INLINE_ANSWER_MARKER, "x".repeat(5000));
+        let (code, detail) = turn_failure(no_sentinel(Some(marked.clone()), true));
+        assert_eq!(code, ReasonCode::DeliveryFailed);
+        assert!(detail.contains(&format!("{INLINE_ANSWER_MAX_BYTES}-byte limit")), "{detail}");
+        assert_eq!(
+            turn_failure(no_sentinel(Some(marked), false)).0,
+            ReasonCode::NoSentinel,
+            "an uncut refusal keeps its code"
+        );
+        assert_eq!(turn_failure(no_sentinel(None, true)).0, ReasonCode::NoSentinel);
+    }
 
     /// Bug 2 (Petar 15:33): the empty-reload reset is requested ONLY by a runsc seat. Every other seat
     /// writes `reset_on_empty_reload = false`, which is not serialized: its follow-up inputs JSON

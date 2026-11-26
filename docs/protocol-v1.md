@@ -745,7 +745,10 @@ contribution-class when it carries `["job-class","contribution"]`; it pins its t
 
 The marker is the inline counterpart of §8.2, and §8.3 states it. Without it the seller MUST refuse
 with `no_sentinel` (§7.1). An empty tree with unmarked text is the shape of an exhausted plan, an
-unreachable model host and a declined task alike, and none of those is a deliverable.
+unreachable model host and a declined task alike, and none of those is a deliverable. A marked
+answer longer than the inline limit (4 KiB including the marker line; the reference seller states
+4076 bytes to the agent) MUST NOT be cut and delivered: the seller refuses it with
+`delivery_failed`, since the agent ran and answered.
 
 The execution metadata block is what the seller reports about its own run. Nothing verifies it. A
 reader MUST NOT treat it as proof that a given harness or model ran.
