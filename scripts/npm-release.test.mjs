@@ -230,3 +230,39 @@ test("wait-npm-published never fetches a tarball location that is not an http(s)
   assert.ok(!fs.existsSync(fetched), "a non-URL tarball was passed to curl");
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ── verify-release-workflow.sh sees the publish wrapper, not just the literal `npm publish` ──────
+// The wrapper publishes too, so the gate must refuse it outside the gated publish job and outside
+// release.yml. RED ON REVERT: match only "npm publish" and both injections pass the gate.
+function verifyWith(edit) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-release-"));
+  fs.cpSync(path.join(repo, ".github"), path.join(dir, ".github"), { recursive: true });
+  const wf = path.join(dir, ".github", "workflows");
+  edit(wf);
+  const result = spawnSync("bash", [path.join(repo, "scripts", "verify-release-workflow.sh"), path.join(wf, "release.yml")], { cwd: repo, encoding: "utf8" });
+  fs.rmSync(dir, { recursive: true, force: true });
+  return result;
+}
+
+test("the release gate passes the real workflows", () => {
+  const ok = verifyWith(() => {});
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+});
+
+test("the release gate refuses the publish wrapper in another workflow or an ungated job", () => {
+  const inCi = verifyWith((wf) => {
+    const ci = path.join(wf, "ci.yml");
+    fs.writeFileSync(ci, fs.readFileSync(ci, "utf8").replace("      - run: ./scripts/verify-release-workflow.sh", "      - run: ./scripts/verify-release-workflow.sh\n      - run: ./scripts/npm-publish-once.sh npm/maxplayer --access public"));
+  });
+  assert.notEqual(inCi.status, 0, "ci.yml publishing through the wrapper passed the gate");
+  assert.match(inCi.stdout + inCi.stderr, /ci\.yml publishes to npm/);
+  const ungated = verifyWith((wf) => {
+    const rel = path.join(wf, "release.yml");
+    const text = fs.readFileSync(rel, "utf8");
+    const at = text.indexOf("\n  npm-probe:\n");
+    assert.ok(at > 0, "harness check: npm-probe job found");
+    fs.writeFileSync(rel, text.slice(0, at) + "\n  sneaky:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./scripts/npm-publish-once.sh npm/maxplayer --access public\n" + text.slice(at));
+  });
+  assert.notEqual(ungated.status, 0, "an ungated job publishing through the wrapper passed the gate");
+  assert.match(ungated.stdout + ungated.stderr, /job 'sneaky' publishes to npm/);
+});
