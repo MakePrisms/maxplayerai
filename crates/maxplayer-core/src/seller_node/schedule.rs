@@ -124,9 +124,6 @@ impl<E> WorkQueue<E> {
     }
 }
 
-/// How long one piece of lane work may run before the loop reports the lane as busy. Later reports
-/// come at double the previous wait (60 s, 120 s, ...), so a lane held for an hour costs a handful of
-/// lines rather than one per tick.
 /// One "WORK-LANE queue full" episode. On a boot re-read the lane frees a slot and the relay stream
 /// refills it at once, so a log line latched on "has room again" fired dozens of times in two
 /// seconds. The episode instead starts at the first fill, counts every refill, and ends only when
@@ -199,11 +196,27 @@ impl RelayHealth {
         });
     }
 
+    /// The relay confirmed liveness without a recovery of ours running: after a failed recovery
+    /// that means the SDK's own background reconnect ended the drop, so it is reported as recovered
+    /// (`outage` after the last confirmation) instead of "FAILED, retrying" on a healthy socket.
+    pub(crate) fn confirmed(&mut self, outage: Duration, now: Instant) {
+        if let Some(drop) = self.last_drop.as_mut()
+            && !drop.recovered
+        {
+            *drop = LastDrop {
+                at: now,
+                outage,
+                recovered: true,
+            };
+        }
+    }
+
     /// `relay confirmed Ns ago` (or `relay RECOVERING …`) plus sign-in, heartbeat and last-drop
     /// state. The leading phrase is unchanged, since scripts and docs key on it.
+    /// `signed_in`: `None` when the loop missed relay notifications and cannot tell.
     pub(crate) fn line(
         &self,
-        signed_in: bool,
+        signed_in: Option<bool>,
         recovering: bool,
         unconfirmed: Duration,
         now: Instant,
@@ -214,10 +227,10 @@ impl RelayHealth {
         } else {
             format!("relay confirmed {}s ago", unconfirmed.as_secs())
         };
-        line.push_str(if signed_in {
-            " · signed in"
-        } else {
-            " · NOT signed in (no NIP-42 sign-in on this connection)"
+        line.push_str(match signed_in {
+            Some(true) => " · signed in",
+            Some(false) => " · NOT signed in (no NIP-42 sign-in on this connection)",
+            None => " · sign-in unknown (missed relay notifications; the next sign-in updates it)",
         });
         match self.beat_landed {
             Some(at) => line.push_str(&format!(" · heartbeat landed {}s ago", ago(at))),
@@ -242,6 +255,17 @@ impl RelayHealth {
     }
 }
 
+/// How long the relay has gone unconfirmed as of `now`, by the later of the monotonic and the
+/// wall clock: the monotonic one stops while the host sleeps, which is exactly when an outage is
+/// longest, so it alone would report a 20-minute sleep as a few seconds.
+pub(crate) fn relay_outage(clock: &LivenessClock, now: Instant, now_unix: i64) -> Duration {
+    let wall = u64::try_from(now_unix.saturating_sub(clock.confirmed_unix())).unwrap_or(0);
+    clock.unconfirmed_for(now).max(Duration::from_secs(wall))
+}
+
+/// How long one piece of lane work may run before the loop reports the lane as busy. Later reports
+/// come at double the previous wait (60 s, 120 s, ...), so a lane held for an hour costs a handful of
+/// lines rather than one per tick.
 pub(crate) const LANE_BUSY_WARN_AFTER: Duration = Duration::from_secs(30);
 
 /// Watches how long the lane has been on its current piece of work.
@@ -967,40 +991,77 @@ mod tests {
 
     /// The status line's relay half names sign-in, the last heartbeat and how the last relay drop
     /// ended, after the unchanged leading phrase.
+    use super::*;
+
     #[test]
     fn relay_health_names_sign_in_heartbeat_and_the_last_drop() {
         let t0 = Instant::now();
         let s = Duration::from_secs;
         let mut health = RelayHealth::default();
         assert_eq!(
-            health.line(false, false, s(3), t0),
+            health.line(Some(false), false, s(3), t0),
             "relay confirmed 3s ago · NOT signed in (no NIP-42 sign-in on this connection) · no heartbeat landed yet"
         );
         health.beat(true, t0);
         health.beat(false, t0 + s(60));
         assert_eq!(
-            health.line(true, false, s(5), t0 + s(90)),
+            health.line(Some(true), false, s(5), t0 + s(90)),
             "relay confirmed 5s ago · signed in · heartbeat landed 90s ago"
         );
         assert_eq!(
-            health.line(true, true, s(140), t0 + s(140)),
+            health.line(Some(true), true, s(140), t0 + s(140)),
             "relay RECOVERING (unconfirmed for 140s) · signed in · heartbeat landed 140s ago"
         );
         health.recovery(false, s(150), t0 + s(150));
         assert!(
             health
-                .line(false, false, s(160), t0 + s(160))
+                .line(Some(false), false, s(160), t0 + s(160))
                 .ends_with(" · relay reconnect FAILED 10s ago (150s unconfirmed), retrying"),
         );
         health.recovery(true, s(200), t0 + s(200));
         health.beat(true, t0 + s(200));
         assert_eq!(
-            health.line(true, false, s(1), t0 + s(230)),
+            health.line(Some(true), false, s(1), t0 + s(230)),
             "relay confirmed 1s ago · signed in · heartbeat landed 30s ago · last relay drop recovered 30s ago after 200s"
+        );
+        assert!(
+            health
+                .line(None, false, s(1), t0 + s(230))
+                .contains(" · sign-in unknown (missed relay notifications;"),
         );
     }
 
-    use super::*;
+    /// advisor r1 of #1438: a failed recovery followed by the SDK's own background reconnect is
+    /// reported as recovered, not "FAILED, retrying" forever. A confirmation with no failed drop
+    /// pending changes nothing. RED ON REVERT: make `confirmed` a no-op.
+    #[test]
+    fn a_background_reconnect_ends_a_failed_drop() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut health = RelayHealth::default();
+        health.confirmed(s(9), t0);
+        assert!(!health.line(Some(true), false, s(1), t0).contains("drop"), "nothing to end");
+        health.recovery(false, s(150), t0 + s(150));
+        health.confirmed(s(170), t0 + s(170));
+        let line = health.line(Some(true), false, s(1), t0 + s(200));
+        assert!(line.ends_with(" · last relay drop recovered 30s ago after 170s"), "{line}");
+        assert!(!line.contains("FAILED"), "{line}");
+        // A later confirmation does not move a drop that already recovered.
+        health.confirmed(s(5), t0 + s(300));
+        assert!(health.line(Some(true), false, s(1), t0 + s(330)).ends_with("recovered 160s ago after 170s"));
+    }
+
+    /// advisor r1 of #1438: the outage counts host sleep (the monotonic clock pauses then; the wall
+    /// clock does not). RED ON REVERT: use only `unconfirmed_for` and the slept outage reads 5 s.
+    #[test]
+    fn a_relay_outage_counts_time_the_host_slept() {
+        let t0 = Instant::now();
+        let clock = LivenessClock::new(t0, 1_000);
+        assert_eq!(relay_outage(&clock, t0 + Duration::from_secs(5), 1_005), Duration::from_secs(5));
+        assert_eq!(relay_outage(&clock, t0 + Duration::from_secs(5), 2_205), Duration::from_secs(1_205), "slept 20 min");
+        assert_eq!(relay_outage(&clock, t0 + Duration::from_secs(5), 900), Duration::from_secs(5), "wall clock stepped back");
+    }
+
 
     #[test]
     fn loop_turns_report_nothing_on_a_loop_that_keeps_turning() {
