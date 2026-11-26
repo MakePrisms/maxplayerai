@@ -11,14 +11,94 @@ pub(crate) async fn seller_delivery_budget(
     job: &str,
     inline_requested: bool,
 ) -> Result<bool, String> {
+    let Some(probe) = probe(home, signer, job)? else {
+        return Ok(inline_requested);
+    };
+    let Probe { request, claim, award, policy, reviewer } = &probe;
+    let identity = Identity::Seller(signer);
+    let git = budget_request(request, claim, award, policy, Reserve::Git)?;
+    identity
+        .request(git.draft(&reviewer.to_hex())?, *reviewer)
+        .await?;
+    if !inline_requested {
+        return Ok(false);
+    }
+    let inline = budget_request(request, claim, award, policy, Reserve::InlineCeiling)?;
+    fits(&identity, &inline, reviewer).await
+}
+
+/// Whether THIS inline answer, with this offer's task, fits one delivery review request.
+///
+/// [`seller_delivery_budget`] reserves the largest answer the protocol admits (the full envelope
+/// ceiling), which a long private task can push past the seal limit although a real answer would
+/// fit. A Git-capable agent is then steered to Git before it runs; a hook has no Git route, so it
+/// runs and its actual answer is measured here before anything is delivered (dot-bot, rc3 swarm
+/// round 2: the hook never ran). `Ok(false)` is permanent: this answer cannot be reviewed.
+pub(crate) async fn seller_inline_answer_fits(
+    home: &MaxplayerHome,
+    signer: &crate::seller_node::signer::SignerHandle,
+    job: &str,
+    answer: &str,
+) -> Result<bool, String> {
+    let Some(probe) = probe(home, signer, job)? else {
+        return Ok(true);
+    };
+    let Probe { request, claim, award, policy, reviewer } = &probe;
+    // Building the request only fails on this answer's own content (its serialized body over the
+    // limit, say): the same inputs already passed the worst-case probe. Retrying cannot help.
+    let inline = budget_request(request, claim, award, policy, Reserve::Inline(answer))
+        .map_err(|error| format!("review: permanent input error (answer): {error}"))?;
+    fits(&Identity::Seller(signer), &inline, reviewer).await
+}
+
+/// Seal a probe request locally (never sent): `Ok(false)` when it is too large to review.
+async fn fits(identity: &Identity<'_>, request: &Request, reviewer: &PublicKey) -> Result<bool, String> {
+    // The request guard is derived from the seal limit (#1349), so an inline reservation too large
+    // to seal can now fail in `draft` instead of `wrap`: both are permanent, both mean "Git".
+    let sent = match request.draft(&reviewer.to_hex()) {
+        Ok(draft) => identity.request(draft, *reviewer).await,
+        Err(error) => Err(error),
+    };
+    match sent {
+        Ok(_) => Ok(true),
+        Err(error) if permanent_error(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// What a probe sizes a delivery review for.
+#[derive(Clone, Copy)]
+enum Reserve<'a> {
+    /// A Git result (fixed-size commit note).
+    Git,
+    /// The largest inline answer the protocol admits, before the agent has run.
+    InlineCeiling,
+    /// An inline answer that exists.
+    Inline(&'a str),
+}
+
+struct Probe {
+    request: Request,
+    claim: Event,
+    award: Event,
+    policy: pc::runtime::Policy,
+    reviewer: PublicKey,
+}
+
+/// The private offer's review inputs, or `None` when the job is not a private one (no review).
+fn probe(
+    home: &MaxplayerHome,
+    signer: &crate::seller_node::signer::SignerHandle,
+    job: &str,
+) -> Result<Option<Probe>, String> {
     let Some((mut ctx, offer)) =
         crate::seller_node::privacy::known(home, signer.public_key_hex(), job)
             .map_err(|e| e.to_string())?
     else {
-        return Ok(inline_requested);
+        return Ok(None);
     };
     if !is_private(&offer) {
-        return Ok(inline_requested);
+        return Ok(None);
     }
     let (claim, award) = ctx
         .store
@@ -53,26 +133,7 @@ pub(crate) async fn seller_delivery_budget(
     };
     let reviewer =
         PublicKey::from_hex(&ctx.policy.service).map_err(|_| reviewer_error("invalid_subject"))?;
-    let identity = Identity::Seller(signer);
-    let git = budget_request(&request, &claim, &award, &ctx.policy, false)?;
-    identity
-        .request(git.draft(&reviewer.to_hex())?, reviewer)
-        .await?;
-    if !inline_requested {
-        return Ok(false);
-    }
-    let inline = budget_request(&request, &claim, &award, &ctx.policy, true)?;
-    // The request guard is derived from the seal limit (#1349), so an inline reservation too large
-    // to seal can now fail in `draft` instead of `wrap`: both are permanent, both mean "Git".
-    let sent = match inline.draft(&reviewer.to_hex()) {
-        Ok(draft) => identity.request(draft, reviewer).await,
-        Err(error) => Err(error),
-    };
-    match sent {
-        Ok(_) => Ok(true),
-        Err(error) if permanent_error(&error) => Ok(false),
-        Err(error) => Err(error),
-    }
+    Ok(Some(Probe { request, claim, award, policy: ctx.policy, reviewer }))
 }
 
 fn budget_request(
@@ -80,9 +141,14 @@ fn budget_request(
     claim: &Event,
     award: &Event,
     policy: &pc::runtime::Policy,
-    inline: bool,
+    reserve: Reserve<'_>,
 ) -> Result<Request, String> {
     use crate::gateway;
+    let inline = !matches!(reserve, Reserve::Git);
+    let answer = match reserve {
+        Reserve::Inline(answer) => answer,
+        _ => "x",
+    };
     let o = pc::wire::validate_private(&request.offer, &policy.host)
         .map_err(|_| reviewer_error("invalid_subject"))?;
     let id = request.offer.id.to_hex();
@@ -99,7 +165,7 @@ fn budget_request(
         &seller,
         &policy.service,
         pc::ContentType::Answer,
-        if inline { "x".into() } else { note.clone() },
+        if inline { answer.into() } else { note.clone() },
         None,
         &policy.host,
     )
@@ -112,7 +178,7 @@ fn budget_request(
             amount,
             &hex64,
             &"f".repeat(128),
-            "x",
+            answer,
             &[],
         )
     } else {
@@ -156,7 +222,7 @@ fn budget_request(
             .map_err(|_| reviewer_error("invalid_subject"))?,
     );
     result.content = draft.content;
-    let answer_envelope = if inline {
+    let answer_envelope = if matches!(reserve, Reserve::InlineCeiling) {
         // Envelope keys/nonce are fixed, body_b64 never needs JSON escaping.
         // Reserve the FULL envelope ceiling plus escaping slack, not 4096 raw
         // answer bytes: quotes, newlines and control bytes can expand sixfold.
@@ -293,7 +359,7 @@ mod tests {
                         !wraps(&r, &buyer, service).await,
                         "regression must reproduce the old oversized delivery"
                     );
-                    let git = budget_request(&r, &e.claim, &e.award, &policy, false).unwrap();
+                    let git = budget_request(&r, &e.claim, &e.award, &policy, Reserve::Git).unwrap();
                     assert!(
                         wraps(&git, &buyer, service).await,
                         "reserved Git result must fit"
@@ -310,6 +376,66 @@ mod tests {
             }
         }
     }
+    /// dot-bot, rc3 swarm round 2: a private inline-only offer whose task is long (the other
+    /// members' votes and evidence) fails the WORST-CASE inline reservation, so the seller fell
+    /// back to Git, which a hook cannot deliver, and the hook never ran. The answer it would have
+    /// given still fits: [`seller_inline_answer_fits`] measures that answer, and still refuses one
+    /// that cannot be reviewed. RED ON REVERT: size a real answer at the envelope ceiling.
+    #[tokio::test]
+    async fn a_long_task_fails_the_ceiling_but_a_real_answer_still_fits() {
+        let mints = vec!["https://testnut.cashu.space".to_owned()];
+        let fixture = |task: &str| {
+            let (e, _, _, policy) =
+                pc::evidence::inline_fixture_with_text(true, false, 2_000_000_000, mints.clone(), task, "x");
+            let (dir, home) = home(&e, &policy);
+            let signer = crate::seller_node::signer::spawn(&home).unwrap();
+            (e, dir, home, signer)
+        };
+        let mut short = None;
+        for size in (1_000..=16_000).step_by(1_000) {
+            let (e, dir, home, signer) = fixture(&"x".repeat(size));
+            if !seller_delivery_budget(&home, &signer, &e.offer.id.to_hex(), true).await.unwrap() {
+                short = Some((size, e, dir, home, signer));
+                break;
+            }
+        }
+        let (size, e, _dir, home, signer) =
+            short.expect("harness check: some task length must exhaust the ceiling reservation");
+        eprintln!("the inline ceiling reservation no longer fits from a {size}-byte task");
+        let job = e.offer.id.to_hex();
+        let answer = "A short chart: Muse A, Grok Bot A, Dots B, Instinct B.";
+        assert!(
+            seller_inline_answer_fits(&home, &signer, &job, answer).await.unwrap(),
+            "a real answer to a {size}-byte task fits its delivery review"
+        );
+        // The measurement is real, not a pass-through: an answer whose envelope nears the ceiling
+        // (control bytes escape sixfold) is refused beside a long task while the short one fits.
+        let largest = format!("x{}", "\u{1}".repeat(2_600));
+        let mut refused = None;
+        for task in (size..=pc::MAX_BODY_BYTES - 512).step_by(500) {
+            let (e, _dir, home, signer) = fixture(&"x".repeat(task));
+            let job = e.offer.id.to_hex();
+            match seller_inline_answer_fits(&home, &signer, &job, &largest).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => panic!("a {task}-byte task: {error}"),
+            }
+            assert!(
+                seller_inline_answer_fits(&home, &signer, &job, answer).await.unwrap(),
+                "at a {task}-byte task the short answer still fits"
+            );
+            refused = Some(task);
+            break;
+        }
+        let refused = refused.expect("some task length must refuse the largest answer");
+        let (e, _dir, home, signer) = fixture("x");
+        let error = seller_inline_answer_fits(&home, &signer, &e.offer.id.to_hex(), &"\u{1}".repeat(4_000))
+            .await
+            .unwrap_err();
+        assert!(permanent_error(&error), "an answer body over the limit is refused, not retried: {error}");
+        eprintln!("the largest inline answer is refused from a {refused}-byte task");
+    }
+
     #[tokio::test]
     async fn private_delivery_budget_keeps_small_inline_and_refuses_oversized_git_before_work() {
         let (e, _, _, policy) = pc::evidence::inline_fixture_for(true);

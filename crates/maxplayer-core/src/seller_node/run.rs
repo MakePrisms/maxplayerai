@@ -10360,12 +10360,22 @@ impl SellerNodeRunner {
             .accepts_delivery
             .iter()
             .any(|m| m == gateway::DELIVERY_MODE_INLINE);
+        // A hook has no Git route, so it keeps the offer as the buyer declared it; when only the
+        // worst-case inline reservation failed, its real answer is size-checked before delivery
+        // (dot-bot, rc3 swarm round 2: the fallback to Git failed a hook that never ran).
+        let hook_offer = offer.clone();
+        let mut inline_ceiling_short = false;
         match crate::review::private::seller_delivery_budget(
             self.node.home(), self.node.signer(), job_id, inline_requested,
         ).await {
             Ok(false) if inline_requested => {
                 offer.accepts_delivery.retain(|m| m != gateway::DELIVERY_MODE_INLINE);
-                opline!("seller job_id={job_id}: reserving delivery review space; agent must deliver files through Git");
+                inline_ceiling_short = true;
+                opline!(
+                    "seller job_id={job_id}: reserving delivery review space; agent must deliver files through Git \
+                     (the largest inline answer would not fit one delivery review together with this offer's task; \
+                     a hook still answers inline and its answer is size-checked before delivery)"
+                );
             }
             Ok(_) => {}
             Err(error) => {
@@ -10415,7 +10425,7 @@ impl SellerNodeRunner {
         // that cannot be read is not an absent one: defer rather than run the hook again.
         match self.node.store().hook_outcome(job_id) {
             Ok(Some(row)) => {
-                self.redeliver_staged_hook_outcome(job_id, &offer, &stored_creq, row).await;
+                self.redeliver_staged_hook_outcome(job_id, &hook_offer, &stored_creq, row, inline_ceiling_short).await;
                 return;
             }
             Ok(None) => {}
@@ -10483,7 +10493,8 @@ impl SellerNodeRunner {
         if agent_kind.is_hook() {
             self.execute_hook_job(
                 job_id,
-                &offer,
+                &hook_offer,
+                inline_ceiling_short,
                 &stored_creq,
                 harness,
                 &agent_command,

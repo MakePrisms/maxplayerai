@@ -10,6 +10,10 @@ pub(super) const HOOK_ANSWER_MAX_BYTES: usize = INLINE_ANSWER_MAX_BYTES;
 const HOOK_DELIVERY_REFUSED_FEEDBACK: &str =
     "seller's agent could not deliver an inline answer for this job; nothing was delivered";
 
+/// The hook answered, but its answer and this offer's task together exceed one delivery review.
+const HOOK_ANSWER_TOO_LARGE_TO_REVIEW_FEEDBACK: &str = "seller's agent answered, but the answer and \
+     this task together are too large for the delivery review; nothing was delivered";
+
 impl SellerNodeRunner {
     /// Run a job on a hook entry and deliver or fail it. Called by `execute_job` after the review
     /// gate, the delivery-budget probe, the creq read, `assign_agent` and `mark_executing`.
@@ -18,6 +22,7 @@ impl SellerNodeRunner {
         &self,
         job_id: &str,
         offer: &crate::seller_node::store::Offer,
+        size_check: bool,
         stored_creq: &str,
         harness: usize,
         argv: &[String],
@@ -204,7 +209,7 @@ impl SellerNodeRunner {
             crate::seller_agents::AgentKind::Hook { model, .. } => model.as_deref(),
             _ => None,
         };
-        self.deliver_hook_answer(job_id, offer, stored_creq, label, model, &status, &answer, wall_ms, session_job)
+        self.deliver_hook_answer(job_id, offer, stored_creq, label, model, &status, &answer, wall_ms, session_job, size_check)
             .await;
     }
 
@@ -217,6 +222,7 @@ impl SellerNodeRunner {
         offer: &crate::seller_node::store::Offer,
         stored_creq: &str,
         row: crate::seller_node::store::HookOutcomeRow,
+        size_check: bool,
     ) {
         let buyer = offer.buyer_pubkey.clone();
         let workdir = job_workdir(self.node.home(), job_id);
@@ -248,6 +254,7 @@ impl SellerNodeRunner {
             &row.answer,
             row.wall_time_ms,
             session_job,
+            size_check,
         )
         .await;
     }
@@ -278,8 +285,45 @@ impl SellerNodeRunner {
         answer: &str,
         wall_ms: u64,
         session_job: bool,
+        size_check: bool,
     ) {
         let workdir = job_workdir(self.node.home(), job_id);
+        // Only the worst-case reservation failed before the hook ran: measure the real answer.
+        if size_check {
+            match crate::review::private::seller_inline_answer_fits(
+                self.node.home(),
+                self.node.signer(),
+                job_id,
+                answer,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Err(error) if !crate::review::permanent_error(&error) => {
+                    opline!(
+                        "seller node hook job_id={job_id}: delivery review size check failed ({error}); \
+                         the staged answer is retried on the next re-drive"
+                    );
+                    return;
+                }
+                fit => {
+                    opline!(
+                        "seller node hook job_id={job_id}: the answer ({} bytes) and this offer's task are \
+                         too large for one delivery review{}; nothing delivered",
+                        answer.len(),
+                        fit.err().map(|error| format!(" ({error})")).unwrap_or_default()
+                    );
+                    self.hook_refused_with(
+                        job_id,
+                        &offer.buyer_pubkey,
+                        &workdir,
+                        HOOK_ANSWER_TOO_LARGE_TO_REVIEW_FEEDBACK,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
         let turn_status = crate::session::TurnStatus::parse(status);
         // A staged non-`done` status exists only for a session claim; sessions switched off since
         // leave nothing to ask the question in (§5.0 rule 3).
