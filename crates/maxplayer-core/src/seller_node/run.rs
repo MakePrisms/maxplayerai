@@ -812,6 +812,61 @@ impl FedUnderRateOffersInner {
     }
 }
 
+/// What one boot re-read found in wraps OLDER than the regular backfill window that would each
+/// print a line on the live path. Printed as one summary at the end of the pass, so a restart
+/// does not replay the history's "possibly money" lines one by one.
+#[derive(Default)]
+struct WrapHistoryTally {
+    /// Payments for jobs this home has no offer for.
+    unknown_payments: std::sync::atomic::AtomicU64,
+    /// Distinct such jobs (bounded keys; the count stops growing at the cap).
+    unknown_jobs: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Payment-shaped wraps that do not parse.
+    unreadable: std::sync::atomic::AtomicU64,
+}
+
+impl WrapHistoryTally {
+    fn unknown_job(&self, key: &str) {
+        self.unknown_payments
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut jobs = self.unknown_jobs.lock().unwrap_or_else(|p| p.into_inner());
+        if jobs.len() < FED_UNDER_RATE_OFFERS_CAP {
+            jobs.insert(key.to_owned());
+        }
+    }
+
+    /// The one summary line, or `None` when nothing was folded.
+    fn summary(&self) -> Option<String> {
+        let payments = self.unknown_payments.load(std::sync::atomic::Ordering::Relaxed);
+        let unreadable = self.unreadable.load(std::sync::atomic::Ordering::Relaxed);
+        if payments == 0 && unreadable == 0 {
+            return None;
+        }
+        let jobs = self.unknown_jobs.lock().unwrap_or_else(|p| p.into_inner()).len();
+        Some(format!(
+            "seller node wrap backfill (boot re-read): older than the regular window, {payments} \
+             payment(s) for {jobs} job(s) this home has no offer for (was ~/.maxplayer reset or \
+             moved?), {unreadable} payment(s) this build cannot read — set {}=1 to list them",
+            crate::oplog::VERBOSE_ENV
+        ))
+    }
+}
+
+/// A first-sight key of bounded size for an id taken from a payload: ids up to 64 bytes (a job id
+/// is 64 hex) are kept as they are; a longer one keeps its first 64 bytes plus its length. Two
+/// long ids that collide only share one log line.
+fn bounded_announce_key(id: &str) -> String {
+    const KEEP: usize = 64;
+    if id.len() <= KEEP {
+        return id.to_owned();
+    }
+    let mut cut = KEEP;
+    while !id.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…{}", &id[..cut], id.len())
+}
+
 /// Whether a lapsed/aged offer skip is worth a default-output line rather than a count.
 ///
 /// Only an offer AIMED AT THIS SEAT and authored within the admit window
@@ -844,6 +899,14 @@ struct QuietTally {
     unknown_closes: std::sync::atomic::AtomicU64,
     /// A follow-up for a session that already ended.
     ended_followups: std::sync::atomic::AtomicU64,
+    /// A kind-1059 to this key that is not a payment (private content, chat, …).
+    wraps_not_payment: std::sync::atomic::AtomicU64,
+    /// A payment wrap for a job already receipted (re-read by backfill).
+    wraps_already_paid: std::sync::atomic::AtomicU64,
+    /// A repeat of a payment wrap for a job this home never recorded (first sight prints).
+    wraps_unknown_job: std::sync::atomic::AtomicU64,
+    /// A repeat of a payment wrap that does not parse (first sight of each wrap prints).
+    wraps_payment_repeat: std::sync::atomic::AtomicU64,
 }
 
 impl QuietTally {
@@ -864,6 +927,10 @@ impl QuietTally {
             ("lapsed or aged offers skipped", take(&self.stale_offers)),
             ("relay CLOSEDs for subscriptions not ours", take(&self.unknown_closes)),
             ("follow-ups to ended sessions", take(&self.ended_followups)),
+            ("wraps that are not payments", take(&self.wraps_not_payment)),
+            ("payments already collected", take(&self.wraps_already_paid)),
+            ("repeat payments for unrecorded jobs", take(&self.wraps_unknown_job)),
+            ("repeat unreadable payments", take(&self.wraps_payment_repeat)),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -1124,13 +1191,18 @@ fn recovery_backoff(attempt: u32) -> Duration {
 /// probe = session liveness, this backfill = money-leg recovery, and a subscription-map reconciler
 /// (#172) = registration integrity. None of them subsumes another.
 const WRAP_BACKFILL_INTERVAL_SECS: u64 = 300;
-/// Skew margin subtracted from the oldest delivered-but-unpaid job when clamping the backfill cursor.
+/// Skew margin subtracted from the last receipt and from the oldest unpaid delivery when resolving
+/// the backfill cursor.
 const WRAP_BACKFILL_MARGIN_SECS: i64 = 3600;
 /// Test-only override of [`WRAP_BACKFILL_INTERVAL_SECS`]. NOT a user config knob; no production path
 /// sets it (mirrors the heartbeat cadence seam).
 const WRAP_BACKFILL_INTERVAL_ENV: &str = "MAXPLAYER_WRAP_BACKFILL_INTERVAL_SECS";
 /// Hard cap on one backfill fetch, so an auth-gated relay that never EOSEs cannot wedge the tick.
 const WRAP_BACKFILL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Most pages one wrap backfill reads. A relay answers one page per REQ (the in-repo relay: the
+/// newest 1,000), so the backfill pages backwards with `until`; this bounds one pass (the boot
+/// re-read of a seat with a long history most of all). Hitting it counts as an incomplete read.
+const WRAP_BACKFILL_MAX_PAGES: usize = 20;
 
 /// Effective backfill cadence: the env test seam wins over [`WRAP_BACKFILL_INTERVAL_SECS`]; a `0` or
 /// unparseable value is ignored.
@@ -1146,28 +1218,71 @@ fn resolve_wrap_backfill_interval_secs() -> u64 {
     }
 }
 
-/// The `since` cursor for a wrap backfill: the last collected receipt, but never later than the
-/// oldest delivered-but-unpaid job (minus a skew margin).
+/// The `since` cursor for a wrap backfill: the last collected receipt (minus a skew margin), but
+/// never later than the oldest delivery still owed a payment (minus the same margin).
 ///
 /// The last-receipt timestamp alone is wrong: a receipt for a NEWER job would advance the cursor past
 /// an OLDER unsettled job and skip its still-uncollected payment wrap forever. Clamping keeps that
 /// wrap in range; the per-job idempotency guards (`has_receipt` skip, mint already-spent refuse) make
 /// the wider re-scan safe.
 ///
+/// A seat with NO receipt (new, free-only, or long idle) used to stay at `since = 0` forever and
+/// re-read its whole kind-1059 history every pass. The last COMPLETE backfill read also moves the
+/// floor: anything published before it was already read once, so the window only needs to reach
+/// [`WRAP_COMPLETE_LOOKBACK_SECS`] behind it — far more than the 3-minute wrap timestamp tweak, and
+/// long enough that a wrap a transient error made us skip is still retried for a day. The
+/// unsettled-delivery clamp below still pulls the cursor back over any delivery we were not paid
+/// for (a job's first delivery or a session turn), whatever either floor says.
+///
+/// Both floors back off: the receipt floor by [`WRAP_BACKFILL_MARGIN_SECS`], because a payment
+/// published around the last receipt can carry an earlier `created_at` (the wrap timestamp tweak,
+/// relay clock skew) and the receipt dedup makes the overlap free; the complete floor by never
+/// trusting a mark later than `now_unix`, so a pass under a clock that ran ahead cannot push the
+/// window into the future.
+///
+/// The first pass after boot ignores this cursor and re-reads everything (see
+/// [`SellerNodeRunner::run_wrap_backfill`]); that pass is the backstop for a payment this window
+/// has already passed.
+///
 /// A journal/store READ ERROR must abort the cycle, never fall back to `since = 0` — that would turn a
 /// transient read failure into a full-history backfill. Absent data (nothing collected, nothing
-/// unsettled) is legitimately `0`; a failure to read is not.
+/// unsettled, no complete pass yet) is legitimately `0`; a failure to read is not.
 fn resolve_backfill_since(
     last_receipt: Result<Option<i64>, super::store::StoreError>,
     oldest_unsettled: Result<Option<i64>, super::store::StoreError>,
+    last_complete: Result<Option<i64>, super::store::StoreError>,
+    now_unix: i64,
 ) -> Result<u64, super::store::StoreError> {
-    let last_receipt = last_receipt?.unwrap_or(0);
-    let cursor = match oldest_unsettled? {
-        Some(oldest) => last_receipt.min(oldest.saturating_sub(WRAP_BACKFILL_MARGIN_SECS)),
-        None => last_receipt,
+    let last_receipt = last_receipt?;
+    let oldest_unsettled = oldest_unsettled?;
+    // Neither stored time is trusted past the clock: both come from the wall clock of the pass or
+    // collection that wrote them, which may have run ahead.
+    let mark = last_complete?.map(|at| at.min(now_unix));
+    let mut receipt_floor = last_receipt
+        .map(|at| at.min(now_unix).saturating_sub(WRAP_BACKFILL_MARGIN_SECS))
+        .unwrap_or(0);
+    // A receipt is not evidence that the wraps before it were read; a complete pass is. Once a
+    // complete pass exists, the receipt floor cannot step past it.
+    if let Some(mark) = mark {
+        receipt_floor = receipt_floor.min(mark);
+    }
+    let complete_floor = mark
+        .map(|at| at.saturating_sub(WRAP_COMPLETE_LOOKBACK_SECS))
+        .unwrap_or(0);
+    let floor = receipt_floor.max(complete_floor);
+    let cursor = match oldest_unsettled {
+        Some(oldest) => floor.min(oldest.saturating_sub(WRAP_BACKFILL_MARGIN_SECS)),
+        None => floor,
     };
+    // Never a window that starts in the future (the boot live REQ uses this too, and a relay
+    // applies `since` to live fan-out).
+    let cursor = cursor.min(now_unix.saturating_sub(WRAP_BACKFILL_MARGIN_SECS));
     Ok(cursor.max(0) as u64)
 }
+
+/// How far behind the last complete wrap backfill the next one still reads (see
+/// [`resolve_backfill_since`]). A day: a bounded window instead of all history, with room to retry.
+const WRAP_COMPLETE_LOOKBACK_SECS: i64 = 86_400;
 
 /// Upper bound on stored open-pool offers a backfilling REQ may return.
 const OFFER_BACKFILL_LIMIT: usize = 500;
@@ -5184,6 +5299,10 @@ pub struct SellerNodeRunner {
     /// the periodic backfill re-reading the same offer does not repeat the line. Same bounded
     /// first-sight set as [`Self::fed_under_rate_offers`].
     announced_stale_offers: FedUnderRateOffers,
+    /// Job ids whose "payment but no offer recorded" line already printed this boot.
+    announced_unknown_payments: FedUnderRateOffers,
+    /// Wrap ids whose "payment does not parse" line already printed this boot.
+    announced_payment_wraps: FedUnderRateOffers,
     /// #747: how this node is asked to leave the selling role, so it can publish its terminal
     /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
     shutdown: shutdown::ShutdownChannel,
@@ -5198,6 +5317,9 @@ pub struct SellerNodeRunner {
     /// shorten them per runner).
     loop_gap_report: Duration,
     loop_gap_reconnect: Duration,
+    /// The next wrap backfill re-reads all history instead of the cursor window: set at boot,
+    /// cleared by the first pass that completes (see [`Self::run_wrap_backfill`]).
+    wrap_boot_rescan_pending: std::sync::atomic::AtomicBool,
     /// Mint redeems between the intent-to-receive breadcrumb and the receipt write. Graceful
     /// shutdown waits (bounded, [`schedule::LANE_SETTLE_MONEY_BOUND`]) while this is non-zero
     /// instead of cutting a swap off mid-flight.
@@ -5689,11 +5811,14 @@ impl SellerNodeRunner {
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             quiet: QuietTally::default(),
             announced_stale_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
+            announced_unknown_payments: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
+            announced_payment_wraps: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
             drain: shutdown::DrainSignal::new(),
             wrap_backfill_interval_secs: resolve_wrap_backfill_interval_secs(),
             loop_gap_report: schedule::LOOP_GAP_REPORT,
             loop_gap_reconnect: schedule::LOOP_GAP_RECONNECT,
+            wrap_boot_rescan_pending: std::sync::atomic::AtomicBool::new(true),
             redeems_in_flight: std::sync::atomic::AtomicUsize::new(0),
             remit_flight: crate::fee_remit::RemitFlight::new(),
             remit_pacing: Arc::new(Mutex::new(crate::fee_remit::RemitBackoff::new())),
@@ -6394,9 +6519,36 @@ impl SellerNodeRunner {
                 self.claim_open_pool(),
                 self.node.home().config.sessions.enabled(),
             ),
-            WRAP_SUB_ID => Filter::new()
-                .kind(Kind::GiftWrap)
-                .pubkey(self.seller_pubkey),
+            WRAP_SUB_ID => {
+                // `since = None` is the boot subscribe (every recovery resubscribe passes an
+                // overlap). Start that live REQ at the backfill cursor instead of asking the relay to
+                // replay every wrap ever sent to this key: the first backfill pass, which runs
+                // straight after boot, re-reads all of it anyway (quietly). A cursor read error
+                // falls back to no `since` (the old full replay), never to a narrower window.
+                let filter = Filter::new().kind(Kind::GiftWrap).pubkey(self.seller_pubkey);
+                if since.is_some() {
+                    filter
+                } else {
+                    let boot_cursor = resolve_backfill_since(
+                        self.node.store().last_receipt_unix(),
+                        self.node.store().oldest_unsettled_delivery_unix(),
+                        self.node.store().wrap_backfill_complete_unix(&self.relay_url),
+                        now_unix() as i64,
+                    )
+                    .ok()
+                    .filter(|cursor| *cursor > 0);
+                    match boot_cursor {
+                        Some(cursor) => {
+                            opline!("seller node wrap subscription (boot): live kind-1059 since ts={cursor}");
+                            filter.since(nostr_sdk::Timestamp::from(cursor))
+                        }
+                        None => {
+                            opline!("seller node wrap subscription (boot): live kind-1059, full replay");
+                            filter
+                        }
+                    }
+                }
+            }
             other => {
                 return Err(NodeError::Relay(format!(
                     "subscribe {other}: not one of ours"
@@ -7279,7 +7431,17 @@ impl SellerNodeRunner {
                 // by the next stored-history backfill, which re-reads exactly those windows.
                 recv = notifications.recv(), if queue.has_room() => {
                     match recv {
-                        Ok(RelayPoolNotification::Event { event, .. }) => {
+                        Ok(RelayPoolNotification::Event { subscription_id, event, .. }) => {
+                            // The SDK also emits every not-yet-seen event of a TRANSIENT read
+                            // (the wrap and private-content backfills' `read_stored`). Those
+                            // backfills handle their own kind-1059s; queueing them here too would
+                            // process each one twice and, on the boot re-read of a long history,
+                            // fill this queue. Only our own live subscriptions feed the lane 1059s.
+                            if event.kind == Kind::GiftWrap
+                                && !is_our_subscription(subscription_id.as_str())
+                            {
+                                continue;
+                            }
                             if handled_event_kind(event.kind) {
                                 queue.push_event(event);
                                 if !queue.has_room() && !queue_full_logged {
@@ -7779,18 +7941,36 @@ impl SellerNodeRunner {
     /// external supervision has — a parked process satisfies pid-presence, so absence of failures is
     /// not evidence of health. Do not make it conditional to reduce noise.
     ///
-    /// Returns whether the pass read COMPLETE history (relay EOSE for the wraps, and the private
+    /// Returns whether the pass read COMPLETE history (relay EOSE on every page, and the private
     /// content read when that is live). `false` is never "nothing there": the caller retries soon, the
     /// private cursor keeps only the windows that completed, and the wrap cursor is store-derived
-    /// (receipts/deliveries), so an incomplete read cannot move it past an unread payment.
+    /// (receipts/deliveries/turns), so an incomplete read cannot move it past an unread payment.
+    ///
+    /// The FIRST pass after boot reads from `since = 0` instead of the cursor: one quiet re-read of
+    /// everything the relay still holds for this key. It is the backstop for a payment the cursor
+    /// has already passed (a redeem that failed and was never retried, a clock that ran ahead), and
+    /// it keeps "restart the seller" a working recovery. It stays pending until a pass completes or
+    /// hits [`WRAP_BACKFILL_MAX_PAGES`], so a timed-out boot read is retried in full.
     async fn run_wrap_backfill(&self) -> bool {
         let private_complete = self.backfill_private_content().await;
-        let since = match resolve_backfill_since(
+        // Taken BEFORE the read: a wrap published while the read runs is newer than this, so the
+        // next pass's window (which reaches a day behind it) still covers it.
+        let started_unix = now_unix() as i64;
+        let full_rescan = self
+            .wrap_boot_rescan_pending
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let cursor = resolve_backfill_since(
             self.node.store().last_receipt_unix(),
             self.node.store().oldest_unsettled_delivery_unix(),
-        ) {
-            Ok(since) => since,
-            Err(error) => {
+            self.node.store().wrap_backfill_complete_unix(&self.relay_url),
+            started_unix,
+        );
+        let (since, regular_since) = match (full_rescan, cursor) {
+            (false, Ok(cursor)) => (cursor, cursor),
+            // The boot re-read does not need the cursor to read; without one it just treats every
+            // wrap as inside the regular window (per-item lines, as on the live path).
+            (true, cursor) => (0, cursor.unwrap_or(0)),
+            (false, Err(error)) => {
                 opline!(
                     "seller node wrap backfill: ABORT — cursor read failed (retrying next cycle, \
                      NOT defaulting to since=0): {error}"
@@ -7798,11 +7978,11 @@ impl SellerNodeRunner {
                 return false;
             }
         };
-        opline!("seller node wrap backfill (periodic): fetching stored kind-1059(s) since ts={since}");
-        let filter = Filter::new()
-            .kind(Kind::GiftWrap)
-            .pubkey(self.seller_pubkey)
-            .since(nostr_sdk::Timestamp::from(since));
+        // The "(periodic): fetching" prefix is the documented liveness line; the boot re-read keeps
+        // it and says what it is after.
+        let mode = if full_rescan { " (boot: full re-read)" } else { "" };
+        opline!("seller node wrap backfill (periodic): fetching stored kind-1059(s) since ts={since}{mode}");
+        let history = WrapHistoryTally::default();
         let relay = match self.own_relay().await {
             Ok(relay) => relay,
             Err(error) => {
@@ -7810,29 +7990,113 @@ impl SellerNodeRunner {
                 return false;
             }
         };
-        let read = read_stored(&relay, vec![filter], WRAP_BACKFILL_FETCH_TIMEOUT).await;
-        let complete = read.is_complete();
-        let events = match read {
-            StoredRead::Complete(events) => {
-                opline!(
-                    "seller node wrap backfill (periodic): {} stored kind-1059(s) returned since ts={since}",
-                    events.len()
-                );
-                events
+        // A relay answers one page per REQ (newest first, as buzz does), and EOSE ends the page, not
+        // the history: a page that brought anything new may have stopped short of `since`, so ask
+        // again for what is at or before its oldest event (`until` is inclusive, so the boundary
+        // second is re-read and the seen-set drops the repeats). A non-empty page with nothing new
+        // means that second is exhausted or saturated: step one second below it. Only an EMPTY page
+        // ends the window. This relies on newest-first order and on `until` being honoured; a relay
+        // that ignores `until` or answers oldest-first ends the loop early and is reported complete
+        // after one page (not buzz).
+        let mut seen = std::collections::HashSet::new();
+        let mut until: Option<nostr_sdk::Timestamp> = None;
+        let mut pages = 0usize;
+        let mut returned = 0usize;
+        let mut complete = true;
+        let mut capped = false;
+        let mut saturated_logged = false;
+        loop {
+            let mut filter = Filter::new()
+                .kind(Kind::GiftWrap)
+                .pubkey(self.seller_pubkey)
+                .since(nostr_sdk::Timestamp::from(since));
+            if let Some(until) = until {
+                filter = filter.until(until);
             }
-            StoredRead::Incomplete { events, reason } => {
-                opline!(
-                    "seller node WARN: wrap backfill INCOMPLETE since ts={since}: {reason}; {} \
-                     kind-1059(s) arrived first (processed), more may exist — retry pending (live \
-                     1059 subscription active)",
-                    events.len()
-                );
-                events
+            let read = read_stored(&relay, vec![filter], WRAP_BACKFILL_FETCH_TIMEOUT).await;
+            pages += 1;
+            let page_complete = read.is_complete();
+            let events = match read {
+                StoredRead::Complete(events) => events,
+                StoredRead::Incomplete { events, reason } => {
+                    opline!(
+                        "seller node WARN: wrap backfill INCOMPLETE since ts={since} (page {pages}): \
+                         {reason}; {} kind-1059(s) arrived first (processed), more may exist — retry \
+                         pending (live 1059 subscription active)",
+                        events.len()
+                    );
+                    events
+                }
+            };
+            let oldest = events.iter().map(|event| event.created_at).min();
+            let fresh: Vec<_> = events.into_iter().filter(|event| seen.insert(event.id)).collect();
+            returned += fresh.len();
+            let any_fresh = !fresh.is_empty();
+            // Every wrap goes through the normal pay-once guards; a partial read is safe to ingest.
+            for event in fresh {
+                let deep = full_rescan && event.created_at.as_secs() < regular_since;
+                self.handle_gift_wrap(&event, deep.then_some(&history)).await;
             }
-        };
-        // Every wrap goes through the normal pay-once guards; a partial read is safe to ingest.
-        for event in events {
-            self.on_gift_wrap(&event).await;
+            if !page_complete {
+                complete = false;
+                break;
+            }
+            let Some(oldest) = oldest else {
+                break;
+            };
+            if !any_fresh {
+                // NIP-01 has no cursor inside one second, so wraps of a second that held a full
+                // page cannot all be listed; step past it and say so once.
+                if !saturated_logged && pages > 1 {
+                    saturated_logged = true;
+                    opline_verbose!(
+                        "seller node wrap backfill: second ts={} re-read with nothing new; stepping below it",
+                        oldest.as_secs()
+                    );
+                }
+                if oldest.as_secs() <= since {
+                    break;
+                }
+                until = Some(nostr_sdk::Timestamp::from(oldest.as_secs() - 1));
+                if pages >= WRAP_BACKFILL_MAX_PAGES {
+                    capped = true;
+                }
+            }
+            if capped || pages >= WRAP_BACKFILL_MAX_PAGES {
+                opline!(
+                    "seller node WARN: wrap backfill stopped after {pages} pages since ts={since}; \
+                     older stored kind-1059(s) were not read this pass"
+                );
+                complete = false;
+                capped = true;
+                break;
+            }
+            if any_fresh {
+                until = Some(oldest);
+            }
+        }
+        if complete {
+            opline!(
+                "seller node wrap backfill (periodic): {returned} stored kind-1059(s) returned since \
+                 ts={since} ({pages} page(s)){mode}"
+            );
+        }
+        if let Some(summary) = history.summary() {
+            opline!("{summary}");
+        }
+        if full_rescan && (complete || capped) {
+            self.wrap_boot_rescan_pending
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Only a COMPLETE read moves the floor: an incomplete one may have missed a payment.
+        if complete
+            && let Err(error) = self.node.store().record_wrap_backfill_complete(
+                &self.relay_url,
+                started_unix,
+                now_unix() as i64,
+            )
+        {
+            opline!("seller node wrap backfill: cursor write failed (next pass re-reads more): {error}");
         }
         complete && private_complete
     }
@@ -11989,13 +12253,22 @@ impl SellerNodeRunner {
     /// collection from the breadcrumb), and only then record the receipt (deduped by the wrap id, so
     /// a replayed wrap credits the job at most once). Every refusal is logged with a named reason.
     async fn on_gift_wrap(&self, event: &nostr_sdk::Event) {
+        self.handle_gift_wrap(event, None).await;
+    }
+
+    /// [`Self::on_gift_wrap`] for one wrap. `history` is set for a wrap the boot re-read found
+    /// OLDER than the regular backfill window: it skips the private-content branch (the private
+    /// backfill has its own cursor for that history) and folds the "possibly money" lines (unknown
+    /// job, unreadable payment) into one summary per pass instead of one line per item per boot.
+    /// The money path itself (redeem, receipt) is the same either way.
+    async fn handle_gift_wrap(&self, event: &nostr_sdk::Event, history: Option<&WrapHistoryTally>) {
         // RC3-02: wrap backfill calls this directly (not via `dispatch_event`); verify the outer 1059
         // (signed by its ephemeral key) here so both entry points share one check.
         if crate::job_lifecycle::verified_author_hex(event).is_none() {
             opline!("seller node wrap ignore id={}: event does not verify", event.id);
             return;
         }
-        if self.node.home().config.privacy.private_content_v2 {
+        if history.is_none() && self.node.home().config.privacy.private_content_v2 {
             if let Ok(Ok(content)) = self.node.signer().unwrap_private_content(event.clone()).await {
                 let received = (|| {
                     let mut ctx = crate::private_content::channel::ContentContext::open(self.node.home(), &self.seller_pubkey.to_hex())?;
@@ -12013,17 +12286,33 @@ impl SellerNodeRunner {
             }
         }
         let event_id = event.id.to_hex();
-        // Log EVERY wrap seen — silence must mean "no wraps", never "lost money".
-        opline!("seller node wrap seen event={event_id}");
+        // Every wrap is still accounted for, just not one line each: the backfill prints how many
+        // it read, routine skips below are counted into the status summary, and every path that
+        // can involve money we are owed (decode failure, unknown job, redeem) still prints.
+        // MAXPLAYER_VERBOSE restores the per-wrap lines.
+        opline_verbose!("seller node wrap seen event={event_id}");
 
         let received = match self.node.signer().unwrap_payment_wrap(event.clone()).await {
             Ok(Ok(Some(received))) => received,
             Ok(Ok(None)) => {
-                opline!("seller node wrap event={event_id}: not a decodable own-payment wrap (skipped)");
+                // Private content, chat or anything else addressed to this key: not money.
+                QuietTally::bump(&self.quiet.wraps_not_payment);
+                opline_verbose!("seller node wrap event={event_id}: not a decodable own-payment wrap (skipped)");
                 return;
             }
             Ok(Err(error)) => {
-                opline!("seller node wrap event={event_id}: decode failed ({error})");
+                // Looks like a payment but this build cannot read it: possibly money owed. Prints
+                // once per wrap per boot; the backfill re-reads are counted.
+                if let Some(history) = history {
+                    history.unreadable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    opline_verbose!("seller node wrap event={event_id}: decode failed ({error})");
+                } else if self.announced_payment_wraps.contains(&event_id) {
+                    QuietTally::bump(&self.quiet.wraps_payment_repeat);
+                    opline_verbose!("seller node wrap event={event_id}: decode failed ({error})");
+                } else {
+                    self.announced_payment_wraps.record(&event_id);
+                    opline!("seller node wrap event={event_id}: decode failed ({error})");
+                }
                 return;
             }
             Err(error) => {
@@ -12056,7 +12345,8 @@ impl SellerNodeRunner {
         // read error (never read an unreadable journal as "not paid ⇒ safe to redeem again").
         match self.node.store().has_receipt(&receipt_key) {
             Ok(true) => {
-                opline!("seller node wrap event={event_id}: job {job_id} already receipted, skipping");
+                QuietTally::bump(&self.quiet.wraps_already_paid);
+                opline_verbose!("seller node wrap event={event_id}: job {job_id} already receipted, skipping");
                 return;
             }
             Ok(false) => {}
@@ -12071,7 +12361,25 @@ impl SellerNodeRunner {
         let offer = match self.node.store().offer_row(&job_id) {
             Ok(Some(offer)) => offer,
             Ok(None) => {
-                opline!("seller node wrap event={event_id}: no offer recorded for job {job_id} (skipped)");
+                // A payment to this key for a job this home never recorded (a reset or moved home,
+                // or pay that beat its offer here). Possibly money owed, so it prints — but once
+                // per job per boot, not on every backfill pass.
+                // Keyed by a bounded form of the id: it comes from the payment payload, so its
+                // length is the sender's choice.
+                let announce_key = bounded_announce_key(&job_id);
+                if let Some(history) = history {
+                    history.unknown_job(&announce_key);
+                    opline_verbose!("seller node wrap event={event_id}: no offer recorded for job {job_id} (skipped)");
+                } else if self.announced_unknown_payments.contains(&announce_key) {
+                    QuietTally::bump(&self.quiet.wraps_unknown_job);
+                    opline_verbose!("seller node wrap event={event_id}: no offer recorded for job {job_id} (skipped)");
+                } else {
+                    self.announced_unknown_payments.record(&announce_key);
+                    opline!(
+                        "seller node wrap event={event_id}: payment for job {job_id}, but this home has \
+                         no offer recorded for it (skipped; was ~/.maxplayer reset or moved?)"
+                    );
+                }
                 return;
             }
             Err(error) => {
@@ -20639,19 +20947,22 @@ esac"#,
     #[test]
     fn wrap_backfill_cursor_clamps_to_the_oldest_unsettled_delivery_and_fails_closed() {
         use super::super::store::StoreError;
+        const NOW: i64 = 1_000_000_000;
 
         // Nothing collected, nothing unsettled ⇒ 0 is legitimate (first boot), not an error.
-        assert_eq!(resolve_backfill_since(Ok(None), Ok(None)).expect("fresh"), 0);
+        assert_eq!(resolve_backfill_since(Ok(None), Ok(None), Ok(None), NOW).expect("fresh"), 0);
 
-        // A receipt at t=10_000 with NO unsettled delivery ⇒ cursor is the receipt.
+        // A receipt at t=10_000 with NO unsettled delivery ⇒ cursor is the receipt minus the skew
+        // margin (a payment published around it can carry an earlier created_at).
         assert_eq!(
-            resolve_backfill_since(Ok(Some(10_000)), Ok(None)).expect("settled"),
-            10_000
+            resolve_backfill_since(Ok(Some(10_000)), Ok(None), Ok(None), NOW).expect("settled"),
+            (10_000 - WRAP_BACKFILL_MARGIN_SECS) as u64
         );
 
         // cursor_stays_behind_an_unsettled_delivery: a NEWER receipt must not step over an OLDER
         // delivered-but-unpaid job — the cursor clamps to that job's delivery minus the skew margin.
-        let cursor = resolve_backfill_since(Ok(Some(10_000)), Ok(Some(6_000))).expect("clamped");
+        let cursor =
+            resolve_backfill_since(Ok(Some(10_000)), Ok(Some(6_000)), Ok(None), NOW).expect("clamped");
         assert_eq!(cursor, (6_000 - WRAP_BACKFILL_MARGIN_SECS) as u64);
         assert!(
             cursor < 6_000,
@@ -20661,13 +20972,96 @@ esac"#,
         // Fail-closed: a store READ ERROR aborts the cycle. Falling back to 0 would turn a transient
         // failure into a full-history rescan.
         assert!(
-            resolve_backfill_since(Err(StoreError("boom".into())), Ok(None)).is_err(),
+            resolve_backfill_since(Err(StoreError("boom".into())), Ok(None), Ok(None), NOW).is_err(),
             "a cursor read failure must abort, never default to since=0"
         );
         assert!(
-            resolve_backfill_since(Ok(Some(1)), Err(StoreError("boom".into()))).is_err(),
+            resolve_backfill_since(Ok(Some(1)), Err(StoreError("boom".into())), Ok(None), NOW).is_err(),
             "an unsettled-delivery read failure must abort too"
         );
+        assert!(
+            resolve_backfill_since(Ok(None), Ok(None), Err(StoreError("boom".into())), NOW).is_err(),
+            "a complete-mark read failure must abort too"
+        );
+    }
+
+    /// A seat with no receipt moves forward with its complete reads instead of re-reading all
+    /// history; an unsettled delivery still pulls the cursor back over its payment.
+    ///
+    /// RED ON REVERT: drop `complete_floor` and the first assertion reads 0 (the field flood);
+    /// apply the floor after the clamp and the second reads past the unsettled delivery.
+    #[test]
+    fn wrap_backfill_cursor_moves_with_complete_reads_but_never_past_an_unpaid_delivery() {
+        const NOW: i64 = 1_000_000_000;
+        let day = WRAP_COMPLETE_LOOKBACK_SECS;
+        let done_at = 10 * day;
+        assert_eq!(
+            resolve_backfill_since(Ok(None), Ok(None), Ok(Some(done_at)), NOW).expect("no receipts"),
+            (done_at - day) as u64,
+            "no receipt, nothing unpaid: a day behind the last complete read, not 0"
+        );
+        let unpaid = done_at - 3 * day;
+        assert_eq!(
+            resolve_backfill_since(Ok(None), Ok(Some(unpaid)), Ok(Some(done_at)), NOW).expect("unpaid"),
+            (unpaid - WRAP_BACKFILL_MARGIN_SECS) as u64,
+            "an older delivered-but-unpaid job still wins"
+        );
+        assert_eq!(
+            resolve_backfill_since(Ok(Some(done_at)), Ok(None), Ok(Some(done_at - 5 * day)), NOW)
+                .expect("receipt newer"),
+            (done_at - 5 * day) as u64,
+            "a receipt newer than the last complete read moves the cursor only as far as that read"
+        );
+        assert_eq!(
+            resolve_backfill_since(Ok(Some(done_at)), Ok(None), Ok(Some(done_at)), NOW)
+                .expect("receipt and mark together"),
+            (done_at - WRAP_BACKFILL_MARGIN_SECS) as u64,
+            "with a fresh complete read, a receipt moves the cursor, less the skew margin"
+        );
+        // The in-repo relay accepts a created_at up to 900 s off its own clock (buzz ingest), on top
+        // of the buyer's backdating tweak: the lookback and the margin must both dwarf that.
+        let skew = crate::private_content::transport::TIMESTAMP_TWEAK_SECS as i64 + 900;
+        assert!(WRAP_COMPLETE_LOOKBACK_SECS > skew * 10, "the lookback must dwarf timestamp skew");
+        assert!(WRAP_BACKFILL_MARGIN_SECS > skew * 3, "the margin must cover timestamp skew");
+    }
+
+    /// A complete-read mark from a clock that ran ahead must not push the window into the future:
+    /// the floor is taken from min(mark, now).
+    ///
+    /// RED ON REVERT: drop the `x60.min(now_unix)`x60 and the cursor lands a day past `x60now`x60's window.
+    #[test]
+    fn wrap_backfill_cursor_never_trusts_a_mark_from_the_future() {
+        let day = WRAP_COMPLETE_LOOKBACK_SECS;
+        let now = 100 * day;
+        let future_mark = now + 365 * day;
+        assert_eq!(
+            resolve_backfill_since(Ok(None), Ok(None), Ok(Some(future_mark)), now).expect("future"),
+            (now - day) as u64,
+            "a mark ahead of the clock reads as now"
+        );
+        // A receipt stamped ahead of the clock: the window (and the boot live REQ that uses it)
+        // never starts in the future.
+        let cursor = resolve_backfill_since(Ok(Some(future_mark)), Ok(None), Ok(None), now)
+            .expect("future receipt");
+        assert!(
+            cursor <= (now - WRAP_BACKFILL_MARGIN_SECS) as u64,
+            "RED ON REVERT: a future receipt put the window at {cursor}, past now={now}"
+        );
+    }
+
+    /// The boot re-read folds the history's "possibly money" lines into one summary.
+    #[test]
+    fn the_boot_reread_summary_counts_payments_jobs_and_unreadables() {
+        let tally = WrapHistoryTally::default();
+        assert_eq!(tally.summary(), None, "nothing folded, nothing printed");
+        tally.unknown_job("job-a");
+        tally.unknown_job("job-a");
+        tally.unknown_job("job-b");
+        tally.unreadable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let line = tally.summary().expect("summary");
+        assert!(line.contains("3 payment(s) for 2 job(s)"), "{line}");
+        assert!(line.contains("1 payment(s) this build cannot read"), "{line}");
+        assert!(line.contains("MAXPLAYER_VERBOSE=1"), "{line}");
     }
 
     // TOOTH (offer backfill, CURSOR — #560) — the periodic offer-backfill `since` cursor is a bounded
@@ -20821,6 +21215,19 @@ esac"#,
         assert!(f.contains("offerX"));
     }
 
+    /// A first-sight key built from a payment payload id stays small whatever the sender put there.
+    #[test]
+    fn a_payload_id_announce_key_is_bounded() {
+        let job = "a".repeat(64);
+        assert_eq!(bounded_announce_key(&job), job, "a job id is kept as is");
+        let long = "b".repeat(10_000);
+        let key = bounded_announce_key(&long);
+        assert!(key.len() < 80, "a long payload id is cut: {} bytes", key.len());
+        assert_ne!(key, bounded_announce_key(&"b".repeat(9_999)), "the length tells long ids apart");
+        let multibyte = "é".repeat(100);
+        assert!(bounded_announce_key(&multibyte).starts_with("éé"), "cut on a char boundary");
+    }
+
     /// An idle seat prints no summary; a busy one prints one line naming only the non-zero counts,
     /// and the counts reset so the next status tick reports only what happened since.
     #[test]
@@ -20848,6 +21255,10 @@ esac"#,
             &tally.stale_offers,
             &tally.unknown_closes,
             &tally.ended_followups,
+            &tally.wraps_not_payment,
+            &tally.wraps_already_paid,
+            &tally.wraps_unknown_job,
+            &tally.wraps_payment_repeat,
         ]
         .into_iter()
         .enumerate()
@@ -20863,6 +21274,10 @@ esac"#,
             "lapsed or aged offers skipped: 3",
             "relay CLOSEDs for subscriptions not ours: 4",
             "follow-ups to ended sessions: 5",
+            "wraps that are not payments: 6",
+            "payments already collected: 7",
+            "repeat payments for unrecorded jobs: 8",
+            "repeat unreadable payments: 9",
         ] {
             assert!(summary.contains(expected), "missing {expected:?} in {summary}");
         }
@@ -25082,17 +25497,188 @@ esac"#,
         // (with it on, its own incomplete read would mask a wrap leg that lied).
         home.config.privacy.private_content_v2 = false;
         let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
-        assert!(
-            runner.run_wrap_backfill().await,
-            "harness check: an answering relay gives a complete backfill"
-        );
+        let mark = || {
+            runner
+                .node
+                .store()
+                .wrap_backfill_complete_unix(&runner.relay_url)
+                .expect("read mark")
+        };
         fixture.withhold_eose_for(&[1059]);
         assert!(
             !runner.run_wrap_backfill().await,
             "a read the relay never finished must not count as a complete (empty) history"
         );
+        assert_eq!(mark(), None, "an incomplete read must not move the cursor mark");
+        fixture.withhold_eose_for(&[]);
+        assert!(runner.run_wrap_backfill().await, "complete once the relay answers");
+        assert!(mark().is_some(), "a complete read records the cursor mark");
+        fixture.withhold_eose_for(&[1059]);
+        assert!(
+            !runner.run_wrap_backfill().await,
+            "an unfinished read after a complete one is still incomplete"
+        );
         fixture.withhold_eose_for(&[]);
         assert!(runner.run_wrap_backfill().await, "complete again once the relay answers");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A runner booted against `fixture` with only the payment-wrap leg live, plus a recorder of
+    /// every kind-1059 backfill REQ's `until` and a signer of throwaway wraps to this seat.
+    async fn paging_runner(fixture: &PGateRelay, label: &str) -> (std::path::PathBuf, SellerNodeRunner) {
+        let root = throwaway_root(label);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.privacy.private_content_v2 = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        (root, runner)
+    }
+
+    fn throwaway_wrap(to: nostr_sdk::PublicKey, created_at: u64) -> nostr_sdk::Event {
+        nostr_sdk::prelude::EventBuilder::new(Kind::GiftWrap, "not a payment")
+            .tag(nostr_sdk::prelude::Tag::public_key(to))
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from(created_at))
+            .sign_with_keys(&nostr_sdk::prelude::Keys::generate())
+            .expect("sign wrap")
+    }
+
+    fn script_wrap_pages(
+        fixture: &PGateRelay,
+        pages: Vec<Vec<crate::seller_node::p_gate_relay_fixture::ScriptedFrame>>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<Option<u64>>>> {
+        let untils = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<u64>>::new()));
+        let seen = untils.clone();
+        fixture.script(
+            move |filter: &serde_json::Value| {
+                let wraps = filter
+                    .get("kinds")
+                    .and_then(|k| k.as_array())
+                    .is_some_and(|k| k.iter().any(|v| v.as_u64() == Some(1059)));
+                if wraps {
+                    seen.lock().unwrap().push(filter.get("until").and_then(|u| u.as_u64()));
+                }
+                wraps
+            },
+            pages,
+        );
+        untils
+    }
+
+    /// The wrap backfill pages backwards through a relay that caps a page (here at 3), re-reading
+    /// each boundary second, and only an empty page ends the window. (Shape from io-fable's round-2
+    /// review of #1418, appendix A.)
+    ///
+    /// RED ON REVERT: read one page per pass and only the newest 3 wraps are asked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrap_backfill_pages_through_a_capped_relay() {
+        use crate::seller_node::p_gate_relay_fixture::ScriptedFrame;
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (root, runner) = paging_runner(&fixture, "wrap-paging").await;
+        let base = now_unix() as u64 - 10_000;
+        // e[0] oldest … e[6] newest, one per second.
+        let e: Vec<_> = (1..=7).map(|i| throwaway_wrap(runner.seller_pubkey, base + i)).collect();
+        let page = |idx: &[usize]| idx.iter().map(|i| ScriptedFrame::event(&e[*i])).collect::<Vec<_>>();
+        let untils = script_wrap_pages(
+            &fixture,
+            vec![page(&[6, 5, 4]), page(&[4, 3, 2]), page(&[2, 1, 0]), page(&[0]), vec![]],
+        );
+        assert!(runner.run_wrap_backfill().await, "every page answered with EOSE");
+        assert_eq!(
+            *untils.lock().unwrap(),
+            vec![None, Some(base + 5), Some(base + 3), Some(base + 1), Some(base)],
+            "each page asks for what is at or before the previous page's oldest wrap, and a page \
+             with nothing new steps one second below it until a page comes back empty"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A second holding a full page of wraps does not end the read: the pass steps below it and
+    /// still reaches the older wrap.
+    ///
+    /// RED ON REVERT: end the pass on a page with nothing new and the older wrap is never asked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrap_backfill_steps_past_a_saturated_second() {
+        use crate::seller_node::p_gate_relay_fixture::ScriptedFrame;
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (root, runner) = paging_runner(&fixture, "wrap-saturated").await;
+        let second = now_unix() as u64 - 10_000;
+        let same: Vec<_> = (0..3).map(|_| throwaway_wrap(runner.seller_pubkey, second)).collect();
+        let older = throwaway_wrap(runner.seller_pubkey, second - 50);
+        let full = || same.iter().map(ScriptedFrame::event).collect::<Vec<_>>();
+        let untils = script_wrap_pages(
+            &fixture,
+            vec![full(), full(), vec![ScriptedFrame::event(&older)], vec![ScriptedFrame::event(&older)], vec![]],
+        );
+        assert!(runner.run_wrap_backfill().await, "every page answered with EOSE");
+        assert_eq!(
+            *untils.lock().unwrap(),
+            vec![None, Some(second), Some(second - 1), Some(second - 50), Some(second - 51)],
+            "the saturated second is re-read once, then the pass steps below it to the older wrap"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The boot kind-1059 REQ starts at the backfill cursor (not at 0), the first backfill after boot
+    /// re-reads everything (since 0), and later passes use the cursor again.
+    ///
+    /// RED ON REVERT: drop the boot re-read and the first pass asks since the cursor; drop the boot
+    /// REQ's cursor and it carries no since.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_boot_wrap_req_uses_the_cursor_and_the_first_backfill_rereads_everything() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("boot-wrap-cursor");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.privacy.private_content_v2 = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+
+        let now = now_unix() as i64;
+        let mark = now - 10 * WRAP_COMPLETE_LOOKBACK_SECS;
+        let cursor = (mark - WRAP_COMPLETE_LOOKBACK_SECS) as u64;
+        runner
+            .node
+            .store()
+            .record_wrap_backfill_complete(&runner.relay_url, mark, now)
+            .expect("seed mark");
+
+        runner.subscribe_all(None).await.expect("boot subscribe");
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| reqs.iter().any(|r| r.subscription_id == WRAP_SUB_ID))
+                .await,
+            "harness check: the boot kind-1059 REQ reaches the relay"
+        );
+        let boot_req = fixture.reqs_for(WRAP_SUB_ID).await.into_iter().next().expect("boot REQ");
+        assert_eq!(boot_req.since, Some(cursor), "the boot live REQ starts at the cursor");
+
+        let backfill_reqs = || async {
+            fixture
+                .reqs()
+                .await
+                .into_iter()
+                .filter(|r| r.subscription_id != WRAP_SUB_ID && r.kinds.contains(&1059))
+                .collect::<Vec<_>>()
+        };
+        assert!(runner.run_wrap_backfill().await, "first pass completes");
+        let first = backfill_reqs().await;
+        assert!(!first.is_empty(), "harness check: the first pass reached the relay");
+        assert!(
+            first.iter().all(|r| r.since == Some(0)),
+            "the first pass after boot re-reads everything: {:?}",
+            first.iter().map(|r| r.since).collect::<Vec<_>>()
+        );
+
+        assert!(runner.run_wrap_backfill().await, "second pass completes");
+        let second: Vec<_> = backfill_reqs().await.into_iter().skip(first.len()).collect();
+        assert!(!second.is_empty(), "harness check: the second pass reached the relay");
+        let now_cursor = (now_unix() as i64 - WRAP_COMPLETE_LOOKBACK_SECS) as u64;
+        assert!(
+            second.iter().all(|r| r.since.is_some_and(|since| since >= cursor && since <= now_cursor)),
+            "later passes read from the cursor (moved forward by the first complete pass): {:?}",
+            second.iter().map(|r| r.since).collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

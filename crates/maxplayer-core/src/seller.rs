@@ -689,8 +689,12 @@ pub fn sign_receipt_hash(
 
 /// Kind-1059 gift-wrap: the ONE decode site — unwrap ONLY when `p-tag==self`.
 ///
-/// Returns `Ok(None)` when the wrap is not addressed to us or fails decrypt (not an error —
-/// other parties' envelopes stay dark). Decrypted contents are NEVER logged.
+/// Returns `Ok(None)` when the wrap is not addressed to us, fails decrypt, or carries something
+/// other than a payment (not an error — other parties' envelopes and our own private content stay
+/// dark). A wrap that decrypts to what LOOKS like a payment (a JSON object with `proofs` or
+/// `mint`) but does not parse is an `Err`: that may be money we are owed in a shape this build
+/// cannot read, and the caller must be able to tell it from "not a payment". Decrypted contents
+/// are NEVER logged, nor is the parser's error text (it can quote payload values).
 #[cfg(all(feature = "gateway", feature = "wallet"))]
 pub async fn unwrap_own_payment_gift_wrap(
     keys: &nostr_sdk::prelude::Keys,
@@ -723,7 +727,42 @@ pub async fn unwrap_own_payment_gift_wrap(
     match crate::payment_send::parse_nip17_payment_payload(&unwrapped.rumor.content, unwrapped.sender)
     {
         Ok(received) => Ok(Some(received)),
-        Err(_) => Ok(None),
+        Err(_) => match payment_shape(&unwrapped.rumor.content) {
+            PaymentShape::NotPayment => Ok(None),
+            PaymentShape::MissingId => Err(SellerError::Payment(
+                "payment wrap carries no job id (not redeemed)".into(),
+            )),
+            PaymentShape::Unparsed => Err(SellerError::Payment(
+                "payment wrap does not parse as a NUT-18 payload (not redeemed)".into(),
+            )),
+        },
+    }
+}
+
+/// What a decrypted rumor that failed the payment parser looks like, without reading any value.
+#[cfg(all(feature = "gateway", feature = "wallet"))]
+#[derive(Debug, PartialEq, Eq)]
+enum PaymentShape {
+    /// Not a JSON object with payment fields: private content, chat, anything else.
+    NotPayment,
+    /// Payment fields but no non-empty `id`: no job to pay.
+    MissingId,
+    /// Payment fields and an id, but the payload does not parse.
+    Unparsed,
+}
+
+#[cfg(all(feature = "gateway", feature = "wallet"))]
+fn payment_shape(content: &str) -> PaymentShape {
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(content)
+    else {
+        return PaymentShape::NotPayment;
+    };
+    if !object.contains_key("proofs") && !object.contains_key("mint") {
+        return PaymentShape::NotPayment;
+    }
+    match object.get("id").and_then(serde_json::Value::as_str) {
+        Some(id) if !id.is_empty() => PaymentShape::Unparsed,
+        _ => PaymentShape::MissingId,
     }
 }
 
@@ -752,6 +791,20 @@ pub fn cashu_secret_from_nostr_hex(secret_hex: &str) -> Result<cashu::SecretKey,
 
 #[cfg(test)]
 mod tests {
+    /// A rumor that looks like a payment but does not parse is told apart from "not a payment", so
+    /// the seller can print it instead of counting it as routine.
+    #[cfg(all(feature = "gateway", feature = "wallet"))]
+    #[test]
+    fn a_payment_that_does_not_parse_is_not_counted_as_not_a_payment() {
+        use super::{PaymentShape, payment_shape};
+        assert_eq!(payment_shape("hello"), PaymentShape::NotPayment);
+        assert_eq!(payment_shape(r#"{"kind":"task","body":{}}"#), PaymentShape::NotPayment);
+        assert_eq!(payment_shape(r#"["proofs"]"#), PaymentShape::NotPayment);
+        assert_eq!(payment_shape(r#"{"mint":"https://m","proofs":[]}"#), PaymentShape::MissingId);
+        assert_eq!(payment_shape(r#"{"id":"","proofs":[]}"#), PaymentShape::MissingId);
+        assert_eq!(payment_shape(r#"{"id":"job","proofs":"nope"}"#), PaymentShape::Unparsed);
+    }
+
     use super::*;
     use crate::gateway::ParsedOffer;
     use crate::home::{self, MaxplayerConfig, SellerConfig};

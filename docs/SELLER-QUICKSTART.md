@@ -1667,6 +1667,15 @@ offers re-read from relay history, a relay `CLOSED` for a subscription that is n
 follow-ups to ended sessions. All but the first two are counted, and the status tick prints one
 `seller node routine (since last status): …` line with the counts when any happened. A lapsed offer
 aimed at this seat and authored within the last hour still prints its `offer skip` line, once.
+Payment gift-wraps re-read by the periodic wrap backfill are summarised the same way (`wraps that are
+not payments`, `payments already collected`); the backfill still prints how many it read. A payment
+to this key for a job this home has no offer for prints once per job per boot — that usually means
+`~/.maxplayer` was reset or moved, and the money is worth checking. A payment this build cannot
+read (`decode failed`) prints once per payment per boot. Each start re-reads the seat's whole
+payment history once (the backfill's `fetching` line ends in `(boot: full re-read)`); payments for
+unknown jobs and unreadable payments older than the regular window are summed up in one
+`wrap backfill (boot re-read): …` line instead of one line each. After that the periodic backfill
+reads only a recent window, so restarting the seller is how to make it look at old payments again.
 Set `MAXPLAYER_VERBOSE=1` in the daemon's environment to see each one. Nothing that reports a state change
 or a failure is behind that flag — you never have to enable it to see something go wrong.
 
