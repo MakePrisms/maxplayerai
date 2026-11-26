@@ -8,7 +8,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -31,6 +31,9 @@ struct Faults {
     ids: Mutex<Vec<String>>,
     // Drop EVENT frames on each connection's first (live) subscription only; later REQs work.
     drop_live_events: AtomicBool,
+    // Hold back the EOSE of every subscription but the live one (the liveness probe and the
+    // history re-read) by this many milliseconds: a slow but healthy relay.
+    slow_side_eose_ms: AtomicU64,
 }
 fn take_fault(value: &AtomicUsize) -> bool {
     let mut n = value.load(Ordering::SeqCst);
@@ -147,6 +150,8 @@ impl RelayFixture {
                                     if v[0]=="OK" && (faults.omit_ok.load(Ordering::SeqCst) || take_fault(&faults.omit_next_ok)) { continue; }
                                     if v[0]=="EOSE" {
                                         if faults.omit_eose.load(Ordering::SeqCst) { continue; }
+                                        let slow = faults.slow_side_eose_ms.load(Ordering::SeqCst);
+                                        if slow > 0 && live_sub.as_ref() != Some(&v[1]) { tokio::time::sleep(Duration::from_millis(slow)).await; }
                                         if faults.wrong_eose.load(Ordering::SeqCst) { frame = json!(["EOSE", "wrong-subscription"]).to_string().into(); }
                                     }
                                 }
@@ -1735,5 +1740,81 @@ async fn review_accepted_send_survives_local_transcript_failure() {
         relay.writes.load(Ordering::SeqCst),
         before + 1,
         "one publication"
+    );
+}
+
+/// A healthy watch whose liveness probe runs long (a slow relay answering the probe and the history
+/// re-read) keeps its status file fresh the whole time. Before, the refresh was skipped while a
+/// probe ran, so a probe longer than the slack left `status` reading `stale status file (>90s)` and
+/// exiting 1 for a watch that was alive and connected.
+/// RED ON REVERT: run the probe without the refresh `select!` and the largest gap between status
+/// writes grows to the probe's length (~1.2 s here) instead of ~the refresh interval.
+#[tokio::test]
+async fn health_status_stays_fresh_while_a_slow_probe_runs() {
+    let relay = RelayFixture::new().await;
+    let (_d, h) = home();
+    let root = h.root.clone();
+    let url = relay.url.clone();
+    let options = maxplayer_chat::WatchOptions {
+        max_failures: 3,
+        cycle_timeout: Duration::from_secs(10),
+        liveness_interval: Duration::from_millis(200),
+        liveness_timeout: Duration::from_secs(5),
+        refresh_interval: Duration::from_millis(100),
+        backoff_unit: Duration::from_millis(30),
+    };
+    let task = tokio::spawn(async move {
+        maxplayer_chat::watch_with_options(&Home::open(root).unwrap(), &url, vec![], options).await
+    });
+    wait_healthy(&h).await;
+    // Each probe now waits ~600 ms for its EOSE and ~600 ms more for the history re-read's.
+    relay.faults.slow_side_eose_ms.store(600, Ordering::SeqCst);
+    let path = h.root.join("chat/status.json");
+    let modified = || std::fs::metadata(&path).unwrap().modified().unwrap();
+    let mut last = modified();
+    let mut last_change = std::time::Instant::now();
+    let mut widest = Duration::ZERO;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(4) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let now = modified();
+        if now != last {
+            widest = widest.max(last_change.elapsed());
+            last = now;
+            last_change = std::time::Instant::now();
+        }
+    }
+    widest = widest.max(last_change.elapsed());
+    relay.faults.slow_side_eose_ms.store(0, Ordering::SeqCst);
+    assert!(
+        widest < Duration::from_millis(700),
+        "status.json went {widest:?} without a write while the watch was alive and probing"
+    );
+    let status = h.status().unwrap();
+    assert_eq!(status.state, "healthy", "{status:?}");
+    assert!(
+        !task.is_finished(),
+        "the watch stayed up through the slow probes"
+    );
+    task.abort();
+}
+
+/// `status` run as another user than the watch (or with the watch under a supervisor) sees EPERM
+/// from `kill(pid, 0)`: the writer exists. Before, that read as a previous watcher's file and
+/// `status` exited 1 for a healthy watch. pid 1 always exists; a non-root run gets EPERM for it.
+/// RED ON REVERT (non-root): drop the EPERM arm and this reads `starting`.
+#[test]
+fn health_status_from_another_user_is_not_a_dead_writer() {
+    let (_d, h) = home();
+    let _guard = h.watch_lock().unwrap();
+    let path = h.root.join("chat/status.json");
+    let value = json!({"state":"healthy", "pid":1, "relay":"ws://127.0.0.1:1", "last_healthy_at":1,
+        "consecutive_failures":0,"last_error":null,"updated_at":Timestamp::now().as_secs()});
+    std::fs::write(&path, value.to_string()).unwrap();
+    let status = cli(&h.root, &["status", "--json"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
     );
 }
