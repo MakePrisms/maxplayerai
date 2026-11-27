@@ -897,6 +897,34 @@ fn an_append_after_a_torn_line_is_still_read() {
     assert_eq!(ids[1], second.id);
 }
 
+/// A record cut mid-character (invalid UTF-8) is skipped like any damaged line; the records
+/// around it still read.
+#[test]
+fn a_torn_line_with_invalid_utf8_does_not_break_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = home(dir.path(), "wss://relay.example");
+    let first = msg_at(&Keys::generate(), "one", now());
+    h.append(&Stored { channel: CH.into(), event: first, verdict: None, error: None }).unwrap();
+    let mut f = OpenOptions::new().append(true).open(h.path("messages.jsonl")).unwrap();
+    f.write_all(b"{\"channel\":\"caf\xc3").unwrap();
+    drop(f);
+    let second = msg_at(&Keys::generate(), "two", now());
+    h.append(&Stored { channel: CH.into(), event: second, verdict: None, error: None }).unwrap();
+    assert_eq!(h.stored().unwrap().len(), 2);
+}
+
+/// One `watch` per home: a second claim is refused while the first is held, and free after.
+#[test]
+fn only_one_watch_per_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = home(dir.path(), "wss://relay.example");
+    let first = h.claim_watch().unwrap();
+    let e = home(dir.path(), "wss://relay.example").claim_watch().unwrap_err().to_string();
+    assert!(e.contains("already running"), "{e}");
+    drop(first);
+    h.claim_watch().unwrap();
+}
+
 /// A restarted worker wakes `--notify` for delivered messages `inbox` has not shown yet.
 #[test]
 fn unread_channels_lists_delivered_messages_not_yet_shown() {
@@ -945,13 +973,17 @@ async fn watch_once_delivers_live_messages_and_ends_at_its_refresh() {
         while live.last().1 != "live" {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let live_at = std::time::Instant::now();
         sender.send_event(&msg_at(&Keys::generate(), "live one", now())).await.unwrap();
+        live_at
     });
     let started = std::time::Instant::now();
     // The local relay asks for no sign-in, so connect waits out its 10 s sign-in window first.
     let ended = tokio::time::timeout(Duration::from_secs(40), h.watch_once(&mut notifier, Duration::from_secs(3))).await;
     ended.unwrap_or_else(|_| panic!("watch_once did not end; last step {}", hb.last().1)).unwrap();
-    send.await.unwrap();
+    let live_at = send.await.unwrap();
+    // The refresh counts from the subscription, not from the start of the (slow) connect.
+    assert!(live_at.elapsed() >= Duration::from_millis(2500), "{:?}", live_at.elapsed());
     assert!(started.elapsed() >= Duration::from_secs(3));
     assert_eq!(delivered(&h), 1);
     if let Some(mut child) = notifier.child.take() {

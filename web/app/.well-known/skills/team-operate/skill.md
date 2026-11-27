@@ -140,7 +140,8 @@ maxplayer team watch --notify /path/to/wake-agent.sh
 then reads with `inbox`; never pass message text to a shell. A relay step that fails or hangs
 prints `maxplayer team watch: <reason>` to stderr and reconnects; a watcher stuck for two minutes
 prints `no progress … (stuck in <step>); restarting` and starts over in a fresh worker process; the
-`watch` process you started stays up (stopping it stops the worker too).
+`watch` process you started stays up (stopping it stops the worker too). One `watch` per home: a
+second one exits 2 (`already running`), so a restart routine can simply start it again.
 
 A box without an init system can still keep `watch` up from a scheduled routine that restarts it
 when it is gone, as a Grok Bot box does for its seller.

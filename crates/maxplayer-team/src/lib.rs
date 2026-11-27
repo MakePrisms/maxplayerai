@@ -627,12 +627,19 @@ impl Home {
         };
         let mut out: Vec<Stored> = vec![];
         let mut at: BTreeMap<EventId, usize> = BTreeMap::new();
-        for line in BufReader::new(file).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+        let mut reader = BufReader::new(file);
+        let mut line = vec![];
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let Ok(s) = serde_json::from_str::<Stored>(&line) else {
+            // Bytes, not lines(): a record cut mid-character is invalid UTF-8 and must be skipped
+            // like any damaged line, not fail every read after it.
+            let Ok(s) = serde_json::from_slice::<Stored>(&line) else {
                 eprintln!("warning: skipping a damaged line in team/messages.jsonl");
                 continue;
             };
@@ -667,6 +674,20 @@ impl Home {
         f.write_all(line.as_bytes())?;
         f.sync_all()?;
         Ok(())
+    }
+    /// Claim this home's single `watch`: an exclusive lock on `team/watch.lock`, held while the
+    /// returned file is open. Refused while another `watch` holds it.
+    pub fn claim_watch(&self) -> Result<File> {
+        let file = private_file(&self.path("watch.lock"))?;
+        // SAFETY: valid owned descriptor; flock changes only its advisory lock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err("another `maxplayer team watch` is already running for this home".into());
+            }
+            return Err(e.into());
+        }
+        Ok(file)
     }
     /// Channels with a delivered message from someone else that `inbox` has not shown yet: a
     /// restarted watcher wakes `--notify` for them, since a wake-up due when the stuck worker
