@@ -623,6 +623,12 @@ session lookup. For a `hook` record it skips the holder gate and calls `run_hook
     prints the JSON and exits 0. No socket ⇒ non-zero (no session running). Ping = the socket
     answers.
   Channels are a Claude Code research preview; the page says so.
+- `examples/hooks/spool-file.sh`: for agents that answer from a scheduled run or a webhook. Each
+  turn is written to `pending/<job_id>-<turn>.json` in a spool folder; the script stays running
+  until the agent writes `answers/<job_id>-<turn>.txt` (or a `.decline` reason), refuses an answer
+  over `answer_max_bytes` and keeps waiting, and prints `cannot_deliver` a few seconds before
+  `deadline_unix`. An optional notify command can wake the agent when a request lands. Ping checks
+  the folder is writable.
 - `maxplayer seller hook test <entry>`: sends `ping`, a `job` turn 1 with a sample input file, a
   `job` turn 2 with the same id, and `close`; prints each result and the verdict the daemon would
   reach. No relay, no money.

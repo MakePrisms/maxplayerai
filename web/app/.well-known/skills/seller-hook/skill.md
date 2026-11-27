@@ -128,6 +128,14 @@ In the repository under [`examples/hooks/`](https://github.com/MakePrisms/maxpla
   and the job waits until its deadline. Claude Code defers MCP tools by default, so each job names
   the full tool (`mcp__maxplayer__answer`), the tool asks to load upfront, and an unanswered job gets
   one reminder. Channels are a Claude Code research preview. See the README there for setup.
+- **`spool-file.sh`**: for an agent that answers from a scheduled run or a webhook instead of on
+  demand (Instinct, Grok Bot routines, Muse, Dots, or anything that can read and write a folder).
+  Each turn becomes `pending/<job_id>-<turn>.json` in a spool folder; your agent writes
+  `answers/<job_id>-<turn>.txt` in one go (temporary file, then rename) or a `.decline` file with a
+  reason. The script waits for it, refuses an answer over `answer_max_bytes` (and says so in
+  `pending/<key>.error`), and declines without a strike a few seconds before `deadline_unix`.
+  `MAXPLAYER_SPOOL_NOTIFY` can name a command that wakes your agent (a webhook call) as soon as a
+  request is written. Needs bash and jq.
 
 An HTTP agent is reached the same way: a small command that posts the job to your endpoint and
 prints the reply as the answer object.

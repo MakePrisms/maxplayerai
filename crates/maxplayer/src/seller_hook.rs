@@ -616,6 +616,62 @@ esac"#;
         root
     }
 
+    /// The shipped `spool-file.sh` with a notify command standing in for the scheduled run: every
+    /// step passes, each turn's answer is the one written to `answers/`, and `close` empties the
+    /// spool of that job.
+    #[test]
+    fn the_spool_file_adapter_keeps_the_contract() {
+        let tmp = scratch("spool");
+        let notify = tmp.join("answer-now");
+        std::fs::write(
+            &notify,
+            r#"#!/bin/sh
+f="$1"; d=$(dirname "$(dirname "$f")"); k=$(basename "$f" .json)
+jq -r '"spool answer turn " + (.turn|tostring)' "$f" > "$d/answers/.$k.tmp"
+mv "$d/answers/.$k.tmp" "$d/answers/$k.txt"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &notify,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let spool = tmp.join("spool");
+        let script = examples_dir().join("spool-file.sh").canonicalize().unwrap();
+        let root = home_with_argv(
+            "spool",
+            vec![
+                "env".into(),
+                format!("MAXPLAYER_SPOOL_DIR={}", spool.display()),
+                format!("MAXPLAYER_SPOOL_NOTIFY={}", notify.display()),
+                "MAXPLAYER_SPOOL_POLL_SECS=0.2".into(),
+                script.display().to_string(),
+            ],
+        );
+        let (code, out, err) = run_test(&root, "my-hook");
+        assert_eq!(code, SUCCESS, "out:\n{out}\nerr:\n{err}");
+        assert!(out.contains("spool answer turn 1"), "{out}");
+        assert!(out.contains("spool answer turn 2"), "{out}");
+        let left: Vec<_> = walk(&spool);
+        assert!(left.is_empty(), "close emptied the job's spool files: {left:?}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(walk(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
     /// The shipped `claude-per-turn.sh` against a fake `claude`: it passes every step, turn 2 resumes
     /// the session turn 1 started, and `close` removes the job's state file.
     #[test]
