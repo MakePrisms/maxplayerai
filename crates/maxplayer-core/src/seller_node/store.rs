@@ -548,7 +548,8 @@ pub struct JobPaymentRow {
     pub job_id: String,
     /// The offer's buyer; `None` when the offer row is missing.
     pub buyer_pubkey: Option<String>,
-    /// The mint the buyer's payment came from (the receive breadcrumb); `None` before a payment.
+    /// The mint the buyer's payment came from (the receive breadcrumb of a collected payment);
+    /// `None` until a payment landed, even if a receive was attempted and failed.
     pub mint: Option<String>,
     /// `jobs.state`: `awarded`, `executing`, `delivered`, `paid` or `failed`.
     pub state: String,
@@ -558,7 +559,8 @@ pub struct JobPaymentRow {
     /// `none` for a free job, `sat` otherwise (a legacy NULL reads `sat`).
     pub payment: String,
     pub delivered_at_unix: Option<i64>,
-    /// The end of the buyer's pay window for this delivery (delivery + 7 days).
+    /// The end of the buyer's pay window for this delivery (delivery + 7 days), for every delivered
+    /// row; whether a window applies (not on a free or paid job) is the reader's call.
     pub pay_by_unix: Option<i64>,
     /// A relay-derived settled marker (see the `jobs` table).
     pub settled_elsewhere_at_unix: Option<i64>,
@@ -575,8 +577,24 @@ pub struct JobReceipt {
     pub fee_sats: u64,
     /// `None` ⇒ the fee is unremitted.
     pub remittance_id: Option<String>,
-    /// `planned`, `settled` or `failed` for the named remittance.
+    /// The named remittance's state: `planned`, `spending` (its payment was sent and awaits the
+    /// mint's answer), `settled` or `failed`.
     pub remittance_state: Option<String>,
+}
+
+/// What `maxplayer seller jobs` reads, from ONE read transaction so the parts agree
+/// ([`SellerStore::job_payments_snapshot`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobPaymentsSnapshot {
+    pub rows: Vec<JobPaymentRow>,
+    /// The latest remittance attempt, whatever its outcome.
+    pub last_attempt: Option<RemitAttempt>,
+    /// The CURRENT state of the remittance that attempt names (`planned`, `spending`, `settled`,
+    /// `failed`), so a reader can tell a failure a later reconciliation already resolved.
+    pub last_attempt_remittance_state: Option<String>,
+    /// Platform fee on this seat not yet confirmed sent: every receipt with a fee whose remittance
+    /// is absent or not `settled`, across all jobs (not only the listed ones).
+    pub unsent_fee_sats: u64,
 }
 
 /// One row of `fee_remit_attempts` — one attempt to pay the accrued platform fee and how it ended.
@@ -1079,6 +1097,27 @@ impl SellerStore {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Self::init_schema(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Open an existing state DB READ-ONLY, for inspection commands (`maxplayer seller jobs`): no
+    /// WAL switch, no schema creation, no migration, so it works on a read-only mount and never
+    /// migrates a store a running (possibly older) `seller serve` owns. A store older than
+    /// [`SCHEMA_VERSION`] is refused with a hint rather than read with missing columns.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(
+            path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let version = read_meta_i64(&conn, "schema_version")?.unwrap_or(0);
+        if version < SCHEMA_VERSION {
+            return Err(StoreError(format!(
+                "seller store schema v{version} is older than this binary's v{SCHEMA_VERSION}; start `maxplayer seller serve` from this binary once to migrate it, then retry"
+            )));
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -3495,103 +3534,52 @@ impl SellerStore {
     /// with a receipt, so a delivered job the buyer has not paid for is visible only here.
     pub fn recent_job_payments(&self, limit: usize) -> Result<Vec<JobPaymentRow>, StoreError> {
         let conn = self.lock()?;
-        let mut statement = conn.prepare(
-            "SELECT jobs.job_id, jobs.state, jobs.created_at_unix, offers.amount_sats,
-                    COALESCE(deliveries.payment, offers.payment, 'sat'),
-                    deliveries.delivered_at_unix, jobs.settled_elsewhere_at_unix,
-                    receipts.received_at_unix, receipts.amount_sats, receipts.fee_sats,
-                    receipts.remittance_id, fee_remittances.state, offers.buyer_pubkey,
-                    (SELECT mint FROM pending_receive p WHERE p.job_id = jobs.job_id
-                     ORDER BY p.created_at_unix DESC LIMIT 1)
-             FROM jobs
-             LEFT JOIN offers ON offers.offer_id = jobs.offer_id
-             LEFT JOIN deliveries ON deliveries.job_id = jobs.job_id
-             LEFT JOIN receipts ON receipts.receipt_id = (
-                 SELECT receipt_id FROM receipts r WHERE r.job_id = jobs.job_id
-                 ORDER BY r.received_at_unix, r.receipt_id LIMIT 1)
-             LEFT JOIN fee_remittances ON fee_remittances.remittance_id = receipts.remittance_id
-             ORDER BY jobs.created_at_unix DESC, jobs.job_id
-             LIMIT ?1",
+        query_job_payments(&conn, limit)
+    }
+
+    /// [`Self::recent_job_payments`], the latest remittance attempt, the current state of the
+    /// remittance it names and the seat's unsent platform fee, all read in ONE transaction: against a
+    /// running `seller serve`, separate reads could pair a job list with an attempt from a different
+    /// moment (a remittance settling between them).
+    pub fn job_payments_snapshot(&self, limit: usize) -> Result<JobPaymentsSnapshot, StoreError> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        let rows = query_job_payments(&tx, limit)?;
+        let last_attempt = query_remit_attempts(&tx, 1)?.into_iter().next();
+        let last_attempt_remittance_state = match last_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.remittance_id.as_deref())
+        {
+            Some(id) => tx
+                .query_row(
+                    &format!("SELECT {REMITTANCE_STATE_SQL} FROM fee_remittances WHERE remittance_id = ?1"),
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        let unsent_fee_sats: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(r.fee_sats), 0) FROM receipts r
+             LEFT JOIN fee_remittances f ON f.remittance_id = r.remittance_id
+             WHERE r.fee_sats > 0 AND (f.state IS NULL OR f.state != 'settled')",
+            [],
+            |row| row.get(0),
         )?;
-        let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-            let received_at: Option<i64> = row.get(7)?;
-            let delivered_at: Option<i64> = row.get(5)?;
-            Ok(JobPaymentRow {
-                job_id: row.get(0)?,
-                buyer_pubkey: row.get(12)?,
-                mint: row.get(13)?,
-                state: row.get(1)?,
-                created_at_unix: row.get(2)?,
-                offer_sats: row.get::<_, Option<i64>>(3)?.map(|sats| sats.max(0) as u64),
-                payment: row.get(4)?,
-                delivered_at_unix: delivered_at,
-                pay_by_unix: delivered_at.map(|at| {
-                    at.saturating_add(
-                        i64::try_from(crate::job_lifecycle::DELIVERY_PAY_WINDOW_SECS)
-                            .unwrap_or(i64::MAX),
-                    )
-                }),
-                settled_elsewhere_at_unix: row.get(6)?,
-                receipt: match received_at {
-                    Some(received_at_unix) => Some(JobReceipt {
-                        received_at_unix,
-                        amount_sats: row.get::<_, i64>(8)?.max(0) as u64,
-                        fee_sats: row.get::<_, i64>(9)?.max(0) as u64,
-                        remittance_id: row.get(10)?,
-                        remittance_state: row.get(11)?,
-                    }),
-                    None => None,
-                },
-            })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        drop(tx);
+        Ok(JobPaymentsSnapshot {
+            rows,
+            last_attempt,
+            last_attempt_remittance_state,
+            unsent_fee_sats: u64::try_from(unsent_fee_sats).unwrap_or(0),
+        })
     }
 
     /// The most recent `limit` remittance attempts, NEWEST first — what `maxplayer seller fees
     /// remit` prints so an operator can see whether the automatic payout has been landing.
     pub fn recent_remit_attempts(&self, limit: usize) -> Result<Vec<RemitAttempt>, StoreError> {
         let conn = self.lock()?;
-        let mut statement = conn.prepare(
-            "SELECT attempt_id, started_at_unix, trigger, unremitted_sats, outcome, detail,
-                    remittance_id
-             FROM fee_remit_attempts
-             ORDER BY attempt_id DESC
-             LIMIT ?1",
-        )?;
-        let rows = statement
-            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-                let trigger_raw: String = row.get(2)?;
-                let outcome_raw: String = row.get(4)?;
-                let trigger = RemitAttemptTrigger::parse(&trigger_raw).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
-                let outcome = RemitAttemptOutcome::parse(&outcome_raw).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
-                Ok(RemitAttempt {
-                    attempt_id: row.get(0)?,
-                    started_at_unix: row.get(1)?,
-                    trigger,
-                    unremitted_sats: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
-                    outcome,
-                    detail: row.get(5)?,
-                    remittance_id: row.get(6)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        query_remit_attempts(&conn, limit)
     }
 
     /// Whether a delivery has been journaled for `job_id` (#552). A delivery row is written only by
@@ -4177,6 +4165,111 @@ impl SellerStore {
             pending_outbox,
         })
     }
+}
+
+/// `remittance_state` as [`RemittanceState::as_str`] names it: a `planned` row whose payment was sent
+/// (`spending_since_unix` set) reads `spending`.
+const REMITTANCE_STATE_SQL: &str = "CASE WHEN fee_remittances.state = 'planned' AND fee_remittances.spending_since_unix IS NOT NULL THEN 'spending' ELSE fee_remittances.state END";
+
+/// The `limit` most recent jobs on `conn` ([`SellerStore::recent_job_payments`]). Turn-1 `jobs` rows
+/// only: a session job's follow-up turns (`session_turns`) are not listed.
+fn query_job_payments(conn: &Connection, limit: usize) -> Result<Vec<JobPaymentRow>, StoreError> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT jobs.job_id, jobs.state, jobs.created_at_unix, offers.amount_sats,
+                COALESCE(deliveries.payment, offers.payment, 'sat'),
+                deliveries.delivered_at_unix, jobs.settled_elsewhere_at_unix,
+                receipts.received_at_unix, receipts.amount_sats, receipts.fee_sats,
+                receipts.remittance_id, {REMITTANCE_STATE_SQL}, offers.buyer_pubkey,
+                CASE WHEN receipts.receipt_id IS NOT NULL THEN
+                    (SELECT mint FROM pending_receive p WHERE p.job_id = jobs.job_id
+                     ORDER BY p.created_at_unix DESC, p.rowid DESC LIMIT 1)
+                END
+         FROM jobs
+         LEFT JOIN offers ON offers.offer_id = jobs.offer_id
+         LEFT JOIN deliveries ON deliveries.job_id = jobs.job_id
+         LEFT JOIN receipts ON receipts.receipt_id = (
+             SELECT receipt_id FROM receipts r WHERE r.job_id = jobs.job_id
+             ORDER BY r.received_at_unix, r.receipt_id LIMIT 1)
+         LEFT JOIN fee_remittances ON fee_remittances.remittance_id = receipts.remittance_id
+         ORDER BY jobs.created_at_unix DESC, jobs.job_id
+         LIMIT ?1"
+    ))?;
+    let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+        let received_at: Option<i64> = row.get(7)?;
+        let delivered_at: Option<i64> = row.get(5)?;
+        Ok(JobPaymentRow {
+            job_id: row.get(0)?,
+            buyer_pubkey: row.get(12)?,
+            mint: row.get(13)?,
+            state: row.get(1)?,
+            created_at_unix: row.get(2)?,
+            offer_sats: row.get::<_, Option<i64>>(3)?.map(|sats| sats.max(0) as u64),
+            payment: row.get(4)?,
+            delivered_at_unix: delivered_at,
+            pay_by_unix: delivered_at.map(|at| {
+                at.saturating_add(
+                    i64::try_from(crate::job_lifecycle::DELIVERY_PAY_WINDOW_SECS).unwrap_or(i64::MAX),
+                )
+            }),
+            settled_elsewhere_at_unix: row.get(6)?,
+            receipt: match received_at {
+                Some(received_at_unix) => Some(JobReceipt {
+                    received_at_unix,
+                    amount_sats: row.get::<_, i64>(8)?.max(0) as u64,
+                    fee_sats: row.get::<_, i64>(9)?.max(0) as u64,
+                    remittance_id: row.get(10)?,
+                    remittance_state: row.get(11)?,
+                }),
+                None => None,
+            },
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The most recent `limit` remittance attempts on `conn`, NEWEST first.
+fn query_remit_attempts(conn: &Connection, limit: usize) -> Result<Vec<RemitAttempt>, StoreError> {
+    let mut statement = conn.prepare(
+        "SELECT attempt_id, started_at_unix, trigger, unremitted_sats, outcome, detail,
+                remittance_id
+         FROM fee_remit_attempts
+         ORDER BY attempt_id DESC
+         LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            let trigger_raw: String = row.get(2)?;
+            let outcome_raw: String = row.get(4)?;
+            let trigger = RemitAttemptTrigger::parse(&trigger_raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let outcome = RemitAttemptOutcome::parse(&outcome_raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(RemitAttempt {
+                attempt_id: row.get(0)?,
+                started_at_unix: row.get(1)?,
+                trigger,
+                unremitted_sats: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                outcome,
+                detail: row.get(5)?,
+                remittance_id: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Decode `(id, dedup_key, draft_json, created_at_unix, attempts, expires_at_unix)` outbox rows.
@@ -5718,6 +5811,79 @@ mod tests {
         let gone = by("gone");
         assert_eq!((gone.delivered_at_unix, gone.pay_by_unix), (None, None));
         assert_eq!(store.recent_job_payments(1).expect("limit").len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1451 r1 (H2, H3, M3, M4): one snapshot reads a §planned§ remittance whose payment was sent as
+    /// §spending§, names the current state of the remittance the latest attempt names, sums the unsent
+    /// fee seat-wide, and gives no mint to a job whose receive was tried but never collected.
+    #[test]
+    fn job_payments_snapshot_reads_spending_attempt_state_and_unsent_fee() {
+        let (store, path) = fresh_store("job-payments-snapshot");
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute_batch(
+                "INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+                     VALUES ('held', 'held', 'paid', 1, 1), ('owed', 'owed', 'paid', 2, 2),
+                            ('tiny', 'tiny', 'paid', 3, 3), ('tried', 'tried', 'delivered', 4, 4),
+                            ('sent', 'sent', 'paid', 5, 5);
+                 INSERT INTO deliveries (job_id, result_ref, delivered_at_unix, payment)
+                     VALUES ('tried', 'r', 4, 'sat');
+                 INSERT INTO pending_receive (job_id, token_hash, buyer_pubkey, mint, amount_sats, created_at_unix)
+                     VALUES ('tried', 't', 'b', 'https://refused.example', 100, 4);
+                 INSERT INTO fee_remittances (remittance_id, gross_sats, net_sats, destination, payment_hash, bolt11, state, created_at_unix, spending_since_unix)
+                     VALUES ('m1', 10, 9, 'd', 'h1', 'b1', 'planned', 6, 7),
+                            ('old', 5, 5, 'd', 'h2', 'b2', 'settled', 1, NULL);
+                 INSERT INTO receipts (receipt_id, job_id, amount_sats, received_at_unix, fee_bps, fee_sats, remittance_id)
+                     VALUES ('c1', 'held', 100, 1, 1000, 10, 'm1'), ('c2', 'owed', 30, 2, 1000, 3, NULL),
+                            ('c3', 'tiny', 5, 3, 1000, 0, NULL), ('c5', 'sent', 50, 5, 1000, 5, 'old');
+                 INSERT INTO fee_remit_attempts (started_at_unix, trigger, unremitted_sats, outcome, detail, remittance_id)
+                     VALUES (7, 'collect', 10, 'failed', 'melt failed', 'm1');",
+            )
+            .expect("seed");
+        }
+        let snapshot = store.job_payments_snapshot(10).expect("snapshot");
+        let by = |id: &str| snapshot.rows.iter().find(|row| row.job_id == id).expect(id).clone();
+        assert_eq!(by("held").receipt.unwrap().remittance_state.as_deref(), Some("spending"));
+        assert_eq!(by("sent").receipt.unwrap().remittance_state.as_deref(), Some("settled"));
+        assert_eq!(by("tried").mint, None, "a receive breadcrumb without a receipt is no payment");
+        let attempt = snapshot.last_attempt.as_ref().expect("attempt");
+        assert_eq!((attempt.detail.as_str(), attempt.remittance_id.as_deref()), ("melt failed", Some("m1")));
+        assert_eq!(snapshot.last_attempt_remittance_state.as_deref(), Some("spending"));
+        assert_eq!(snapshot.unsent_fee_sats, 13, "m1's 10 plus the unremitted 3; settled and zero fees excluded");
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute("UPDATE fee_remittances SET state = 'settled', spending_since_unix = NULL WHERE remittance_id = 'm1'", [])
+                .expect("reconcile");
+        }
+        let snapshot = store.job_payments_snapshot(10).expect("snapshot");
+        assert_eq!(snapshot.last_attempt_remittance_state.as_deref(), Some("settled"));
+        assert_eq!(snapshot.unsent_fee_sats, 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1451 r1 M6: the read-only opener reads a current store and refuses an older one without
+    /// migrating it or writing anything.
+    #[test]
+    fn open_read_only_reads_current_stores_and_leaves_older_ones_alone() {
+        let (store, path) = fresh_store("open-read-only");
+        drop(store);
+        let read_only = SellerStore::open_read_only(&path).expect("current store opens");
+        assert!(read_only.job_payments_snapshot(5).expect("read").rows.is_empty());
+        assert!(read_only.mark_settled_elsewhere("x", 1).is_err(), "a read-only handle cannot write");
+        drop(read_only);
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute("UPDATE seller_meta SET value = '3' WHERE key = 'schema_version'", [])
+                .expect("age");
+        }
+        let error = SellerStore::open_read_only(&path).err().expect("older store refused");
+        assert!(error.0.contains("older than this binary"), "{error:?}");
+        let conn = Connection::open(&path).expect("open");
+        let version: String = conn
+            .query_row("SELECT value FROM seller_meta WHERE key = 'schema_version'", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, "3");
         let _ = std::fs::remove_file(&path);
     }
 
