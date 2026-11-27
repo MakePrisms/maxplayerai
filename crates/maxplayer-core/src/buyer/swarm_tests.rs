@@ -457,6 +457,61 @@ async fn expired_task_frees_its_seller() {
     assert_eq!(task(&e, b).seller, Some(fx.seller(0)));
 }
 
+/// An expired task stops holding its seller as soon as the seller's own beat, sent after the
+/// deadline, shows its seat free; a beat showing the seat taken keeps the full grace.
+#[tokio::test]
+async fn an_idle_beat_after_the_deadline_frees_the_seller_before_the_grace() {
+    let fx = Fx::math(1, 10, 10_000, "public");
+    *fx.stub.seats.lock().unwrap() = Some((1, 1));
+    let e = fx.engine(false);
+    let a = fx.queue(&e, "math-1", "a", false);
+    let b = fx.queue(&e, "math-1", "b", false);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(
+        (task(&e, a).state.as_str(), task(&e, b).state.as_str()),
+        ("posted", "queued")
+    );
+    let deadline = task(&e, a).deadline_unix.unwrap();
+    // Before the deadline an idle-looking beat proves nothing: one task per swarm per seller.
+    fx.at(deadline - 1);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(task(&e, b).state, "queued", "not before the deadline");
+    // After it, a beat that shows the seat taken: the seller may still run `a`.
+    *fx.stub.seats.lock().unwrap() = Some((1, 0));
+    fx.at(deadline + 60);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(task(&e, b).state, "queued", "a busy seat keeps the grace");
+    // The seat is free in a beat sent after the deadline: `b` goes out, `a` stays collectable.
+    *fx.stub.seats.lock().unwrap() = Some((1, 1));
+    fx.at(deadline + 120);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(task(&e, b).state, "posted", "freed by the idle beat");
+    assert_eq!(task(&e, b).seller, Some(fx.seller(0)));
+    assert_eq!(task(&e, a).state, "posted", "a late delivery is still collected");
+    assert_eq!(fx.stub.posts().len(), 2);
+}
+
+/// A seller with several seats is freed only when all of them are free: one free seat of two may
+/// sit next to the one still running the expired task.
+#[tokio::test]
+async fn one_free_seat_of_several_does_not_free_an_expired_task() {
+    let fx = Fx::math(1, 10, 10_000, "public");
+    *fx.stub.seats.lock().unwrap() = Some((2, 2));
+    let e = fx.engine(false);
+    let a = fx.queue(&e, "math-1", "a", false);
+    let b = fx.queue(&e, "math-1", "b", false);
+    e.tick(&fx.stub).await.unwrap();
+    let deadline = task(&e, a).deadline_unix.unwrap();
+    *fx.stub.seats.lock().unwrap() = Some((2, 1));
+    fx.at(deadline + 60);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(task(&e, b).state, "queued", "one of two seats free");
+    *fx.stub.seats.lock().unwrap() = Some((2, 2));
+    fx.at(deadline + 120);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(task(&e, b).state, "posted", "both seats free");
+}
+
 /// §1.14 (Josip 18 Nov): a member of two of this buyer's swarms runs one task at a time across
 /// both, never one from each at once; the next goes out once the running one is collected.
 #[tokio::test]

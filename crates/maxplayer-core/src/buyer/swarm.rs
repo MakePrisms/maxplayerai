@@ -158,6 +158,23 @@ pub(crate) fn seats_left(hb: &ParsedHeartbeat, beat_at: u64, running: &[&TaskRow
     )
 }
 
+/// Is `t`, past its deadline, no longer running on its seller? Yes when the seller's beat was sent
+/// after the deadline and states every seat free: a seat still executing `t` would count it as
+/// taken. Without such a beat (none since the deadline, a busy seat, or a beat stating no seats)
+/// the seller stays busy until deadline + [`EXPIRED_GRACE_SECS`], the latest its container can run.
+/// One free seat of several is not enough: the others may still be running `t`.
+pub(crate) fn idle_since_deadline(
+    t: &TaskRow,
+    hb: Option<&ParsedHeartbeat>,
+    beat_at: u64,
+    now: u64,
+) -> bool {
+    let (Some(deadline), Some(seats)) = (t.deadline_unix, hb.and_then(|h| h.slots)) else {
+        return false;
+    };
+    now > deadline && beat_at > deadline && seats.total > 0 && seats.free >= seats.total
+}
+
 /// The heartbeat shows a seat that can take work now.
 fn ready(hb: &ParsedHeartbeat) -> bool {
     hb.accepting && hb.serving_state != ServingState::NotServing
@@ -853,6 +870,19 @@ impl Engine {
             .map_err(es)?
             .into_iter()
             .filter(|t| t.state == "posted" && t.seller.is_some())
+            .collect();
+        // A task past its deadline stops holding its seller once the seller's own beat, sent after
+        // that deadline, shows every seat free ([`idle_since_deadline`]). It stays `posted` (a late
+        // delivery is still collected) but no longer blocks the next task for the rest of the grace.
+        let running: Vec<TaskRow> = running
+            .into_iter()
+            .filter(|t| {
+                let Some(seller) = t.seller.as_deref() else {
+                    return true;
+                };
+                let beat_at = world.beat_at.get(seller).copied().unwrap_or(0);
+                !idle_since_deadline(t, world.heartbeats.get(seller), beat_at, now)
+            })
             .collect();
         // (swarm, seller) pairs with a running task.
         let mut in_swarm: BTreeSet<(String, String)> = running
