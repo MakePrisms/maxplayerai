@@ -158,15 +158,18 @@ pub(crate) fn seats_left(hb: &ParsedHeartbeat, beat_at: u64, running: &[&TaskRow
     )
 }
 
-/// How far a seller's clock may run ahead of the buyer's before [`idle_since_deadline`] trusts its
-/// beat. A beat's time is the seller's `created_at`; the deadline is the buyer's clock.
+/// How far ahead of the buyer's clock a beat's `created_at` (the seller's clock) may be before
+/// [`idle_since_deadline`] stops trusting it.
 pub(crate) const BEAT_SKEW_SECS: u64 = 60;
 
-/// Is `t`, past its deadline, no longer running on its seller? Yes when the seller's beat was sent
-/// more than [`BEAT_SKEW_SECS`] after the deadline (and not more than that ahead of the buyer's
-/// clock) and states every seat free: a seat still executing `t` would count it as taken. Without
-/// such a beat (none since the deadline, a busy seat, or a beat stating no seats) the seller stays
-/// busy until deadline + [`EXPIRED_GRACE_SECS`], the latest its container can run. One free seat of
+/// Is `t`, past its deadline, no longer running on its seller? Yes when the buyer's clock is past
+/// the deadline, the seller's beat was sent after it (and is not more than [`BEAT_SKEW_SECS`] ahead
+/// of the buyer's clock), and the beat states every seat free: a seat still executing `t` would
+/// count it as taken. The seller reads its seats when it builds the beat, and its own deadline
+/// gates use the same clock as `created_at`, so the seat-freed beat it sends a few seconds after
+/// the deadline already counts (the next one may be a full heartbeat interval later). Without such
+/// a beat (none since the deadline, a busy seat, or a beat stating no seats) the seller stays busy
+/// until deadline + [`EXPIRED_GRACE_SECS`], the latest its container can run. One free seat of
 /// several is not enough: the others may still be running `t`.
 ///
 /// A session turn always keeps the grace: the seller's next task would ride the same session, and
@@ -186,7 +189,7 @@ pub(crate) fn idle_since_deadline(
         return false;
     };
     now > deadline
-        && beat_at > deadline.saturating_add(BEAT_SKEW_SECS)
+        && beat_at > deadline
         && beat_at <= now.saturating_add(BEAT_SKEW_SECS)
         && seats.total > 0
         && seats.free >= seats.total
@@ -493,7 +496,10 @@ impl Engine {
         let stored = self.store.swarm_session(&t.job, seller).map_err(es)?;
         // Only the session this turn rode, and only while no later turn of it is running: a failed
         // old turn must not mark a newer session (or one already carrying the next turn) dead.
-        if stored.as_ref().is_some_and(|s| s.job_id != *job_id) {
+        // Nor a turn the session already got past (a later turn settled, `last_turn` moved on).
+        if stored.as_ref().is_some_and(|s| {
+            s.job_id != *job_id || t.turn.is_some_and(|n| n <= s.last_turn)
+        }) {
             return Ok(());
         }
         let later_running = self.store.swarm_tasks(&t.job).map_err(es)?.iter().any(|x| {

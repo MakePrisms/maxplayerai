@@ -494,11 +494,10 @@ async fn an_idle_beat_after_the_deadline_frees_the_seller_before_the_grace() {
     assert_eq!(fx.stub.posts().len(), 2);
 }
 
-/// The idle beat must be the seller's, sent more than [`BEAT_SKEW_SECS`] after the deadline and not
-/// from the future: a beat stamped at or just after the deadline may have been built before the
-/// seller took the task (debounced beats, a seller clock running ahead).
+/// The idle beat must come after the buyer's deadline on both clocks and not from more than
+/// [`BEAT_SKEW_SECS`] in the future; the upper bound is inclusive.
 #[tokio::test]
-async fn an_idle_beat_near_the_deadline_or_from_the_future_does_not_free_the_seller() {
+async fn an_idle_beat_at_the_deadline_or_from_the_future_does_not_free_the_seller() {
     let fx = Fx::math(1, 10, 10_000, "public");
     *fx.stub.seats.lock().unwrap() = Some((1, 1));
     let e = fx.engine(false);
@@ -507,27 +506,29 @@ async fn an_idle_beat_near_the_deadline_or_from_the_future_does_not_free_the_sel
     e.tick(&fx.stub).await.unwrap();
     let deadline = task(&e, a).deadline_unix.unwrap();
     let queued = |why: &str| assert_eq!(task(&e, b).state, "queued", "{why}");
-    // At the deadline itself, with a beat in step.
+    let beat = |at: u64| *fx.stub.beat_at.lock().unwrap() = Some(at);
+    // The seller's clock is past the deadline, the buyer's is not yet.
     fx.at(deadline);
+    beat(deadline + 1);
     e.tick(&fx.stub).await.unwrap();
-    queued("now == deadline");
-    fx.at(deadline + 300);
+    queued("buyer's clock at the deadline");
+    let now = deadline + 300;
+    fx.at(now);
     for (at, why) in [
         (deadline, "beat at the deadline"),
-        (deadline + BEAT_SKEW_SECS, "beat within the skew after the deadline"),
-        (deadline + 300 + BEAT_SKEW_SECS + 1, "beat from the future"),
+        (now + BEAT_SKEW_SECS + 1, "beat from the future"),
     ] {
-        *fx.stub.beat_at.lock().unwrap() = Some(at);
+        beat(at);
         e.tick(&fx.stub).await.unwrap();
         queued(why);
     }
-    *fx.stub.beat_at.lock().unwrap() = Some(deadline + BEAT_SKEW_SECS + 1);
+    beat(now + BEAT_SKEW_SECS);
     e.tick(&fx.stub).await.unwrap();
-    assert_eq!(task(&e, b).state, "posted", "first beat past deadline + skew");
+    assert_eq!(task(&e, b).state, "posted", "a beat at the skew bound is trusted");
     // `a` delivers late, after `b` went out: collected once, `b` untouched.
     let job_a = task(&e, a).job_id.unwrap();
     fx.stub.deliver(&job_a);
-    fx.at(deadline + 400);
+    fx.at(now + 100);
     *fx.stub.beat_at.lock().unwrap() = None;
     e.tick(&fx.stub).await.unwrap();
     e.tick(&fx.stub).await.unwrap();
@@ -537,6 +538,23 @@ async fn an_idle_beat_near_the_deadline_or_from_the_future_does_not_free_the_sel
     assert!(holds_budget(&ta), "a collected late task still counts against the budget");
     assert_eq!(task(&e, b).state, "posted");
     assert_eq!(fx.stub.posts().len(), 2, "no third post");
+}
+
+/// The seller's seat-freed beat comes 5-20 s after the deadline (drain tick + debounce) and the
+/// next one only a heartbeat interval (300 s) later: that first beat must count.
+#[tokio::test]
+async fn the_debounced_seat_freed_beat_just_after_the_deadline_frees_the_seller() {
+    let fx = Fx::math(1, 10, 10_000, "public");
+    *fx.stub.seats.lock().unwrap() = Some((1, 1));
+    let e = fx.engine(false);
+    let a = fx.queue(&e, "math-1", "a", false);
+    let b = fx.queue(&e, "math-1", "b", false);
+    e.tick(&fx.stub).await.unwrap();
+    let deadline = task(&e, a).deadline_unix.unwrap();
+    *fx.stub.beat_at.lock().unwrap() = Some(deadline + 15);
+    fx.at(deadline + 20);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(task(&e, b).state, "posted");
 }
 
 /// An expired session turn keeps its seller for the whole grace even with an idle beat: the next
@@ -554,14 +572,14 @@ async fn an_expired_session_turn_keeps_its_seller_and_its_late_delivery_is_colle
     let c = fx.queue(&e, "math-1", "c", false);
     *fx.stub.seats.lock().unwrap() = Some((1, 1));
     let deadline = tb.deadline_unix.unwrap();
-    fx.at(deadline + BEAT_SKEW_SECS + 120);
+    fx.at(deadline + 120);
     e.tick(&fx.stub).await.unwrap();
     assert_eq!(task(&e, c).state, "queued", "an expired turn is not freed early");
     assert_eq!(fx.stub.replies.lock().unwrap().len(), 1, "no turn 3 yet");
     assert_eq!(task(&e, b).state, "posted");
     // The turn delivers late: collected, the session stays open and `c` rides it as turn 3.
     fx.stub.deliver_turn(tb.followup_id.as_deref().unwrap());
-    fx.at(deadline + BEAT_SKEW_SECS + 180);
+    fx.at(deadline + 180);
     e.tick(&fx.stub).await.unwrap();
     e.tick(&fx.stub).await.unwrap();
     assert_eq!(task(&e, b).state, "collected");
@@ -600,7 +618,14 @@ async fn a_failed_turn_does_not_kill_another_or_a_newer_session() {
     };
     e.session_dead(&other, T0 + 200).unwrap();
     assert_eq!(state(), "open", "another session's turn");
-    // An earlier turn of this session failing while turn 2 runs.
+    // An earlier turn of this session failing while turn 2 runs. `last_turn` is set back to 0 so
+    // only the later-turn guard (not the settled-turn one) stands between it and the kill.
+    let set_last = |n: u32| {
+        e.store
+            .put_swarm_session("math-1", &fx.seller(0), &job_a, n, "open", T0 + 200)
+            .unwrap()
+    };
+    set_last(0);
     let earlier = TaskRow {
         id: tb.id + 1001,
         turn: Some(1),
@@ -608,10 +633,17 @@ async fn a_failed_turn_does_not_kill_another_or_a_newer_session() {
     };
     e.session_dead(&earlier, T0 + 200).unwrap();
     assert_eq!(state(), "open", "a later turn is running");
+    set_last(1);
     // Turn 2 itself failing does kill it.
     e.session_dead(&tb, T0 + 200).unwrap();
     assert_eq!(state(), "dead");
     assert_eq!(tb.session_job_id.as_deref(), Some(job_a.as_str()));
+    // A turn the session already got past (turn 2 settled, last_turn 2) failing late does not.
+    e.store
+        .put_swarm_session("math-1", &fx.seller(0), &job_a, 2, "open", T0 + 300)
+        .unwrap();
+    e.session_dead(&tb, T0 + 300).unwrap();
+    assert_eq!(state(), "open", "a settled turn failing late");
 }
 
 /// A seller with several seats is freed only when all of them are free: one free seat of two may
