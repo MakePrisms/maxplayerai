@@ -653,9 +653,110 @@ mv "$d/answers/.$k.tmp" "$d/answers/$k.txt"
         assert_eq!(code, SUCCESS, "out:\n{out}\nerr:\n{err}");
         assert!(out.contains("spool answer turn 1"), "{out}");
         assert!(out.contains("spool answer turn 2"), "{out}");
-        let left: Vec<_> = walk(&spool);
-        assert!(left.is_empty(), "close emptied the job's spool files: {left:?}");
+        // Nothing is left waiting: both turns were answered, none expired. (A single-turn job gets
+        // no `close`, so its answer stays until the weekly sweep on `ping`.)
+        let waiting: Vec<_> = walk(&spool.join("pending"))
+            .into_iter()
+            .chain(walk(&spool.join("expired")))
+            .collect();
+        assert!(waiting.is_empty(), "no request left pending or expired: {waiting:?}");
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// One direct call of `spool-file.sh` with `event` on stdin: (exit code, stdout, stderr).
+    fn spool_call(spool: &Path, env: &[(&str, String)], event: &serde_json::Value) -> (i32, String, String) {
+        use std::io::Write as _;
+        let script = examples_dir().join("spool-file.sh").canonicalize().unwrap();
+        let mut command = std::process::Command::new(script);
+        command
+            .env("MAXPLAYER_SPOOL_DIR", spool)
+            .env("MAXPLAYER_SPOOL_POLL_SECS", "0.1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn executable(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(
+            path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    /// A notify command that fails is retried until it succeeds; a retried turn whose request is
+    /// still pending (a daemon restart) notifies again; a session turn can answer `needs_input`;
+    /// and `MAXPLAYER_SPOOL_READY` decides `ping`.
+    #[test]
+    fn the_spool_file_adapter_retries_notify_and_resumes_after_a_restart() {
+        let tmp = scratch("spool-retry");
+        let spool = tmp.join("spool");
+        let calls = tmp.join("calls");
+        let notify = tmp.join("notify");
+        // Fails the first two calls, then answers for the agent.
+        executable(
+            &notify,
+            &format!(
+                r#"#!/bin/sh
+n=$(($(cat '{calls}' 2>/dev/null || echo 0) + 1)); echo $n > '{calls}'
+[ "$n" -lt 3 ] && exit 7
+f="$1"; d=$(dirname "$(dirname "$f")"); k=$(basename "$f" .json)
+echo "answered on call $n" > "$d/answers/.$k.tmp" && mv "$d/answers/.$k.tmp" "$d/answers/$k.txt"
+"#,
+                calls = calls.display()
+            ),
+        );
+        let job = "ab".repeat(32);
+        let deadline = now_unix() + 60;
+        let event = |turn: u32, session: bool| {
+            serde_json::json!({"v": 1, "event": "job", "job_id": job, "turn": turn, "session": session,
+                "prompt": "p", "answer_max_bytes": 100, "deadline_unix": deadline})
+        };
+        let env = [
+            ("MAXPLAYER_SPOOL_NOTIFY", notify.display().to_string()),
+            ("MAXPLAYER_SPOOL_NOTIFY_RETRY_SECS", "1".to_owned()),
+        ];
+        let (code, out, err) = spool_call(&spool, &env, &event(1, false));
+        assert_eq!(code, 0, "{err}");
+        let answer = |out: &str| serde_json::from_str::<serde_json::Value>(out.trim()).unwrap();
+        assert_eq!(answer(&out), serde_json::json!({"status": "done", "answer": "answered on call 3\n"}), "{err}");
+        assert_eq!(err.matches("notify failed").count(), 2, "{err}");
+
+        // A restart: turn 2's request is already pending from the earlier attempt, unanswered.
+        std::fs::write(spool.join("pending").join(format!("{job}-2.json")), "{}").unwrap();
+        let (code, out, err) = spool_call(&spool, &env, &event(2, true));
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(
+            answer(&out),
+            serde_json::json!({"status": "done", "answer": "answered on call 4\n"}),
+            "the pending request was notified again: {err}"
+        );
+
+        // A session turn the agent answers with needs_input.
+        std::fs::write(spool.join("answers").join(format!("{job}-3.needs_input")), "which file?").unwrap();
+        let (code, out, _) = spool_call(&spool, &[], &event(3, true));
+        assert_eq!(code, 0);
+        assert_eq!(answer(&out), serde_json::json!({"status": "needs_input", "answer": "which file?"}));
+
+        let ping = serde_json::json!({"v": 1, "event": "ping", "reason": "boot"});
+        let (code, _, err) = spool_call(&spool, &[("MAXPLAYER_SPOOL_READY", "/bin/false".to_owned())], &ping);
+        assert_eq!(code, 1, "a failing readiness check fails the ping: {err}");
+        assert!(err.contains("readiness check failed"), "{err}");
+        let (code, _, _) = spool_call(&spool, &[("MAXPLAYER_SPOOL_READY", "/bin/true".to_owned())], &ping);
+        assert_eq!(code, 0);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -131,11 +131,13 @@ In the repository under [`examples/hooks/`](https://github.com/MakePrisms/maxpla
 - **`spool-file.sh`**: for an agent that answers from a scheduled run or a webhook instead of on
   demand (Instinct, Grok Bot routines, Muse, Dots, or anything that can read and write a folder).
   Each turn becomes `pending/<job_id>-<turn>.json` in a spool folder; your agent writes
-  `answers/<job_id>-<turn>.txt` in one go (temporary file, then rename) or a `.decline` file with a
-  reason. The script waits for it, refuses an answer over `answer_max_bytes` (and says so in
+  `answers/<job_id>-<turn>.txt` in one go (temporary file, then rename), `.needs_input` or
+  `.out_of_time` on a session turn, or a `.decline` file with a reason. The script waits for it, refuses an answer over `answer_max_bytes` (and says so in
   `pending/<key>.error`), and declines without a strike a few seconds before `deadline_unix`.
   `MAXPLAYER_SPOOL_NOTIFY` can name a command that wakes your agent (a webhook call) as soon as a
-  request is written. Needs bash and jq.
+  request is written; a failed call is retried, and a request still waiting after a daemon restart
+  is notified again. `MAXPLAYER_SPOOL_READY` can name a check `ping` runs, so a ping proves your
+  agent answers. Needs bash and jq.
 
 An HTTP agent is reached the same way: a small command that posts the job to your endpoint and
 prints the reply as the answer object.
