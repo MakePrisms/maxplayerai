@@ -56,13 +56,6 @@ struct Check {
     /// it exists only in builds that carry that gate — a buyer-only (wallet, no-acp) build has none.
     #[cfg(any(feature = "acp", test))]
     transient: bool,
-    /// KIND of the check this result came from, distinct from both outcome SEVERITY (`status`) and
-    /// fault CLASS (`transient`): `true` for an ENVIRONMENT requirement — a check that asks "can
-    /// this box EVER do the work" (nix, #745) — which `--skip-doctor` never bypasses; `false` for a
-    /// READINESS check — "is this box ready RIGHT NOW" — which the blanket bypass may skip. Read
-    /// only by the boot gate's refusal message, so it is cfg-gated exactly like `transient`.
-    #[cfg(any(feature = "acp", test))]
-    skip_doctor_exempt: bool,
 }
 
 impl Check {
@@ -76,10 +69,6 @@ impl Check {
             // opt into transient via `fail_transient`, so every other blocking Fail refuses at once.
             #[cfg(any(feature = "acp", test))]
             transient: false,
-            // Default kind is READINESS: only the nix check opts into the environment kind via
-            // `fail_environment`, so every other blocking Fail stays --skip-doctor-bypassable.
-            #[cfg(any(feature = "acp", test))]
-            skip_doctor_exempt: false,
         }
     }
 
@@ -115,21 +104,6 @@ impl Check {
         let check = Self::fail(name, detail, hint);
         #[cfg(any(feature = "acp", test))]
         let check = Self { transient: true, ..check };
-        check
-    }
-
-    /// A blocking failure of an ENVIRONMENT requirement (#745): a check that asks "can this box
-    /// EVER do the work", where every readiness check asks "is this box ready RIGHT NOW". A
-    /// different KIND, and the difference is load-bearing twice over: the failure is unrecoverable
-    /// (no retry, no sleep — `transient` stays `false`), and `--skip-doctor` does NOT bypass it —
-    /// #745 rules out any escape hatch, and a blanket bypass that swept this up would be that
-    /// escape hatch wearing an existing flag. Renders identically to [`Check::fail`]; in a
-    /// buyer-only (wallet, no-acp) build there is no gate and no marker, so this collapses to
-    /// `fail` — same shape as [`Check::fail_transient`].
-    fn fail_environment(name: &str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
-        let check = Self::fail(name, detail, hint);
-        #[cfg(any(feature = "acp", test))]
-        let check = Self { skip_doctor_exempt: true, ..check };
         check
     }
 
@@ -265,37 +239,10 @@ fn run_readiness_with_retry(
         for failure in &failures {
             let _ = writeln!(err, "  {}", failure.render());
         }
-        // The bypass epilogue is per-KIND (#745). A readiness failure may be bypassed with
-        // --skip-doctor; an environment failure (nix) may not, and the refusal says WHY the kinds
-        // differ so the asymmetry reads as the design it is, not as an inconsistency for a later
-        // edit to "fix" by sweeping the environment check back into the blanket bypass.
-        let exempt: Vec<&str> = failures
-            .iter()
-            .filter(|c| c.skip_doctor_exempt)
-            .map(|c| c.name.as_str())
-            .collect();
-        if exempt.is_empty() {
-            let _ = writeln!(
-                err,
-                "resolve the item(s) above, then re-run `maxplayer seller serve`. To bypass these checks (NOT recommended), pass --skip-doctor."
-            );
-        } else {
-            let names = exempt.join(", ");
-            let _ = writeln!(
-                err,
-                "resolve the item(s) above, then re-run `maxplayer seller serve`."
-            );
-            if failures.len() > exempt.len() {
-                let _ = writeln!(
-                    err,
-                    "--skip-doctor can bypass the readiness failure(s) (NOT recommended) — but not {names}."
-                );
-            }
-            let _ = writeln!(
-                err,
-                "{names} is not bypassable — not by --skip-doctor, not by any flag (#745): a readiness check asks whether this box is ready RIGHT NOW; {names} asks whether it can EVER do the work — a different kind of requirement, with no warn-and-serve mode and no escape hatch."
-            );
-        }
+        let _ = writeln!(
+            err,
+            "resolve the item(s) above, then re-run `maxplayer seller serve`. To bypass these checks (NOT recommended), pass --skip-doctor."
+        );
         return Err(());
     }
 }
@@ -352,16 +299,17 @@ mod checks {
     const DETERMINATE_NIX_INSTALL: &str =
         "curl -fsSL https://install.determinate.systems/nix | sh -s -- install";
 
-    /// #745: a working nix, or `maxplayer seller` refuses to boot. This is an ENVIRONMENT
-    /// requirement — every other check in the registry asks "is this box ready RIGHT NOW"
-    /// (transient, operator-overridable); this one asks "can this box EVER do the work". A
-    /// different KIND, hence [`Check::fail_environment`]: the failure is unrecoverable (a re-run
-    /// cannot install nix, so the gate refuses immediately — no retry, no sleep) and it survives
-    /// `--skip-doctor` — a nix-less seat serving the pool is exactly the state the requirement
-    /// exists to prevent, so a blanket bypass that swept this check up would be #745's ruled-out
-    /// escape hatch wearing an existing flag. If an operator override is ever wanted it must be
-    /// its own explicitly named flag (the `--unsafe-no-sandbox` precedent, which waives exactly
-    /// one check by name); we deliberately ship none.
+    /// Whether nix works on this host. ADVISORY ONLY: it never FAILs, so it never blocks
+    /// `maxplayer seller serve` or fails `maxplayer doctor`. #745 once made it a boot gate because
+    /// buyer-declared checks environments (`.maxplayer/checks.toml`) were provisioned with
+    /// `nix develop` on the seller host. Production no longer provisions one at all — host delivery
+    /// refuses it (`checks_env_refused_on_host`) and container delivery never reads it — so a host
+    /// nix is not needed to sell. What nix still buys a seat is tooling: the seller measures, at boot,
+    /// whether nix works IN THE JOB ENVIRONMENT (the host for a seat with no `[sandbox]`, the
+    /// container otherwise) and only then tells the job's agent to get toolchains through it. This
+    /// row reports the host side of that, so on a seat with no `[sandbox]` a missing nix is a WARN with
+    /// the optional remedy. A seat with a `[sandbox]` never runs this probe: its row is a SKIP (see
+    /// `sandboxed_nix`), because the host nix is not where its jobs run.
     ///
     /// The probe EXECUTES `nix --version` rather than looking nix up on PATH — a resolvable but
     /// broken shim must not pass (same reason install.sh's probe runs it). When PATH fails, the
@@ -377,10 +325,11 @@ mod checks {
 
     /// Pure verdict over the two probe legs — the testable core of [`check_nix`]. `on_path` is
     /// "`nix --version` ran from this process's PATH"; `off_path` is a runnable nix found at a
-    /// well-known install location despite that. Either failure carries BOTH remedies — the
-    /// Determinate one-liner AND the PATH-skew fix — because a refusing gate cannot always tell an
-    /// uninstalled box from a skewed one; when it CAN (the off-path leg found a runnable nix) the
-    /// message leads with "installed, do NOT reinstall" so the box is never misread as uninstalled.
+    /// well-known install location despite that. Never a FAIL: either miss is a WARN that says nix
+    /// is optional and carries BOTH remedies — the Determinate one-liner AND the PATH-skew fix —
+    /// because the probe cannot always tell an uninstalled box from a skewed one; when it CAN (the
+    /// off-path leg found a runnable nix) the message leads with "installed, do NOT reinstall" so
+    /// the box is never misread as uninstalled.
     pub(super) fn fold_nix(on_path: bool, off_path: Option<std::path::PathBuf>) -> Check {
         if on_path {
             return Check::pass(
@@ -394,7 +343,7 @@ mod checks {
                     .parent()
                     .map(|dir| dir.display().to_string())
                     .unwrap_or_else(|| "/nix/var/nix/profiles/default/bin".to_owned());
-                Check::fail_environment(
+                Check::warn(
                     NIX_CHECK,
                     format!(
                         "nix IS installed ({} runs) but `nix` is absent from this process's PATH — \
@@ -404,21 +353,20 @@ mod checks {
                         nix.display()
                     ),
                     format!(
-                        "do NOT reinstall — put the nix bin dir on the service PATH: `systemctl edit <unit>` \
+                        "{NIX_OPTIONAL}. To use it here, do NOT reinstall — put the nix bin dir on the service PATH: `systemctl edit <unit>` \
                          and add `[Service]` `Environment=\"PATH={bin_dir}:/usr/local/bin:/usr/bin:/bin\"`, \
                          then restart the unit (only a box with no nix at all would instead need the \
                          installer: `{DETERMINATE_NIX_INSTALL}`)"
                     ),
                 )
             }
-            None => Check::fail_environment(
+            None => Check::warn(
                 NIX_CHECK,
                 "no working nix: `nix --version` did not run from PATH, and no runnable nix was \
                  found at the well-known install locations (/nix/var/nix/profiles/default/bin, \
-                 /run/current-system/sw/bin, ~/.nix-profile/bin) — a box without nix can never do \
-                 the work, so the seller must not serve the pool from it",
+                 /run/current-system/sw/bin, ~/.nix-profile/bin)",
                 format!(
-                    "install nix: `{DETERMINATE_NIX_INSTALL}` — or, if nix already works in your \
+                    "{NIX_OPTIONAL}. To add it: `{DETERMINATE_NIX_INSTALL}` — or, if nix already works in your \
                      login shell, this is the PATH-skew case (a systemd unit does not source a \
                      login shell, so the login-shell PATH never reaches the service environment): \
                      add the nix bin dir to the unit's PATH, e.g. `systemctl edit <unit>` with \
@@ -428,13 +376,16 @@ mod checks {
         }
     }
 
-    /// The nix verdict for a home with no `[seller]` section, as `maxplayer doctor` reports it. Nix
-    /// is a seller requirement (#745), so for a home that only buys a missing nix is NOT APPLICABLE:
-    /// a passing probe stays PASS (it is real evidence), and either failing variant becomes SKIP so
-    /// a buyer's doctor run does not exit 1 over something buying never uses. The gate's own detail
-    /// and remedy are kept verbatim, so the PATH-skew case still reads "nix IS installed … do NOT
-    /// reinstall" rather than being flattened into "install nix". Only the doctor report calls this;
-    /// the boot gate keeps the FAIL.
+    /// What a missing nix means for a seat. Shared by the seller WARN rows and the buyer SKIP note.
+    const NIX_OPTIONAL: &str = "optional: when nix works where jobs run (this host, for a seat with \
+         no [sandbox]), the job prompt tells agents to get toolchains through it (`nix shell`, or \
+         `nix develop` for a project flake)";
+
+    /// The nix verdict for a home with no `[seller]` section, as `maxplayer doctor` reports it.
+    /// Buying never uses nix, so for a home that only buys a missing nix is NOT APPLICABLE: a
+    /// passing probe stays PASS (it is real evidence), and either WARN variant becomes SKIP. The
+    /// seller row's own detail and remedy are kept verbatim, so the PATH-skew case still reads
+    /// "nix IS installed … do NOT reinstall" rather than being flattened into "install nix".
     pub(super) fn nix_for_buyer_home(check: Check) -> Check {
         if check.status == super::Status::Pass {
             return check;
@@ -444,8 +395,8 @@ mod checks {
             NIX_CHECK,
             format!("not needed to buy, and this home has no [seller] section — {}", check.detail),
             format!(
-                "nix is a seller requirement (#745), and buying never uses it; `maxplayer seller serve` \
-                 refuses to start without it, so before selling: {remedy}"
+                "buying never uses nix, and `maxplayer seller serve` starts without it; for selling it is \
+                 {remedy}"
             ),
         )
     }
@@ -2660,7 +2611,7 @@ mod checks {
 fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "Usage:\n  maxplayer doctor [--home <dir>] [--offline]   # seller environment self-check (nix — FAILs only on a home with a [seller] section, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions, maxplayer version, maxplayer-mint version; --offline skips the GitHub latest-release check of the maxplayer version row)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed\n{}",
+        "Usage:\n  maxplayer doctor [--home <dir>] [--offline]   # seller environment self-check (nix — optional, never FAILs, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions, maxplayer version, maxplayer-mint version; --offline skips the GitHub latest-release check of the maxplayer version row)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed\n{}",
         crate::skill::docs_pointer_line()
     );
 }
@@ -2759,9 +2710,9 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
 /// duplicated. The seller key is read once only to probe NIP-42 relay auth; it is NEVER placed in
 /// any Check detail.
 ///
-/// This is the GATE's registry: nix is always a blocking environment check here, whatever the
-/// home's role. `maxplayer doctor` reads [`build_report_checks`], which differs only in how it
-/// reports nix on a home with no `[seller]`.
+/// This is the GATE's registry. Its nix row is advisory (PASS or WARN; SKIP on a hook-only seat or
+/// a seat with a `[sandbox]` section) and never blocks. `maxplayer doctor` reads [`build_report_checks`], which differs only in how
+/// it reports nix on a home with no `[seller]`.
 // Gate-only (plus tests): `maxplayer doctor` reads `build_report_checks`, so a buyer-only build
 // (wallet, no acp) has no caller.
 #[cfg(all(feature = "wallet", any(feature = "acp", test)))]
@@ -2769,42 +2720,61 @@ fn build_checks(
     home: &maxplayer_core::home::MaxplayerHome,
     unsafe_no_sandbox: bool,
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
-    build_checks_with_environment(home, unsafe_no_sandbox, environment_checks_for(home))
+    build_checks_with_nix_probe(home, unsafe_no_sandbox, real_nix_probe())
 }
 
-/// [`build_environment_checks`], or a SKIP row on a hook-only seat (see [`hook_only_seat`]).
+/// [`build_checks`] with the nix probe injected, so a test can drive the gate's real registry
+/// with a missing nix on a box where nix works.
 #[cfg(all(feature = "wallet", any(feature = "acp", test)))]
-fn environment_checks_for(home: &maxplayer_core::home::MaxplayerHome) -> Vec<Box<dyn FnOnce() -> Check>> {
+fn build_checks_with_nix_probe(
+    home: &maxplayer_core::home::MaxplayerHome,
+    unsafe_no_sandbox: bool,
+    nix_probe: impl FnOnce() -> Check + 'static,
+) -> Vec<Box<dyn FnOnce() -> Check>> {
+    build_checks_with_environment(
+        home,
+        unsafe_no_sandbox,
+        environment_checks_for(home, nix_probe),
+    )
+}
+
+/// A seller seat's nix row, shared by the boot gate and `maxplayer doctor` so the two cannot drift: a
+/// SKIP row on a hook-only seat (see [`hook_only_seat`]) and on a seat with a `[sandbox]` section
+/// (see [`sandboxed_nix`]), otherwise the probe's own advisory verdict. The probe is not run for
+/// either SKIP.
+#[cfg(feature = "wallet")]
+fn environment_checks_for(
+    home: &maxplayer_core::home::MaxplayerHome,
+    nix_probe: impl FnOnce() -> Check + 'static,
+) -> Vec<Box<dyn FnOnce() -> Check>> {
     if hook_only_seat(home) {
         vec![Box::new(hook_only_nix)]
+    } else if home.config.sandbox.is_some() {
+        vec![Box::new(sandboxed_nix)]
     } else {
-        build_environment_checks()
+        vec![Box::new(nix_probe)]
     }
 }
 
-/// The registry `maxplayer doctor` reports. Nix is a SELLER requirement (#723/#745: "every buyer
-/// path must never require nix"), so on a home with no `[seller]` section a missing nix is reported
-/// as not applicable instead of failing the exit — a buyer running doctor must not be told the box
-/// is broken. A home that has a `[seller]` gets exactly the gate's registry. The boot gate never
-/// reads this: `maxplayer seller` writes `[seller]` before the gate runs, and the gate builds from
-/// [`build_checks`], so a nix-less seat is still refused at boot.
+/// The registry `maxplayer doctor` reports. Buying never uses nix (#723: "every buyer path must
+/// never require nix"), so on a home with no `[seller]` section a missing nix is reported as not
+/// applicable rather than as a seller's WARN. A home that has a `[seller]` gets exactly the gate's
+/// registry, whose nix row is advisory too.
 ///
 /// `nix_probe` is the nix verdict as the boot gate would see it ([`checks::check_nix`] in
-/// production). It is a parameter so the doctor path can be tested end to end with a failing probe
+/// production). It is a parameter so the doctor path can be tested end to end with a missing nix
 /// on any box, including one where nix works.
 #[cfg(feature = "wallet")]
 fn build_report_checks(
     home: &maxplayer_core::home::MaxplayerHome,
     nix_probe: impl FnOnce() -> Check + 'static,
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
-    // A hook-only seat gets the gate's own SKIP row: `seller serve` boots past a missing nix there,
-    // so the report must not call the same box broken.
+    // A seller home gets the gate's own nix row (SKIP on a hook-only or sandboxed seat), so the
+    // report never calls a box broken that `seller serve` boots on.
     let environment: Vec<Box<dyn FnOnce() -> Check>> = if home.config.seller.is_none() {
         vec![Box::new(move || checks::nix_for_buyer_home(nix_probe()))]
-    } else if hook_only_seat(home) {
-        vec![Box::new(hook_only_nix)]
     } else {
-        vec![Box::new(nix_probe)]
+        environment_checks_for(home, nix_probe)
     };
     // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
     // waive. The containment check is read at its own severity.
@@ -2898,9 +2868,9 @@ fn build_checks_with_environment(
     // carried as None — never guessed as a relative `.claude`.
     let user_home = user_home_dir();
 
-    // Environment requirements (#745) head the ONE registry. The boot gate passes
-    // build_environment_checks; `maxplayer doctor` passes the same nix probe, folded to SKIP on a
-    // home with no [seller] (build_report_checks). Everything below is shared, never a second list.
+    // The advisory nix row heads the ONE registry. The boot gate passes environment_checks_for;
+    // `maxplayer doctor` passes the same nix probe, folded to SKIP on a home with no [seller]
+    // (build_report_checks). Everything below is shared, never a second list.
     let mut checks: Vec<Box<dyn FnOnce() -> Check>> = environment;
     checks.push(Box::new(checks::check_credential_helper));
     checks.push(Box::new(move || checks::check_seller_key(&key_path, key_present)));
@@ -3024,22 +2994,9 @@ fn build_checks_with_environment(
     checks
 }
 
-/// The ENVIRONMENT requirements — checks that ask "can this box EVER do the work" rather than "is
-/// it ready right now" — currently just nix (#745). These head [`build_checks`], the boot gate's
-/// registry; `maxplayer doctor` runs the same probe through [`build_report_checks`], which reports
-/// it as SKIP on a home with no `[seller]`. They are ALSO the entire
-/// registry the boot gate still runs under `--skip-doctor`, because #745 rules out any escape
-/// hatch for them — the blanket bypass narrows the gate to this subset, it never skips it. A
-/// second gate beside [`sell_readiness_gate`] was the rejected alternative: that is the #728
-/// keep-two-things-in-sync defect, committed prospectively.
-#[cfg(all(feature = "wallet", any(feature = "acp", test)))]
-fn build_environment_checks() -> Vec<Box<dyn FnOnce() -> Check>> {
-    vec![Box::new(real_nix_probe())]
-}
-
 /// docs/specs/hook-agents.md §9: every configured `[seller] agents` entry is a `hook` preset, so
 /// nothing of ours runs a job on this box — no sandbox, no nix job environment. Those checks are
-/// then not applicable (an exception to #745 keyed on the resolved roster, not a bypass).
+/// then not applicable (keyed on the resolved roster, not a bypass).
 #[cfg(feature = "wallet")]
 fn hook_only_seat(home: &maxplayer_core::home::MaxplayerHome) -> bool {
     maxplayer_core::seller_agents::hook_only_home(home)
@@ -3055,8 +3012,22 @@ fn hook_only_nix() -> Check {
 const HOOK_ONLY_WHY: &str =
     "hook-only seat: every agent is the seller's own program behind a hook, so no job runs in an environment of ours";
 
-/// The production nix probe: the one [`build_environment_checks`] runs for the gate and
-/// [`run_doctor`] hands to [`build_report_checks`], so the two cannot drift.
+/// The nix row of a seat with a `[sandbox]` section (docker or launcher mode), shared by the boot
+/// gate and `maxplayer doctor`. Every job runs inside the sandbox, so the HOST's nix says nothing
+/// about the job environment: the row is a SKIP whether or not the host has nix, and the host
+/// probe is not run, as on a hook-only seat. Whether nix works where the jobs run is measured by
+/// the seller itself at boot (the seat capability probe, logged as
+/// `seller node job environment nix: …`).
+#[cfg(feature = "wallet")]
+fn sandboxed_nix() -> Check {
+    Check::skip("nix", "not applicable", SANDBOXED_NIX_WHY)
+}
+
+#[cfg(feature = "wallet")]
+const SANDBOXED_NIX_WHY: &str = "jobs run inside [sandbox]; whether nix works there is measured by the seat capability probe at boot";
+
+/// The production nix probe: the one [`build_checks`] runs for the gate and [`run_doctor`] hands
+/// to [`build_report_checks`], so the two cannot drift.
 #[cfg(feature = "wallet")]
 fn real_nix_probe() -> impl FnOnce() -> Check + 'static {
     // The single-user nix profile lives under the operator $HOME (`~/.nix-profile`).
@@ -3139,7 +3110,8 @@ fn run_doctor_with_nix_probe(
 
 /// `maxplayer seller` startup readiness gate (issue #107 — auto-doctor, NOT a first-run wizard). Runs the
 /// same registry as `maxplayer doctor` via [`build_checks`] (doctor differs only in reporting a
-/// missing nix as SKIP on a home with no `[seller]`, see [`build_report_checks`]) and REFUSES to boot when any BLOCKING check
+/// missing nix as SKIP on a home with no `[seller]`, see [`build_report_checks`]; the gate's nix
+/// row is an advisory WARN that never blocks) and REFUSES to boot when any BLOCKING check
 /// (`Status::Fail`) fails, echoing each failure's one-line fix hint. WARN checks are advisory: they
 /// print but never block. Returns `Ok(())` when the box can sell, `Err(())` when it must not start.
 ///
@@ -3162,11 +3134,7 @@ fn run_doctor_with_nix_probe(
 // a buyer-only (wallet, no-acp) build this is correctly absent rather than dead. Every shipped build
 // carrying `acp` also carries `wallet`, so the wallet-gated `checks` it calls are present.
 ///
-/// `--skip-doctor` narrows the gate instead of skipping it (#745): the READINESS checks — the
-/// "ready right now" kind — are bypassed, but the ENVIRONMENT requirement (nix) still runs,
-/// because a box that can never do the work must not serve the pool and #745 rules out any escape
-/// hatch for that check. Environment failures are never transient, so the narrowed gate refuses
-/// immediately — no retry, no sleep.
+/// `--skip-doctor` skips the gate entirely: no check runs, and the seller starts.
 #[cfg(feature = "acp")]
 pub fn sell_readiness_gate(
     home: &maxplayer_core::home::MaxplayerHome,
@@ -3178,18 +3146,9 @@ pub fn sell_readiness_gate(
     if skip_doctor {
         let _ = writeln!(
             err,
-            "maxplayer seller --skip-doctor: startup readiness checks bypassed (box may be unable to sell); \
-             the nix environment check still runs — it asks whether this box can EVER do the work, not \
-             whether it is ready right now, and #745 rules out any bypass for it"
+            "maxplayer seller --skip-doctor: startup readiness checks bypassed (box may be unable to sell)"
         );
-        return run_readiness_with_retry(
-            || run_checks(environment_checks_for(home)),
-            READINESS_MAX_ATTEMPTS,
-            readiness_backoff,
-            std::thread::sleep,
-            out,
-            err,
-        );
+        return Ok(());
     }
     let _ = writeln!(
         out,
@@ -6755,7 +6714,7 @@ mod tests {
         assert!(run.waits.is_empty(), "no sleep when an unrecoverable failure is present");
     }
 
-    // ---- Issue #745: `maxplayer seller` refuses to start without a working nix ----
+    // ---- nix is optional: an advisory row that never blocks a seller boot (reverses #745's gate) ----
 
     #[cfg(feature = "wallet")]
     #[test]
@@ -6764,16 +6723,39 @@ mod tests {
         assert_eq!(check.status, Status::Pass, "{}", check.render());
     }
 
-    // Not installed anywhere ⇒ FAIL, and the ONE message carries BOTH remedies: the Determinate
-    // one-liner AND the PATH-skew case by name (a systemd unit does not source a login shell, so
-    // an installed nix can be absent from the service PATH) with the systemd fix — the gate
-    // cannot always tell the two apart, so the operator must be able to.
+    // Not installed anywhere ⇒ WARN (never FAIL), saying nix is optional and what it is for, and
+    // the ONE message carries BOTH remedies: the Determinate one-liner AND the PATH-skew case by
+    // name (a systemd unit does not source a login shell, so an installed nix can be absent from
+    // the service PATH) with the systemd fix — the probe cannot always tell the two apart, so the
+    // operator must be able to.
     #[cfg(feature = "wallet")]
     #[test]
-    fn nix_check_failure_carries_installer_one_liner_and_names_path_skew() {
+    fn nix_check_without_nix_warns_with_installer_one_liner_and_names_path_skew() {
         let check = checks::fold_nix(false, None);
-        assert_eq!(check.status, Status::Fail, "no working nix must block boot: {}", check.render());
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "a missing nix must not block boot: {}",
+            check.render()
+        );
+        assert_eq!(
+            exit_code(&[check.clone()]),
+            SUCCESS,
+            "a missing nix must not fail doctor"
+        );
         let rendered = check.render();
+        assert!(
+            rendered.contains("optional"),
+            "must say nix is optional: {rendered}"
+        );
+        assert!(
+            rendered.contains("where jobs run") && rendered.contains("no [sandbox]"),
+            "must say where nix would be used: {rendered}"
+        );
+        assert!(
+            !rendered.contains("must not serve") && !rendered.contains("can never do"),
+            "the old requirement wording must be gone: {rendered}"
+        );
         assert!(
             rendered
                 .contains("curl -fsSL https://install.determinate.systems/nix | sh -s -- install"),
@@ -6787,14 +6769,6 @@ mod tests {
             rendered.contains("systemctl edit"),
             "must carry the systemd fix, not just name the skew: {rendered}"
         );
-        assert!(
-            !check.transient,
-            "a missing nix is UNRECOVERABLE — refuse immediately, no retry, no sleep"
-        );
-        assert!(
-            check.skip_doctor_exempt,
-            "the nix check must survive --skip-doctor (#745: no escape hatch)"
-        );
     }
 
     // The skew DETECTED: nix runs from a well-known install location but is off this process's
@@ -6807,7 +6781,7 @@ mod tests {
             false,
             Some(std::path::PathBuf::from("/nix/var/nix/profiles/default/bin/nix")),
         );
-        assert_eq!(check.status, Status::Fail, "{}", check.render());
+        assert_eq!(check.status, Status::Warn, "{}", check.render());
         let rendered = check.render();
         assert!(
             rendered.contains("IS installed")
@@ -6829,11 +6803,146 @@ mod tests {
                 .contains("curl -fsSL https://install.determinate.systems/nix | sh -s -- install"),
             "the one message carries both remedies: {rendered}"
         );
-        assert!(!check.transient && check.skip_doctor_exempt);
+        assert!(rendered.contains("optional"), "{rendered}");
+    }
+
+    // The key behaviour: a seller seat with NO working nix boots. Drives the gate's real registry
+    // (`build_checks_with_nix_probe`, what `build_checks` runs with the production probe) with a
+    // missing-nix verdict on any box, including one where nix works, for both miss variants: the
+    // nix row is WARN, never FAIL. Then the gate itself (`run_readiness_with_retry`) is driven over
+    // the seat's nix row and must start the seller. A hook-only seat keeps its SKIP row.
+    // Red-proof: make `fold_nix`'s miss a FAIL again and every assertion below on a seller seat
+    // fails (the gate refuses).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn seller_boot_gate_does_not_refuse_a_nix_less_seat() {
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-nix-optional-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        // Network-free: relay_url is unparseable and no mints are configured.
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+        home.config.seller = Some(seller_for_agents(
+            vec!["claude".into()],
+            vec!["claude-agent-acp".into()],
+        ));
+        assert!(
+            !hook_only_seat(&home),
+            "precondition: a seat that runs jobs in our environment"
+        );
+
+        let skewed = || {
+            checks::fold_nix(
+                false,
+                Some(std::path::PathBuf::from(
+                    "/nix/var/nix/profiles/default/bin/nix",
+                )),
+            )
+        };
+        let probes: [fn() -> Check; 2] = [|| checks::fold_nix(false, None), skewed];
+        for probe in probes {
+            let results = run_checks(build_checks_with_nix_probe(&home, false, probe));
+            let nix = results
+                .iter()
+                .find(|c| c.name == "nix")
+                .unwrap_or_else(|| panic!("the gate registry carries a nix row: {results:?}"));
+            assert_eq!(
+                nix.status,
+                Status::Warn,
+                "seller seat, no nix: {}",
+                nix.render()
+            );
+            assert!(
+                !results
+                    .iter()
+                    .any(|c| c.status == Status::Fail && c.name == "nix"),
+                "nix must never be a blocking row"
+            );
+
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let gate = run_readiness_with_retry(
+                || run_checks(environment_checks_for(&home, probe)),
+                READINESS_MAX_ATTEMPTS,
+                readiness_backoff,
+                |_| panic!("a missing nix is never retried"),
+                &mut out,
+                &mut err,
+            );
+            let (out, err) = (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            );
+            assert_eq!(
+                gate,
+                Ok(()),
+                "a nix-less seller seat must boot; out={out} err={err}"
+            );
+            assert!(out.contains("WARN nix"), "{out}");
+            assert!(out.contains("starting seller"), "{out}");
+            assert!(!err.contains("REFUSING"), "{err}");
+        }
+
+        // A hook-only seat keeps the SKIP row it had (no job runs in an environment of ours).
+        home.config.seller = Some(seller_for_agents(vec!["my-hook".into()], Vec::new()));
+        let argv = vec!["sh".into(), "-c".into(), "cat >/dev/null".into()];
+        home.config.agents.insert(
+            "my-hook".into(),
+            maxplayer_core::home::AgentPresetConfig::hook(argv),
+        );
+        assert!(hook_only_seat(&home), "precondition: every agent is a hook");
+        let hook = run_checks(environment_checks_for(&home, || {
+            checks::fold_nix(false, None)
+        }));
+        assert_eq!(hook.len(), 1);
+        assert_eq!(hook[0].status, Status::Skip, "{}", hook[0].render());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // `--skip-doctor` skips the whole gate again: no nix check runs under it (#745 had narrowed
+    // the bypass to nix). Network-free: nothing is probed at all.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn skip_doctor_runs_no_check_not_even_nix() {
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-skip-doctor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let gate = sell_readiness_gate(&home, false, true, &mut out, &mut err);
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        assert_eq!(gate, Ok(()), "out={out} err={err}");
+        assert!(
+            out.is_empty(),
+            "no check row is printed under --skip-doctor: {out}"
+        );
+        assert!(err.contains("bypassed"), "{err}");
+        assert!(
+            !err.contains("nix"),
+            "the bypass no longer mentions a nix exception: {err}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // RED-PROVE (wiring): nix is part of the ONE registry both `maxplayer doctor` and the boot
-    // gate run — drop the `build_environment_checks` head from `build_checks` and this goes red.
+    // gate run — drop the `environment_checks_for` head from `build_checks` and this goes red.
     // The nix result's status is machine-dependent (the CI box has nix, a bare box does not), so
     // only presence is asserted. Network-free: relay_url is unparseable and no mints are configured.
     #[cfg(feature = "wallet")]
@@ -6859,18 +6968,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    // The registry `--skip-doctor` cannot narrow past: exactly the environment checks, i.e. nix.
-    #[cfg(feature = "wallet")]
-    #[test]
-    fn skip_doctor_registry_is_exactly_the_environment_checks() {
-        let results = run_checks(build_environment_checks());
-        assert_eq!(
-            results.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-            vec!["nix"],
-            "the --skip-doctor gate runs the environment subset of the one registry — only nix today"
-        );
     }
 
     // A leftover standalone `maxplayer-trade` on PATH is a WARN naming the file (never a FAIL: it
@@ -6910,9 +7007,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Nix is a seller requirement: on a home with no [seller] the doctor REPORT shows a missing nix
-    // as SKIP (both failure variants), never FAIL, and a working nix keeps its PASS. Pure, so it is
-    // red-provable on any box — drop the fold and the two failures stay FAIL.
+    // Buying never uses nix: on a home with no [seller] the doctor REPORT shows a missing nix as
+    // SKIP (both miss variants), never WARN or FAIL, and a working nix keeps its PASS. Pure, so it
+    // is red-provable on any box — drop the fold and the two misses stay WARN.
     #[test]
     fn nix_for_buyer_home_skips_a_missing_nix_and_keeps_a_pass() {
         let pass = checks::nix_for_buyer_home(checks::fold_nix(true, None));
@@ -6920,7 +7017,7 @@ mod tests {
 
         let skewed = std::path::PathBuf::from("/nix/var/nix/profiles/default/bin/nix");
         for (failed, skew) in [(checks::fold_nix(false, None), false), (checks::fold_nix(false, Some(skewed)), true)] {
-            assert_eq!(failed.status, Status::Fail, "precondition: the gate's verdict is FAIL");
+            assert_eq!(failed.status, Status::Warn, "precondition: the seller row's verdict is WARN");
             let reported = checks::nix_for_buyer_home(failed);
             assert_eq!(reported.status, Status::Skip, "{}", reported.render());
             assert_eq!(reported.name, "nix");
@@ -6931,12 +7028,13 @@ mod tests {
             assert_eq!(rendered.contains("do NOT reinstall"), skew, "{rendered}");
             assert_eq!(rendered.contains("nix IS installed"), skew, "{rendered}");
             assert!(
-                rendered.contains("`maxplayer seller serve`"),
-                "names what needs nix: {rendered}"
+                rendered.contains("`maxplayer seller serve` starts without it") && rendered.contains("optional"),
+                "says nix is optional for selling too: {rendered}"
             );
+            assert!(!rendered.contains("refuses"), "no requirement wording left: {rendered}");
             assert!(
                 rendered.contains("curl -fsSL https://install.determinate.systems/nix | sh -s -- install"),
-                "says how to install it before selling: {rendered}"
+                "says how to add it: {rendered}"
             );
             assert_eq!(exit_code(&[reported]), SUCCESS, "a buyer's missing nix must not fail the exit");
         }
@@ -6944,8 +7042,8 @@ mod tests {
 
     // Wiring, end to end through the doctor path: `run_doctor_with_nix_probe` is everything
     // `maxplayer doctor` runs (home load from disk, registry choice, render, exit) with only the
-    // nix probe replaced by a real FAIL verdict, so this holds on a box where nix works. A buyer
-    // home must render nix as SKIP; a home with [seller] must render it as FAIL and exit 1.
+    // nix probe replaced by a real missing-nix verdict, so this holds on a box where nix works. A
+    // buyer home must render nix as SKIP; a home with [seller] as WARN (advisory, never FAIL).
     // Red-proof: point the doctor path back at `build_checks`, or make `build_report_checks` skip
     // the fold for buyer homes, and the buyer assertions fail.
     #[cfg(feature = "wallet")]
@@ -7003,8 +7101,17 @@ mod tests {
         .expect("write a [seller] section");
         let (code, seller) = doctor(&tmp);
         let seller_nix = nix_line(&seller);
-        assert!(seller_nix.starts_with("FAIL nix"), "seller home: {seller_nix}");
-        assert_eq!(code, FAILURE, "a seller home without nix must fail doctor: {seller}");
+        assert!(
+            seller_nix.starts_with("WARN nix"),
+            "seller home: {seller_nix}"
+        );
+        // The network-free config makes other rows FAIL, so the exit says nothing about nix; the
+        // point is that no FAIL row is the nix one.
+        let _ = code;
+        assert!(
+            !seller.lines().any(|l| l.starts_with("FAIL nix")),
+            "seller home: {seller}"
+        );
 
         // A hook-only seat: `seller serve` boots past the missing nix (the gate's SKIP row), so
         // `doctor` must report the same row, not FAIL. Red-proof: drop the hook-only arm from
@@ -7021,12 +7128,132 @@ mod tests {
         let (_, hook) = doctor(&tmp);
         let hook_nix = nix_line(&hook);
         assert!(hook_nix.starts_with("SKIP nix"), "hook-only seat: {hook_nix}");
-        let gate_nix = run_checks(environment_checks_for(&home))
+        let gate_nix = run_checks(environment_checks_for(&home, || checks::fold_nix(false, None)))
             .iter()
             .find(|c| c.name == "nix")
             .map(Check::render)
             .expect("the gate carries a nix row");
         assert_eq!(hook_nix, gate_nix, "doctor and the seller boot gate agree on nix");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // A seat with a [sandbox] section (docker or launcher mode) runs every job inside the sandbox,
+    // so the HOST nix is not applicable there: the seller boot gate and `maxplayer doctor` both show
+    // SKIP nix even when the host probe fails, and the gate boots. Drives the gate's real registry
+    // (`build_checks_with_nix_probe`) and the doctor's real path (`run_doctor_with_nix_probe`, home
+    // reloaded from config.toml) with an injected failing probe, so it holds on a box where nix
+    // works. Red-proof: drop the [sandbox] arm from `environment_checks_for` and every row reads
+    // "WARN nix".
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn sandboxed_seat_skips_the_host_nix_row_and_boots() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-nix-sandboxed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        let failing = || checks::fold_nix(false, None);
+        let nix_line = |report: &str| {
+            report
+                .lines()
+                .find(|line| line.split_whitespace().nth(1) == Some("nix"))
+                .map(str::to_owned)
+                .unwrap_or_else(|| panic!("the report carries a nix line: {report}"))
+        };
+        let sandboxes = [
+            (
+                "docker",
+                SandboxConfig {
+                    mode: SandboxMode::Docker,
+                    image: Some("maxplayer/sandbox:test".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "launcher",
+                SandboxConfig {
+                    mode: SandboxMode::Launcher,
+                    launcher: vec!["env".into()],
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (label, sandbox) in sandboxes {
+            // Network-free, and on disk: the doctor path reloads the home from config.toml.
+            maxplayer_core::home::save_config(&mut home, |config| {
+                config.relay_url = "not-a-relay-url".into();
+                config.accepted_mints = Vec::new();
+                config.seller = Some(seller_for_agents(
+                    vec!["claude".into()],
+                    vec!["claude-agent-acp".into()],
+                ));
+                config.sandbox = Some(sandbox);
+            })
+            .expect("write a sandboxed [seller]");
+            assert!(
+                !hook_only_seat(&home),
+                "precondition ({label}): not a hook-only seat"
+            );
+
+            // The boot gate's registry, with a host nix probe that fails.
+            let results = run_checks(build_checks_with_nix_probe(&home, false, failing));
+            let nix = results
+                .iter()
+                .find(|c| c.name == "nix")
+                .unwrap_or_else(|| panic!("{label}: the gate registry carries a nix row"));
+            assert_eq!(nix.status, Status::Skip, "{label}: {}", nix.render());
+            let gate_nix = nix.render();
+            assert!(
+                gate_nix.contains("jobs run inside [sandbox]")
+                    && gate_nix.contains("seat capability probe at boot"),
+                "{label}: {gate_nix}"
+            );
+
+            // ...and the gate boots over that row.
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let gate = run_readiness_with_retry(
+                || run_checks(environment_checks_for(&home, failing)),
+                READINESS_MAX_ATTEMPTS,
+                readiness_backoff,
+                |_| panic!("a nix row is never retried"),
+                &mut out,
+                &mut err,
+            );
+            let (out, err) = (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            );
+            assert_eq!(gate, Ok(()), "{label}: out={out} err={err}");
+            assert!(out.contains("SKIP nix"), "{label}: {out}");
+            assert!(out.contains("starting seller"), "{label}: {out}");
+
+            // The doctor report renders the very same row.
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let _ = run_doctor_with_nix_probe(Some(tmp.clone()), failing, &mut out, &mut err);
+            let report = String::from_utf8(out).unwrap();
+            assert_eq!(
+                nix_line(&report),
+                gate_nix,
+                "{label}: doctor and the seller boot gate agree on nix"
+            );
+        }
+
+        // Control: the same seller home without [sandbox] keeps the WARN.
+        maxplayer_core::home::save_config(&mut home, |config| config.sandbox = None)
+            .expect("drop [sandbox]");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let _ = run_doctor_with_nix_probe(Some(tmp.clone()), failing, &mut out, &mut err);
+        let unsandboxed = nix_line(&String::from_utf8(out).unwrap());
+        assert!(
+            unsandboxed.starts_with("WARN nix"),
+            "no [sandbox]: {unsandboxed}"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -7105,55 +7332,19 @@ mod tests {
         assert_eq!(exit_code(&[older, newer]), SUCCESS, "advisory only");
     }
 
-    // #745's ruled-out bypass, pinned: the refusal for an environment failure must NOT advertise
-    // --skip-doctor as a way past it (that flag does not bypass it), and must state the KIND
-    // distinction so the asymmetry reads as design. Also unrecoverable: one attempt, no sleep.
+    // With nix no longer a non-bypassable requirement, every refusal offers --skip-doctor the same
+    // way: there is no per-kind epilogue left.
     #[test]
-    fn environment_failure_refusal_does_not_advertise_skip_doctor() {
+    fn every_refusal_offers_skip_doctor() {
         let run = drive_gate(READINESS_MAX_ATTEMPTS, |_| {
-            vec![Check::fail_environment("nix", "no working nix", "install nix")]
-        });
-        assert_eq!(run.result, Err(()), "an environment failure must refuse");
-        assert_eq!(run.attempts, 1, "unrecoverable: no retry");
-        assert!(run.waits.is_empty(), "unrecoverable: no sleep");
-        assert!(run.err.contains("REFUSING to start"), "{}", run.err);
-        assert!(
-            !run.err.contains("pass --skip-doctor"),
-            "must not offer --skip-doctor past an environment failure: {}",
-            run.err
-        );
-        assert!(
-            run.err.contains("RIGHT NOW") && run.err.contains("EVER do the work"),
-            "must state the readiness-vs-environment kind distinction: {}",
-            run.err
-        );
-        assert!(
-            run.err.contains("not bypassable"),
-            "must say the check has no bypass: {}",
-            run.err
-        );
-    }
-
-    // Mixed refusal: --skip-doctor is offered for the readiness failure but explicitly NOT for the
-    // environment one — never a blanket "pass --skip-doctor" that reads as covering everything.
-    #[test]
-    fn mixed_refusal_offers_skip_doctor_only_for_the_readiness_failures() {
-        let run = drive_gate(READINESS_MAX_ATTEMPTS, |_| {
-            vec![
-                Check::fail("seller key", "key missing", "generate the key"),
-                Check::fail_environment("nix", "no working nix", "install nix"),
-            ]
+            vec![Check::fail("seller key", "key missing", "generate the key")]
         });
         assert_eq!(run.result, Err(()));
-        assert_eq!(run.attempts, 1, "the unrecoverable pair refuses at once");
+        assert!(run.err.contains("REFUSING to start"), "{}", run.err);
+        assert!(run.err.contains("pass --skip-doctor"), "{}", run.err);
         assert!(
-            run.err.contains("--skip-doctor can bypass the readiness failure(s)"),
-            "the readiness failure keeps its documented bypass: {}",
-            run.err
-        );
-        assert!(
-            run.err.contains("but not nix"),
-            "…and the environment failure is named as NOT covered by it: {}",
+            !run.err.contains("not bypassable") && !run.err.contains("#745"),
+            "{}",
             run.err
         );
     }

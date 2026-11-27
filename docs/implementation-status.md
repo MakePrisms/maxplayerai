@@ -43,14 +43,15 @@ numbers are from the commit that moved the default.
 
 ## Verification checks and rejection
 
-The checks declaration and environment-provisioning path is wired into contribution jobs. Running
-the declared checks and producing or verifying their attestation remain absent from production.
+Production reads a checks declaration only to refuse it on host delivery. Since the RC3-01 hardening
+(v0.7.3-rc3) no production path provisions a checks environment, runs the declared checks, or
+produces or verifies their attestation.
 
 | Spec | v1 says | Code today | Issue |
 |---|---|---|---|
-| §9.1 | A reader reads `.maxplayer/checks.toml` from the pinned base and validates it. | The seller's contribution-workdir path inspects the pinned base commit. If the declaration blob is absent, it returns `Ok(())` and silently skips provisioning. If present, `capture_job_checks` calls `parse_declaration` and `validate_against_base`; the path then calls `env_lock_ref` and records the declaration and resolved reference — `seller_node/run.rs:1837`. | — |
+| §9.1 | A reader reads `.maxplayer/checks.toml` from the pinned base and validates it. | On host delivery, `refuse_host_checks_declaration` inspects the pinned base commit after checkout. If the declaration blob is absent, it returns `Ok(())`. If present, `capture_job_checks` calls `parse_declaration` and `validate_against_base` (so a malformed declaration keeps its own refusal), and the job is then refused — `seller_node/run.rs:3068`. Nothing records the declaration: `record_job_checks` (`seller_node/store.rs:1686`) has only a test caller. Container delivery never reads the declaration. | — |
 | §9.2 | A checked delivery carries an attestation the buyer verifies. | No production path calls `render_attestation` or `parse_attestation`. | — |
-| §9.1 | The runner resolves an environment backend and runs declared commands with the required network posture. | The seller calls `resolve_backend` and `provision`: Nix provisioning warms the dev shell with `true`; container provisioning pulls and verifies the pinned digest; and `argv_prefix` produces the checks-posture prefix. Provisioning failures become `execution_failed` feedback with detail `env_unprovisionable` through `refusal_feedback` — `seller_node/run.rs:1840`, `seller_node/run.rs:5025`. No production path runs the declaration's `prepare` or `commands` arrays. | — |
+| §9.1 | The runner resolves an environment backend and runs declared commands with the required network posture. | No production path provisions a buyer-declared checks environment (RC3-01). A host-delivery seat skips an offer tagged `param:checks-env` before claiming (`checks_env_claim_skip`, `seller_node/run.rs:3103`); a declaration that still reaches the host workdir is refused before any process is spawned, as `execution_failed` with detail `checks_env_refused_on_host` (a malformed declaration: `env_unprovisionable`) through `refusal_feedback` — `seller_node/run.rs:10820`. Container delivery ignores the declaration. `resolve_backend`, `provision` and the Nix and container provisioning code in `env_provision.rs` are `#[cfg(test)]`: test-only. No production path runs the declaration's `prepare` or `commands` arrays. | — |
 | §10 | A buyer publishes `REJECT` on a deterministic verification failure. | No production path publishes it. `reject_draft` exists (`gateway.rs:725`) and its only caller is its own unit test (`gateway.rs:986`). | — |
 
 The execution sentinel in §8.2 is a separate mechanism, and it **is** enforced. A buyer refuses to

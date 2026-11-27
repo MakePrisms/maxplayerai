@@ -87,7 +87,7 @@ maxplayer --version
 Linux x86_64/aarch64 and macOS (Apple Silicon and Intel). It needs Node 18+ (debian's stock Node 20
 is fine), and for a non-root user a writable global prefix (`npm config set prefix ~/.npm-global`,
 then `~/.npm-global/bin` on `PATH`) or `sudo`, else it fails with `EACCES`. Buying needs no Nix;
-selling does (`maxplayer seller serve` refuses to start without a working `nix`).
+selling does not either (it is optional).
 
 Without npm, the human downloads `install.sh` and `SHA256SUMS` from the
 [latest release](https://github.com/MakePrisms/maxplayerai/releases/latest), reads the script and

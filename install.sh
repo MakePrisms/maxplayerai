@@ -6,8 +6,8 @@
 #
 # What it does: resolves a release, downloads that release's asset for THIS platform, verifies the
 # download against the release's own SHA256SUMS, proves the binary runs and reports the version it was supposed to be, and only then
-# puts it on PATH. Nix is not required to install or to buy; only `maxplayer seller serve` needs it (#745),
-# and when it is missing the installer says so in one note after a successful install.
+# puts it on PATH. Nix is not required to install, to buy or to sell; it is optional for sellers, and
+# when it is missing the installer says so in one note after a successful install.
 #
 # Options (flags and environment are equivalent; the flag wins):
 #   --version <x.y.z>   MAXPLAYER_VERSION   install this exact version instead of the latest release
@@ -176,9 +176,12 @@ fetch() {
 }
 
 # ── Nix (#745) ──────────────────────────────────────────────────────────────────────────────────
-# Nix is a SELLER requirement, not an install or buyer one: `maxplayer seller serve` refuses to start
-# without a working nix (its boot gate, #745), and `maxplayer doctor` reports it as a FAIL only on a
-# home configured to sell. Buying, `mcp` and `version` never use it.
+# Nix is optional: not an install, buyer or seller requirement. `maxplayer seller serve` starts
+# without it (#745's boot gate was dropped: production never provisions a buyer-declared nix checks
+# environment), and `maxplayer doctor` reports a missing nix as a WARN on a home configured to sell
+# with no [sandbox] (SKIP on a seat with a [sandbox] section or a hook-only seat).
+# When nix works where jobs run, the job prompt tells agents to get toolchains through it. Buying,
+# `mcp` and `version` never use it.
 #
 # ★ This reverses an earlier ruling. Until this change the installer probed nix before any
 #   download and, with no nix, either chained the Determinate installer (TTY) or refused and
@@ -187,7 +190,7 @@ fetch() {
 #   npm never ran this script anyway, so the boot gate was always the real enforcement. A buyer on a
 #   box without nix — a CI runner, a container, an agent sandbox — was turned away for something
 #   buying never uses. So the installer no longer probes, prompts or chains: it installs, and when
-#   nix is missing it prints one note naming what needs it and how to get it.
+#   nix is missing it prints one note saying what nix is for and how to get it.
 #
 # Probes PATH only: nix must be on PATH *and* actually run, so a broken shim reads as missing. The
 # boot gate also probes the well-known install locations; this note cannot, so it says what to do
@@ -198,8 +201,8 @@ note_nix_for_sellers() {
         return 0
     fi
     say ""
-    say "note: no working nix found. Buying does not need it. Selling does: \`maxplayer seller serve\` refuses"
-    say "to start without nix. Install it before you sell:"
+    say "note: no working nix found. Buying does not need it, and selling does not either. Optional: when nix"
+    say "works where jobs run, seller agents use it to get toolchains. To add it:"
     say "  curl -fsSL https://install.determinate.systems/nix | sh -s -- install"
     say "If \`nix --version\` works in another shell, nix is installed but not on this PATH: do not reinstall."
 }

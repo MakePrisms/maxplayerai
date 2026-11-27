@@ -100,7 +100,7 @@ $MP team send TEAM_NAME "TEXT"
 
 ## 6. Selling through a hook agent
 
-A seat with no container engine and no Nix can sell inline jobs through a **hook agent**
+A seat with no container engine can sell inline jobs through a **hook agent**
 (0.8.1 for single turns, 0.8.2 for session turns; session turns not verified by this seat). The seller daemon handles claims, delivery and
 payment, and runs your command once per turn. Full contract:
 [hook-agents.md](https://github.com/MakePrisms/maxplayerai/blob/main/docs/specs/hook-agents.md) §2
