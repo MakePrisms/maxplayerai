@@ -94,6 +94,14 @@ grep -qF -- "$surface_verifier" "$WORKFLOW" \
 [ -x "$surface_verifier" ] \
     || die "$WORKFLOW runs $surface_verifier, which is missing or not executable"
 
+# The publish job's own helpers. Missing or not executable, the publish job would fail at the tag,
+# after the release exists.
+for helper in scripts/npm-publish-once.sh scripts/wait-npm-published.sh; do
+    grep -qF -- "$helper" "$WORKFLOW" \
+        || die "$WORKFLOW does not run $helper — this check is out of date with the publish job"
+    [ -x "$helper" ] || die "$WORKFLOW runs $helper, which is missing or not executable"
+done
+
 # The release completeness gate names the asset stem. It is what stops a release publishing with a
 # platform missing, and a stem that drifted from `maxplayer` would break every install URL and every
 # npm payload extraction at once.
@@ -157,14 +165,16 @@ for (const name of ["release", "publish", "publish-images"]) {
 
 // `npm publish` may appear in exactly two jobs, and the second one is a deliberate exception whose
 // fences are checked below. A copy in any THIRD job would be covered by no gate at all.
+// A publish is `npm publish` itself or the release's wrapper around it (scripts/npm-publish-once.sh),
+// on a line that runs something: comments and step names do not publish.
+const isPublishCmd = (l) => !/^\s*(#|-?\s*name:)/.test(l) && /\bnpm publish\b|npm-publish-once\.sh/.test(l);
 const PUBLISHING_JOBS = ["publish", "npm-probe"];
 for (const [name, body] of jobs) {
   if (PUBLISHING_JOBS.includes(name)) continue;
-  const at = body.findIndex((l) => l.includes("npm publish"));
-  if (at >= 0) fail(`job '${name}' runs 'npm publish' — only the gated publish job and the fenced npm-probe job may publish`);
+  if (body.some(isPublishCmd)) fail(`job '${name}' publishes to npm — only the gated publish job and the fenced npm-probe job may publish`);
 }
-if (!jobs.get("publish").some((l) => l.includes("npm publish"))) {
-  fail("the publish job does not run 'npm publish' — this check is out of date with the workflow");
+if (!jobs.get("publish").some(isPublishCmd)) {
+  fail("the publish job does not publish to npm — this check is out of date with the workflow");
 }
 
 // ── The probe may publish, so what it CANNOT publish is the property ────────────────────────────
@@ -233,8 +243,8 @@ const workflowDir = nodePath.dirname(path);
 for (const entry of fs.readdirSync(workflowDir)) {
   if (!/\.ya?ml$/.test(entry) || entry === nodePath.basename(path)) continue;
   const text = fs.readFileSync(nodePath.join(workflowDir, entry), "utf8");
-  if (text.split("\n").filter((l) => !/^\s*#/.test(l)).some((l) => l.includes("npm publish"))) {
-    fail(`${entry} runs 'npm publish' — npm scopes a trusted publisher to a workflow filename, so publishing from any file but ${nodePath.basename(path)} exercises a credential no release uses`);
+  if (text.split("\n").some(isPublishCmd)) {
+    fail(`${entry} publishes to npm — npm scopes a trusted publisher to a workflow filename, so publishing from any file but ${nodePath.basename(path)} exercises a credential no release uses`);
   }
 }
 

@@ -772,3 +772,6 @@ jobs:
       # dispatched, rather than only in the release workflow's own dry run.
       - run: ./scripts/verify-release-surface.sh --no-artifacts
       - run: ./scripts/verify-reserved-paths.sh
+      # The launcher's install check and run-time message, the registry wait the publish job uses,
+      # and that the publish job waits for every payload before it publishes the launcher.
+      - run: node --test scripts/npm-release.test.mjs
