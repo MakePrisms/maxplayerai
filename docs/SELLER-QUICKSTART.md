@@ -166,6 +166,7 @@ to `serve` when convenient.
 Usage:
   maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]
   maxplayer seller serve   # zero-prompt relaunch from config.toml
+  maxplayer seller serve   # hook seat (Muse, Grok Bot, Instinct or your own command): add [agents.<name>] hook = [...] and [seller] agents = ["<name>"] to config.toml, check it with `maxplayer seller hook test <name>`
   maxplayer seller serve --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
   maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted
   maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm
@@ -174,6 +175,7 @@ Usage:
 
 Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
+  - --agent takes a built-in harness preset (claude, cursor, codex); Muse, Grok Bot and Instinct are not presets, they serve as hook seats (seller-hook skill)
   - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto
   - no --key (packaged key file only)
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
