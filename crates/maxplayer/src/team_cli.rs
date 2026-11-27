@@ -55,6 +55,32 @@ team_list, team_invites, team_join, team_send, team_inbox and team_delete on the
 Exit codes: 0 done, 1 usage error, 2 refused or failed.
 ";
 
+/// The watchdog's action when `watch` made no progress for [`maxplayer_team::WATCH_STALL`]: say
+/// where it was stuck, then replace this process with a fresh `watch` (same pid, arguments,
+/// environment and output), so a watcher started without a supervisor still recovers.
+fn restart_stalled_watch(phase: &'static str, quiet: std::time::Duration) {
+    use std::os::unix::process::CommandExt;
+    eprintln!("maxplayer team watch: no progress for {}s (stuck in {phase}); restarting", quiet.as_secs());
+    let error = restart_command(std::env::args_os().collect()).exec();
+    eprintln!("maxplayer team watch: restart failed ({error}); exiting");
+    std::process::exit(RUNTIME_ERROR);
+}
+/// This binary again with `args` (`args[0]` kept as the program name). On Linux through
+/// `/proc/self/exe`, which still works after an upgrade replaced the file on disk.
+fn restart_command(args: Vec<std::ffi::OsString>) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let exe = if cfg!(target_os = "linux") {
+        PathBuf::from("/proc/self/exe")
+    } else {
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from(args.first().cloned().unwrap_or_default()))
+    };
+    let mut command = std::process::Command::new(exe);
+    if let Some((name, rest)) = args.split_first() {
+        command.arg0(name).args(rest);
+    }
+    command
+}
+
 /// Entry point for `maxplayer team …`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     if args.is_empty() || crate::cli::is_help_request(args) {
@@ -400,6 +426,10 @@ async fn execute(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> R
                 }
                 _ => return usage_error(err, "usage: watch [--notify <cmd> [args…]]"),
             };
+            let heartbeat = std::sync::Arc::new(maxplayer_team::Heartbeat::default());
+            maxplayer_team::spawn_watchdog(heartbeat.clone(), maxplayer_team::WATCH_STALL, restart_stalled_watch)?;
+            let mut home = home;
+            home.heartbeat = Some(heartbeat);
             home.watch(notify).await?;
         }
         ("clone", [team]) => writeln!(out, "{}", home.clone_repo(team, None).await?)?,
@@ -631,5 +661,17 @@ mod tests {
         assert_eq!(list["teams"].as_object().unwrap().len(), 1, "{list}");
         let _ = std::fs::remove_dir_all(&root_a);
         let _ = std::fs::remove_dir_all(&root_b);
+    }
+
+    /// A stalled `watch` restarts as this same binary with the same arguments and program name.
+    #[test]
+    fn a_stalled_watch_restarts_with_the_same_arguments() {
+        let args: Vec<std::ffi::OsString> =
+            ["maxplayer", "team", "--home", "/h", "watch", "--notify", "wake.sh"].iter().map(Into::into).collect();
+        let command = restart_command(args);
+        let exe = if cfg!(target_os = "linux") { PathBuf::from("/proc/self/exe") } else { std::env::current_exe().unwrap() };
+        assert_eq!(std::path::Path::new(command.get_program()), exe);
+        let rest: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(rest, ["team", "--home", "/h", "watch", "--notify", "wake.sh"]);
     }
 }

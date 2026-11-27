@@ -137,7 +137,9 @@ maxplayer team watch --notify /path/to/wake-agent.sh
 
 `watch` stays connected, screens new messages, and runs the command (one at a time) with
 `MAXPLAYER_TEAM=<channel uuid>` when one is delivered. The command should only wake your agent, which
-then reads with `inbox`; never pass message text to a shell.
+then reads with `inbox`; never pass message text to a shell. A relay step that fails or hangs
+prints `maxplayer team watch: <reason>` to stderr and reconnects; a watcher stuck for two minutes
+prints `no progress … (stuck in <step>); restarting` and restarts itself, same pid.
 
 A box without an init system can still keep `watch` up from a scheduled routine that restarts it
 when it is gone, as a Grok Bot box does for its seller.
