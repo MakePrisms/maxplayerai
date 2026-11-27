@@ -46,7 +46,12 @@ pub const KILL_GRACE: Duration = Duration::from_secs(2);
 /// The fixed budget of a `ping` or `close` call.
 pub const CONTROL_EVENT_BUDGET: Duration = Duration::from_secs(30);
 /// Seconds before the job deadline at which a `job` call is cut, leaving time to sign + publish.
-pub const PUBLISH_MARGIN_SECS: u64 = 30;
+/// The hook is handed `deadline_unix` with this margin ALREADY subtracted, so a hook must not
+/// subtract it again. After the cutoff the daemon needs at most the kill grace plus the stdout
+/// drain (~4 s) before it signs; publishing has its own budget, and the outbox keeps retrying
+/// after the deadline (a delivered result stays payable), so the margin only has to cover a
+/// normal sign + first publish.
+pub const PUBLISH_MARGIN_SECS: u64 = 15;
 /// How long stdout/stderr get to reach EOF after the hook exits. Stdout still open then is incomplete.
 const READER_JOIN_BUDGET: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
@@ -1681,8 +1686,9 @@ mod tests {
     #[test]
     fn the_job_cutoff_leaves_the_publish_margin() {
         let now = Instant::now();
-        assert_eq!(job_cutoff(1_000, 900, now), now + Duration::from_secs(70));
-        assert_eq!(job_cutoff(1_000, 980, now), now, "inside the margin: no time left");
+        assert_eq!(PUBLISH_MARGIN_SECS, 15);
+        assert_eq!(job_cutoff(1_000, 900, now), now + Duration::from_secs(85));
+        assert_eq!(job_cutoff(1_000, 990, now), now, "inside the margin: no time left");
     }
 
     #[test]
