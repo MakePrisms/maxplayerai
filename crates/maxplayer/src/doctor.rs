@@ -303,8 +303,8 @@ mod checks {
     /// `maxplayer seller serve` or fails `maxplayer doctor`. #745 once made it a boot gate because
     /// buyer-declared checks environments (`.maxplayer/checks.toml`) were provisioned with
     /// `nix develop` on the seller host. Production no longer provisions one at all — host delivery
-    /// refuses it (`env_unprovisionable`) and container delivery never reads it — so a host nix is
-    /// not needed to sell. What nix still buys a seat is tooling: the seller measures, at boot,
+    /// refuses it (`checks_env_refused_on_host`) and container delivery never reads it — so a host
+    /// nix is not needed to sell. What nix still buys a seat is tooling: the seller measures, at boot,
     /// whether nix works IN THE JOB ENVIRONMENT (the host for a seat with no `[sandbox]`, the
     /// container otherwise) and only then tells the job's agent to get toolchains through it. This
     /// row reports the host side of that, so on a seat with no `[sandbox]` a missing nix is a WARN with

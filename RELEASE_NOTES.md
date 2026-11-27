@@ -5,10 +5,11 @@
 - **Seller: Nix is optional; `maxplayer seller serve` starts without it** (reverses #745's boot
   gate). The gate measured the host nix because buyer-declared checks environments
   (`.maxplayer/checks.toml`) were once provisioned with `nix develop` on the seller host; since
-  v0.7.3-rc3 production never provisions one (host delivery refuses it with `env_unprovisionable`,
-  container delivery never reads it). A missing nix is now a `WARN nix` row in the startup checks
-  and in `maxplayer doctor` (still `SKIP` on a buyer-only or hook-only home, and now `SKIP` on a
-  seat with a `[sandbox]` section, whose jobs run inside the sandbox), never a refusal.
+  v0.7.3-rc3 production never provisions one (host delivery refuses it, as `execution_failed` /
+  `checks_env_refused_on_host`; container delivery never reads it). A missing nix is now a
+  `WARN nix` row in the startup checks and in `maxplayer doctor` (still `SKIP` on a buyer-only
+  or hook-only home, and now `SKIP` on a seat with a `[sandbox]` section, whose jobs run inside
+  the sandbox), never a refusal.
   `--skip-doctor` again skips every check; it no longer runs the nix check. When nix works where
   jobs run (the host, for a seat with no `[sandbox]`), the job prompt still tells agents to get
   toolchains through it, as before. The `install.sh` and `maxplayer mcp` notes for a missing nix
