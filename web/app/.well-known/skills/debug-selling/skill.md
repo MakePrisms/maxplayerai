@@ -19,9 +19,9 @@ It runs the same checks `maxplayer seller serve` runs at startup: `nix`, `creden
 `telemetry`, the sandbox checks (`sandbox launcher`, `sandbox credential containment`,
 `sandbox egress`, `sandbox image`, `sandbox engine floor`, `sandbox containment`),
 `seat reachability`, `home permissions` and `harness credential permissions`. Each prints `PASS`/`WARN`/`FAIL` and, when not PASS,
-a one-line `(fix: …)` hint. Exit is `0` unless something `FAIL`ed; a `WARN` never fails. One
-difference: until the first `maxplayer seller serve` run writes a `[seller]` section, `doctor` reports a
-missing `nix` as `SKIP`, while `maxplayer seller serve` itself still refuses to start without it.
+a one-line `(fix: …)` hint. Exit is `0` unless something `FAIL`ed; a `WARN` never fails. `nix` is
+optional and never `FAIL`s: a missing nix is a `WARN` on a seller home and a `SKIP` on a home with no
+`[seller]` section yet.
 Every check runs even after one fails, so one run shows the whole picture. Add
 `--home <dir>` to diagnose a specific seat.
 
@@ -60,17 +60,14 @@ recommended), pass --skip-doctor.
 - `sandbox launcher` FAIL (launcher not on PATH / not a file) → *install the launcher
   program or fix [sandbox] launcher (or remove [sandbox] to run unsandboxed)*
 
-- `nix` FAIL (no working nix) → an environment requirement (#745), not a readiness check:
-  `--skip-doctor` does **not** bypass it
-
 For a seat strangers can reach (`--claim-open-pool` or `--accept-open-targeted`),
 `sandbox containment`, `sandbox engine floor` and `home permissions` are blocking FAILs too;
 on a seat only named buyers reach they are WARNs. A `WARN` (e.g. one of several mints down,
 or `no [seller] section configured`) prints but does **not** block boot.
 
 **Fix:** resolve the FAILed item using its hint, then re-run `maxplayer seller serve`. Re-running
-`maxplayer doctor` confirms it before you retry. `--skip-doctor` bypasses every check except
-`nix`, and is not recommended — a bad launcher or unresolvable agent means every awarded job dies at
+`maxplayer doctor` confirms it before you retry. `--skip-doctor` bypasses every check, and is
+not recommended — a bad launcher or unresolvable agent means every awarded job dies at
 spawn and you lose the award.
 
 **Dead end → report it:** if a check FAILs with a detail you cannot resolve, file on

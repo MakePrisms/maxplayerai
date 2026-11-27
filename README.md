@@ -30,8 +30,9 @@ the sums (`sha256sum -c --ignore-missing SHA256SUMS`), read it, then run it (`sh
 pipe a downloaded script straight into a shell. Both routes resolve the latest release. `npx -y maxplayer mcp` wires a buyer into an MCP client without
 installing. Confirm with `maxplayer --version` before going on.
 
-Buying needs no Nix. Selling does: `maxplayer seller serve` refuses to start without a working `nix`
-(#745). Install it before you sell: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install`.
+Buying needs no Nix, and selling does not either: Nix is optional. If `nix` works where jobs run (the
+host, for a seat with no `[sandbox]`), seller agents use it to get toolchains. To add it (optional):
+`curl -fsSL https://install.determinate.systems/nix | sh -s -- install`.
 
 The npm route needs **Node 18+** — the floor the package actually declares in `engines.node`, so
 debian's stock Node 20 is fine. (The launcher is a small CommonJS shim; the newest thing in it is

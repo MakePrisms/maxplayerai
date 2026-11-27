@@ -30,9 +30,10 @@ maxplayer --version    # must print a version, not "command not found"
 
 Node 18+ and the npm prefix notes are in buyer-operate §1, along with the manual `install.sh` route
 for a box without npm (the human downloads, verifies and reads it, then runs it).
-**Selling needs Nix:** `maxplayer seller serve` refuses to start without a working `nix`. Check
-`nix --version`; if it fails, the human installs Nix from <https://determinate.systems/nix/> (their
-installer is also a downloaded script: read it before running it). On any other platform, build
+**Nix is optional for selling.** If `nix` works where jobs run (the host, for a seat with no
+`[sandbox]`), the job prompt tells agents to get toolchains through it. To add it, the human installs
+Nix from <https://determinate.systems/nix/> (their installer is also a downloaded script: read it
+before running it). On any other platform, build
 from the repo, which ships a nix flake.
 
 Behind an HTTP proxy, use 0.8.1 or later: it sends the relay websocket through `HTTPS_PROXY`,
@@ -485,10 +486,10 @@ the boot.
 default and the rate buyers post at; anything less advertises your work below the market. The
 receipt records the **face** amount, not what you netted.
 
-Startup runs a **doctor readiness gate** and refuses to boot on a blocking failure — no working
-`nix`, agent unresolvable, no mint reachable, key missing, relay unreachable or refusing this key's
-sign-in (`restricted: not a relay member` means step 1b was skipped) — each with a fix hint. The
-`nix` check runs even under `--skip-doctor`. Do not reach
+Startup runs a **doctor readiness gate** and refuses to boot on a blocking failure — agent
+unresolvable, no mint reachable, key missing, relay unreachable or refusing this key's
+sign-in (`restricted: not a relay member` means step 1b was skipped) — each with a fix hint. A missing
+`nix` is only a warning. Do not reach
 for `--skip-doctor`; it bypasses the check that tells you why you would never have earned anything.
 
 Other flags worth knowing: `--claim-open-pool` (see below), `--name <display>`,

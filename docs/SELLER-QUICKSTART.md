@@ -6,8 +6,10 @@ Documented seller steps only. The key never leaves the box.
 **`--agent`** and **`--rate-sats`**. Everything else (relay, mint, delivery remote, key) defaults
 and persists to `config.toml`, so relaunching is zero-prompt.
 
-> **Prerequisite — Nix.** `maxplayer seller serve` refuses to start without a working `nix` (#745). Only
-> selling needs it, so install it yourself: run `nix --version`, and if it fails, run
+> **Nix is optional.** `maxplayer seller serve` starts without a working `nix`; `maxplayer doctor`
+> and the startup checks show a `WARN nix` row. If nix works where jobs run (the host, for a seat
+> with no `[sandbox]`), the job prompt tells agents to get toolchains through it. To add it: run
+> `nix --version`, and if it fails, run
 > `curl -fsSL https://install.determinate.systems/nix | sh -s -- install`. A systemd unit does not
 > source your login shell, so put `/nix/var/nix/profiles/default/bin` on the unit's `PATH` too.
 
@@ -175,8 +177,9 @@ Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
   - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto
   - no --key (packaged key file only)
-  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
-  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass
+  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
+  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended)
+  - nix is optional: a missing nix is a warning, never a refusal; when nix works where jobs run, agents use it for toolchains
   - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)
   - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named
   - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot
@@ -194,7 +197,7 @@ Notes:
 | `--name <display>` | no | Optional kind-0 display name published for discoverability. |
 | `--job-timeout-secs <n>` | no | Per-job timeout (seconds). |
 | `--offer-backfill-secs <n>` | no | See OPEN-POOL offers posted up to `n` seconds before startup (default `1200`; `0` = live-only; targeted offers always backfill). |
-| `--skip-doctor` | no | Bypass the startup readiness checks (checks-on by default; not recommended). Does **not** bypass the nix check — that is an environment requirement (#745: "can this box EVER do the work"), so it survives every flag. |
+| `--skip-doctor` | no | Bypass the startup readiness checks (checks-on by default; not recommended). |
 | `--unsafe-no-sandbox` | no | Serve a stranger-facing surface (either open surface) with no working sandbox — this box then runs strangers' code uncontained. Waives that one check only. |
 | `--home <dir>` | no | Home root (else `MAXPLAYER_HOME` / `~/.maxplayer`). |
 
@@ -1834,8 +1837,9 @@ Wants=network-online.target
 [Service]
 ExecStart=%h/.local/bin/maxplayer seller serve
 Environment=MAXPLAYER_HOME=%h/.maxplayer
-# The npm global bin dir must be here too if your adapter lives there (§3b). The nix profile dir is
-# required: `maxplayer seller serve` refuses to start without nix, and a unit does not source your shell.
+# The npm global bin dir must be here too if your adapter lives there (§3b). Keep the nix profile dir
+# if nix is installed (optional: jobs on a seat with no [sandbox] use it for toolchains); a unit does
+# not source your shell.
 Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
 # Anything the agent harness writes outside the seat home stays owner-only (§0b).
 UMask=0077

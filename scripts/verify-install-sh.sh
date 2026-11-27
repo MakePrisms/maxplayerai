@@ -13,9 +13,9 @@
 #
 # ── Why containers, and why two ─────────────────────────────────────────────────────────────────
 # The claim is "installs on a machine that has never heard of nix", so it has to be tested somewhere
-# that has no nix, no rust and no prior maxplayer. Nix is a seller requirement only (#745: the
-# `maxplayer seller serve` boot gate enforces it), so the installer must install here and print one note
-# naming what needs nix; leg 0 proves that on the image as-is. A PATH stub is injected only after
+# that has no nix, no rust and no prior maxplayer. Nix is optional (not an install, buyer or seller
+# requirement), so the installer must install here and print one note
+# saying what nix is for; leg 0 proves that on the image as-is. A PATH stub is injected only after
 # that, so the remaining legs also cover the nix-present path, where the note must be absent. The
 # two images are not redundant:
 #
@@ -140,12 +140,12 @@ echo "  (downloader under test: $DL)"
 # downloader later would find the shim itself and the shim would exec itself forever (leg 7).
 REAL_DL="$(command -v "$DL")"
 
-# ── Legs 0 — no nix: installs, and says only selling needs it (#745) ────────────────────────────
+# ── Legs 0 — no nix: installs, and notes that nix is optional ────────────────────────────────────
 # These run BEFORE the stub nix is injected. The image has no nix (asserted above) and docker did
 # not allocate a TTY: the path where the installer used to refuse and install nothing. It must now
 # install, exit 0, and print the seller note — never the old "Nix is required" refusal or a prompt.
 
-echo "leg 0: missing nix and no TTY installs, and notes that selling needs nix"
+echo "leg 0: missing nix and no TTY installs, and notes that nix is optional"
 BIN0="$(leg_dir nonix)"
 MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN0" sh "$INSTALLER" >/legs/nonix.out 2>&1 \
     || fail "the installer exited non-zero with no nix — buying never needs nix, so it must install. Output: $(cat /legs/nonix.out)"
