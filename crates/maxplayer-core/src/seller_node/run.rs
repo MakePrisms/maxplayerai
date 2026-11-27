@@ -1735,6 +1735,58 @@ fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter 
     award_filter_with(seller_pubkey, open_pool, false)
 }
 
+/// A private award's provisioning result, as the award handler acts on it. A failure is fatal
+/// (the award stays pending and is retried) unless the offer needs no job repository: an
+/// inline-only offer with no Git inputs and no contribution base delivers through private content
+/// events alone, so it proceeds without the repository.
+fn private_provision_outcome(
+    sent: Result<(), crate::private_content::hosting::SendError>,
+    inline_only: bool,
+    job_id: &str,
+) -> Result<(), crate::private_content::hosting::SendError> {
+    match sent {
+        Err(error) if inline_only => {
+            opline!(
+                "seller node award job_id={job_id}: private repository provisioning failed ({error}); \
+                 the offer is inline-only with no Git inputs, so the job runs without it"
+            );
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// The payment terms of an EARLIER claim this seat signed for `job_id`: `Some("")` for a free
+/// claim, `Some(creq)` for a priced one, `None` when `claim` is not a verified kind-3402 claim
+/// authored by `seller_hex` whose root is `job_id` (then it is another seat's claim, or no claim).
+fn own_earlier_claim_terms(claim: &nostr_sdk::Event, job_id: &str, seller_hex: &str) -> Option<String> {
+    if claim.kind.as_u16() != crate::kinds::JOB_CLAIM_KIND
+        || crate::job_lifecycle::verified_author_hex(claim).as_deref() != Some(seller_hex)
+    {
+        return None;
+    }
+    let root = claim.tags.iter().find_map(|tag| {
+        let fields = tag.as_slice();
+        (fields.first().map(String::as_str) == Some("e")
+            && fields.get(3).map(String::as_str) == Some("root"))
+        .then(|| fields.get(1).cloned())
+        .flatten()
+    })?;
+    if root != job_id {
+        return None;
+    }
+    let creq = claim.tags.iter().find_map(|tag| {
+        let fields = tag.as_slice();
+        (fields.first().map(String::as_str) == Some("creq")).then(|| fields.get(1).cloned()).flatten()
+    });
+    let draft = event_to_draft(claim);
+    match (creq, crate::gateway::PaymentMode::from_claim_tags(&draft.tags)) {
+        (Some(creq), _) if !creq.is_empty() => Some(creq),
+        (None, mode) if mode.is_free() => Some(String::new()),
+        _ => None,
+    }
+}
+
 /// How often the work-lane tick may re-read the relay for awards owed to claims still parked
 /// unawarded ([`SellerNodeRunner::recover_missed_awards`]).
 const AWARD_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
@@ -8468,6 +8520,60 @@ impl SellerNodeRunner {
         complete
     }
 
+    /// The award names `claim_id`, not the claim on record for `job_id`. If `claim_id` is an
+    /// earlier claim this seat signed for the same job (read from the relay and verified), make it
+    /// the claim on record (its payment terms and published id) and cache it where the execute arm
+    /// reads it, so the award binds instead of releasing the job. Returns whether it was adopted.
+    async fn adopt_own_earlier_claim(&self, job_id: &str, claim_id: &str) -> bool {
+        let Ok(id) = nostr_sdk::EventId::from_hex(claim_id) else {
+            return false;
+        };
+        let Ok(relay) = self.own_relay().await else {
+            return false;
+        };
+        let filter = Filter::new().id(id).kind(Kind::Custom(crate::kinds::JOB_CLAIM_KIND)).limit(1);
+        let events = match read_stored(&relay, vec![filter], AWARD_RECOVERY_FETCH_TIMEOUT).await {
+            StoredRead::Complete(events) | StoredRead::Incomplete { events, .. } => events,
+        };
+        let Some(claim) = events.into_iter().find(|event| event.id == id) else {
+            return false;
+        };
+        let seller_hex = self.seller_pubkey.to_hex();
+        let Some(terms) = own_earlier_claim_terms(&claim, job_id, &seller_hex) else {
+            return false;
+        };
+        let home = self.node.home();
+        let cached: Result<(), String> = match super::privacy::known(home, &seller_hex, job_id) {
+            Ok(Some((mut ctx, offer))) => ctx
+                .store
+                .remember_event(&claim, &offer, &seller_hex, &ctx.policy.service, &ctx.policy.host)
+                .map_err(|e| e.to_string()),
+            Ok(None) => match crate::private_content::public_v2::known(home, job_id) {
+                Ok(Some((mut public, offer))) => public.remember(&offer, &claim).map_err(|e| e.to_string()),
+                Ok(None) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            },
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = cached {
+            opline!("seller node award job_id={job_id}: earlier claim {claim_id} is ours but could not be cached ({error}); not adopting");
+            return false;
+        }
+        match self.node.store().adopt_claim(job_id, claim_id, &terms) {
+            Ok(true) => {
+                opline!(
+                    "seller node award job_id={job_id}: the award names claim {claim_id}, an earlier claim this seat signed for the same job; adopting it"
+                );
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                opline!("seller node award job_id={job_id}: adopting earlier claim failed ({error})");
+                false
+            }
+        }
+    }
+
     /// Re-read the relay for awards owed to claims this node still holds unawarded, and hand each
     /// one to [`Self::on_award`] again.
     ///
@@ -10231,10 +10337,20 @@ impl SellerNodeRunner {
         // Ensure our claim is on the wire, then read its published id for the win check. Only OUR
         // claim's row: a backlog behind a slow relay must not stand between the award and the check.
         self.publish_now(&format!("claim:{job_id}")).await;
-        let our_claim_id = match self.node.store().outbox_row(&format!("claim:{job_id}")) {
+        let mut our_claim_id = match self.node.store().outbox_row(&format!("claim:{job_id}")) {
             Ok(Some((_, _, published))) => published,
             _ => None,
         };
+        // An award naming a claim that is not the one on record may still name OURS: an earlier
+        // claim this seat signed for the same job before its claim row was lost and it claimed
+        // again (a host paused between claim and award). Adopt that claim rather than release a
+        // job the buyer gave us.
+        if match_award(&award.claim_id, our_claim_id.as_deref(), &award_author, &buyer)
+            == AwardMatch::Release
+            && self.adopt_own_earlier_claim(&job_id, &award.claim_id).await
+        {
+            our_claim_id = Some(award.claim_id.clone());
+        }
         match match_award(&award.claim_id, our_claim_id.as_deref(), &award_author, &buyer) {
             AwardMatch::Execute => {
                 let private: Result<(), crate::private_content::hosting::SendError> = async {
@@ -10251,7 +10367,12 @@ impl SellerNodeRunner {
                     let provision = crate::private_content::hosting::ProvisionRequest::new(&offer, Some(&claim), Some(event), &ctx.policy.host)?;
                     let auth = self.node.signer().private_provision_auth(&provision).await
                         .map_err(|_| crate::private_content::Error("private provision signer unavailable"))??;
-                    provision.send(&auth).await
+                    let sent = provision.send(&auth).await;
+                    let inline_only = sent.is_err()
+                        && ctx
+                            .resolve_offer(&offer, nostr_sdk::Timestamp::now().as_secs())
+                            .is_ok_and(|resolved| super::privacy::needs_no_job_repo(&resolved));
+                    private_provision_outcome(sent, inline_only, &job_id)
                 }.await;
                 if let Err(e) = private { opline!("seller private award pending job_id={job_id}: {e}"); return; }
 
@@ -15871,6 +15992,141 @@ mod tests {
             match_award("claim1", Some("claim1"), "attacker", "buyer"),
             AwardMatch::Ignore
         );
+    }
+
+    /// Only a verified kind-3402 claim signed by THIS seat for THIS job yields terms to adopt.
+    #[test]
+    fn own_earlier_claim_terms_accepts_only_this_seats_claim_for_this_job() {
+        let seller = Keys::generate();
+        let other = Keys::generate();
+        let seller_hex = seller.public_key().to_hex();
+        let job = "1".repeat(64);
+        let buyer = "b".repeat(64);
+        let sign = |draft: &crate::gateway::EventDraft, keys: &Keys| {
+            crate::gateway::nostr::event_builder(draft).unwrap().sign_with_keys(keys).unwrap()
+        };
+        let priced = claim_draft(&job, &buyer, &seller_hex, crate::gateway::ClaimPayment::Sat("creqA-x"), &[], &Default::default());
+        let free = claim_draft(&job, &buyer, &seller_hex, crate::gateway::ClaimPayment::None, &[], &Default::default());
+        assert_eq!(own_earlier_claim_terms(&sign(&priced, &seller), &job, &seller_hex).as_deref(), Some("creqA-x"));
+        assert_eq!(own_earlier_claim_terms(&sign(&free, &seller), &job, &seller_hex).as_deref(), Some(""));
+        // Another seat's claim, a claim for another job, or not a claim at all: nothing to adopt.
+        assert_eq!(own_earlier_claim_terms(&sign(&priced, &other), &job, &seller_hex), None);
+        assert_eq!(own_earlier_claim_terms(&sign(&priced, &seller), &"2".repeat(64), &seller_hex), None);
+        let award = crate::gateway::award_draft(&job, &"3".repeat(64), &buyer, &seller_hex);
+        assert_eq!(own_earlier_claim_terms(&sign(&award, &seller), &job, &seller_hex), None);
+    }
+
+    /// A provisioning failure keeps the award pending, except for an offer that needs no job
+    /// repository (inline-only, no Git inputs), which runs without it.
+    #[test]
+    fn a_failed_private_provisioning_blocks_only_jobs_that_need_the_repository() {
+        let failed = || -> Result<(), crate::private_content::hosting::SendError> {
+            Err(crate::private_content::Error("private repository provisioning unavailable").into())
+        };
+        assert!(private_provision_outcome(failed(), true, "job").is_ok(), "inline-only runs");
+        assert!(private_provision_outcome(failed(), false, "job").is_err(), "a Git job stays pending");
+        assert!(private_provision_outcome(Ok(()), false, "job").is_ok());
+    }
+
+    /// The restart case: this seat claimed an offer, lost its claim row, and claimed it again (a
+    /// new claim id); the buyer then awards the EARLIER claim, which this seat also signed. The
+    /// award binds and the earlier claim's terms become the claim on record; it is not released as
+    /// "another seller's claim". (An award naming another key's claim still releases:
+    /// `award_binds_our_claim_and_releases_on_a_different_one`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_award_naming_an_earlier_claim_of_this_seat_binds_after_a_reclaim() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_capacity_skip_seller("earlier-claim", &relay_url, true, 0, Some(3600)).await;
+        let runner = Arc::new(runner);
+        let seller_hex = runner.seller_pubkey();
+        let seller_keys = Keys::parse(
+            &crate::home::read_secret_key_hex(runner.node.home()).expect("seller secret"),
+        )
+        .expect("seller keys");
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let publisher = Client::new(buyer.clone());
+        publisher.add_relay(&relay_url).await.expect("publisher add relay");
+        publisher.connect().await;
+        publisher.wait_for_connection(Duration::from_secs(5)).await;
+        let mut notifs = runner.client.notifications();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.subscribe_all(None).await.expect("subscriptions");
+                let not_live =
+                    await_subscriptions_live(&mut notifs, &[OFFER_SUB_ID, AWARD_SUB_ID], Duration::from_secs(5))
+                        .await;
+                assert!(not_live.is_empty(), "the relay never served the REQs: {not_live:?}");
+                let deadline_unix = now_unix() as u64 + 3_600;
+                let job_id =
+                    post_offer(&publisher, &buyer, "earlier-claim offer", None, 100, deadline_unix).await;
+                assert!(
+                    pump_offers_until(
+                        &runner,
+                        &mut notifs,
+                        std::time::Instant::now() + Duration::from_secs(5),
+                        |r| r.node.store().claim_row_state(&job_id).ok().flatten().is_some(),
+                    )
+                    .await,
+                    "the seat must claim the offer"
+                );
+                runner.drain(DrainMode::Routine, true).await;
+                let current = match runner.node.store().outbox_row(&format!("claim:{job_id}")) {
+                    Ok(Some((_, _, Some(published)))) => published,
+                    other => panic!("the claim must be published with an id; got {other:?}"),
+                };
+
+                // The EARLIER claim this seat signed for the same job, before its row was lost.
+                let earlier = claim_draft(
+                    &job_id,
+                    &buyer_hex,
+                    &seller_hex,
+                    crate::gateway::ClaimPayment::Sat("creqA-earlier"),
+                    &[],
+                    &Default::default(),
+                );
+                let earlier = crate::gateway::nostr::event_builder(&earlier)
+                    .expect("claim builder")
+                    .sign_with_keys(&seller_keys)
+                    .expect("sign the earlier claim as the seat");
+                publisher.send_event(&earlier).await.expect("post the earlier claim");
+                assert_ne!(earlier.id.to_hex(), current, "two distinct claims of one seat");
+
+                let award = crate::gateway::award_draft(&job_id, &earlier.id.to_hex(), &buyer_hex, &seller_hex);
+                let award = crate::gateway::nostr::event_builder(&award)
+                    .expect("award builder")
+                    .sign_with_keys(&buyer)
+                    .expect("sign the award as the buyer");
+                publisher.send_event(&award).await.expect("post the award");
+                runner.on_award(&award).await;
+
+                assert_eq!(
+                    runner.node.store().claim_row_state(&job_id).ok().flatten().as_deref(),
+                    Some("awarded"),
+                    "the award on the earlier claim binds; it is not released"
+                );
+                assert_eq!(
+                    runner.node.store().job_creq(&job_id).ok().flatten().as_deref(),
+                    Some("creqA-earlier"),
+                    "the earlier claim's payment terms are the ones the buyer pays against"
+                );
+                assert!(
+                    matches!(
+                        runner.node.store().outbox_row(&format!("claim:{job_id}")),
+                        Ok(Some((_, _, Some(ref published)))) if *published == earlier.id.to_hex()
+                    ),
+                    "the earlier claim is the claim on record"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

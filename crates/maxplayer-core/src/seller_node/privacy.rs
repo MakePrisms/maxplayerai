@@ -261,6 +261,28 @@ pub fn input_cache(home: &MaxplayerHome, offer: &str) -> std::path::PathBuf {
 /// objects; execution later uses this pinned baseline instead of fetching a new tip.
 /// Whether [`preflight`] has anything to stage. Offers without inputs or a contribution
 /// base skip the off-loop gate entirely.
+/// Whether a private offer can run without its per-job Git repository: it reads inline answers
+/// only and carries no Git inputs and no contribution base, so nothing is fetched from or pushed to
+/// the repository. An offer stating no delivery mode reads as Git-only.
+pub fn needs_no_job_repo(resolved: &pc::lifecycle::ResolvedOffer) -> bool {
+    inline_only_without_git(
+        &resolved.offer.accepts_delivery,
+        !resolved.attachments.is_empty(),
+        resolved.contribution.is_some(),
+    )
+}
+
+pub(crate) fn inline_only_without_git(
+    accepts_delivery: &[String],
+    has_inputs: bool,
+    has_contribution: bool,
+) -> bool {
+    !has_inputs
+        && !has_contribution
+        && !accepts_delivery.is_empty()
+        && accepts_delivery.iter().all(|mode| mode == "inline")
+}
+
 pub fn needs_preflight(resolved: &pc::lifecycle::ResolvedOffer) -> bool {
     !resolved.attachments.is_empty() || resolved.contribution.is_some()
 }
@@ -516,6 +538,18 @@ pub fn execution(home: &MaxplayerHome, seller: &str, id: &str) -> pc::Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_an_inline_only_offer_without_git_inputs_needs_no_job_repo() {
+        let modes = |list: &[&str]| list.iter().map(|m| (*m).to_owned()).collect::<Vec<_>>();
+        assert!(inline_only_without_git(&modes(&["inline"]), false, false));
+        // Git-dependent controls: a Git delivery mode, inputs, a contribution base, or no stated
+        // mode (which reads as Git-only).
+        assert!(!inline_only_without_git(&modes(&["inline", "git"]), false, false));
+        assert!(!inline_only_without_git(&modes(&["inline"]), true, false));
+        assert!(!inline_only_without_git(&modes(&["inline"]), false, true));
+        assert!(!inline_only_without_git(&modes(&[]), false, false));
+    }
+
     #[test]
     fn only_an_existing_claim_with_a_recorded_award_skips_the_replay() {
         // A first claim (no claim row) is never skipped, whatever the content store says.

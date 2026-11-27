@@ -2075,6 +2075,29 @@ impl SellerStore {
         Ok(out)
     }
 
+    /// Make `claim_id`, an earlier claim this seat signed for `job_id`, the claim on record: its
+    /// payment terms (`creq`, `""` for free) and its id as the published claim id, so the award
+    /// and acceptance that name it match. Only while the claim is still `claimed`; returns whether
+    /// it was adopted.
+    pub fn adopt_claim(&self, job_id: &str, claim_id: &str, creq: &str) -> Result<bool, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE claims SET creq = ?2 WHERE job_id = ?1 AND state = 'claimed'",
+            params![job_id, creq],
+        )?;
+        if updated == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE nostr_event_outbox SET published_event_id = ?2 WHERE dedup_key = ?1",
+            params![format!("claim:{job_id}"), claim_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Buyer pubkey carried by the recorded AWARD for this job.
     pub fn job_award_buyer(&self, job_id: &str) -> Result<Option<String>, StoreError> {
         let conn = self.lock()?;
@@ -6048,6 +6071,26 @@ mod tests {
             vec![("5".repeat(64), 20), ("1".repeat(64), 30)],
             "only claimed + unawarded + live claims, oldest first"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn adopt_claim_rebinds_only_a_claim_still_claimed() {
+        let (store, path) = fresh_store("adopt-claim");
+        let job = "1".repeat(64);
+        store
+            .claim_and_enqueue(&job, &job, Some("creq-new"), &claim(), 1, 9_999, 1)
+            .expect("claim");
+        assert!(store.adopt_claim(&job, "earlier-id", "creq-earlier").expect("adopt"));
+        assert_eq!(store.job_creq(&job).expect("creq").as_deref(), Some("creq-earlier"));
+        assert_eq!(
+            store.outbox_row(&format!("claim:{job}")).expect("row").and_then(|(_, _, id)| id).as_deref(),
+            Some("earlier-id")
+        );
+        store.record_award(&"w".repeat(64), &job, "b", 2).expect("award");
+        assert!(!store.adopt_claim(&job, "other", "x").expect("no-op"), "an awarded claim is never rebound");
+        assert_eq!(store.job_creq(&job).expect("creq").as_deref(), Some("creq-earlier"));
+        assert!(!store.adopt_claim(&"9".repeat(64), "x", "x").expect("absent"), "no claim, nothing adopted");
         let _ = std::fs::remove_file(&path);
     }
 
