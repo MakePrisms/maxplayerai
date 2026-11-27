@@ -32,8 +32,9 @@ pub struct HomeLock {
 pub enum LockError {
     /// The lock file could not be opened/created.
     Open(String),
-    /// Another live node already holds the lock for this home (fail closed).
-    Held { path: PathBuf },
+    /// Another live node already holds the lock for this home (fail closed). `holder` is the pid of
+    /// the process holding it when it could be identified from here, so the refusal can name it.
+    Held { path: PathBuf, holder: Option<u32> },
     /// The lock syscall itself failed for an unexpected reason.
     Flock(String),
 }
@@ -42,17 +43,86 @@ impl std::fmt::Display for LockError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Open(message) => write!(formatter, "seller lock open error: {message}"),
-            Self::Held { path } => write!(
-                formatter,
-                "another maxplayer seller already owns this home (lock held: {}); refusing to start a second owner",
-                path.display()
-            ),
+            Self::Held { path, holder } => {
+                formatter.write_str(&held_message(path, *holder, HOLDER_CONFIRMED))
+            }
             Self::Flock(message) => write!(formatter, "seller lock flock error: {message}"),
         }
     }
 }
 
 impl std::error::Error for LockError {}
+
+/// Whether [`identify_holder`] proves its pid holds the lock. On Linux it does (`/proc` shows the
+/// pid has the lock file open, or the kernel's lock table names it). Elsewhere it only knows the pid
+/// the holder recorded is alive and ours to signal, which a reused pid also passes, so the refusal
+/// must not tell anyone to `kill` it.
+#[cfg(target_os = "linux")]
+const HOLDER_CONFIRMED: bool = true;
+#[cfg(not(target_os = "linux"))]
+const HOLDER_CONFIRMED: bool = false;
+
+/// Why no holder was named. On Linux the kernel's lock table names any holder visible from here, so
+/// only another user's or a container's process is missed. Elsewhere a seller that is still
+/// starting (or predates #1299) has recorded no pid yet, so that is the likelier case.
+#[cfg(target_os = "linux")]
+const UNIDENTIFIED_WHY: &str = "another OS user or a container";
+#[cfg(not(target_os = "linux"))]
+const UNIDENTIFIED_WHY: &str =
+    "it has not recorded its pid yet, or it runs as another OS user or in a container";
+
+/// A path as one POSIX shell word, so a copied command works for a home with spaces or quotes.
+fn shell_word(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+:,@%=~".contains(&byte));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// The refusal for a held lock. `confirmed` is whether `holder` is proven to hold it
+/// ([`HOLDER_CONFIRMED`]); an unproven pid gets a check-first hint and no `kill`.
+fn held_message(path: &Path, holder: Option<u32>, confirmed: bool) -> String {
+    let mut message = format!(
+        "another maxplayer seller already owns this home (lock held: {}); refusing to start a second owner",
+        path.display()
+    );
+    // A flock is released by the kernel when its holder exits, so a refusal always means a LIVE
+    // process holds it (an old seller still running after an upgrade, a second terminal, a
+    // supervisor's copy). Say which one and how to stop it.
+    let drain = match path.parent() {
+        Some(home) if !home.as_os_str().is_empty() => {
+            format!("maxplayer seller drain --home {}", shell_word(&home.to_string_lossy()))
+        }
+        _ => "maxplayer seller drain".to_owned(),
+    };
+    let lock = shell_word(&path.to_string_lossy());
+    match holder {
+        Some(pid) if confirmed => message.push_str(&format!(
+            ". It is held by pid {pid}: stop that seller first, with `{drain}` (finishes in-flight \
+             jobs, which can take until their deadlines, then exits) or `kill {pid}` (stops it now), then start again"
+        )),
+        // `seller drain` signals the RECORDED pid, so it is only safe once that pid is shown to hold
+        // the lock; otherwise the holder the inspector names is the one to stop.
+        Some(pid) => message.push_str(&format!(
+            ". The seller that took it recorded pid {pid}, which is still running, but this platform \
+             cannot confirm that pid holds the lock (a pid can be reused): check with \
+             `{FIND_HOLDER} {lock}`. If it lists pid {pid}, stop that seller with `{drain}` \
+             (finishes in-flight jobs, which can take until their deadlines, then exits); if it lists \
+             another process, stop that one instead and do not run `seller drain`, which signals pid \
+             {pid}. Then start again"
+        )),
+        None => message.push_str(&format!(
+            ". Its holder could not be identified from here ({UNIDENTIFIED_WHY}); find it with \
+             `{FIND_HOLDER} {lock}` and stop it, or run `{drain}` where it runs, then start again"
+        )),
+    }
+    message
+}
 
 impl HomeLock {
     /// Take the exclusive lock at `path`, or fail closed if it is already held.
@@ -86,7 +156,12 @@ impl HomeLock {
             }
             attempts += 1;
             if attempts >= 5 {
-                return Err(LockError::Held { path });
+                // Close our own descriptor first: `identify_holder` confirms a pid by its open
+                // descriptor on the lock file, and ours would confirm a recorded pid that happens to
+                // equal our own (two containers' PID 1 sharing a home) as the holder.
+                drop(file);
+                let holder = identify_holder(&path);
+                return Err(LockError::Held { path, holder });
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -123,6 +198,72 @@ impl Drop for HomeLock {
     fn drop(&mut self) {
         let _ = self._file.set_len(0);
     }
+}
+
+/// The pid of the live process holding the seller lock at `path`, for the refusal message.
+///
+/// Prefers the pid the node recorded (`record_pid`), confirmed on Linux by that pid having the lock
+/// file open. A node still booting, or one older than #1299, records nothing: on Linux the kernel's
+/// lock table (`/proc/locks`) still names the process that took the flock, so that is read next, and
+/// its pid is confirmed the same way. `None` when neither identifies a holder visible from here.
+fn identify_holder(path: &Path) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    let table = std::fs::read_to_string("/proc/locks").ok();
+    #[cfg(not(target_os = "linux"))]
+    let table: Option<String> = None;
+    identify_holder_with(path, table.as_deref())
+}
+
+/// [`identify_holder`] with the kernel lock table passed in (`None`: not readable, or not Linux), so
+/// tests can prove the recorded-pid branch on its own.
+fn identify_holder_with(path: &Path, proc_locks: Option<&str>) -> Option<u32> {
+    if let Ok(content) = std::fs::read_to_string(path)
+        && let Some(pid) = content
+            .strip_suffix('\n')
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+        && pid > 0
+        && holds_file_open(pid, path).unwrap_or(false)
+    {
+        return Some(pid);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        flock_holder_from_proc_locks(proc_locks?, path)
+            .into_iter()
+            .find(|pid| holds_file_open(*pid, path).unwrap_or(false))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = proc_locks;
+        None
+    }
+}
+
+/// The pids of FLOCK entries in a `/proc/locks` table that lock the file at `path` (matched by
+/// device and inode). Entries marked `->` are waiters, not holders, and are skipped.
+#[cfg(target_os = "linux")]
+fn flock_holder_from_proc_locks(table: &str, path: &Path) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    let (major, minor, inode) = (libc::major(meta.dev()), libc::minor(meta.dev()), meta.ino());
+    table
+        .lines()
+        .filter_map(|line| {
+            // "1: FLOCK  ADVISORY  WRITE 4242 fd:01:123456 0 EOF"
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.get(1) != Some(&"FLOCK") {
+                return None;
+            }
+            let pid = fields.get(4)?.parse::<u32>().ok().filter(|pid| *pid > 0)?;
+            let mut location = fields.get(5)?.split(':');
+            let dev_major = u32::from_str_radix(location.next()?, 16).ok()?;
+            let dev_minor = u32::from_str_radix(location.next()?, 16).ok()?;
+            let ino = location.next()?.parse::<u64>().ok()?;
+            (dev_major == major && dev_minor == minor && ino == inode).then_some(pid)
+        })
+        .collect()
 }
 
 /// #1299: who holds a seller home lock, as seen by another process.
@@ -282,11 +423,21 @@ fn holds_file_open(pid: u32, path: &Path) -> Result<bool, String> {
     }))
 }
 
-/// Elsewhere there is no `/proc`: the held lock plus the pid its holder wrote is the evidence.
+/// Elsewhere there is no `/proc`: the held lock plus a pid its holder wrote that is alive and ours
+/// to signal is the evidence. A dead pid (ESRCH) or one we may not signal (EPERM: another user, or
+/// a pid such as 1 a container wrote) is not named.
 #[cfg(not(target_os = "linux"))]
-fn holds_file_open(_pid: u32, _path: &Path) -> Result<bool, String> {
-    Ok(true)
+fn holds_file_open(pid: u32, _path: &Path) -> Result<bool, String> {
+    // Safety: signal 0 only checks existence and permission; nothing is delivered.
+    Ok(libc::pid_t::try_from(pid).is_ok_and(|raw| unsafe { libc::kill(raw, 0) } == 0))
 }
+
+/// The command that names a lock file's holder: `fuser -v` on Linux; macOS's BSD `fuser` has no
+/// `-v`, so `lsof` there.
+#[cfg(target_os = "linux")]
+const FIND_HOLDER: &str = "fuser -v";
+#[cfg(not(target_os = "linux"))]
+const FIND_HOLDER: &str = "lsof";
 
 #[cfg(test)]
 mod tests {
@@ -320,6 +471,184 @@ mod tests {
         let third = HomeLock::acquire(&path).expect("acquire after release");
         drop(third);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refused start names the live holder and how to stop it, also when the holder recorded no
+    /// pid (a node still booting, or one older than #1299, as after an upgrade): the kernel's lock
+    /// table names it. RED ON REVERT: make `identify_holder` return `None` and the pid is missing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_start_names_the_holding_pid_and_how_to_stop_it() {
+        let path = temp_lock("names-holder");
+        let _ = std::fs::remove_file(&path);
+        let me = std::process::id();
+
+        // Held, no pid recorded: found through /proc/locks.
+        let held = HomeLock::acquire(&path).expect("first acquire");
+        let refused = HomeLock::acquire(&path).expect_err("second acquire must be refused");
+        assert!(
+            matches!(refused, LockError::Held { holder: Some(pid), .. } if pid == me),
+            "{refused:?}"
+        );
+        let message = refused.to_string();
+        assert!(
+            message.starts_with("another maxplayer seller already owns this home (lock held: "),
+            "the existing line shape is kept: {message}"
+        );
+        assert!(message.contains(&format!("held by pid {me}")), "{message}");
+        assert!(message.contains(&format!("`kill {me}`")), "{message}");
+        let home = path.parent().unwrap().display().to_string();
+        assert!(
+            message.contains(&format!("`maxplayer seller drain --home {home}`")),
+            "{message}"
+        );
+
+        // Held, pid recorded: the recorded pid is used.
+        held.record_pid().expect("record");
+        let refused = HomeLock::acquire(&path).expect_err("still held");
+        assert!(
+            matches!(refused, LockError::Held { holder: Some(pid), .. } if pid == me),
+            "{refused:?}"
+        );
+
+        drop(held);
+        HomeLock::acquire(&path).expect("free again once the holder releases it");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The lock-table parser matches only FLOCK holders of this exact file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_locks_parsing_matches_only_flock_holders_of_this_file() {
+        use std::os::unix::fs::MetadataExt;
+        let path = temp_lock("proc-locks");
+        std::fs::write(&path, "").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let (major, minor) = (libc::major(meta.dev()), libc::minor(meta.dev()));
+        let here = format!("{major:02x}:{minor:02x}:{}", meta.ino());
+        let other = format!("{major:02x}:{minor:02x}:{}", meta.ino() + 1);
+        let table = format!(
+            "1: POSIX  ADVISORY  WRITE 11 {here} 0 EOF\n\
+             2: FLOCK  ADVISORY  WRITE 22 {other} 0 EOF\n\
+             3: FLOCK  ADVISORY  WRITE 33 {here} 0 EOF\n\
+             3: -> FLOCK  ADVISORY  WRITE 44 {here} 0 EOF\n"
+        );
+        assert_eq!(flock_holder_from_proc_locks(&table, &path), vec![33]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// dot-bot review of #1431: where the holder's pid cannot be proven (no `/proc`), the refusal
+    /// names the recorded pid as unconfirmed, says how to check it, and never suggests `kill`.
+    /// RED ON REVERT: format an unconfirmed pid like a confirmed one and `kill 4242` appears.
+    #[test]
+    fn an_unconfirmed_pid_gets_a_check_and_no_kill_hint() {
+        let path = Path::new("/h/seller.lock");
+        let unconfirmed = held_message(path, Some(4242), false);
+        assert!(!unconfirmed.contains("kill"), "{unconfirmed}");
+        assert!(unconfirmed.contains("recorded pid 4242"), "{unconfirmed}");
+        assert!(unconfirmed.contains("cannot confirm"), "{unconfirmed}");
+        assert!(unconfirmed.contains(&format!("`{FIND_HOLDER} /h/seller.lock`")), "{unconfirmed}");
+        assert!(unconfirmed.contains("`maxplayer seller drain --home /h`"), "{unconfirmed}");
+        // advisor r2 of #1431: `seller drain` signals the recorded pid, so it is offered only for
+        // the case where the inspector shows that pid, and the reader is told not to run it
+        // otherwise. RED ON REVERT: the old "then stop that seller with drain" wording.
+        assert!(unconfirmed.contains("If it lists pid 4242, stop that seller with"), "{unconfirmed}");
+        assert!(unconfirmed.contains("do not run `seller drain`, which signals pid 4242"), "{unconfirmed}");
+        assert!(unconfirmed.contains("until their deadlines"), "{unconfirmed}");
+        let confirmed = held_message(path, Some(4242), true);
+        assert!(confirmed.contains("`kill 4242`"), "{confirmed}");
+        assert!(confirmed.contains("until their deadlines"), "{confirmed}");
+    }
+
+    /// advisor r2 of #1431: the refusal a user actually sees (`LockError::Held`'s Display, which
+    /// applies [`HOLDER_CONFIRMED`]) suggests `kill` only on Linux, and names the platform's real
+    /// inspector by its literal command. RED ON REVERT: `HOLDER_CONFIRMED = true` off Linux, or
+    /// `FIND_HOLDER = "fuser -v"` on macOS (BSD fuser has no `-v`).
+    #[test]
+    fn the_shown_refusal_matches_the_platform() {
+        let shown = LockError::Held {
+            path: PathBuf::from("/h/seller.lock"),
+            holder: Some(4242),
+        }
+        .to_string();
+        #[cfg(target_os = "linux")]
+        {
+            assert!(shown.contains("`kill 4242`"), "{shown}");
+            let none = held_message(Path::new("/h/seller.lock"), None, true);
+            assert!(none.contains("`fuser -v /h/seller.lock`"), "{none}");
+            assert!(none.contains("(another OS user or a container)"), "{none}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(!shown.contains("kill"), "{shown}");
+            assert!(shown.contains("`lsof /h/seller.lock`"), "{shown}");
+            let none = held_message(Path::new("/h/seller.lock"), None, false);
+            assert!(none.contains("has not recorded its pid yet"), "{none}");
+        }
+    }
+
+    /// advisor r2 of #1431: off Linux the only evidence is that the recorded pid is alive and ours
+    /// to signal. RED ON REVERT: return `Ok(true)` unconditionally and the dead pid is named.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn off_linux_a_holder_pid_must_be_alive_and_ours() {
+        let path = Path::new("/nonexistent/seller.lock");
+        assert_eq!(holds_file_open(std::process::id(), path), Ok(true));
+        assert_eq!(holds_file_open(u32::MAX, path), Ok(false), "does not fit a pid_t");
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let dead = child.id();
+        child.wait().expect("reap");
+        assert_eq!(holds_file_open(dead, path), Ok(false), "an exited, reaped pid");
+    }
+
+    /// advisor r2 of #1431: the recorded pid alone identifies the holder, with no kernel lock table
+    /// to fall back on (a Linux host without a readable `/proc/locks`, or any other platform).
+    /// RED ON REVERT: delete the recorded-pid branch of `identify_holder_with` and this is `None`;
+    /// on Linux the table-only path is proven to stay independent by passing `None` here.
+    #[test]
+    fn the_recorded_pid_alone_names_the_holder() {
+        let path = temp_lock("recorded-only");
+        let held = HomeLock::acquire(&path).expect("first acquire");
+        assert_eq!(identify_holder_with(&path, None), None, "nothing recorded yet");
+        held.record_pid().expect("record");
+        assert_eq!(identify_holder_with(&path, None), Some(std::process::id()));
+        drop(held);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// dot-bot review of #1431: a home path with a space or a quote is shell-quoted in the copied
+    /// commands, so pasting them works. RED ON REVERT: print `home.display()` raw.
+    #[test]
+    fn copied_commands_quote_a_home_with_spaces() {
+        let message = held_message(Path::new("/srv/my seats/bob's/seller.lock"), None, true);
+        assert!(
+            message.contains("`maxplayer seller drain --home '/srv/my seats/bob'\\''s'`"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("`{FIND_HOLDER} '/srv/my seats/bob'\\''s/seller.lock'`")),
+            "{message}"
+        );
+        assert_eq!(shell_word("/home/a-b/.mp_1"), "/home/a-b/.mp_1");
+    }
+
+    /// An unidentified holder still gets a next step rather than a bare refusal.
+    #[test]
+    fn an_unidentified_holder_still_gets_a_next_step() {
+        let message = LockError::Held {
+            path: PathBuf::from("/h/seller.lock"),
+            holder: None,
+        }
+        .to_string();
+        assert!(message.contains("could not be identified"), "{message}");
+        #[cfg(target_os = "linux")]
+        assert!(message.contains("`fuser -v /h/seller.lock`"), "{message}");
+        #[cfg(not(target_os = "linux"))]
+        assert!(message.contains("`lsof /h/seller.lock`"), "{message}");
+        assert!(
+            message.contains("`maxplayer seller drain --home /h`"),
+            "{message}"
+        );
     }
 
     /// #1299: taking the lock records NO pid (a booting node must not be signalled); the pid appears
@@ -437,6 +766,41 @@ mod tests {
         held.record_pid().expect("child record");
         std::thread::sleep(std::time::Duration::from_secs(30));
         std::process::exit(7); // never signalled
+    }
+
+    /// A refused starter whose own pid is the one recorded in the lock file (two containers' PID 1
+    /// sharing a home) must name the real holder, not itself: its own descriptor on the lock file is
+    /// closed before the holder is identified. RED ON REVERT: drop the `drop(file)` in `acquire` and
+    /// the parent names its own pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_starter_whose_pid_is_recorded_does_not_name_itself() {
+        let path = temp_lock("self-pid");
+        let _ = std::fs::remove_file(&path);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "seller_node::lock::tests::drain_child_process", "--test-threads=1"])
+            .env(DRAIN_CHILD_ENV, &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while holder(&path).unwrap() != LockHolder::Pid(child.id()) {
+            assert!(child.try_wait().unwrap().is_none(), "the child exited early");
+            assert!(std::time::Instant::now() < deadline, "the child never took the lock");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let me = std::process::id();
+        std::fs::write(&path, format!("{me}\n")).expect("record our own pid");
+        let refused = HomeLock::acquire(&path).expect_err("the child holds it");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(refused, LockError::Held { holder: Some(pid), .. } if pid == child.id()),
+            "must name the child {}, not ourselves {me}: {refused:?}",
+            child.id()
+        );
     }
 
     /// #1299: `request_drain` finds the real holder in another process through the lock alone and
