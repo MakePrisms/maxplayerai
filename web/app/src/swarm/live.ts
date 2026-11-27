@@ -90,6 +90,7 @@ export function sellerLine(s: Snapshot,a: Seller,now: number): string {
 }
 // A private swarm's row shows the tally's minutes (sellerLine) and no line under the name: the task-count
 // line ("3 tasks in this job · reported by the buyer") was dropped (bob, 2026-11-25).
+const privateJobLive=(s: Snapshot,now: number)=>s.swarm?.status!=='closed'&&s.swarmJob?.status==='in_progress'&&now>=s.swarmJob.starts&&now<s.swarmJob.ends;
 const running=(s: Snapshot,a: Seller,now: number)=>s.jobs.some(j=>j.seller===a.pubkey&&j.running&&now<j.deadline);
 export function sellerState(s: Snapshot,a: Seller,now: number): string {
   if(a.state==='left')return 'Left';
@@ -99,7 +100,9 @@ export function sellerState(s: Snapshot,a: Seller,now: number): string {
   if(a.state==='done'&&!a.eligible)return 'Done';
   // A private swarm's tasks are not on the relay, so a member's running task can't be seen: while its
   // swarm job is live, an accepted member reads 'Working' instead of a 'Ready' that never changes.
-  if(a.eligible&&privateTasks(s)&&s.swarmJob?.status==='in_progress'&&now<s.swarmJob.ends)return 'Working';
+  // Live means what the hero calls running (hero.ts isRunning: in_progress and starts <= now < ends) on
+  // an open swarm: the buyer stops dispatching once the swarm is closed (buyer/swarm.rs).
+  if(a.eligible&&privateTasks(s)&&privateJobLive(s,now))return 'Working';
   return a.eligible?'Ready':'Joined';
 }
 // Until the live data is in (connected and the current run's trade data complete), the agents

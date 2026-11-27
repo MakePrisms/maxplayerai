@@ -26,9 +26,28 @@ test('a private swarm reads Working while its job is live, Ready before and afte
   assert.equal(sellerState({...priv,swarmJob:{...priv.swarmJob!,status:'completed'}},a,2920),'Ready','job closed');
   assert.equal(sellerState({...priv,swarmJob:null,budget:null},a,2920),'Ready','no job');
   assert.equal(sellerState(priv,{...a,eligible:false,state:'joined'},2920),'Joined','not accepted');
-  assert.equal(sellerState(priv,{...a,minutesUsed:60,reported:{tasksDone:3,minutesToday:60}},2920),'Done','out of minutes');
+  // A private member's minutes come from the tally only (minutesUsed is not read).
+  assert.equal(sellerState(priv,{...a,minutesUsed:0,reported:{tasksDone:3,minutesToday:60}},2920),'Done','out of minutes');
   assert.equal(sellerState(priv,{...a,state:'left'},2920),'Left');
-  assert.equal(sellerState({...s,jobs:[]},a,2920),'Ready','a public swarm still needs a visible running task');
+  assert.equal(sellerState({...s,jobs:[]},a,2920),'Ready','no swarm: a visible running task is needed');
+  assert.equal(sellerState({...priv,swarm:{...priv.swarm!,tasks:'public'}},a,2920),'Ready','a public swarm still needs a visible running task');
+});
+// The same window the hero calls running (hero.ts isRunning), on an open swarm only.
+test('a private swarm reads Working only from start to end of an in-progress job on an open swarm',()=>{
+  const priv:Snapshot={...s,swarm:{buyer,buyerNpub:npubEncode(buyer),buyerName:'buyer',id:'sw',name:'Swarm',purpose:'p',status:'open',tasks:'private',address:'a'},jobs:[]};
+  const a={...seller,state:'accepted',minutesUsed:0};
+  assert.equal(sellerState(priv,a,999),'Ready','in_progress before its start (early event or clock skew)');
+  assert.equal(sellerState(priv,a,1000),'Working','at the start');
+  assert.equal(sellerState(priv,a,9999),'Working','just before the end');
+  assert.equal(sellerState(priv,a,10000),'Ready','at the end');
+  for(const status of ['scheduled','cancelled','completed'] as const)
+    assert.equal(sellerState({...priv,swarmJob:{...priv.swarmJob!,status}},a,2920),'Ready',status);
+  assert.equal(sellerState({...priv,swarm:{...priv.swarm!,status:'closed'}},a,2920),'Ready','closed swarm: the buyer dispatches nothing');
+  assert.equal(sellerState(priv,{...a,eligible:false,state:'accepted'},2920),'Joined','rejoined after the start: not eligible this run');
+  // A task that is visible still wins over the inferred Working.
+  const task={id:'t',seller:a.pubkey,start:2000,deadline:4600,end:null,running:true,usedMinutes:0};
+  assert.equal(sellerState({...priv,jobs:[task]},a,2920),'Working now');
+  assert.equal(sellerState({...priv,jobs:[task]},{...a,state:'awaiting acceptance'},2920),'Awaiting acceptance');
 });
 test('a seller whose job finished but has minutes left is Ready, not Done',()=>{const a={...seller,state:'done',minutesUsed:5};assert.equal(sellerState({...s,jobs:[]},a,2920),'Ready');assert.equal(sellerState({...s,jobs:[]},{...a,minutesUsed:60},2920),'Done');});
 
