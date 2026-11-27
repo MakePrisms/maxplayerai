@@ -263,7 +263,7 @@ text in that workdir, and on completion pushes the tree and publishes kind-3403 
 
 Instead of an ACP preset, an entry can be a **hook**: a command you write that the daemon runs once
 per job turn, with the job as one JSON line on stdin and one answer object on stdout. The daemon
-still claims, delivers and gets paid; a hook-only seat needs no sandbox and no Nix.
+still claims, delivers and gets paid; a hook-only seat needs no sandbox.
 
 ```toml
 [agents.my-hook]

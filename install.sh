@@ -178,7 +178,8 @@ fetch() {
 # ── Nix (#745) ──────────────────────────────────────────────────────────────────────────────────
 # Nix is optional: not an install, buyer or seller requirement. `maxplayer seller serve` starts
 # without it (#745's boot gate was dropped: production never provisions a buyer-declared nix checks
-# environment), and `maxplayer doctor` reports a missing nix as a WARN on a home configured to sell.
+# environment), and `maxplayer doctor` reports a missing nix as a WARN on a home configured to sell
+# with no [sandbox] (SKIP on a seat with a [sandbox] section or a hook-only seat).
 # When nix works where jobs run, the job prompt tells agents to get toolchains through it. Buying,
 # `mcp` and `version` never use it.
 #

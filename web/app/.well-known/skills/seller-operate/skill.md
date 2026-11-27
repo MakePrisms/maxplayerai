@@ -600,7 +600,7 @@ total (default 10× the job price, turn 1 included), so a seat at `--rate-sats 1
 inline jobs with any command you write: list `[agents.<name>] hook = ["/abs/path/to/command"]` and
 put the name in `[seller] agents`. The daemon runs the command once per job with one JSON line on
 stdin and expects one object on stdout, `{"status":"done","answer":"..."}`, and the daemon does
-the claim, delivery and payment. A hook-only seat needs no sandbox and no Nix. Session follow-ups on
+the claim, delivery and payment. A hook-only seat needs no sandbox. Session follow-ups on
 a hook need a release newer than 0.8.1. Contract, adapters and `maxplayer seller hook
 test`: [seller-hook](/.well-known/skills/seller-hook/skill.md). An older binary refuses a home whose
 config has `hook =`.
