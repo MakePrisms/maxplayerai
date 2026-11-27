@@ -546,6 +546,10 @@ impl RemitAttemptOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobPaymentRow {
     pub job_id: String,
+    /// The offer's buyer; `None` when the offer row is missing.
+    pub buyer_pubkey: Option<String>,
+    /// The mint the buyer's payment came from (the receive breadcrumb); `None` before a payment.
+    pub mint: Option<String>,
     /// `jobs.state`: `awarded`, `executing`, `delivered`, `paid` or `failed`.
     pub state: String,
     pub created_at_unix: i64,
@@ -3496,7 +3500,9 @@ impl SellerStore {
                     COALESCE(deliveries.payment, offers.payment, 'sat'),
                     deliveries.delivered_at_unix, jobs.settled_elsewhere_at_unix,
                     receipts.received_at_unix, receipts.amount_sats, receipts.fee_sats,
-                    receipts.remittance_id, fee_remittances.state
+                    receipts.remittance_id, fee_remittances.state, offers.buyer_pubkey,
+                    (SELECT mint FROM pending_receive p WHERE p.job_id = jobs.job_id
+                     ORDER BY p.created_at_unix DESC LIMIT 1)
              FROM jobs
              LEFT JOIN offers ON offers.offer_id = jobs.offer_id
              LEFT JOIN deliveries ON deliveries.job_id = jobs.job_id
@@ -3512,6 +3518,8 @@ impl SellerStore {
             let delivered_at: Option<i64> = row.get(5)?;
             Ok(JobPaymentRow {
                 job_id: row.get(0)?,
+                buyer_pubkey: row.get(12)?,
+                mint: row.get(13)?,
                 state: row.get(1)?,
                 created_at_unix: row.get(2)?,
                 offer_sats: row.get::<_, Option<i64>>(3)?.map(|sats| sats.max(0) as u64),
@@ -5677,7 +5685,9 @@ mod tests {
                  INSERT INTO fee_remittances (remittance_id, gross_sats, net_sats, destination, payment_hash, bolt11, state, created_at_unix)
                      VALUES ('rem', 10, 9, 'd', 'h', 'bolt', 'settled', 13);
                  INSERT INTO receipts (receipt_id, job_id, amount_sats, received_at_unix, fee_bps, fee_sats, remittance_id)
-                     VALUES ('rc', 'paid', 100, 12, 1000, 10, 'rem');",
+                     VALUES ('rc', 'paid', 100, 12, 1000, 10, 'rem');
+                 INSERT INTO pending_receive (job_id, token_hash, buyer_pubkey, mint, amount_sats, created_at_unix)
+                     VALUES ('paid', 'th', 'b', 'https://mint.example', 100, 12);",
             )
             .expect("seed");
         }
@@ -5687,6 +5697,9 @@ mod tests {
         let by = |id: &str| rows.iter().find(|row| row.job_id == id).expect(id).clone();
 
         let paid = by("paid");
+        assert_eq!(paid.buyer_pubkey.as_deref(), Some("b"));
+        assert_eq!(paid.mint.as_deref(), Some("https://mint.example"));
+        assert_eq!(by("owed").mint, None, "no payment, no mint");
         assert_eq!(
             paid.receipt,
             Some(JobReceipt {
@@ -5705,6 +5718,41 @@ mod tests {
         let gone = by("gone");
         assert_eq!((gone.delivered_at_unix, gone.pay_by_unix), (None, None));
         assert_eq!(store.recent_job_payments(1).expect("limit").len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Receipts whose own remittance attempts failed and that a later BULK remittance discharged
+    /// read as remitted: each receipt names the settled bulk row.
+    #[test]
+    fn recent_job_payments_shows_a_bulk_remittance_on_every_receipt_it_covered() {
+        let (store, path) = fresh_store("job-payments-bulk");
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute_batch(
+                "INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+                     VALUES ('r1', 'r1', 'paid', 1, 1), ('r2', 'r2', 'paid', 2, 2), ('r3', 'r3', 'paid', 3, 3);
+                 INSERT INTO fee_remittances (remittance_id, gross_sats, net_sats, destination, payment_hash, bolt11, state, created_at_unix)
+                     VALUES ('one-failed', 1, 1, 'd', 'h1', 'b1', 'failed', 4),
+                            ('two-failed', 1, 1, 'd', 'h2', 'b2', 'failed', 5),
+                            ('bulk', 3, 3, 'd', 'h3', 'b3', 'settled', 6);
+                 INSERT INTO receipts (receipt_id, job_id, amount_sats, received_at_unix, fee_bps, fee_sats, remittance_id)
+                     VALUES ('c1', 'r1', 10, 1, 1000, 1, 'bulk'),
+                            ('c2', 'r2', 10, 2, 1000, 1, 'bulk'),
+                            ('c3', 'r3', 10, 3, 1000, 1, 'bulk');",
+            )
+            .expect("seed");
+        }
+        let rows = store.recent_job_payments(10).expect("read");
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            let receipt = row.receipt.as_ref().expect("paid");
+            assert_eq!(
+                (receipt.remittance_id.as_deref(), receipt.remittance_state.as_deref()),
+                (Some("bulk"), Some("settled")),
+                "{}",
+                row.job_id
+            );
+        }
         let _ = std::fs::remove_file(&path);
     }
 

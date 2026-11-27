@@ -94,7 +94,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
 fn usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]\n\nLists the jobs this seat won, newest first (default {DEFAULT_LIMIT}), each with its state and\nwhether it was paid: free, paid (with the platform fee's remittance), delivered and awaiting\npayment (the buyer can pay for 7 days after delivery), or unpaid once that window closed. When the\nlatest platform-fee remittance attempt did not pay, it prints that attempt's error too; see\n`maxplayer seller fees remit` to retry it. Moves no sats (it only opens, reads and prints the\nseller store). Exit 0 = printed; 1 = usage; 2 = error."
+        "Usage:\n  maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]\n\nLists the jobs this seat won, newest first (default {DEFAULT_LIMIT}), each with its state and\nwhether it was paid: free, paid (with the platform fee's remittance), delivered and awaiting\npayment (the buyer can pay for 7 days after delivery), or unpaid once that window closed. When the\nlatest platform-fee remittance attempt did not pay, it prints that attempt's error too; see\n`maxplayer seller fees remit` to retry it. Moves no sats (it only opens, reads and prints the\nseller store). --json prints a flat array, one object per job: job_id, buyer, amount_sats, mint,\nstatus (in_progress | failed | free | paid | awaiting_payment | settled_elsewhere | unpaid),\npay_by_unix, fee_sats, fee_sent, fee_error. A seat that never ran `seller serve` has no store:\nthat is an error (exit 2), not an empty list. Exit 0 = printed; 1 = usage; 2 = error."
     );
 }
 
@@ -117,36 +117,7 @@ fn print_jobs(options: &Options, out: &mut dyn Write) -> Result<(), String> {
         .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0);
     if options.json {
-        let jobs: Vec<serde_json::Value> = rows
-            .iter()
-            .map(|row| {
-                serde_json::json!({
-                    "job_id": row.job_id,
-                    "state": row.state,
-                    "created_at_unix": row.created_at_unix,
-                    "offer_sats": row.offer_sats,
-                    "payment": row.payment,
-                    "delivered_at_unix": row.delivered_at_unix,
-                    "pay_by_unix": row.pay_by_unix,
-                    "pay_status": pay_status(row, now).key(),
-                    "paid_sats": row.receipt.as_ref().map(|r| r.amount_sats),
-                    "fee_sats": row.receipt.as_ref().map(|r| r.fee_sats),
-                    "fee_status": row.receipt.as_ref().map(|r| fee_status(r).key()),
-                })
-            })
-            .collect();
-        let attempt = last_attempt.as_ref().map(|attempt| {
-            serde_json::json!({
-                "started_at_unix": attempt.started_at_unix,
-                "outcome": attempt.outcome.as_str(),
-                "detail": attempt.detail,
-            })
-        });
-        let _ = writeln!(
-            out,
-            "{}",
-            serde_json::json!({"ok": true, "jobs": jobs, "last_failed_remit_attempt": attempt})
-        );
+        let _ = writeln!(out, "{}", json_rows(&rows, last_attempt.as_ref(), now));
     } else {
         let _ = write!(
             out,
@@ -155,6 +126,46 @@ fn print_jobs(options: &Options, out: &mut dyn Write) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// `--json`: a flat array, one object per job, with these keys (stable):
+/// `job_id`, `buyer`, `amount_sats` (what was paid, else the offer amount), `mint` (the paying
+/// mint, `null` before a payment), `status` (one of [`PayStatus::key`]), `pay_by_unix`, `fee_sats`,
+/// `fee_sent` (the platform fee reached the platform) and `fee_error`. `fee_error` is the seat's
+/// latest failed remittance attempt, set only on a paid job whose fee is still unremitted and that
+/// the attempt covered (it started after the payment): remittance is seat-wide, never per job.
+#[cfg(feature = "wallet")]
+fn json_rows(
+    rows: &[maxplayer_core::seller_node::store::JobPaymentRow],
+    last_failed_attempt: Option<&maxplayer_core::seller_node::store::RemitAttempt>,
+    now: i64,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|row| {
+                let fee = row.receipt.as_ref().map(fee_status);
+                let fee_error = match (row.receipt.as_ref(), fee, last_failed_attempt) {
+                    (Some(receipt), Some(FeeStatus::Unremitted), Some(attempt))
+                        if attempt.started_at_unix >= receipt.received_at_unix =>
+                    {
+                        Some(format!("{}: {}", attempt.outcome.as_str(), attempt.detail))
+                    }
+                    _ => None,
+                };
+                serde_json::json!({
+                    "job_id": row.job_id,
+                    "buyer": row.buyer_pubkey,
+                    "amount_sats": row.receipt.as_ref().map(|r| r.amount_sats).or(row.offer_sats),
+                    "mint": row.mint,
+                    "status": pay_status(row, now).key(),
+                    "pay_by_unix": row.pay_by_unix,
+                    "fee_sats": row.receipt.as_ref().map(|r| r.fee_sats),
+                    "fee_sent": fee == Some(FeeStatus::Remitted),
+                    "fee_error": fee_error,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Whether one job was paid, as `seller jobs` reports it.
@@ -328,7 +339,7 @@ fn render(
     }
     if let Some(attempt) = last_failed_attempt {
         text.push_str(&format!(
-            "Latest platform-fee remittance attempt {} at {}: {}\n  Run `maxplayer seller fees remit` to see the plan and retry.\n",
+            "Seat-wide: the latest platform-fee remittance attempt {} at {}: {}\n  It covers every unremitted fee above. Run `maxplayer seller fees remit` to see the plan and retry.\n",
             attempt.outcome.as_str(),
             utc(attempt.started_at_unix),
             attempt.detail
@@ -377,6 +388,8 @@ mod tests {
         fn row(id: &str, state: &str, payment: &str, delivered: Option<i64>) -> JobPaymentRow {
             JobPaymentRow {
                 job_id: id.to_owned(),
+                buyer_pubkey: Some("b".repeat(64)),
+                mint: None,
                 state: state.to_owned(),
                 created_at_unix: 0,
                 offer_sats: Some(100),
@@ -454,9 +467,94 @@ mod tests {
             assert!(text.contains("AWAITING PAYMENT (the buyer can pay until 1970-01-08 00:00 UTC)"), "{text}");
             assert!(text.contains("UNPAID (the buyer's 7-day pay window has closed)"), "{text}");
             assert!(text.contains("1 delivered job(s) awaiting payment, 1 unpaid after the pay window."), "{text}");
-            assert!(text.contains("remittance attempt failed at 1970-01-01 00:00 UTC: mint quote failed"), "{text}");
+            assert!(text.contains("Seat-wide: the latest platform-fee remittance attempt failed at 1970-01-01 00:00 UTC: mint quote failed"), "{text}");
             assert!(text.contains("maxplayer seller fees remit"), "{text}");
             assert_eq!(render(&[], None, 0, "db"), "Seller jobs — db\nNo jobs won yet.\n");
+        }
+
+        fn paid_row(id: &str, received_at: i64, remittance: Option<(&str, &str)>) -> JobPaymentRow {
+            let mut paid = row(id, "paid", "sat", Some(received_at));
+            paid.mint = Some("https://mint.example".into());
+            paid.receipt = Some(JobReceipt {
+                received_at_unix: received_at,
+                amount_sats: 90,
+                fee_sats: 9,
+                remittance_id: remittance.map(|(id, _)| id.to_owned()),
+                remittance_state: remittance.map(|(_, state)| state.to_owned()),
+            });
+            paid
+        }
+
+        #[test]
+        fn json_is_a_flat_array_and_pins_the_seat_wide_error_only_where_it_applies() {
+            let rows = vec![
+                paid_row("bulk", 10, Some(("b2786f75", "settled"))),
+                paid_row("owed-fee", 10, None),
+                paid_row("after-attempt", 30, None),
+                row("waiting", "delivered", "sat", Some(10)),
+            ];
+            let attempt = RemitAttempt {
+                attempt_id: 7,
+                started_at_unix: 20,
+                trigger: RemitAttemptTrigger::Retry,
+                unremitted_sats: 18,
+                outcome: RemitAttemptOutcome::Failed,
+                detail: "melt failed".into(),
+                remittance_id: None,
+            };
+            let value = json_rows(&rows, Some(&attempt), 100);
+            let jobs = value.as_array().expect("a flat array");
+            assert_eq!(jobs.len(), 4);
+            let mut keys: Vec<&str> = jobs[0].as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["amount_sats", "buyer", "fee_error", "fee_sats", "fee_sent", "job_id", "mint", "pay_by_unix", "status"]
+            );
+            // A bulk remittance that discharged this receipt: sent, no error.
+            assert_eq!(jobs[0]["status"], "paid");
+            assert_eq!(jobs[0]["fee_sent"], true);
+            assert_eq!(jobs[0]["fee_error"], serde_json::Value::Null);
+            assert_eq!(jobs[0]["amount_sats"], 90);
+            assert_eq!(jobs[0]["mint"], "https://mint.example");
+            // Unremitted, and the failed attempt came after the payment: it carries the error.
+            assert_eq!(jobs[1]["fee_sent"], false);
+            assert_eq!(jobs[1]["fee_error"], "failed: melt failed");
+            // Paid after the failed attempt: that attempt never covered it.
+            assert_eq!(jobs[2]["fee_error"], serde_json::Value::Null);
+            // Not paid yet: no fee, no error.
+            assert_eq!(jobs[3]["status"], "awaiting_payment");
+            assert_eq!(jobs[3]["fee_sent"], false);
+            assert_eq!(jobs[3]["fee_error"], serde_json::Value::Null);
+            assert_eq!(jobs[3]["amount_sats"], 100);
+            assert_eq!(json_rows(&[], None, 0), serde_json::json!([]));
+        }
+
+        #[test]
+        fn a_missing_store_is_an_error_and_an_empty_one_an_empty_list() {
+            let root = std::env::temp_dir().join(format!("mx-seller-jobs-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let call = |extra: &[&str]| {
+                let mut args = vec!["--home".to_owned(), root.display().to_string()];
+                args.extend(extra.iter().map(|s| (*s).to_owned()));
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                let code = run(&args, &mut out, &mut err);
+                (code, String::from_utf8_lossy(&out).into_owned(), String::from_utf8_lossy(&err).into_owned())
+            };
+            let (code, out, err) = call(&["--json"]);
+            assert_eq!((code, out.as_str()), (RUNTIME_ERROR, ""), "{err}");
+            assert!(err.contains("no seller store"), "{err}");
+            maxplayer_core::seller_node::store::SellerStore::open(
+                &root.join(maxplayer_core::seller_node::STATE_DB_FILE),
+            )
+            .expect("create an empty store");
+            let (code, out, _) = call(&["--json"]);
+            assert_eq!((code, out.trim()), (SUCCESS, "[]"));
+            let (code, out, _) = call(&[]);
+            assert_eq!(code, SUCCESS);
+            assert!(out.contains("No jobs won yet."), "{out}");
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }
