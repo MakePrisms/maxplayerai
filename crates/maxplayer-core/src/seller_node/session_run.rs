@@ -123,6 +123,13 @@ const HOOK_TURN_REPLY_TOO_LONG_FEEDBACK: &str = "seller's agent replied but the 
     than the 4076-byte inline limit, so it was not delivered (a cut reply is never sent); the session \
     stays open: ask for a shorter reply";
 
+/// Buyer-facing reason for a private follow-up whose reply fits the inline limit but, with the
+/// offer's task and the turn's result tags, not the buyer's delivery review: nothing is published
+/// that the buyer could not review, and the session is still open for a shorter reply.
+const TURN_REPLY_TOO_LARGE_TO_REVIEW_FEEDBACK: &str = "seller's agent replied, but the reply and \
+    this task together are too large for the delivery review, so it was not delivered; the session \
+    stays open: ask for a shorter reply";
+
 /// A failed turn: its reason code, a log-only `detail`, and the static text the buyer reads.
 ///
 /// The buyer text is carried as a value, chosen where the failure is built, never recovered from
@@ -1452,6 +1459,46 @@ impl SellerNodeRunner {
                         answer.len()
                     );
                     return Err(reply_too_long());
+                }
+                // The buyer reviews a private turn's RESULT with the offer's whole task beside it,
+                // and turn n ≥ 2 carries more tags than turn 1's reservation covered (`reply`,
+                // `turn_status`, `context`, `creq`): measure exactly this result, with the tags
+                // appended below, before anything is signed or published (#1441 review r1).
+                let tags = crate::review::private::ResultTags {
+                    followup_id: Some(r.fid),
+                    status: r.status,
+                    context_reset: r.context_reset,
+                    turn_creq: turn_creq.as_deref(),
+                };
+                match crate::review::private::seller_inline_answer_fits(
+                    home,
+                    self.node.signer(),
+                    r.job_id,
+                    answer,
+                    tags,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        opline!(
+                            "seller node session job_id={}: turn {} reply ({} bytes) and this offer's \
+                             task are too large for one delivery review; nothing delivered",
+                            r.job_id,
+                            r.turn,
+                            answer.len()
+                        );
+                        return Err(TurnFailure {
+                            code: ReasonCode::DeliveryFailed,
+                            detail: "reply and task too large for one delivery review".into(),
+                            feedback: TURN_REPLY_TOO_LARGE_TO_REVIEW_FEEDBACK,
+                        });
+                    }
+                    Err(error) => {
+                        return Err(delivery_failed(format!(
+                            "delivery review size check: {error}"
+                        )));
+                    }
                 }
                 (
                     crate::receipt::result_content_hash_hex(answer),

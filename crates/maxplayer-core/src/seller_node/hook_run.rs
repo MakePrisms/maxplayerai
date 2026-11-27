@@ -30,8 +30,10 @@ impl SellerNodeRunner {
         kind: &crate::seller_agents::AgentKind,
     ) {
         let buyer = offer.buyer_pubkey.clone();
-        // §3.1: the budget probe drops `inline` from the offer row when an inline answer cannot be
-        // sealed for review. A hook has no git route, so that is a delivery it cannot make.
+        // §3.1: an offer row without `inline` is a delivery a hook cannot make (it has no git route).
+        // `execute_job` hands a hook the offer as the buyer declared it: when only the worst-case
+        // inline reservation failed, it passes `size_check` and the real answer is measured before
+        // delivery (`deliver_hook_answer`) instead of the job failing before the hook runs.
         if !offer.accepts_delivery.iter().any(|m| m == gateway::DELIVERY_MODE_INLINE) {
             opline!(
                 "seller node hook job_id={job_id}: offer does not (or no longer) accept inline delivery; a hook cannot deliver git"
@@ -288,13 +290,33 @@ impl SellerNodeRunner {
         size_check: bool,
     ) {
         let workdir = job_workdir(self.node.home(), job_id);
-        // Only the worst-case reservation failed before the hook ran: measure the real answer.
+        let turn_status = crate::session::TurnStatus::parse(status);
+        // A staged non-`done` status exists only for a session claim; sessions switched off since
+        // leave nothing to ask the question in (§5.0 rule 3). Decided before the size check: such
+        // a status cannot be delivered at any size.
+        if !session_job && turn_status != Some(crate::session::TurnStatus::Done) {
+            opline!(
+                "seller node hook job_id={job_id}: status {status} without a session; nothing delivered"
+            );
+            self.hook_refused(job_id, &offer.buyer_pubkey, &workdir)
+                .await;
+            return;
+        }
+        // The status the result is tagged with: exactly what `deliver_inline_with` receives below.
+        let delivered_status = turn_status.filter(|_| session_job);
+        // Only the worst-case reservation failed before the hook ran: measure the result that will
+        // be published (this answer and its `turn_status` tag) before anything is delivered.
         if size_check {
+            let tags = crate::review::private::ResultTags {
+                status: delivered_status.unwrap_or(crate::session::TurnStatus::Done),
+                ..crate::review::private::ResultTags::NONE
+            };
             match crate::review::private::seller_inline_answer_fits(
                 self.node.home(),
                 self.node.signer(),
                 job_id,
                 answer,
+                tags,
             )
             .await
             {
@@ -306,12 +328,11 @@ impl SellerNodeRunner {
                     );
                     return;
                 }
-                fit => {
+                Ok(false) => {
                     opline!(
-                        "seller node hook job_id={job_id}: the answer ({} bytes) and this offer's task are \
-                         too large for one delivery review{}; nothing delivered",
-                        answer.len(),
-                        fit.err().map(|error| format!(" ({error})")).unwrap_or_default()
+                        "seller node hook job_id={job_id}: the answer ({} bytes, status {status}) and this \
+                         offer's task are too large for one delivery review; nothing delivered",
+                        answer.len()
                     );
                     self.hook_refused_with(
                         job_id,
@@ -322,18 +343,17 @@ impl SellerNodeRunner {
                     .await;
                     return;
                 }
+                // Not a size verdict (the answer's own body refused, or the review inputs unusable):
+                // the generic refusal, not a claim that the answer was too large for the task.
+                Err(error) => {
+                    opline!(
+                        "seller node hook job_id={job_id}: delivery review size check refused ({error}); nothing delivered"
+                    );
+                    self.hook_refused(job_id, &offer.buyer_pubkey, &workdir)
+                        .await;
+                    return;
+                }
             }
-        }
-        let turn_status = crate::session::TurnStatus::parse(status);
-        // A staged non-`done` status exists only for a session claim; sessions switched off since
-        // leave nothing to ask the question in (§5.0 rule 3).
-        if !session_job && turn_status != Some(crate::session::TurnStatus::Done) {
-            opline!(
-                "seller node hook job_id={job_id}: status {status} without a session; nothing delivered"
-            );
-            self.hook_refused(job_id, &offer.buyer_pubkey, &workdir)
-                .await;
-            return;
         }
         let metadata = hook_exec_metadata(label, model, wall_ms);
         let seller_pubkey = self.seller_pubkey.to_hex();
@@ -367,7 +387,7 @@ impl SellerNodeRunner {
                 stored_creq,
                 answer,
                 &metadata,
-                turn_status.filter(|_| session_job),
+                delivered_status,
                 record.as_ref(),
             )
             .await;

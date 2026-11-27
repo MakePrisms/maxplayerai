@@ -14,7 +14,13 @@ pub(crate) async fn seller_delivery_budget(
     let Some(probe) = probe(home, signer, job)? else {
         return Ok(inline_requested);
     };
-    let Probe { request, claim, award, policy, reviewer } = &probe;
+    let Probe {
+        request,
+        claim,
+        award,
+        policy,
+        reviewer,
+    } = &probe;
     let identity = Identity::Seller(signer);
     let git = budget_request(request, claim, award, policy, Reserve::Git)?;
     identity
@@ -27,34 +33,74 @@ pub(crate) async fn seller_delivery_budget(
     fits(&identity, &inline, reviewer).await
 }
 
-/// Whether THIS inline answer, with this offer's task, fits one delivery review request.
+/// The session tags an inline RESULT carries on top of a one-shot result (session-jobs §2.3),
+/// exactly the arguments [`crate::session::append_result_tags`] is called with when the result is
+/// built, so the probe sizes the same tags the published result has.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResultTags<'a> {
+    /// Turn n ≥ 2: the follow-up the result replies to (`["e", id, "", "reply"]`).
+    pub(crate) followup_id: Option<&'a str>,
+    /// `turn_status` (written only when not `done`).
+    pub(crate) status: crate::session::TurnStatus,
+    /// `["context", "reset"]`.
+    pub(crate) context_reset: bool,
+    /// A priced turn's fresh payment request (`creq`).
+    pub(crate) turn_creq: Option<&'a str>,
+}
+
+impl ResultTags<'_> {
+    /// A one-shot result, or a session's turn 1 that ended `done`: no session tags.
+    pub(crate) const NONE: ResultTags<'static> = ResultTags {
+        followup_id: None,
+        status: crate::session::TurnStatus::Done,
+        context_reset: false,
+        turn_creq: None,
+    };
+}
+
+/// Whether THIS inline result (its answer and session tags), with this offer's task, fits one
+/// delivery review request.
 ///
 /// [`seller_delivery_budget`] reserves the largest answer the protocol admits (the full envelope
 /// ceiling), which a long private task can push past the seal limit although a real answer would
 /// fit. A Git-capable agent is then steered to Git before it runs; a hook has no Git route, so it
 /// runs and its actual answer is measured here before anything is delivered (dot-bot, rc3 swarm
-/// round 2: the hook never ran). `Ok(false)` is permanent: this answer cannot be reviewed.
+/// round 2: the hook never ran). A session turn n ≥ 2 is measured here too: its RESULT carries
+/// more tags than turn 1's reservation covered. `Ok(false)` is permanent: this result cannot be
+/// reviewed. `Ok(true)` for a job with no private delivery review.
 pub(crate) async fn seller_inline_answer_fits(
     home: &MaxplayerHome,
     signer: &crate::seller_node::signer::SignerHandle,
     job: &str,
     answer: &str,
+    tags: ResultTags<'_>,
 ) -> Result<bool, String> {
     let Some(probe) = probe(home, signer, job)? else {
         return Ok(true);
     };
-    let Probe { request, claim, award, policy, reviewer } = &probe;
+    let Probe {
+        request,
+        claim,
+        award,
+        policy,
+        reviewer,
+    } = &probe;
     // Building the request only fails on this answer's own content (its serialized body over the
     // limit, say): the same inputs already passed the worst-case probe. Retrying cannot help.
-    let inline = budget_request(request, claim, award, policy, Reserve::Inline(answer))
+    let inline = budget_request(request, claim, award, policy, Reserve::Inline(answer, tags))
         .map_err(|error| format!("review: permanent input error (answer): {error}"))?;
     fits(&Identity::Seller(signer), &inline, reviewer).await
 }
 
 /// Seal a probe request locally (never sent): `Ok(false)` when it is too large to review.
-async fn fits(identity: &Identity<'_>, request: &Request, reviewer: &PublicKey) -> Result<bool, String> {
-    // The request guard is derived from the seal limit (#1349), so an inline reservation too large
-    // to seal can now fail in `draft` instead of `wrap`: both are permanent, both mean "Git".
+async fn fits(
+    identity: &Identity<'_>,
+    request: &Request,
+    reviewer: &PublicKey,
+) -> Result<bool, String> {
+    // The request guard is derived from the seal limit (#1349), so a request too large to seal can
+    // fail in `draft` instead of `wrap`: both are permanent, both mean "does not fit" (the worst-case
+    // probe then selects Git; a measured answer is not delivered).
     let sent = match request.draft(&reviewer.to_hex()) {
         Ok(draft) => identity.request(draft, *reviewer).await,
         Err(error) => Err(error),
@@ -73,8 +119,8 @@ enum Reserve<'a> {
     Git,
     /// The largest inline answer the protocol admits, before the agent has run.
     InlineCeiling,
-    /// An inline answer that exists.
-    Inline(&'a str),
+    /// An inline answer that exists, with the session tags its result carries.
+    Inline(&'a str, ResultTags<'a>),
 }
 
 struct Probe {
@@ -133,7 +179,13 @@ fn probe(
     };
     let reviewer =
         PublicKey::from_hex(&ctx.policy.service).map_err(|_| reviewer_error("invalid_subject"))?;
-    Ok(Some(Probe { request, claim, award, policy: ctx.policy, reviewer }))
+    Ok(Some(Probe {
+        request,
+        claim,
+        award,
+        policy: ctx.policy,
+        reviewer,
+    }))
 }
 
 fn budget_request(
@@ -146,7 +198,7 @@ fn budget_request(
     use crate::gateway;
     let inline = !matches!(reserve, Reserve::Git);
     let answer = match reserve {
-        Reserve::Inline(answer) => answer,
+        Reserve::Inline(answer, _) => answer,
         _ => "x",
     };
     let o = pc::wire::validate_private(&request.offer, &policy.host)
@@ -170,7 +222,7 @@ fn budget_request(
         &policy.host,
     )
     .map_err(|e| e.to_string())?;
-    let local = if inline {
+    let mut local = if inline {
         gateway::inline_result_draft(
             &id,
             &buyer,
@@ -199,6 +251,17 @@ fn budget_request(
             &[],
         )
     };
+    // The session tags the delivered result carries, as `deliver_inline_with` and
+    // `publish_turn_result` append them before projecting (`project` keeps all of them on 3403).
+    if let Reserve::Inline(_, tags) = reserve {
+        crate::session::append_result_tags(
+            &mut local,
+            tags.followup_id,
+            tags.status,
+            tags.context_reset,
+            tags.turn_creq,
+        );
+    }
     let draft = pc::carriers::project(
         &request.offer,
         &local,
@@ -359,7 +422,8 @@ mod tests {
                         !wraps(&r, &buyer, service).await,
                         "regression must reproduce the old oversized delivery"
                     );
-                    let git = budget_request(&r, &e.claim, &e.award, &policy, Reserve::Git).unwrap();
+                    let git =
+                        budget_request(&r, &e.claim, &e.award, &policy, Reserve::Git).unwrap();
                     assert!(
                         wraps(&git, &buyer, service).await,
                         "reserved Git result must fit"
@@ -385,8 +449,14 @@ mod tests {
     async fn a_long_task_fails_the_ceiling_but_a_real_answer_still_fits() {
         let mints = vec!["https://testnut.cashu.space".to_owned()];
         let fixture = |task: &str| {
-            let (e, _, _, policy) =
-                pc::evidence::inline_fixture_with_text(true, false, 2_000_000_000, mints.clone(), task, "x");
+            let (e, _, _, policy) = pc::evidence::inline_fixture_with_text(
+                true,
+                false,
+                2_000_000_000,
+                mints.clone(),
+                task,
+                "x",
+            );
             let (dir, home) = home(&e, &policy);
             let signer = crate::seller_node::signer::spawn(&home).unwrap();
             (e, dir, home, signer)
@@ -394,7 +464,10 @@ mod tests {
         let mut short = None;
         for size in (1_000..=16_000).step_by(1_000) {
             let (e, dir, home, signer) = fixture(&"x".repeat(size));
-            if !seller_delivery_budget(&home, &signer, &e.offer.id.to_hex(), true).await.unwrap() {
+            if !seller_delivery_budget(&home, &signer, &e.offer.id.to_hex(), true)
+                .await
+                .unwrap()
+            {
                 short = Some((size, e, dir, home, signer));
                 break;
             }
@@ -405,7 +478,9 @@ mod tests {
         let job = e.offer.id.to_hex();
         let answer = "A short chart: Muse A, Grok Bot A, Dots B, Instinct B.";
         assert!(
-            seller_inline_answer_fits(&home, &signer, &job, answer).await.unwrap(),
+            seller_inline_answer_fits(&home, &signer, &job, answer, ResultTags::NONE)
+                .await
+                .unwrap(),
             "a real answer to a {size}-byte task fits its delivery review"
         );
         // The measurement is real, not a pass-through: an answer whose envelope nears the ceiling
@@ -415,13 +490,16 @@ mod tests {
         for task in (size..=pc::MAX_BODY_BYTES - 512).step_by(500) {
             let (e, _dir, home, signer) = fixture(&"x".repeat(task));
             let job = e.offer.id.to_hex();
-            match seller_inline_answer_fits(&home, &signer, &job, &largest).await {
+            match seller_inline_answer_fits(&home, &signer, &job, &largest, ResultTags::NONE).await
+            {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(error) => panic!("a {task}-byte task: {error}"),
             }
             assert!(
-                seller_inline_answer_fits(&home, &signer, &job, answer).await.unwrap(),
+                seller_inline_answer_fits(&home, &signer, &job, answer, ResultTags::NONE)
+                    .await
+                    .unwrap(),
                 "at a {task}-byte task the short answer still fits"
             );
             refused = Some(task);
@@ -429,11 +507,230 @@ mod tests {
         }
         let refused = refused.expect("some task length must refuse the largest answer");
         let (e, _dir, home, signer) = fixture("x");
-        let error = seller_inline_answer_fits(&home, &signer, &e.offer.id.to_hex(), &"\u{1}".repeat(4_000))
-            .await
-            .unwrap_err();
-        assert!(permanent_error(&error), "an answer body over the limit is refused, not retried: {error}");
+        let error = seller_inline_answer_fits(
+            &home,
+            &signer,
+            &e.offer.id.to_hex(),
+            &"\u{1}".repeat(4_000),
+            ResultTags::NONE,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            permanent_error(&error),
+            "an answer body over the limit is refused, not retried: {error}"
+        );
         eprintln!("the largest inline answer is refused from a {refused}-byte task");
+    }
+
+    /// An answer whose delivery body is exactly `n` bytes: a control byte escapes to six body bytes
+    /// (`\u0001`), so `n / 6` of them and `n % 6` letters. Each step adds one body byte, and the raw
+    /// answer stays far under the inline answer cap.
+    fn answer_of(n: usize) -> String {
+        format!("{}{}", "\u{1}".repeat(n / 6), "x".repeat(n % 6))
+    }
+
+    /// The buyer's delivery review request for the RESULT a seller (key 2, the fixtures' seat)
+    /// publishes for `answer` with `tags`: built and signed as `deliver_inline_with` /
+    /// `publish_turn_result` build it, with a real timestamp, independently of the probe.
+    fn real_request(
+        e: &pc::evidence::PrivateEvidence,
+        policy: &pc::runtime::Policy,
+        answer: &str,
+        tags: ResultTags<'_>,
+    ) -> Request {
+        let seller = Keys::parse(&format!("{:064x}", 2)).unwrap();
+        let id = e.offer.id.to_hex();
+        let o = pc::wire::validate_private(&e.offer, &policy.host).unwrap();
+        let amount = pc::wire::decimal(o.required("amount").unwrap()).unwrap();
+        let content = pc::carriers::prepare_content(
+            &e.offer,
+            Some(&e.claim),
+            Some(&e.award),
+            &seller.public_key().to_hex(),
+            &policy.service,
+            pc::ContentType::Answer,
+            answer.into(),
+            None,
+            &policy.host,
+        )
+        .unwrap();
+        let job_hash = pc::job_hash(&id).unwrap();
+        let sig = seller
+            .sign_schnorr(&nostr_sdk::secp256k1::Message::from_digest([7; 32]))
+            .to_string();
+        let mut local = crate::gateway::inline_result_draft(
+            &id,
+            &e.offer.pubkey.to_hex(),
+            "text/markdown",
+            amount,
+            &job_hash,
+            &sig,
+            answer,
+            &[],
+        );
+        crate::session::append_result_tags(
+            &mut local,
+            tags.followup_id,
+            tags.status,
+            tags.context_reset,
+            tags.turn_creq,
+        );
+        let result = pc::builders::sign(
+            &seller,
+            pc::carriers::project(
+                &e.offer,
+                &local,
+                Some(&e.award),
+                Some(&content),
+                &policy.host,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut evidence = e.clone();
+        evidence.result = result;
+        evidence.answer_envelope = Some(content.envelope().to_owned());
+        request(&evidence)
+    }
+
+    /// The largest `n` in `0..hi` for which `fits(answer_of(n))`; `fits` must hold at 0 and fail at `hi`.
+    async fn largest<F, Fut>(hi: usize, mut fits: F) -> usize
+    where
+        F: FnMut(usize) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        assert!(fits(0).await, "harness check: an empty answer fits");
+        assert!(
+            !fits(hi).await,
+            "harness check: a {hi}-byte body does not fit"
+        );
+        let (mut lo, mut hi) = (0, hi);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if fits(mid).await {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// #1441 advisor r1 (Findings 1 and 3): the answer probe sizes the RESULT that is published,
+    /// session tags included: turn 1's `turn_status`, and turn n ≥ 2's `reply` and `creq`. For
+    /// each, the probe's largest answer is checked against the buyer's real delivery review request
+    /// for a result carrying those tags: the real request still seals at the probe's limit (never
+    /// optimistic) and stops within a few bytes of it (the timestamp margin). The tags cost real
+    /// bytes, so each limit is below the one-shot result's.
+    /// RED ON REVERT: size the answer without the session tags.
+    #[tokio::test]
+    async fn the_answer_probe_sizes_the_session_tags_of_the_result_it_measures() {
+        let mints = vec!["https://testnut.cashu.space".to_owned()];
+        let fid = "f".repeat(64);
+        let creq = crate::gateway::creq::build_seller_creq(
+            &fid,
+            10,
+            "sat",
+            &mints,
+            &Keys::parse(&format!("{:064x}", 2))
+                .unwrap()
+                .public_key()
+                .to_hex(),
+        )
+        .unwrap();
+        let cases = [
+            ("one-shot", ResultTags::NONE),
+            (
+                "turn 1, needs_input",
+                ResultTags {
+                    status: crate::session::TurnStatus::NeedsInput,
+                    ..ResultTags::NONE
+                },
+            ),
+            (
+                "turn 2, priced, out_of_time",
+                ResultTags {
+                    followup_id: Some(&fid),
+                    status: crate::session::TurnStatus::OutOfTime,
+                    turn_creq: Some(&creq),
+                    ..ResultTags::NONE
+                },
+            ),
+        ];
+        // A long private task (the ceiling reservation fails) with room for a few KiB of answer.
+        let mut chosen = None;
+        for task in (4_000..=pc::MAX_BODY_BYTES - 600).step_by(1_000) {
+            let (e, _, buyer, policy) = pc::evidence::inline_fixture_with_text(
+                true,
+                true,
+                2_000_000_000,
+                mints.clone(),
+                &"t".repeat(task),
+                "x",
+            );
+            let (dir, home) = home(&e, &policy);
+            let signer = crate::seller_node::signer::spawn(&home).unwrap();
+            let job = e.offer.id.to_hex();
+            if seller_delivery_budget(&home, &signer, &job, true)
+                .await
+                .unwrap()
+            {
+                continue;
+            }
+            let fits_max = seller_inline_answer_fits(
+                &home,
+                &signer,
+                &job,
+                &answer_of(15_000),
+                ResultTags::NONE,
+            )
+            .await
+            .unwrap();
+            if !fits_max {
+                chosen = Some((task, e, buyer, policy, dir, home, signer));
+                break;
+            }
+        }
+        let (task, e, buyer, policy, _dir, home, signer) =
+            chosen.expect("harness check: some long task leaves less than 15000 answer bytes");
+        let job = e.offer.id.to_hex();
+        let service = PublicKey::from_hex(&policy.service).unwrap();
+        let mut one_shot = None;
+        for (name, tags) in cases {
+            let probed = largest(15_000, |n| {
+                let (home, signer, job) = (&home, &signer, &job);
+                async move {
+                    seller_inline_answer_fits(home, signer, job, &answer_of(n), tags)
+                        .await
+                        .unwrap_or_else(|error| panic!("{name}: {n}: {error}"))
+                }
+            })
+            .await;
+            let real = largest(15_000, |n| {
+                let r = real_request(&e, &policy, &answer_of(n), tags);
+                let buyer = buyer.clone();
+                async move { wraps(&r, &buyer, service).await }
+            })
+            .await;
+            eprintln!("{task}-byte task, {name}: probe {probed}, real {real}");
+            assert!(
+                real >= probed,
+                "{name}: the probe accepts a {probed}-byte answer whose real review request does not seal (real limit {real})"
+            );
+            assert!(
+                real - probed <= 16,
+                "{name}: the probe refuses {} bytes the real request still holds",
+                real - probed
+            );
+            match one_shot {
+                None => one_shot = Some(probed),
+                Some(limit) => assert!(
+                    probed < limit,
+                    "{name}: the session tags must cost answer bytes ({probed} vs one-shot {limit})"
+                ),
+            }
+        }
     }
 
     #[tokio::test]
