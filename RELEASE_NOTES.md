@@ -1,3 +1,95 @@
+## v0.8.2-rc4
+
+Release candidate for 0.8.2, built from main after #1438. Most of it is for sellers: a quieter log
+(payment-wrap history, settled offers and a full work-lane queue are each reported once instead of
+on every pass), a status line that shows relay sign-in, the last heartbeat and how the last relay
+drop ended, an offer review that failed while the relay was unreachable is retried once the relay
+is back, and a refused `seller serve` start names the process holding the lock. `maxplayer mcp`
+now picks up an upgraded binary without a client restart, a swarm task without `duration_secs`
+runs until the swarm job ends, and the npm launcher refuses to install without its platform
+binary. After publication, install with `npm install -g maxplayer@0.8.2-rc4` (or
+`install.sh --version 0.8.2-rc4`). Publish as a GitHub prerelease on npm `rc`; leave stable
+`latest` (0.8.1) unchanged.
+
+**Relay, reviewer and registration service: nothing to deploy for this RC.** Nothing in
+`crates/buzz`, the registration service, the relay write policy or the reviewer changed since
+v0.8.2-rc3; the review retry (#1440) runs in the seller. No wire change and no store schema change:
+the seller store stays at 16 and the buyer store at 10. The sandbox image is rebuilt and tagged
+`maxplayer-sandbox:v0.8.2-rc4`. Website pages keep naming the latest stable release (0.8.1).
+Restart seller daemons to pick up the seller changes; a restarted seller re-reads its payment-wrap
+history once, quietly, on its first backfill pass (#1418).
+
+### Changes
+
+- **Seller: stop re-reading and re-printing the whole payment-wrap history** (#1418). A seat with
+  no receipt yet, or with a free delivery, re-read every kind-1059 wrap ever sent to it on every
+  backfill pass and printed two lines per wrap (~1,500 lines at boot, ~760 every 5 minutes on one
+  seat).
+  - Free deliveries (`payment = 'none'`) no longer hold the backfill cursor back; a delivered
+    session turn without a receipt now does.
+  - The cursor moves with the last complete backfill read (kept per relay URL, minus 24 h), still
+    clamped to the oldest unpaid priced delivery minus 1 h. A backfill pages backwards while a page
+    brings new events, so a relay-capped page is not taken as the whole history.
+  - The boot live wrap subscription starts at the same cursor. The first backfill pass after a
+    boot re-reads from the start, quietly, so restarting stays a full recovery.
+  - `wrap seen`, `not a decodable own-payment wrap` and `already receipted` print only with
+    `MAXPLAYER_VERBOSE`, counted in the routine summary; `no offer recorded for job` prints once
+    per job per boot. A payment that does not parse prints `decode failed` again.
+- **Seller: retry an offer review that failed while the relay was down** (#1440). After each
+  completed NIP-42 sign-in, cached non-terminal review errors of offers still awaiting a claim are
+  dropped and retried, with one line:
+  `seller node relay back (NIP-42 auth): retrying N offer review(s) that failed while it was unreachable: <ids>`.
+  Policy refusals and permanent input errors are left alone. `maxplayer review retry` is no
+  longer needed after a host thaw.
+- **Seller: the status line shows relay sign-in, the last heartbeat and the last relay drop**
+  (#1438). After `relay confirmed Ns ago` (or `relay RECOVERING (unconfirmed for Ns)`) it adds
+  `signed in` / `NOT signed in …`, `heartbeat landed Ns ago` / `no heartbeat landed yet`, and
+  once the relay has dropped, `last relay drop recovered Ns ago after Ns` or
+  `relay reconnect FAILED Ns ago (Ns unconfirmed), retrying`. The leading phrase is unchanged.
+- **Seller: a settled or taken offer's skip is logged once per boot** (#1432), not on every
+  backfill pass; repeats are counted as `settled or taken offers skipped again: N` and printed with
+  `MAXPLAYER_VERBOSE=1`. The claim decision is unchanged.
+- **Seller: a full work-lane queue is logged once per episode** (#1436), then one
+  `seller node WORK-LANE queue empty again after Ns (it filled N time(s) meanwhile)` line when it
+  drains. Back-pressure is unchanged.
+- **Seller: a refused start names the live lock holder and how to stop it** (#1431). On Linux the
+  holder's pid comes from the recorded pid or `/proc/locks` (also finding an old seller left running
+  after an upgrade), and the message suggests `maxplayer seller drain --home <home>` or
+  `kill <pid>`. Elsewhere an unconfirmed pid gets an `lsof` check instead of a kill hint.
+- **Hook agents: a crashed hook run is recognised by its `MAXPLAYER_HOOK_RUN` tag** (#1403). A
+  hook now gets `MAXPLAYER_HOOK_RUN=<invocation>/<attempt>`, inherited by every process it starts.
+  After a daemon crash, a journaled group whose leader is gone, or that has no recorded identity,
+  is proven ours by a member carrying the tag and stopped, so the job is re-run instead of waiting
+  for its deadline. macOS gets the same reaping via `proc_pidinfo`/`proc_listpgrppids`
+  (type-checked only, not run on macOS). Both hook variables are reserved, so `maxplayer` run
+  inside a hook no longer refuses them.
+- **`maxplayer doctor`: a hook-only seat reports nix as `SKIP`, like the boot gate** (#1437), instead
+  of `FAIL nix` and exit 1 on a box that sells fine.
+- **`maxplayer mcp` serves the next request on an upgraded binary** (#1434). When the file it was
+  started from changes and the new one answers `--version`, the server execs it in place (same pid
+  and stdio) and hands over the pending request and any buffered input. A broken copy is ignored
+  and the old version keeps serving. The buyer daemon is a separate process and keeps its version
+  until it restarts.
+- **Swarm: a task without `duration_secs` runs until the swarm job ends** (#1435). Omitted, the
+  offer deadline is the swarm job's `ends`, capped by the member's minutes left today, for turn 1
+  and session follow-up turns. An explicit `duration_secs` (at least 300) still sets a fixed slot.
+  The MCP schema no longer requires it. Buyers on 0.8.1 or earlier RCs still require it.
+- **`maxplayer-chat status` stays fresh while a liveness probe runs** (#1433): the status file keeps
+  being written during the probe and the reconnect backoff, and an `EPERM` from `kill(pid, 0)`
+  counts as a live writer, so a healthy watch no longer reads `stale status file (>90s)`.
+- **Release: the npm launcher is published only after its payloads are served, and an install
+  without the payload fails** (#1430). The release job waits until each `@maxplayerai/<platform>`
+  version is listed and its tarball downloads (up to 45 min) before publishing `maxplayer`.
+  `maxplayer` gains a `postinstall` check: on a supported platform with the payload missing (for
+  example `--omit=optional`), the install fails and names `@maxplayerai/<platform>@<version>`;
+  `npm i -g` then keeps the previous version. `--ignore-scripts` skips only the check.
+
+### Website and docs (live on merge, not part of the binary)
+
+- instinct-operate replaced with a reviewed draft from an Instinct seat (#1439); debug-selling
+  updated for the quieter wrap logs, the once-only skip lines and the new status line (#1418, #1432,
+  #1438); swarm-buyer describes the optional `duration_secs` (#1435).
+
 ## v0.8.2-rc3
 
 Release candidate for 0.8.2, built from main after #1426. It fixes sellers whose seat announcement
