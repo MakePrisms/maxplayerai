@@ -124,10 +124,25 @@ impl<E> WorkQueue<E> {
     }
 }
 
-/// The first queue-full episode starting this soon after the loop starts is the boot replay: the
-/// live subscriptions hand back their stored history at once, so it happens on every restart of a
-/// seat with any history and is not a problem to report.
+/// The boot replay: the stored history the live subscriptions hand back right after start, which
+/// can fill the queue on every restart of a seat with any history. It is over at the relay's EOSE
+/// on every boot subscription, at a reconnect or loop gap, and at the latest this long after the
+/// subscriptions went out. A queue-full episode that starts after it is reported like any other.
 pub(crate) const BOOT_REPLAY_WINDOW: Duration = Duration::from_secs(120);
+
+/// A boot-replay episode still not drained this long after it started is reported at default level
+/// (and its end with the ordinary "queue empty again" line): a queue that never drains must not
+/// stay invisible just because it started during the replay.
+pub(crate) const BOOT_REPLAY_STUCK_AFTER: Duration = Duration::from_secs(120);
+
+/// One lane log line and the level it prints at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LaneLine {
+    /// `opline!`: always printed.
+    Default(String),
+    /// `opline_verbose!`: only with `MAXPLAYER_VERBOSE`.
+    Verbose(String),
+}
 
 /// One "WORK-LANE queue full" episode. On a boot re-read the lane frees a slot and the relay stream
 /// refills it at once, so a log line latched on "has room again" fired dozens of times in two
@@ -137,8 +152,10 @@ pub(crate) const BOOT_REPLAY_WINDOW: Duration = Duration::from_secs(120);
 pub(crate) struct QueueFullEpisode {
     started: Option<Instant>,
     fills: u32,
-    /// When the work loop started. `None` (`default()`): no episode is the boot replay.
-    loop_started: Option<Instant>,
+    /// When the boot subscriptions went out. `None` (`default()`): no episode is the boot replay.
+    replay_started: Option<Instant>,
+    /// Boot subscriptions whose stored history has not ended yet (no EOSE). Empty: replay over.
+    replay_pending: Vec<String>,
     /// An episode has started since the loop did: only the first can be the boot replay.
     seen: bool,
     /// The current (or, after [`Self::after_take`] ended it, the last) episode is the boot replay.
@@ -146,16 +163,34 @@ pub(crate) struct QueueFullEpisode {
 }
 
 impl QueueFullEpisode {
-    /// For a work loop that started at `loop_started`.
-    pub(crate) fn new(loop_started: Instant) -> Self {
+    /// For a node whose boot subscriptions `subs` went out at `replay_started`.
+    pub(crate) fn new(replay_started: Instant, subs: &[&str]) -> Self {
         Self {
-            loop_started: Some(loop_started),
+            replay_started: Some(replay_started),
+            replay_pending: subs.iter().map(|s| (*s).to_owned()).collect(),
             ..Self::default()
         }
     }
 
-    /// After an event was queued. `true` exactly once per episode: log the "queue full" line
-    /// (quietly when [`Self::boot`] says it is the boot replay).
+    /// The relay's EOSE for subscription `id`: its stored history is in.
+    pub(crate) fn stored_history_ended(&mut self, id: &str) {
+        self.replay_pending.retain(|s| s != id);
+    }
+
+    /// A reconnect or loop gap: whatever arrives next is not the boot replay.
+    pub(crate) fn end_boot_replay(&mut self) {
+        self.replay_pending.clear();
+    }
+
+    /// Is the boot replay still arriving at `now`?
+    pub(crate) fn in_boot_replay(&self, now: Instant) -> bool {
+        !self.replay_pending.is_empty()
+            && self
+                .replay_started
+                .is_some_and(|at| now.saturating_duration_since(at) < BOOT_REPLAY_WINDOW)
+    }
+
+    /// After an event was queued. `true` exactly once per episode: log [`Self::full_line`].
     pub(crate) fn after_push(&mut self, has_room: bool, now: Instant) -> bool {
         if has_room {
             return false;
@@ -165,10 +200,7 @@ impl QueueFullEpisode {
             return false;
         }
         self.started = Some(now);
-        self.boot = !self.seen
-            && self
-                .loop_started
-                .is_some_and(|at| now.saturating_duration_since(at) <= BOOT_REPLAY_WINDOW);
+        self.boot = !self.seen && self.in_boot_replay(now);
         self.seen = true;
         true
     }
@@ -176,6 +208,37 @@ impl QueueFullEpisode {
     /// Is the current episode (or the one [`Self::after_take`] just ended) the boot replay?
     pub(crate) fn boot(&self) -> bool {
         self.boot
+    }
+
+    /// The "queue full" line for the episode [`Self::after_push`] just started: verbose-only for
+    /// the boot replay, default otherwise.
+    pub(crate) fn full_line(&self, cap: usize) -> LaneLine {
+        if self.boot {
+            LaneLine::Verbose(format!(
+                "seller node WORK-LANE queue full ({cap} events) during the boot replay: relay \
+                 reads pause until it drains"
+            ))
+        } else {
+            LaneLine::Default(format!(
+                "seller node WORK-LANE queue full ({cap} events): relay reads pause until it drains"
+            ))
+        }
+    }
+
+    /// A boot-replay episode open for [`BOOT_REPLAY_STUCK_AFTER`] or longer stops being treated as
+    /// the replay: returns its default-level line once.
+    pub(crate) fn overdue(&mut self, now: Instant) -> Option<String> {
+        let open = now.saturating_duration_since(self.started?);
+        if !self.boot || open < BOOT_REPLAY_STUCK_AFTER {
+            return None;
+        }
+        self.boot = false;
+        Some(format!(
+            "seller node WORK-LANE queue full since the boot replay {}s ago and not drained yet \
+             (filled {} time(s)): relay reads pause until it drains",
+            open.as_secs(),
+            self.fills
+        ))
     }
 
     /// With `queued` events left in the queue. When an episode is open and the queue is empty, it
@@ -187,6 +250,24 @@ impl QueueFullEpisode {
         let started = self.started.take()?;
         let fills = std::mem::take(&mut self.fills);
         Some((fills, now.saturating_duration_since(started)))
+    }
+
+    /// The line for an episode [`Self::after_take`] just ended (always default level).
+    pub(crate) fn ended_line(&self, fills: u32, took: Duration) -> String {
+        if self.boot {
+            format!(
+                "seller node WORK-LANE boot replay done after {}s: the relay's stored events \
+                 filled the queue {fills} time(s) after start (expected after a restart; anything \
+                 skipped is re-read by the next history backfill)",
+                took.as_secs()
+            )
+        } else {
+            format!(
+                "seller node WORK-LANE queue empty again after {}s (it filled {fills} time(s) \
+                 meanwhile)",
+                took.as_secs()
+            )
+        }
     }
 }
 
@@ -1019,27 +1100,114 @@ mod tests {
         assert_eq!(logged, 2);
     }
 
-    /// The first episode right after start is the boot replay; a later one, or a first one past
-    /// the window, is not. `default()` (no start time) never marks one.
-    #[test]
-    fn only_the_first_episode_after_start_is_the_boot_replay() {
-        let t0 = Instant::now();
-        let mut episode = QueueFullEpisode::new(t0);
-        assert!(episode.after_push(false, t0 + Duration::from_secs(3)));
-        assert!(episode.boot(), "first fill seconds after start");
-        assert!(!episode.after_push(false, t0 + Duration::from_secs(4)), "same episode");
-        assert!(episode.after_take(0, t0 + Duration::from_secs(9)).is_some());
-        assert!(episode.boot(), "still readable after the episode ended");
-        assert!(episode.after_push(false, t0 + Duration::from_secs(30)));
-        assert!(!episode.boot(), "a second episode, even inside the window, is live");
+    const BOOT_SUBS: &[&str] = &["offers", "awards", "wraps"];
 
-        let mut late = QueueFullEpisode::new(t0);
-        assert!(late.after_push(false, t0 + BOOT_REPLAY_WINDOW + Duration::from_secs(1)));
-        assert!(!late.boot(), "first episode past the window");
+    /// The first episode while the boot subscriptions' stored history is still arriving is the boot
+    /// replay; a later one, or a first one after every EOSE, is not. `default()` never marks one.
+    #[test]
+    fn only_the_first_episode_during_the_stored_replay_is_the_boot_replay() {
+        let t0 = Instant::now();
+        let mut episode = QueueFullEpisode::new(t0, BOOT_SUBS);
+        assert!(episode.after_push(false, t0 + Duration::from_secs(3)));
+        assert!(episode.boot(), "first fill during the replay");
+        assert!(matches!(episode.full_line(1024), LaneLine::Verbose(_)));
+        assert!(!episode.after_push(false, t0 + Duration::from_secs(4)), "same episode");
+        let (fills, took) = episode.after_take(0, t0 + Duration::from_secs(9)).unwrap();
+        assert_eq!((fills, took), (2, Duration::from_secs(6)));
+        assert!(episode.boot(), "still readable after the episode ended");
+        assert!(episode.ended_line(fills, took).contains("boot replay done after 6s"));
+        assert!(episode.after_push(false, t0 + Duration::from_secs(30)));
+        assert!(!episode.boot(), "a second episode, even during the replay, is live");
+        assert!(matches!(episode.full_line(1024), LaneLine::Default(_)));
 
         let mut unset = QueueFullEpisode::default();
         assert!(unset.after_push(false, t0));
-        assert!(!unset.boot(), "no loop start: never the boot replay");
+        assert!(!unset.boot(), "no boot subscriptions: never the boot replay");
+    }
+
+    /// The replay ends at the EOSE of EVERY boot subscription, not at a timer: a burst after the
+    /// last EOSE is live even seconds after start, and one before it is still the replay.
+    #[test]
+    fn the_boot_replay_ends_at_the_last_eose() {
+        let t0 = Instant::now();
+        let mut episode = QueueFullEpisode::new(t0, BOOT_SUBS);
+        episode.stored_history_ended("offers");
+        episode.stored_history_ended("awards");
+        episode.stored_history_ended("not-ours");
+        assert!(episode.in_boot_replay(t0 + Duration::from_secs(5)), "wraps still replaying");
+        episode.stored_history_ended("wraps");
+        assert!(!episode.in_boot_replay(t0 + Duration::from_secs(5)));
+        assert!(episode.after_push(false, t0 + Duration::from_secs(5)));
+        assert!(!episode.boot(), "a live burst 5 s after start, after every EOSE");
+        assert!(matches!(episode.full_line(1024), LaneLine::Default(_)));
+        let (fills, took) = episode.after_take(0, t0 + Duration::from_secs(8)).unwrap();
+        assert!(episode.ended_line(fills, took).contains("queue empty again after 3s"));
+    }
+
+    /// A reconnect or loop gap ends the replay, and so does the window, exclusive at its end.
+    #[test]
+    fn a_reconnect_or_the_window_ends_the_boot_replay() {
+        let t0 = Instant::now();
+        let mut gap = QueueFullEpisode::new(t0, BOOT_SUBS);
+        gap.end_boot_replay();
+        assert!(gap.after_push(false, t0 + Duration::from_secs(1)));
+        assert!(!gap.boot(), "after a reconnect");
+
+        let episode = QueueFullEpisode::new(t0, BOOT_SUBS);
+        assert!(episode.in_boot_replay(t0 + BOOT_REPLAY_WINDOW - Duration::from_millis(1)));
+        assert!(!episode.in_boot_replay(t0 + BOOT_REPLAY_WINDOW), "no EOSE, window over");
+        let mut late = QueueFullEpisode::new(t0, BOOT_SUBS);
+        assert!(late.after_push(false, t0 + BOOT_REPLAY_WINDOW));
+        assert!(!late.boot(), "first episode at the window's end");
+    }
+
+    /// A boot-replay episode that never drains is reported once at default level after
+    /// [`BOOT_REPLAY_STUCK_AFTER`], and its end then prints the ordinary line.
+    #[test]
+    fn a_stuck_boot_replay_episode_is_reported() {
+        let t0 = Instant::now();
+        let mut episode = QueueFullEpisode::new(t0, BOOT_SUBS);
+        assert!(episode.overdue(t0).is_none(), "no episode");
+        assert!(episode.after_push(false, t0 + Duration::from_secs(2)));
+        assert!(episode.boot());
+        let opened = t0 + Duration::from_secs(2);
+        let just_before = opened + BOOT_REPLAY_STUCK_AFTER - Duration::from_millis(1);
+        assert!(episode.overdue(just_before).is_none());
+        let at = opened + BOOT_REPLAY_STUCK_AFTER;
+        let line = episode.overdue(at).expect("reported at the threshold");
+        assert!(line.contains("not drained yet"), "{line}");
+        assert!(!episode.boot());
+        assert!(episode.overdue(at + Duration::from_secs(60)).is_none(), "once");
+        let (fills, took) = episode.after_take(0, at + Duration::from_secs(60)).unwrap();
+        assert!(episode.ended_line(fills, took).contains("queue empty again"));
+        // A live episode is never "overdue": its full line already printed at default level.
+        let mut live = QueueFullEpisode::default();
+        assert!(live.after_push(false, t0));
+        assert!(live.overdue(t0 + BOOT_REPLAY_STUCK_AFTER * 3).is_none());
+    }
+
+    /// The run loop feeds the episode: every EOSE, every loop gap and every recovery can end the
+    /// replay, the "queue full" line prints at the level [`QueueFullEpisode::full_line`] picks, and
+    /// an overdue boot episode is reported. Pinned on the source: the loop needs a relay to run.
+    #[test]
+    fn the_run_loop_feeds_the_boot_replay_episode() {
+        let src = include_str!("run.rs");
+        for needle in [
+            "schedule::QueueFullEpisode::new(boot_replay_started, &boot_subs)",
+            "queue_full.stored_history_ended(eose_id.as_str());",
+            "match queue_full.full_line(EVENT_QUEUE_CAP)",
+            "schedule::LaneLine::Default(line) => opline!(\"{line}\")",
+            "opline_verbose!(\"{line}\")",
+            "queue_full.overdue(tokio::time::Instant::now())",
+            "queue_full.ended_line(fills, took)",
+        ] {
+            assert!(src.contains(needle), "run.rs lost {needle:?}");
+        }
+        assert_eq!(
+            src.matches("queue_full.end_boot_replay();").count(),
+            2,
+            "a loop gap and a recovery each end the replay"
+        );
     }
 
     /// The status line's relay half names sign-in, the last heartbeat and how the last relay drop

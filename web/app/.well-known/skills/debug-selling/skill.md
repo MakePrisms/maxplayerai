@@ -272,8 +272,9 @@ lapsed or aged offers re-read from relay history, settled or taken offers after 
 line this boot, a relay `CLOSED` for a subscription that is not ours, follow-ups to ended sessions, and payment gift-wraps re-read by the wrap backfill (not a
 payment, or already collected). After a reconnect these can be hundreds of lines, so instead
 the status tick prints one `seller node routine (since last status): …` line counting them; it is
-informational, not a problem. The boot replay's `WORK-LANE queue full` line is hidden too; one
-`WORK-LANE boot replay done` line still prints after each start. A lapsed offer aimed at this seat and authored within the last hour
+informational, not a problem. The boot replay's `WORK-LANE queue full` line is hidden too; a
+start whose replay filled the queue prints one `WORK-LANE boot replay done` line, and a replay
+still full after 2 minutes is reported. A lapsed offer aimed at this seat and authored within the last hour
 still prints its `offer skip` line (check the buyer's deadline and this host's clock), and a
 payment for a job this home has no offer for prints once per job per boot (usually a reset or moved
 `~/.maxplayer`; the payment may be money you are owed), as does a payment this build cannot read

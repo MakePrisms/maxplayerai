@@ -6765,6 +6765,13 @@ impl SellerNodeRunner {
         // backfill re-feeds is already gated. After the subscribe it would be a race against our own
         // recovery path.
         self.rehydrate_suppressions();
+        // The boot replay (stored history on these subscriptions) is told apart from a live queue
+        // fill by their EOSEs, not by a timer (#1444 advisor r1).
+        let mut boot_subs = vec![OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID];
+        if self.claim_open_pool() {
+            boot_subs.push(RECEIPT_SUB_ID);
+        }
+        let boot_replay_started = tokio::time::Instant::now();
         self.subscribe_all(None).await?;
         opline!(
             "seller node live: pubkey={} relay={}",
@@ -6971,7 +6978,7 @@ impl SellerNodeRunner {
         // reads a recovery cut off is re-run, not reported as a failed read (finding 1).
         let mut lane_started_at = tokio::time::Instant::now();
         let mut last_recovery_end: Option<tokio::time::Instant> = None;
-        let mut queue_full = schedule::QueueFullEpisode::new(tokio::time::Instant::now());
+        let mut queue_full = schedule::QueueFullEpisode::new(boot_replay_started, &boot_subs);
         // Heartbeat supervision (probe + publish + watchdog + recovery), single-flight.
         let mut supervision: Option<SupervisionFuture> = None;
         // Set while a recovery is reconnecting: nothing on the loop may issue a long-lived REQ then
@@ -7011,6 +7018,8 @@ impl SellerNodeRunner {
         macro_rules! notice_loop_gap {
             ($firing_heartbeat:expr) => {
                 if let Some(gap) = loop_turns.turn(std::time::Instant::now(), schedule::wall_ms()) {
+                    // After a gap (host sleep included) nothing that arrives is the boot replay.
+                    queue_full.end_boot_replay();
                     // The sockets are presumed dead after a long gap; the watchdog's monotonic
                     // clock cannot see a host sleep, so it would not reconnect for intervals.
                     let reconnect = heartbeat_enabled
@@ -7052,25 +7061,18 @@ impl SellerNodeRunner {
                     lane = Some(Box::pin(Arc::clone(&self).lane_work(work, drain, flush_private)));
                 }
             }
+            // A recovery reconnects and resubscribes: what it brings is not the boot replay.
+            if recovering.get() {
+                queue_full.end_boot_replay();
+            }
+            if let Some(line) = queue_full.overdue(tokio::time::Instant::now()) {
+                opline!("{line}");
+            }
             if let Some((fills, took)) =
                 queue_full.after_take(queue.queued_events(), tokio::time::Instant::now())
             {
-                if queue_full.boot() {
-                    // The stored-history replay every restart brings: one line, worded as the
-                    // expected event it is, instead of a "queue full" warning per boot.
-                    opline!(
-                        "seller node WORK-LANE boot replay done after {}s: the relay's stored \
-                         events filled the queue {fills} time(s) after start (expected on every \
-                         restart; anything skipped is re-read by the next history backfill)",
-                        took.as_secs()
-                    );
-                } else {
-                    opline!(
-                        "seller node WORK-LANE queue empty again after {}s (it filled {fills} \
-                         time(s) meanwhile)",
-                        took.as_secs()
-                    );
-                }
+                // The boot replay's end prints one line worded as the expected event it is.
+                opline!("{}", queue_full.ended_line(fills, took));
             }
             tokio::select! {
                 // #747: leave the selling role. Breaking here — rather than exiting the process
@@ -7523,17 +7525,11 @@ impl SellerNodeRunner {
                                 if queue_full
                                     .after_push(queue.has_room(), tokio::time::Instant::now())
                                 {
-                                    if queue_full.boot() {
-                                        opline_verbose!(
-                                            "seller node WORK-LANE queue full ({EVENT_QUEUE_CAP} \
-                                             events) during the boot replay: relay reads pause \
-                                             until it drains"
-                                        );
-                                    } else {
-                                        opline!(
-                                            "seller node WORK-LANE queue full ({EVENT_QUEUE_CAP} events): \
-                                             relay reads pause until it drains"
-                                        );
+                                    match queue_full.full_line(EVENT_QUEUE_CAP) {
+                                        schedule::LaneLine::Default(line) => opline!("{line}"),
+                                        schedule::LaneLine::Verbose(line) => {
+                                            opline_verbose!("{line}")
+                                        }
                                     }
                                 }
                             }
@@ -7704,8 +7700,11 @@ impl SellerNodeRunner {
                         Ok(RelayPoolNotification::Message {
                             message: nostr_sdk::RelayMessage::EndOfStoredEvents(eose_id),
                             ..
-                        }) if eose_id.to_string() == OFFER_SUB_ID => {
-                            if open_pool.is_some_and(|state| state.attempt_pending) {
+                        }) => {
+                            queue_full.stored_history_ended(eose_id.as_str());
+                            if eose_id.as_str() == OFFER_SUB_ID
+                                && open_pool.is_some_and(|state| state.attempt_pending)
+                            {
                                 open_pool = None;
                                 opline!(
                                     "seller node RELAY-CLOSED RE-ARMED: the open-pool half of the \

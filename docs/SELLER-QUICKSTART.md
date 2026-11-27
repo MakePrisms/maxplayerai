@@ -166,16 +166,17 @@ to `serve` when convenient.
 Usage:
   maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]
   maxplayer seller serve   # zero-prompt relaunch from config.toml
-  maxplayer seller serve   # hook seat (Muse, Grok Bot, Instinct or your own command): add [agents.<name>] hook = [...] and [seller] agents = ["<name>"] to config.toml, check it with `maxplayer seller hook test <name>`
+  maxplayer seller serve   # hook seat (Muse, Grok Bot, Instinct or your own command): add [agents.<name>] hook = [...] and [seller] agents = ["<name>"] to a seat's config.toml (a first run with --rate-sats writes the rest), check it with `maxplayer seller hook test <name>`
   maxplayer seller serve --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
   maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted
   maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm
-  maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]   # each job this seat won and whether it was paid: free / paid (fee remitted?) / awaiting payment / unpaid
+  maxplayer seller drain [--home <dir>] [--no-wait | --timeout <secs>]   # finish in-flight jobs, then exit 0 (upgrade without interrupting a job)
+  maxplayer seller hook test <entry> [--home <dir>]   # run an [agents.<entry>] hook through ping, two job turns, close; no relay, no money
   maxplayer seller [flags]   # deprecated alias for `maxplayer seller serve [flags]` (still works)
 
 Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
-  - --agent takes a built-in harness preset (claude, cursor, codex); Muse, Grok Bot and Instinct are not presets, they serve as hook seats (seller-hook skill)
+  - --agent takes a built-in harness preset (claude, cursor, codex) or an [agents.<name>] entry from config.toml; Muse, Grok Bot and Instinct are not presets, they serve as hook seats (seller-hook skill)
   - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto
   - no --key (packaged key file only)
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
@@ -1667,7 +1668,8 @@ Lines worth knowing when something is slow:
 | `WORK-LANE clear: <what> finished after Ns` | The long-running work ended. |
 | `WORK-LANE queue full (1024 events): relay reads pause until it drains` | Back-pressure, logged once per episode. Anything dropped meanwhile is re-read by the next history backfill. |
 | `WORK-LANE queue empty again after Ns (it filled N time(s) meanwhile)` | The back-pressure episode above ended. |
-| `WORK-LANE boot replay done after Ns: the relay's stored events filled the queue N time(s) after start (…)` | The same back-pressure right after a start, while the relay hands back its stored events. Expected on every restart; its `queue full` line prints only with `MAXPLAYER_VERBOSE=1`. |
+| `WORK-LANE boot replay done after Ns: the relay's stored events filled the queue N time(s) after start (…)` | The same back-pressure right after a start, while the relay is still handing back its stored events (until its end-of-stored-events reply on each subscription, at most 2 minutes). Printed only after a start whose replay filled the queue; that episode's `queue full` line prints only with `MAXPLAYER_VERBOSE=1`. |
+| `WORK-LANE queue full since the boot replay Ns ago and not drained yet (filled N time(s)) …` | A boot-replay episode still full after 2 minutes: reported like any other back-pressure, and its end prints the ordinary `queue empty again` line. |
 | `outbox: the relay confirmed none of N pending publication(s); routine drains pause 5s, backing off to 30s` | The relay is not acknowledging what we publish. The rows stay pending and are retried with the same event ids; new claims still get their first attempt during the pause. |
 | `outbox drain: confirmed=… failed=… expired=… deferred=…` | One bounded publishing pass. `deferred` rows were not reached before the pass's 15 s budget and go first next time. |
 | `backfill INCOMPLETE: retrying in Ns` (and `WARN: wrap backfill INCOMPLETE …`) | The relay did not finish answering a history read. It is retried soon (30 s, doubling) and is never treated as "nothing there". |
@@ -1687,9 +1689,10 @@ Routine no-ops are hidden by default: a re-seen offer already claimed, a duplica
 and acceptances for other sellers' jobs, pay-binds for jobs already awarded here, lapsed or aged
 offers re-read from relay history, an offer already settled or awarded to another seller after its
 first skip line this boot, a relay `CLOSED` for a subscription that is not ours, and follow-ups to
-ended sessions. The boot replay's `WORK-LANE queue full` line is hidden too; its `boot replay done`
-line still prints. All but the first two are counted, and the status tick prints one
-`seller node routine (since last status): …` line with the counts when any happened. A lapsed offer
+ended sessions. All but the first two are counted, and the status tick prints one
+`seller node routine (since last status): …` line with the counts when any happened. The boot
+replay's `WORK-LANE queue full` line is hidden too (not counted); its `boot replay done` line still
+prints, and a replay still full after 2 minutes is reported. A lapsed offer
 aimed at this seat and authored within the last hour still prints its `offer skip` line, once.
 Payment gift-wraps re-read by the periodic wrap backfill are summarised the same way (`wraps that are
 not payments`, `payments already collected`); the backfill still prints how many it read. A payment
