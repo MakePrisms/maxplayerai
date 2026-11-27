@@ -1621,7 +1621,7 @@ can tell at a glance whether anything has happened since you last looked, and li
 against relay events. Every ~5 minutes the daemon states its own condition:
 
 ```text
-14:32:07Z seller node status: ADVERTISING, ready for work · harness: claude · 0/1 job slot(s) busy · relay confirmed 41s ago · work idle
+14:32:07Z seller node status: ADVERTISING, ready for work · harness: claude · 0/1 job slot(s) busy · relay confirmed 41s ago · signed in · heartbeat landed 41s ago · work idle
 ```
 
 That line is the answer to "is it working": it arriving means the loop is turning, and it says
@@ -1629,12 +1629,19 @@ whether the seat is advertising and how much capacity is in use. `NOT serving �
 means the process is up but every harness has faulted out, so it will take no work.
 
 The line is printed by the loop itself, not by the work it schedules, so it keeps its cadence even
-while that work is stuck on a slow relay. Its last two fields say how both halves are doing:
+while that work is stuck on a slow relay. Its relay and work fields say how both halves are doing:
 
 - `relay confirmed Ns ago` — when the relay last both answered our read probe and acknowledged our
   heartbeat. A number that keeps growing past a few heartbeat intervals means the relay has stopped
-  answering. `relay RECOVERING` means a reconnect is in progress; `relay watchdog off` means
-  heartbeats are disabled in config.
+  answering. `relay RECOVERING (unconfirmed for Ns)` means a reconnect is in progress; `relay
+  watchdog off` means heartbeats are disabled in config; `relay REFUSED sign-in (…)` means the
+  relay denied this key and nothing the seat writes reaches buyers.
+- `signed in` or `NOT signed in` — whether this connection completed the relay's NIP-42 sign-in.
+  Payments and private jobs need it.
+- `heartbeat landed Ns ago` — when the relay last confirmed this seat's announcement; buyers stop
+  seeing a seat whose announcements stop landing.
+- `last relay drop recovered Ns ago after Ns` (or `relay reconnect FAILED …, retrying`) — appears
+  once the relay has dropped: when it came back and how long it was gone.
 - `work idle`, or `work BUSY Ns on <what>` — the one work lane that handles relay events (offers,
   awards, payments), housekeeping, outbox publishing and history backfills, one at a time.
   `(N event(s) queued)` follows when events are waiting behind it.

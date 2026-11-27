@@ -6756,6 +6756,11 @@ impl SellerNodeRunner {
             .ok_or_else(|| NodeError::Relay("relay missing in run loop".into()))?;
 
         let mut notifications = self.client.notifications();
+        // Taken before the first REQ: a relay that challenges lazily (on the first REQ, after the boot
+        // handshake saw no challenge) authenticates during `subscribe_all`, and a receiver created
+        // after it would never see that `Authenticated`, leaving the status line on "NOT signed in"
+        // for the life of a signed-in socket.
+        let mut relay_notifications = relay.notifications();
         // #814: refill the suppression cache BEFORE any REQ goes out, so the very first offer the
         // backfill re-feeds is already gated. After the subscribe it would be a race against our own
         // recovery path.
@@ -6917,7 +6922,9 @@ impl SellerNodeRunner {
         // while stale-true spends the single retry this session allows and then does the same.
         let mut nip42_authed = matches!(self.boot_auth, AuthWait::Authenticated);
         let mut last_authenticated_at = tokio::time::Instant::now();
-        let mut relay_notifications = relay.notifications();
+        // False once this stream lagged: the status line then says the sign-in state is unknown
+        // until the next auth or connection change re-establishes it.
+        let mut sign_in_known = true;
         // Subscriptions that have already spent their one post-auth retry on this session (#189
         // belt). Cleared whenever a new session authenticates, so the budget is per-session and can
         // never become a loop.
@@ -6947,6 +6954,7 @@ impl SellerNodeRunner {
         // How long the seat announcement has gone unconfirmed, and when the in-flight supervision
         // started: an announcement that falls behind is logged even if a supervision never returns.
         let mut announcement_gap = schedule::AnnouncementGap::new(tokio::time::Instant::now());
+        let mut relay_health = schedule::RelayHealth::default();
         let mut supervision_started: Option<tokio::time::Instant> = None;
         let mut drain_private_only_since: Option<tokio::time::Instant> = None;
         // The serialized work lane and what feeds it. Events queue (bounded: when full, relay reads
@@ -7245,17 +7253,15 @@ impl SellerNodeRunner {
                     // The status line comes from the LOOP, so it keeps its cadence — and says so —
                     // while the lane is stuck on a slow relay.
                     let now = tokio::time::Instant::now();
-                    let relay_state = if let Some(refusal) = self.sign_in.refusal() {
-                        // #1228: no write lands while sign-in is refused, so "relay confirmed Ns
-                        // ago" would describe an older socket. Say what is wrong and what to do.
-                        format!("relay REFUSED sign-in ({refusal}){}", hint_suffix(&refusal))
-                    } else if !heartbeat_enabled {
-                        "relay watchdog off".to_owned()
-                    } else if recovering.get() {
-                        "relay RECOVERING".to_owned()
-                    } else {
-                        format!("relay confirmed {}s ago", liveness.unconfirmed_for(now).as_secs())
-                    };
+                    let relay_state = relay_status_segment(
+                        self.sign_in.refusal().as_deref(),
+                        heartbeat_enabled,
+                        &relay_health,
+                        sign_in_known.then_some(nip42_authed),
+                        recovering.get(),
+                        liveness.unconfirmed_for(now),
+                        now,
+                    );
                     let work_state = match lane_busy.current(now) {
                         None => "work idle".to_owned(),
                         Some((label, busy)) => format!("work BUSY {}s on {label}", busy.as_secs()),
@@ -7364,6 +7370,15 @@ impl SellerNodeRunner {
                         stalled_since_recovery = false;
                         manual_recovery_succeeded = false;
                     }
+                    // Before `liveness` moves on: the clock from before this supervision is what
+                    // measures an outage a background reconnect ended.
+                    fold_supervision(
+                        &mut relay_health,
+                        &report,
+                        &liveness,
+                        tokio::time::Instant::now(),
+                        now_unix(),
+                    );
                     liveness = report.clock;
                     if report.recovered.is_some() {
                         last_recovery_end = Some(tokio::time::Instant::now());
@@ -7696,6 +7711,7 @@ impl SellerNodeRunner {
                     match relay_event {
                         Ok(RelayNotification::Authenticated) => {
                             nip42_authed = true;
+                            sign_in_known = true;
                             self.private_authenticated.store(true, std::sync::atomic::Ordering::Relaxed);
                             last_authenticated_at = tokio::time::Instant::now();
                             // A newly authenticated session earns a fresh retry budget: the budget
@@ -7757,20 +7773,22 @@ impl SellerNodeRunner {
                                 ),
                             }
                         }
-                        Ok(RelayNotification::AuthenticationFailed) => { nip42_authed = false; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
+                        Ok(RelayNotification::AuthenticationFailed) => { nip42_authed = false; sign_in_known = true; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
                         // A socket that went away takes its NIP-42 state with it — whatever comes
                         // back starts unauthenticated.
                         Ok(RelayNotification::RelayStatus { status })
                             if status != nostr_sdk::prelude::RelayStatus::Connected =>
                         {
                             nip42_authed = false;
+                            sign_in_known = true;
                             self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Ok(RelayNotification::Shutdown) => { nip42_authed = false; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
+                        Ok(RelayNotification::Shutdown) => { nip42_authed = false; sign_in_known = true; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
                         Ok(_) => {}
                         // Lagging this stream costs only auth-state precision, and both stale
-                        // readings are bounded (see the declaration). Never go deaf over it.
-                        Err(_) => {}
+                        // readings are bounded (see the declaration). Never go deaf over it, but
+                        // stop claiming a sign-in state the loop may have missed a change of.
+                        Err(_) => sign_in_known = false,
                     }
                 }
             }
@@ -13154,6 +13172,7 @@ impl SellerNodeRunner {
         // recovery (after a host sleep, say) may follow a probe that succeeded on a socket the SDK
         // had already replaced, and confirming first would move the cursor past the whole gap.
         let confirmed_before_tick = clock.confirmed_unix();
+        let clock_before_tick = clock;
         let confirmed = relay_liveness_confirmed(probe_ok, publish_ok);
         if confirms_before_recovery(confirmed, input.forced.as_deref()) {
             clock.confirm(started, started_unix);
@@ -13164,7 +13183,7 @@ impl SellerNodeRunner {
         let stalled =
             !confirmed && schedule::watchdog_tripped(unconfirmed, input.threshold, input.interval);
         if !stalled && input.forced.is_none() {
-            return SupervisionDone { clock, probe_ok, publish_ok, recovered: None };
+            return SupervisionDone { clock, probe_ok, publish_ok, recovered: None, recovery_end: None };
         }
         let overlap_since =
             nostr_sdk::Timestamp::from(recovery_overlap_since(confirmed_before_tick));
@@ -13199,6 +13218,11 @@ impl SellerNodeRunner {
         let recovery_started = tokio::time::Instant::now();
         let result = self.recover_stall(&relay, overlap_since).await;
         drop(guard);
+        let recovery_finished = tokio::time::Instant::now();
+        let recovery_end = Some((
+            schedule::relay_outage(&clock_before_tick, recovery_finished, now_unix()),
+            recovery_finished,
+        ));
         let took = recovery_started.elapsed().as_secs();
         let mut republished = false;
         let recovered = match result {
@@ -13224,7 +13248,13 @@ impl SellerNodeRunner {
                 false
             }
         };
-        SupervisionDone { clock, probe_ok, publish_ok: publish_ok || republished, recovered: Some(recovered) }
+        SupervisionDone {
+            clock,
+            probe_ok,
+            publish_ok: publish_ok || republished,
+            recovered: Some(recovered),
+            recovery_end,
+        }
     }
 
     async fn publish_heartbeat_bounded(&self) -> bool {
@@ -13287,6 +13317,56 @@ struct SupervisionDone {
     publish_ok: bool,
     /// `Some(ok)` when a recovery ran.
     recovered: Option<bool>,
+    /// When a recovery ran: the outage it ended (or did not), measured as the RELAY-STALL line does,
+    /// when it finished, before the post-recovery heartbeat publish.
+    recovery_end: Option<(Duration, tokio::time::Instant)>,
+}
+
+/// The relay segment of the periodic status line.
+fn relay_status_segment(
+    refusal: Option<&str>,
+    heartbeat_enabled: bool,
+    health: &schedule::RelayHealth,
+    signed_in: Option<bool>,
+    recovering: bool,
+    unconfirmed: Duration,
+    now: tokio::time::Instant,
+) -> String {
+    if let Some(refusal) = refusal {
+        // #1228: no write lands while sign-in is refused, so "relay confirmed Ns ago" would
+        // describe an older socket. Say what is wrong and what to do.
+        format!("relay REFUSED sign-in ({refusal}){}", hint_suffix(refusal))
+    } else if !heartbeat_enabled {
+        "relay watchdog off".to_owned()
+    } else {
+        health.line(signed_in, recovering, unconfirmed, now)
+    }
+}
+
+/// Fold one finished supervision into the status line's relay health. `before` is the liveness
+/// clock from BEFORE this supervision (the loop replaces it with `report.clock` afterwards).
+fn fold_supervision(
+    health: &mut schedule::RelayHealth,
+    report: &SupervisionDone,
+    before: &schedule::LivenessClock,
+    now: tokio::time::Instant,
+    now_unix: i64,
+) {
+    health.beat(report.publish_ok, now);
+    match report.recovered {
+        Some(recovered) => {
+            let (outage, at) = report
+                .recovery_end
+                .unwrap_or_else(|| (schedule::relay_outage(before, now, now_unix), now));
+            health.recovery(recovered, outage, at);
+        }
+        // Confirmed with no recovery of ours: the SDK's background reconnect (if a drop was
+        // pending) ended it.
+        None if relay_liveness_confirmed(report.probe_ok, report.publish_ok) => {
+            health.confirmed(schedule::relay_outage(before, now, now_unix), now);
+        }
+        None => {}
+    }
 }
 
 /// Events the lane may have queued before relay reads pause.
@@ -13914,6 +13994,51 @@ mod tests {
         }
     }
     use super::*;
+
+    /// advisor r1 of #1438: the status line's relay segment is built from the same supervision
+    /// reports the loop folds, with refusal and watchdog-off taking precedence. RED ON REVERT:
+    /// fold without the background-reconnect arm and "FAILED, retrying" stays on a healthy relay;
+    /// fold with the post-heartbeat time instead of `recovery_end` and the outage and age shift;
+    /// drop a precedence arm and the refusal is hidden behind "relay confirmed".
+    #[test]
+    fn the_status_line_folds_supervisions_and_picks_the_relay_segment() {
+        let s = Duration::from_secs;
+        let t0 = tokio::time::Instant::now();
+        let before = schedule::LivenessClock::new(t0, 1_000);
+        let report = |probe_ok, publish_ok, recovered, recovery_end| SupervisionDone {
+            clock: before,
+            probe_ok,
+            publish_ok,
+            recovered,
+            recovery_end,
+        };
+        let mut health = schedule::RelayHealth::default();
+        let segment = |health: &schedule::RelayHealth, now| {
+            relay_status_segment(None, true, health, Some(true), false, s(1), now)
+        };
+        // A recovery of ours fails...
+        fold_supervision(&mut health, &report(false, false, Some(false), Some((s(150), t0 + s(150)))), &before, t0 + s(180), 1_180);
+        let line = segment(&health, t0 + s(190));
+        assert!(line.ends_with(" · relay reconnect FAILED 40s ago (150s unconfirmed), retrying"), "{line}");
+        // ...then the SDK reconnects on its own and the next supervision confirms the relay.
+        fold_supervision(&mut health, &report(true, true, None, None), &before, t0 + s(200), 1_200);
+        let line = segment(&health, t0 + s(230));
+        assert!(line.ends_with(" · last relay drop recovered 30s ago after 200s"), "{line}");
+        assert!(line.contains(" · heartbeat landed 30s ago"), "{line}");
+        // A recovery reports the outage it measured when it finished (here across a host sleep),
+        // not the time the fold ran after its heartbeat publish.
+        fold_supervision(&mut health, &report(true, true, Some(true), Some((s(1_205), t0 + s(240)))), &before, t0 + s(270), 2_270);
+        let line = segment(&health, t0 + s(300));
+        assert!(line.ends_with(" · last relay drop recovered 60s ago after 1205s"), "{line}");
+        // An unconfirmed supervision with no recovery changes no drop.
+        fold_supervision(&mut health, &report(false, true, None, None), &before, t0 + s(310), 2_310);
+        assert!(segment(&health, t0 + s(320)).ends_with("recovered 80s ago after 1205s"));
+        // Precedence and the unknown sign-in state.
+        let refused = relay_status_segment(Some("restricted: key not linked"), true, &health, Some(true), true, s(1), t0);
+        assert!(refused.starts_with("relay REFUSED sign-in (restricted: key not linked)"), "{refused}");
+        assert_eq!(relay_status_segment(None, false, &health, Some(true), true, s(1), t0), "relay watchdog off");
+        assert!(relay_status_segment(None, true, &health, None, false, s(1), t0 + s(320)).contains(" · sign-in unknown ("));
+    }
 
     // §5.6: the bounded `docker info` read maps every failure to an `Err` (which closes the gate):
     // a read that does not answer in time, and a read that panics. A good read passes through.
