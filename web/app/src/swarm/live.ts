@@ -97,6 +97,9 @@ export function sellerState(s: Snapshot,a: Seller,now: number): string {
   if(a.eligible&&sellerMinutes(s,a,now)>=a.minutesOffered)return 'Done';
   // Projected state 'done' means the last job finished, not that the seller is out of minutes.
   if(a.state==='done'&&!a.eligible)return 'Done';
+  // A private swarm's tasks are not on the relay, so a member's running task can't be seen: while its
+  // swarm job is live, an accepted member reads 'Working' instead of a 'Ready' that never changes.
+  if(a.eligible&&privateTasks(s)&&s.swarmJob?.status==='in_progress'&&now<s.swarmJob.ends)return 'Working';
   return a.eligible?'Ready':'Joined';
 }
 // Until the live data is in (connected and the current run's trade data complete), the agents

@@ -181,9 +181,10 @@ test('private swarm: only the buyer-signed swarm job is read', () => {
 test('private swarm: a leaver with reported work is listed as Left; without, not listed', () => {
   const events = [swarmEvent('private'), member(S1), member(S2, 'left'), accept(S1), accept(S2)];
   const worked = project([...events, job(tally({ [pub(S1)]: entry(0, 0), [pub(S2)]: entry(1, 12) }))]);
-  assert.deepEqual(render(worked).rows.map(x => x[2]).sort(), ['Left', 'Ready']);
+  // A private swarm's live job shows accepted members as Working (no task is visible on the relay).
+  assert.deepEqual(render(worked).rows.map(x => x[2]).sort(), ['Left', 'Working']);
   const idle = project([...events, job(tally({ [pub(S1)]: entry(0, 0), [pub(S2)]: entry(0, 0) }))]);
-  assert.deepEqual(render(idle).rows.map(x => x[2]), ['Ready']);
+  assert.deepEqual(render(idle).rows.map(x => x[2]), ['Working']);
 });
 
 test('the snapshot parser refuses malformed reported figures', () => {

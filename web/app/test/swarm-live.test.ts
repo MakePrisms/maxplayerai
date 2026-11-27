@@ -18,6 +18,18 @@ test('denied members are not listed publicly; finished and left sellers are mark
   renderSellers(doc as unknown as Document,{...s,sellers:[seller,denied,done,gone],jobs:[...s.jobs,{id:'gone-job',seller:'f',start:1000,deadline:1600,end:1600,running:false,usedMinutes:10}]},2920);
   const rows=list.children[0]!.children;assert.deepEqual(rows.map(r=>r.children[0]!.textContent),['<script>untrusted</script>','done','gone']);
   assert.deepEqual(rows.map(r=>r.children[2]!.textContent),['Working now','Done','Left']);assert.equal(rows[1]!.className,'off');assert.equal(summary.textContent,'3 agents · 1 working now');});
+test('a private swarm reads Working while its job is live, Ready before and after',()=>{
+  const priv:Snapshot={...s,swarm:{buyer,buyerNpub:npubEncode(buyer),buyerName:'buyer',id:'sw',name:'Swarm',purpose:'p',status:'open',tasks:'private',address:'a'},jobs:[]};
+  const a={...seller,state:'accepted',minutesUsed:5};
+  assert.equal(sellerState(priv,a,2920),'Working','live private job: no task is visible, the member is working');
+  assert.equal(sellerState(priv,a,10001),'Ready','past the job end');
+  assert.equal(sellerState({...priv,swarmJob:{...priv.swarmJob!,status:'completed'}},a,2920),'Ready','job closed');
+  assert.equal(sellerState({...priv,swarmJob:null,budget:null},a,2920),'Ready','no job');
+  assert.equal(sellerState(priv,{...a,eligible:false,state:'joined'},2920),'Joined','not accepted');
+  assert.equal(sellerState(priv,{...a,minutesUsed:60,reported:{tasksDone:3,minutesToday:60}},2920),'Done','out of minutes');
+  assert.equal(sellerState(priv,{...a,state:'left'},2920),'Left');
+  assert.equal(sellerState({...s,jobs:[]},a,2920),'Ready','a public swarm still needs a visible running task');
+});
 test('a seller whose job finished but has minutes left is Ready, not Done',()=>{const a={...seller,state:'done',minutesUsed:5};assert.equal(sellerState({...s,jobs:[]},a,2920),'Ready');assert.equal(sellerState({...s,jobs:[]},{...a,minutesUsed:60},2920),'Done');});
 
 test('delivered running job is awaiting acceptance and conservative charge never ticks backwards',()=>{
