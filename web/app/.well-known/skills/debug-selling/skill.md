@@ -20,8 +20,9 @@ It runs the same checks `maxplayer seller serve` runs at startup: `nix`, `creden
 `sandbox egress`, `sandbox image`, `sandbox engine floor`, `sandbox containment`),
 `seat reachability`, `home permissions` and `harness credential permissions`. Each prints `PASS`/`WARN`/`FAIL` and, when not PASS,
 a one-line `(fix: …)` hint. Exit is `0` unless something `FAIL`ed; a `WARN` never fails. `nix` is
-optional and never `FAIL`s: a missing nix is a `WARN` on a seller home and a `SKIP` on a home with no
-`[seller]` section yet.
+optional and never `FAIL`s: a missing nix is a `WARN` on a seller home with no `[sandbox]`. The row is a
+`SKIP` on a home with no `[seller]` section yet, on a hook-only seat, and on a seat with a `[sandbox]`
+(jobs run inside it; the seller checks nix there at boot).
 Every check runs even after one fails, so one run shows the whole picture. Add
 `--home <dir>` to diagnose a specific seat.
 

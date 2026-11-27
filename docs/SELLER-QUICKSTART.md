@@ -6,8 +6,10 @@ Documented seller steps only. The key never leaves the box.
 **`--agent`** and **`--rate-sats`**. Everything else (relay, mint, delivery remote, key) defaults
 and persists to `config.toml`, so relaunching is zero-prompt.
 
-> **Nix is optional.** `maxplayer seller serve` starts without a working `nix`; `maxplayer doctor`
-> and the startup checks show a `WARN nix` row. If nix works where jobs run (the host, for a seat
+> **Nix is optional.** `maxplayer seller serve` starts without a working `nix`; on a seat with no
+> `[sandbox]`, `maxplayer doctor` and the startup checks show a `WARN nix` row. A seat with a `[sandbox]`
+> shows `SKIP nix` instead: its jobs run inside the sandbox, so the host nix does not matter, and the
+> seller checks nix inside the sandbox at boot. If nix works where jobs run (the host, for a seat
 > with no `[sandbox]`), the job prompt tells agents to get toolchains through it. To add it: run
 > `nix --version`, and if it fails, run
 > `curl -fsSL https://install.determinate.systems/nix | sh -s -- install`. A systemd unit does not

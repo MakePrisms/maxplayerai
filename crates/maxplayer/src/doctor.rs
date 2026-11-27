@@ -307,7 +307,9 @@ mod checks {
     /// not needed to sell. What nix still buys a seat is tooling: the seller measures, at boot,
     /// whether nix works IN THE JOB ENVIRONMENT (the host for a seat with no `[sandbox]`, the
     /// container otherwise) and only then tells the job's agent to get toolchains through it. This
-    /// row reports the host side of that, so a missing nix is a WARN with the optional remedy.
+    /// row reports the host side of that, so on a seat with no `[sandbox]` a missing nix is a WARN with
+    /// the optional remedy. A seat with a `[sandbox]` never runs this probe: its row is a SKIP (see
+    /// `sandboxed_nix`), because the host nix is not where its jobs run.
     ///
     /// The probe EXECUTES `nix --version` rather than looking nix up on PATH — a resolvable but
     /// broken shim must not pass (same reason install.sh's probe runs it). When PATH fails, the
@@ -2708,8 +2710,8 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
 /// duplicated. The seller key is read once only to probe NIP-42 relay auth; it is NEVER placed in
 /// any Check detail.
 ///
-/// This is the GATE's registry. Its nix row is advisory (PASS, WARN, or SKIP on a hook-only seat)
-/// and never blocks. `maxplayer doctor` reads [`build_report_checks`], which differs only in how
+/// This is the GATE's registry. Its nix row is advisory (PASS or WARN; SKIP on a hook-only seat or
+/// a seat with a `[sandbox]` section) and never blocks. `maxplayer doctor` reads [`build_report_checks`], which differs only in how
 /// it reports nix on a home with no `[seller]`.
 // Gate-only (plus tests): `maxplayer doctor` reads `build_report_checks`, so a buyer-only build
 // (wallet, no acp) has no caller.
@@ -2736,15 +2738,19 @@ fn build_checks_with_nix_probe(
     )
 }
 
-/// The gate's nix row: the probe's own advisory verdict, or a SKIP row on a hook-only seat (see
-/// [`hook_only_seat`]).
-#[cfg(all(feature = "wallet", any(feature = "acp", test)))]
+/// A seller seat's nix row, shared by the boot gate and `maxplayer doctor` so the two cannot drift: a
+/// SKIP row on a hook-only seat (see [`hook_only_seat`]) and on a seat with a `[sandbox]` section
+/// (see [`sandboxed_nix`]), otherwise the probe's own advisory verdict. The probe is not run for
+/// either SKIP.
+#[cfg(feature = "wallet")]
 fn environment_checks_for(
     home: &maxplayer_core::home::MaxplayerHome,
     nix_probe: impl FnOnce() -> Check + 'static,
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
     if hook_only_seat(home) {
         vec![Box::new(hook_only_nix)]
+    } else if home.config.sandbox.is_some() {
+        vec![Box::new(sandboxed_nix)]
     } else {
         vec![Box::new(nix_probe)]
     }
@@ -2763,14 +2769,12 @@ fn build_report_checks(
     home: &maxplayer_core::home::MaxplayerHome,
     nix_probe: impl FnOnce() -> Check + 'static,
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
-    // A hook-only seat gets the gate's own SKIP row: `seller serve` boots past a missing nix there,
-    // so the report must not call the same box broken.
+    // A seller home gets the gate's own nix row (SKIP on a hook-only or sandboxed seat), so the
+    // report never calls a box broken that `seller serve` boots on.
     let environment: Vec<Box<dyn FnOnce() -> Check>> = if home.config.seller.is_none() {
         vec![Box::new(move || checks::nix_for_buyer_home(nix_probe()))]
-    } else if hook_only_seat(home) {
-        vec![Box::new(hook_only_nix)]
     } else {
-        vec![Box::new(nix_probe)]
+        environment_checks_for(home, nix_probe)
     };
     // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
     // waive. The containment check is read at its own severity.
@@ -3007,6 +3011,20 @@ fn hook_only_nix() -> Check {
 #[cfg(feature = "wallet")]
 const HOOK_ONLY_WHY: &str =
     "hook-only seat: every agent is the seller's own program behind a hook, so no job runs in an environment of ours";
+
+/// The nix row of a seat with a `[sandbox]` section (docker or launcher mode), shared by the boot
+/// gate and `maxplayer doctor`. Every job runs inside the sandbox, so the HOST's nix says nothing
+/// about the job environment: the row is a SKIP whether or not the host has nix, and the host
+/// probe is not run, as on a hook-only seat. Whether nix works where the jobs run is measured by
+/// the seller itself at boot (the seat capability probe, logged as
+/// `seller node job environment nix: …`).
+#[cfg(feature = "wallet")]
+fn sandboxed_nix() -> Check {
+    Check::skip("nix", "not applicable", SANDBOXED_NIX_WHY)
+}
+
+#[cfg(feature = "wallet")]
+const SANDBOXED_NIX_WHY: &str = "jobs run inside [sandbox]; whether nix works there is measured by the seat capability probe at boot";
 
 /// The production nix probe: the one [`build_checks`] runs for the gate and [`run_doctor`] hands
 /// to [`build_report_checks`], so the two cannot drift.
@@ -7116,6 +7134,126 @@ mod tests {
             .map(Check::render)
             .expect("the gate carries a nix row");
         assert_eq!(hook_nix, gate_nix, "doctor and the seller boot gate agree on nix");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // A seat with a [sandbox] section (docker or launcher mode) runs every job inside the sandbox,
+    // so the HOST nix is not applicable there: the seller boot gate and `maxplayer doctor` both show
+    // SKIP nix even when the host probe fails, and the gate boots. Drives the gate's real registry
+    // (`build_checks_with_nix_probe`) and the doctor's real path (`run_doctor_with_nix_probe`, home
+    // reloaded from config.toml) with an injected failing probe, so it holds on a box where nix
+    // works. Red-proof: drop the [sandbox] arm from `environment_checks_for` and every row reads
+    // "WARN nix".
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn sandboxed_seat_skips_the_host_nix_row_and_boots() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-nix-sandboxed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        let failing = || checks::fold_nix(false, None);
+        let nix_line = |report: &str| {
+            report
+                .lines()
+                .find(|line| line.split_whitespace().nth(1) == Some("nix"))
+                .map(str::to_owned)
+                .unwrap_or_else(|| panic!("the report carries a nix line: {report}"))
+        };
+        let sandboxes = [
+            (
+                "docker",
+                SandboxConfig {
+                    mode: SandboxMode::Docker,
+                    image: Some("maxplayer/sandbox:test".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "launcher",
+                SandboxConfig {
+                    mode: SandboxMode::Launcher,
+                    launcher: vec!["env".into()],
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (label, sandbox) in sandboxes {
+            // Network-free, and on disk: the doctor path reloads the home from config.toml.
+            maxplayer_core::home::save_config(&mut home, |config| {
+                config.relay_url = "not-a-relay-url".into();
+                config.accepted_mints = Vec::new();
+                config.seller = Some(seller_for_agents(
+                    vec!["claude".into()],
+                    vec!["claude-agent-acp".into()],
+                ));
+                config.sandbox = Some(sandbox);
+            })
+            .expect("write a sandboxed [seller]");
+            assert!(
+                !hook_only_seat(&home),
+                "precondition ({label}): not a hook-only seat"
+            );
+
+            // The boot gate's registry, with a host nix probe that fails.
+            let results = run_checks(build_checks_with_nix_probe(&home, false, failing));
+            let nix = results
+                .iter()
+                .find(|c| c.name == "nix")
+                .unwrap_or_else(|| panic!("{label}: the gate registry carries a nix row"));
+            assert_eq!(nix.status, Status::Skip, "{label}: {}", nix.render());
+            let gate_nix = nix.render();
+            assert!(
+                gate_nix.contains("jobs run inside [sandbox]")
+                    && gate_nix.contains("seat capability probe at boot"),
+                "{label}: {gate_nix}"
+            );
+
+            // ...and the gate boots over that row.
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let gate = run_readiness_with_retry(
+                || run_checks(environment_checks_for(&home, failing)),
+                READINESS_MAX_ATTEMPTS,
+                readiness_backoff,
+                |_| panic!("a nix row is never retried"),
+                &mut out,
+                &mut err,
+            );
+            let (out, err) = (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            );
+            assert_eq!(gate, Ok(()), "{label}: out={out} err={err}");
+            assert!(out.contains("SKIP nix"), "{label}: {out}");
+            assert!(out.contains("starting seller"), "{label}: {out}");
+
+            // The doctor report renders the very same row.
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let _ = run_doctor_with_nix_probe(Some(tmp.clone()), failing, &mut out, &mut err);
+            let report = String::from_utf8(out).unwrap();
+            assert_eq!(
+                nix_line(&report),
+                gate_nix,
+                "{label}: doctor and the seller boot gate agree on nix"
+            );
+        }
+
+        // Control: the same seller home without [sandbox] keeps the WARN.
+        maxplayer_core::home::save_config(&mut home, |config| config.sandbox = None)
+            .expect("drop [sandbox]");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let _ = run_doctor_with_nix_probe(Some(tmp.clone()), failing, &mut out, &mut err);
+        let unsandboxed = nix_line(&String::from_utf8(out).unwrap());
+        assert!(
+            unsandboxed.starts_with("WARN nix"),
+            "no [sandbox]: {unsandboxed}"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
