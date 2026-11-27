@@ -119,6 +119,9 @@ impl SwarmJobRow {
 #[serde(deny_unknown_fields)]
 pub struct NewTask {
     pub text: String,
+    /// Seconds the seller gets (the offer deadline). Omitted or 0: until the swarm job's `ends`,
+    /// capped by the member's minutes left today (`buyer::swarm::task_secs`).
+    #[serde(default)]
     pub duration_secs: u64,
     pub max_sats: u64,
     /// Pin the task to one seller (hex).

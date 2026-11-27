@@ -670,13 +670,13 @@ fn with_swarm_tools(mut list: Value, swarm: bool) -> Value {
         "type": "object",
         "properties": {
             "text": { "type": "string", "description": "Self-contained task text: everything the seller needs, since sellers see nothing else of the swarm job." },
-            "duration_secs": { "type": "integer", "minimum": 300, "description": "Time the seller gets (the offer deadline); at least 300 s, and only a member with that many minutes left today takes it." },
+            "duration_secs": { "type": "integer", "minimum": 300, "description": "Optional. Omit it (recommended) and the task runs until the swarm job's ends, capped by the member's minutes left today: the offer deadline then matches the job window. Set it (at least 300 s) only for a shorter fixed slot; only a member with that many minutes left today takes it." },
             "max_sats": { "type": "integer", "minimum": 0, "description": "Most this task may pay. The task goes at the seller's advertised rate, and only to a member whose rate is at or under this." },
             "seller": { "type": "string", "description": "Optional: pin the task to this member (hex pubkey)." },
             "fresh": { "type": "boolean", "description": "Optional: a new agent with no history (never a session turn)." },
             "workstream": { "type": "string", "description": "Optional label for your own bookkeeping." }
         },
-        "required": ["text", "duration_secs", "max_sats"],
+        "required": ["text", "max_sats"],
         "additionalProperties": false
     });
     let address = "A swarm address: the naddr1… swarm_create/swarm_list print, <your npub|hex>/<slug>, or just the slug.";
