@@ -564,6 +564,10 @@ enum ClaimOutcome {
 enum SkipReason {
     /// The offer's own absolute deadline already passed — dead, never resurrected.
     Lapsed,
+    /// The offer's deadline is closer than `[seller] min_claim_remaining_secs`: a seat that answers
+    /// only when its scheduled run wakes could not answer in time, so it leaves the offer to one
+    /// that can. Off unless the operator sets it.
+    TooLittleTime,
     /// #604: the offer was authored too long ago — its WIRE age (`now − created_at`) exceeds
     /// [`MAX_OFFER_ADMIT_AGE_SECS`]. A long-aged, never-awarded historical the backfill keeps
     /// re-surfacing; admitting it only parks an execution slot on work that will not be awarded.
@@ -640,6 +644,9 @@ impl SkipReason {
     fn reason(self) -> &'static str {
         match self {
             Self::Lapsed => "offer deadline already passed (lapsed; never resurrected)",
+            Self::TooLittleTime => {
+                "too little time before the offer deadline ([seller] min_claim_remaining_secs)"
+            }
             Self::TooOld => "offer authored too long ago (aged historical; not re-admitted from backfill)",
             Self::NotAllowlisted => "buyer not in accept_offers_only_from allowlist",
             Self::OpenTargetedRefused => {
@@ -1726,6 +1733,38 @@ fn offer_subscription_filters(
 /// static for the node's lifetime — no per-claim re-subscription to drift or leak.
 fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter {
     award_filter_with(seller_pubkey, open_pool, false)
+}
+
+/// How often the work-lane tick may re-read the relay for awards owed to claims still parked
+/// unawarded ([`SellerNodeRunner::recover_missed_awards`]).
+const AWARD_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+/// A claim younger than this is left to the live award subscription.
+const AWARD_RECOVERY_MIN_AGE_SECS: i64 = 20;
+/// How far before the oldest waiting claim the recovery read starts (clock skew between hosts).
+const AWARD_RECOVERY_SKEW_SECS: i64 = 120;
+/// Bound on one recovery read, so a relay that never EOSEs cannot hold the work lane.
+const AWARD_RECOVERY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most stored awards one recovery read asks for.
+const AWARD_RECOVERY_LIMIT: usize = 500;
+
+/// The stored-award read behind [`SellerNodeRunner::recover_missed_awards`]: awards only (not the
+/// accept/reject kinds the live filter also carries), scoped exactly as [`award_filter`] scopes them,
+/// from `since`. The handler still matches each award's claim id against ours before acting.
+fn award_recovery_filter(
+    seller_pubkey: nostr_sdk::PublicKey,
+    open_pool: bool,
+    since: u64,
+) -> Filter {
+    let base = Filter::new()
+        .kind(Kind::Custom(JOB_AWARD_KIND))
+        .hashtag(crate::gateway::MAXPLAYER_TAG)
+        .since(nostr_sdk::Timestamp::from(since))
+        .limit(AWARD_RECOVERY_LIMIT);
+    if open_pool {
+        base
+    } else {
+        base.pubkey(seller_pubkey)
+    }
 }
 
 /// Bound on the §5.6 `docker info` read. A daemon that does not answer in time closes the gate.
@@ -3290,6 +3329,13 @@ fn classify_offer(
     // refused here before `job_deadline_unix` could hand it a fresh window.
     if offer.deadline_unix <= now_unix {
         return ClaimDecision::Skip(SkipReason::Lapsed);
+    }
+    // A seat that answers only when a scheduled run wakes cannot answer a job that ends before it
+    // next wakes. Claiming it anyway takes the award from a seat that could have answered.
+    if let Some(min) = seller.min_claim_remaining_secs.filter(|min| *min > 0)
+        && offer.deadline_unix.saturating_sub(now_unix) < min
+    {
+        return ClaimDecision::Skip(SkipReason::TooLittleTime);
     }
     // #604 offer-age gate — DISTINCT from the self-declared deadline above. The periodic backfill
     // re-ingests every stored offer in its lookback each tick; a long-aged, never-awarded historical
@@ -5429,6 +5475,9 @@ pub struct SellerNodeRunner {
     fed_under_rate_offers: FedUnderRateOffers,
     /// Routine no-ops counted instead of printed (see [`QuietTally`]).
     quiet: QuietTally,
+    /// When [`Self::recover_missed_awards`] last read the relay (paces it to
+    /// [`AWARD_RECOVERY_INTERVAL`]).
+    award_recovery_last: Mutex<Option<Instant>>,
     /// Offer ids whose stale skip was already printed this boot (see [`stale_skip_is_news`]), so
     /// the periodic backfill re-reading the same offer does not repeat the line. Same bounded
     /// first-sight set as [`Self::fed_under_rate_offers`].
@@ -5956,6 +6005,7 @@ impl SellerNodeRunner {
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             quiet: QuietTally::default(),
+            award_recovery_last: Mutex::new(None),
             announced_stale_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             announced_terminal_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             announced_unknown_payments: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
@@ -8416,6 +8466,73 @@ impl SellerNodeRunner {
             }
         }
         complete
+    }
+
+    /// Re-read the relay for awards owed to claims this node still holds unawarded, and hand each
+    /// one to [`Self::on_award`] again.
+    ///
+    /// The live subscription is otherwise the only route to an award, and [`Self::on_award`] drops
+    /// one it could not act on: our claim's publish not yet confirmed (`AwardMatch::Ignore`), or a
+    /// private award whose provisioning failed ("private award pending"). Neither records the
+    /// award, so the claim stays `claimed` and the next pass retries it, until the award lands,
+    /// the claim lapses, or the offer's deadline passes. A recorded award is never re-driven: only
+    /// claims still `claimed` are read, and `record_award` dedups by award id.
+    async fn recover_missed_awards(self: &Arc<Self>) {
+        let now = now_unix();
+        let waiting = match self.node.store().claims_awaiting_award(now) {
+            Ok(rows) => rows,
+            Err(error) => {
+                opline!("seller node award recovery: claim read failed ({error})");
+                return;
+            }
+        };
+        let Some(oldest) = waiting
+            .iter()
+            .filter(|(_, claimed_at)| now.saturating_sub(*claimed_at) >= AWARD_RECOVERY_MIN_AGE_SECS)
+            .map(|(_, claimed_at)| *claimed_at)
+            .min()
+        else {
+            return;
+        };
+        {
+            let mut last = self.award_recovery_last.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_some_and(|at| at.elapsed() < AWARD_RECOVERY_INTERVAL) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let relay = match self.own_relay().await {
+            Ok(relay) => relay,
+            Err(error) => {
+                opline_verbose!("seller node award recovery: relay unavailable ({error})");
+                return;
+            }
+        };
+        let since = u64::try_from(oldest.saturating_sub(AWARD_RECOVERY_SKEW_SECS)).unwrap_or(0);
+        let filter = award_recovery_filter(self.seller_pubkey, self.claim_open_pool(), since);
+        let events = match read_stored(&relay, vec![filter], AWARD_RECOVERY_FETCH_TIMEOUT).await {
+            StoredRead::Complete(events) => events,
+            StoredRead::Incomplete { events, reason } => {
+                opline_verbose!("seller node award recovery: read incomplete ({reason})");
+                events
+            }
+        };
+        let waiting: std::collections::HashSet<&str> =
+            waiting.iter().map(|(job_id, _)| job_id.as_str()).collect();
+        for event in events {
+            let Some(award) = parse_award(&event_to_draft(&event)) else {
+                continue;
+            };
+            if !waiting.contains(award.offer_id.as_str()) {
+                continue;
+            }
+            opline!(
+                "seller node award recovery job_id={}: award found on the relay for a claim still \
+                 waiting; handling it now",
+                award.offer_id
+            );
+            self.on_award(&event).await;
+        }
     }
 
     /// The pool's handle for our one relay (the same `Relay` across reconnects).
@@ -13497,6 +13614,7 @@ impl SellerNodeRunner {
                     self.on_offer(&staged).await;
                 }
                 self.sweep_lapsed_claims();
+                self.recover_missed_awards().await;
                 self.redrive_followups().await;
                 self.reconsider_capacity_skips().await;
                 self.start_due_harness_probes();
@@ -14666,6 +14784,7 @@ mod tests {
             contribution_enabled: true,
             slots: 1,
             claim_award_timeout_secs: None,
+            min_claim_remaining_secs: None,
         }
     }
 
@@ -14854,6 +14973,40 @@ mod tests {
     fn claims_fresh_targeted_offer_at_rate() {
         let decision = classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW, NOW);
         assert_eq!(decision, ClaimDecision::Claim { deadline_unix: NOW + 600 });
+    }
+
+    // `min_claim_remaining_secs`: a seat that answers only on a scheduled wake skips an offer that
+    // ends before it could answer; at exactly the minimum it claims; unset or 0 never skips.
+    #[test]
+    fn min_claim_remaining_secs_skips_offers_that_end_too_soon() {
+        let mut cfg = seller_cfg(2, false);
+        cfg.min_claim_remaining_secs = Some(600);
+        let decide = |cfg: &crate::home::SellerConfig, left: u64| {
+            classify_offer(&offer(5, Some(SELLER), NOW + left), cfg, &claude_only(), SELLER, BUYER, NOW, NOW)
+        };
+        assert_eq!(decide(&cfg, 599), ClaimDecision::Skip(SkipReason::TooLittleTime));
+        assert_eq!(decide(&cfg, 600), ClaimDecision::Claim { deadline_unix: NOW + 600 });
+        cfg.min_claim_remaining_secs = Some(0);
+        assert_eq!(decide(&cfg, 60), ClaimDecision::Claim { deadline_unix: NOW + 60 });
+        cfg.min_claim_remaining_secs = None;
+        assert_eq!(decide(&cfg, 60), ClaimDecision::Claim { deadline_unix: NOW + 60 });
+        // A lapsed offer still reads as lapsed, not as too little time.
+        cfg.min_claim_remaining_secs = Some(600);
+        assert_eq!(decide(&cfg, 0), ClaimDecision::Skip(SkipReason::Lapsed));
+    }
+
+    // The award-recovery read asks for awards only, from `since`, scoped like the live filter.
+    #[test]
+    fn award_recovery_filter_reads_awards_only_scoped_like_live() {
+        let pk = nostr_sdk::Keys::generate().public_key();
+        let targeted = serde_json::to_value(award_recovery_filter(pk, false, 1_000)).unwrap();
+        assert_eq!(targeted["kinds"], serde_json::json!([JOB_AWARD_KIND]));
+        assert_eq!(targeted["since"], serde_json::json!(1_000));
+        assert_eq!(targeted["#p"], serde_json::json!([pk.to_hex()]));
+        assert_eq!(targeted["limit"], serde_json::json!(AWARD_RECOVERY_LIMIT));
+        let open = serde_json::to_value(award_recovery_filter(pk, true, 1_000)).unwrap();
+        assert!(open.get("#p").is_none(), "open pool reads unscoped, as the live filter does");
+        assert_eq!(open["kinds"], serde_json::json!([JOB_AWARD_KIND]));
     }
 
     // MONEY-SAFETY ORDER: a lapsed offer (deadline already passed) is refused BEFORE the rate gate —

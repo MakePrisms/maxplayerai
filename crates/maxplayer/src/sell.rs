@@ -608,6 +608,8 @@ fn ensure_seller_config(
         // operators tune it by editing `[seller] slots = N`.
         slots: existing.as_ref().map(|s| s.slots).unwrap_or_else(home::default_slots),
         claim_award_timeout_secs: existing.as_ref().and_then(|s| s.claim_award_timeout_secs),
+        // Carried like the claim timeout: an operator edit in `[seller]`, never reset by a relaunch.
+        min_claim_remaining_secs: existing.as_ref().and_then(|s| s.min_claim_remaining_secs),
     };
     home::save_config(home, |config| {
         config.seller = Some(seller);
@@ -1357,6 +1359,7 @@ mod tests {
                 contribution_enabled: true,
                 slots: 3,
                 claim_award_timeout_secs: None,
+                min_claim_remaining_secs: None,
             });
         })
         .expect("seed multi-harness [seller]");
@@ -1411,6 +1414,7 @@ mod tests {
                 contribution_enabled: false,
                 slots: 3,
                 claim_award_timeout_secs: None,
+                min_claim_remaining_secs: None,
             });
         })
         .expect("seed [seller] with contribution disabled");
@@ -1472,6 +1476,7 @@ mod tests {
                 contribution_enabled: true,
                 slots: 3,
                 claim_award_timeout_secs: None,
+                min_claim_remaining_secs: None,
             });
         })
         .expect("seed [seller] with a populated allowlist");
@@ -1528,6 +1533,7 @@ mod tests {
                 contribution_enabled: true,
                 slots: 3,
                 claim_award_timeout_secs: None,
+                min_claim_remaining_secs: None,
             });
         })
         .expect("seed [seller] with an opened targeted surface");
@@ -1607,6 +1613,7 @@ mod tests {
                 contribution_enabled: true,
                 slots: 2,
                 claim_award_timeout_secs: Some(777),
+                min_claim_remaining_secs: None,
             });
         })
         .expect("seed existing [seller]");

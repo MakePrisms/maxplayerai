@@ -2053,6 +2053,28 @@ impl SellerStore {
         Ok(Awarded::New)
     }
 
+    /// Claims this node parked that no award has reached yet, for offers still inside their
+    /// deadline: `(job_id, claim created_at_unix)`, oldest first. The award-recovery source: the
+    /// live award subscription is the only other route to an award, so an award that arrived while
+    /// its handling failed (our claim not yet confirmed on the relay, a private provisioning error)
+    /// would otherwise wait for a reconnect or a restart. Bounded by the offer deadline, so the set
+    /// cannot grow without limit; a claim that lapses is `released` and leaves it.
+    pub fn claims_awaiting_award(&self, now_unix: i64) -> Result<Vec<(String, i64)>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT claims.job_id, claims.created_at_unix
+             FROM claims JOIN offers ON offers.offer_id = claims.job_id
+             WHERE claims.state = 'claimed' AND offers.deadline_unix > ?1
+             ORDER BY claims.created_at_unix, claims.job_id",
+        )?;
+        let rows = stmt.query_map([now_unix], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Buyer pubkey carried by the recorded AWARD for this job.
     pub fn job_award_buyer(&self, job_id: &str) -> Result<Option<String>, StoreError> {
         let conn = self.lock()?;
@@ -5986,6 +6008,46 @@ mod tests {
                 row.job_id
             );
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claims_awaiting_award_lists_only_live_unawarded_claims() {
+        let (store, path) = fresh_store("awaiting-award");
+        let buyer = "b".repeat(64);
+        let now = 5_000;
+        let offer_at = |id: &str, deadline: i64| {
+            let mut offer = sample_offer(id);
+            offer.buyer_pubkey = buyer.clone();
+            offer.deadline_unix = deadline;
+            store.record_offer(&offer, 1).expect("record offer");
+        };
+        let claim_at = |id: &str, at: i64| {
+            store
+                .claim_and_enqueue(id, id, Some("creq"), &claim(), at, 9_999, at)
+                .expect("claim");
+        };
+        // (1) THE CASE: claimed, no award, still live.
+        offer_at(&"1".repeat(64), 10_000);
+        claim_at(&"1".repeat(64), 30);
+        // (2) claimed and live, but the award already arrived.
+        offer_at(&"2".repeat(64), 10_000);
+        claim_at(&"2".repeat(64), 10);
+        store.record_award(&"w2".repeat(32), &"2".repeat(64), &buyer, 40).expect("award 2");
+        // (3) claimed, no award, but its deadline has passed.
+        offer_at(&"3".repeat(64), 4_000);
+        claim_at(&"3".repeat(64), 10);
+        // (4) recorded, never claimed.
+        offer_at(&"4".repeat(64), 10_000);
+        // (5) claimed earlier than (1), no award, live: listed first.
+        offer_at(&"5".repeat(64), 10_000);
+        claim_at(&"5".repeat(64), 20);
+
+        assert_eq!(
+            store.claims_awaiting_award(now).expect("read"),
+            vec![("5".repeat(64), 20), ("1".repeat(64), 30)],
+            "only claimed + unawarded + live claims, oldest first"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

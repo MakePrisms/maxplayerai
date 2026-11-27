@@ -346,6 +346,12 @@ pub struct SellerConfig {
     /// default (see `DEFAULT_CLAIM_AWARD_TIMEOUT_SECS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_award_timeout_secs: Option<u64>,
+    /// Skip an offer whose deadline is fewer than this many seconds away. For a seat that answers
+    /// only when a scheduled run wakes (a file-spool hook): set it to the wake interval plus the
+    /// time one answer takes, so the seat never claims a job that ends before it next wakes and
+    /// leaves the offer to a seat that can answer in time. `None` or `0` ⇒ off (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_claim_remaining_secs: Option<u64>,
 }
 
 /// Every route back to reachable, named once for the whole workspace.

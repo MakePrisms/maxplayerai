@@ -1334,6 +1334,7 @@ mod tests {
             contribution_enabled: true,
             slots: home::default_slots(),
             claim_award_timeout_secs: None,
+            min_claim_remaining_secs: None,
         }
     }
 
