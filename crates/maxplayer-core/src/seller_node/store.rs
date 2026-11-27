@@ -542,6 +542,39 @@ impl RemitAttemptOutcome {
     }
 }
 
+/// One job as `maxplayer seller jobs` lists it ([`SellerStore::recent_job_payments`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobPaymentRow {
+    pub job_id: String,
+    /// `jobs.state`: `awarded`, `executing`, `delivered`, `paid` or `failed`.
+    pub state: String,
+    pub created_at_unix: i64,
+    /// The offer's amount; `None` when the offer row is missing.
+    pub offer_sats: Option<u64>,
+    /// `none` for a free job, `sat` otherwise (a legacy NULL reads `sat`).
+    pub payment: String,
+    pub delivered_at_unix: Option<i64>,
+    /// The end of the buyer's pay window for this delivery (delivery + 7 days).
+    pub pay_by_unix: Option<i64>,
+    /// A relay-derived settled marker (see the `jobs` table).
+    pub settled_elsewhere_at_unix: Option<i64>,
+    /// The collected payment, if any.
+    pub receipt: Option<JobReceipt>,
+}
+
+/// The collected payment of one job, with its platform-fee remittance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobReceipt {
+    pub received_at_unix: i64,
+    /// The offer face the buyer paid.
+    pub amount_sats: u64,
+    pub fee_sats: u64,
+    /// `None` ⇒ the fee is unremitted.
+    pub remittance_id: Option<String>,
+    /// `planned`, `settled` or `failed` for the named remittance.
+    pub remittance_state: Option<String>,
+}
+
 /// One row of `fee_remit_attempts` — one attempt to pay the accrued platform fee and how it ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemitAttempt {
@@ -3452,6 +3485,64 @@ impl SellerStore {
         Ok(conn.last_insert_rowid())
     }
 
+    /// The `limit` most recent jobs this seat won, NEWEST first, each with whether it was paid —
+    /// what `maxplayer seller jobs` prints. Read-only. A job's payment facts live in three tables
+    /// (`deliveries`, `receipts`, `fee_remittances`) and `maxplayer seller fees` lists only jobs
+    /// with a receipt, so a delivered job the buyer has not paid for is visible only here.
+    pub fn recent_job_payments(&self, limit: usize) -> Result<Vec<JobPaymentRow>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT jobs.job_id, jobs.state, jobs.created_at_unix, offers.amount_sats,
+                    COALESCE(deliveries.payment, offers.payment, 'sat'),
+                    deliveries.delivered_at_unix, jobs.settled_elsewhere_at_unix,
+                    receipts.received_at_unix, receipts.amount_sats, receipts.fee_sats,
+                    receipts.remittance_id, fee_remittances.state
+             FROM jobs
+             LEFT JOIN offers ON offers.offer_id = jobs.offer_id
+             LEFT JOIN deliveries ON deliveries.job_id = jobs.job_id
+             LEFT JOIN receipts ON receipts.receipt_id = (
+                 SELECT receipt_id FROM receipts r WHERE r.job_id = jobs.job_id
+                 ORDER BY r.received_at_unix, r.receipt_id LIMIT 1)
+             LEFT JOIN fee_remittances ON fee_remittances.remittance_id = receipts.remittance_id
+             ORDER BY jobs.created_at_unix DESC, jobs.job_id
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            let received_at: Option<i64> = row.get(7)?;
+            let delivered_at: Option<i64> = row.get(5)?;
+            Ok(JobPaymentRow {
+                job_id: row.get(0)?,
+                state: row.get(1)?,
+                created_at_unix: row.get(2)?,
+                offer_sats: row.get::<_, Option<i64>>(3)?.map(|sats| sats.max(0) as u64),
+                payment: row.get(4)?,
+                delivered_at_unix: delivered_at,
+                pay_by_unix: delivered_at.map(|at| {
+                    at.saturating_add(
+                        i64::try_from(crate::job_lifecycle::DELIVERY_PAY_WINDOW_SECS)
+                            .unwrap_or(i64::MAX),
+                    )
+                }),
+                settled_elsewhere_at_unix: row.get(6)?,
+                receipt: match received_at {
+                    Some(received_at_unix) => Some(JobReceipt {
+                        received_at_unix,
+                        amount_sats: row.get::<_, i64>(8)?.max(0) as u64,
+                        fee_sats: row.get::<_, i64>(9)?.max(0) as u64,
+                        remittance_id: row.get(10)?,
+                        remittance_state: row.get(11)?,
+                    }),
+                    None => None,
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// The most recent `limit` remittance attempts, NEWEST first — what `maxplayer seller fees
     /// remit` prints so an operator can see whether the automatic payout has been landing.
     pub fn recent_remit_attempts(&self, limit: usize) -> Result<Vec<RemitAttempt>, StoreError> {
@@ -5561,6 +5652,59 @@ mod tests {
             1,
             "a second award row must not duplicate the offer"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recent_job_payments_reports_each_jobs_payment_facts() {
+        let (store, path) = fresh_store("job-payments");
+        let pay_window = crate::job_lifecycle::DELIVERY_PAY_WINDOW_SECS as i64;
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute_batch(
+                "INSERT INTO offers (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix, payment)
+                     VALUES ('paid', 'b', 100, 'sat', 't', 9, 1, 1, 'sat'),
+                            ('owed', 'b', 50, 'sat', 't', 9, 1, 1, 'sat'),
+                            ('free', 'b', 0, 'sat', 't', 9, 1, 1, 'none'),
+                            ('gone', 'b', 70, 'sat', 't', 9, 1, 1, 'sat');
+                 INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+                     VALUES ('paid', 'paid', 'paid', 10, 10),
+                            ('owed', 'owed', 'delivered', 20, 20),
+                            ('free', 'free', 'delivered', 30, 30),
+                            ('gone', 'gone', 'failed', 40, 40);
+                 INSERT INTO deliveries (job_id, result_ref, delivered_at_unix, payment)
+                     VALUES ('paid', 'r', 11, 'sat'), ('owed', 'r', 21, 'sat'), ('free', 'r', 31, 'none');
+                 INSERT INTO fee_remittances (remittance_id, gross_sats, net_sats, destination, payment_hash, bolt11, state, created_at_unix)
+                     VALUES ('rem', 10, 9, 'd', 'h', 'bolt', 'settled', 13);
+                 INSERT INTO receipts (receipt_id, job_id, amount_sats, received_at_unix, fee_bps, fee_sats, remittance_id)
+                     VALUES ('rc', 'paid', 100, 12, 1000, 10, 'rem');",
+            )
+            .expect("seed");
+        }
+        let rows = store.recent_job_payments(10).expect("read");
+        let ids: Vec<&str> = rows.iter().map(|row| row.job_id.as_str()).collect();
+        assert_eq!(ids, ["gone", "free", "owed", "paid"], "newest first");
+        let by = |id: &str| rows.iter().find(|row| row.job_id == id).expect(id).clone();
+
+        let paid = by("paid");
+        assert_eq!(
+            paid.receipt,
+            Some(JobReceipt {
+                received_at_unix: 12,
+                amount_sats: 100,
+                fee_sats: 10,
+                remittance_id: Some("rem".into()),
+                remittance_state: Some("settled".into()),
+            })
+        );
+        let owed = by("owed");
+        assert_eq!((owed.state.as_str(), owed.receipt.is_none()), ("delivered", true));
+        assert_eq!(owed.offer_sats, Some(50));
+        assert_eq!(owed.pay_by_unix, Some(21 + pay_window));
+        assert_eq!(by("free").payment, "none");
+        let gone = by("gone");
+        assert_eq!((gone.delivered_at_unix, gone.pay_by_unix), (None, None));
+        assert_eq!(store.recent_job_payments(1).expect("limit").len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 
