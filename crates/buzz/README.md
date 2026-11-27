@@ -209,9 +209,15 @@ From the `30873ba46` copy (relay-v13 and earlier since #1134) to this one:
 - Migration 0083 adds a unique index on listed channel names and refuses to
   build over duplicates (`docs/channel-name-uniqueness-deployment.md`).
   Migration 0086 and the indexes before 0076, 0078 and 0081 build at startup
-  under bounded lock and time budgets; a large `events` table should prebuild
-  0086's index first (`docs/private-media-index-deployment.md`,
-  `scripts/maintenance/prebuild-media-edit-index.sql`). Several migrations wait
+  under bounded lock and time budgets. **Prebuild 0086's index first**, while
+  the old relay serves (`docs/private-media-index-deployment.md`,
+  `scripts/maintenance/prebuild-media-edit-index.sql`, run from
+  `scripts/maintenance/` so its `\ir verify-media-edit-index.sql` resolves):
+  the index is partial but its build scans all of `events`, and in a rehearsal
+  of the full NixOS system with 1M events (5.2 GB) 0086 hit its 5 s statement
+  timeout on every start, so the relay restart-looped without serving until the
+  prebuild ran. The old relay cannot take over at that point (0061–0085 are
+  already applied), so skipping the prebuild means downtime or a restore. Several migrations wait
   at most 5 s for a table lock; start the relay while nothing else holds one,
   for example not during a `pg_dump`.
 - Upstream now defaults `BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED` to true. A

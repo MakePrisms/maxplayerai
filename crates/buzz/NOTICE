@@ -39,7 +39,8 @@ buzz-workflow. Also these single files:
   `scripts/seed-admin-dashboard.sh`,
   `scripts/maintenance/plan_duplicate_listed_channel_renames.sql` and
   `scripts/maintenance/rename_duplicate_listed_channel_names.sh`, which tests read;
-- `scripts/maintenance/prebuild-media-edit-index.sql` and the operator documents
+- `scripts/maintenance/prebuild-media-edit-index.sql` with the
+  `scripts/maintenance/verify-media-edit-index.sql` it includes, and the operator documents
   migrations and startup refer to: `docs/database.md`,
   `docs/thread-window-deployment.md`, `docs/artifact-sync-deployment.md`,
   `docs/profile-search.md`, `docs/channel-name-uniqueness-deployment.md`,
