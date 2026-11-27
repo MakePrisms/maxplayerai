@@ -1667,6 +1667,7 @@ Lines worth knowing when something is slow:
 | `WORK-LANE clear: <what> finished after Ns` | The long-running work ended. |
 | `WORK-LANE queue full (1024 events): relay reads pause until it drains` | Back-pressure, logged once per episode. Anything dropped meanwhile is re-read by the next history backfill. |
 | `WORK-LANE queue empty again after Ns (it filled N time(s) meanwhile)` | The back-pressure episode above ended. |
+| `WORK-LANE boot replay done after Ns: the relay's stored events filled the queue N time(s) after start (…)` | The same back-pressure right after a start, while the relay hands back its stored events. Expected on every restart; its `queue full` line prints only with `MAXPLAYER_VERBOSE=1`. |
 | `outbox: the relay confirmed none of N pending publication(s); routine drains pause 5s, backing off to 30s` | The relay is not acknowledging what we publish. The rows stay pending and are retried with the same event ids; new claims still get their first attempt during the pause. |
 | `outbox drain: confirmed=… failed=… expired=… deferred=…` | One bounded publishing pass. `deferred` rows were not reached before the pass's 15 s budget and go first next time. |
 | `backfill INCOMPLETE: retrying in Ns` (and `WARN: wrap backfill INCOMPLETE …`) | The relay did not finish answering a history read. It is retried soon (30 s, doubling) and is never treated as "nothing there". |
@@ -1686,7 +1687,8 @@ Routine no-ops are hidden by default: a re-seen offer already claimed, a duplica
 and acceptances for other sellers' jobs, pay-binds for jobs already awarded here, lapsed or aged
 offers re-read from relay history, an offer already settled or awarded to another seller after its
 first skip line this boot, a relay `CLOSED` for a subscription that is not ours, and follow-ups to
-ended sessions. All but the first two are counted, and the status tick prints one
+ended sessions. The boot replay's `WORK-LANE queue full` line is hidden too; its `boot replay done`
+line still prints. All but the first two are counted, and the status tick prints one
 `seller node routine (since last status): …` line with the counts when any happened. A lapsed offer
 aimed at this seat and authored within the last hour still prints its `offer skip` line, once.
 Payment gift-wraps re-read by the periodic wrap backfill are summarised the same way (`wraps that are

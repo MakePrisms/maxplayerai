@@ -6971,7 +6971,7 @@ impl SellerNodeRunner {
         // reads a recovery cut off is re-run, not reported as a failed read (finding 1).
         let mut lane_started_at = tokio::time::Instant::now();
         let mut last_recovery_end: Option<tokio::time::Instant> = None;
-        let mut queue_full = schedule::QueueFullEpisode::default();
+        let mut queue_full = schedule::QueueFullEpisode::new(tokio::time::Instant::now());
         // Heartbeat supervision (probe + publish + watchdog + recovery), single-flight.
         let mut supervision: Option<SupervisionFuture> = None;
         // Set while a recovery is reconnecting: nothing on the loop may issue a long-lived REQ then
@@ -7055,11 +7055,22 @@ impl SellerNodeRunner {
             if let Some((fills, took)) =
                 queue_full.after_take(queue.queued_events(), tokio::time::Instant::now())
             {
-                opline!(
-                    "seller node WORK-LANE queue empty again after {}s (it filled {fills} time(s) \
-                     meanwhile)",
-                    took.as_secs()
-                );
+                if queue_full.boot() {
+                    // The stored-history replay every restart brings: one line, worded as the
+                    // expected event it is, instead of a "queue full" warning per boot.
+                    opline!(
+                        "seller node WORK-LANE boot replay done after {}s: the relay's stored \
+                         events filled the queue {fills} time(s) after start (expected on every \
+                         restart; anything skipped is re-read by the next history backfill)",
+                        took.as_secs()
+                    );
+                } else {
+                    opline!(
+                        "seller node WORK-LANE queue empty again after {}s (it filled {fills} \
+                         time(s) meanwhile)",
+                        took.as_secs()
+                    );
+                }
             }
             tokio::select! {
                 // #747: leave the selling role. Breaking here — rather than exiting the process
@@ -7512,10 +7523,18 @@ impl SellerNodeRunner {
                                 if queue_full
                                     .after_push(queue.has_room(), tokio::time::Instant::now())
                                 {
-                                    opline!(
-                                        "seller node WORK-LANE queue full ({EVENT_QUEUE_CAP} events): \
-                                         relay reads pause until it drains"
-                                    );
+                                    if queue_full.boot() {
+                                        opline_verbose!(
+                                            "seller node WORK-LANE queue full ({EVENT_QUEUE_CAP} \
+                                             events) during the boot replay: relay reads pause \
+                                             until it drains"
+                                        );
+                                    } else {
+                                        opline!(
+                                            "seller node WORK-LANE queue full ({EVENT_QUEUE_CAP} events): \
+                                             relay reads pause until it drains"
+                                        );
+                                    }
                                 }
                             }
                         }

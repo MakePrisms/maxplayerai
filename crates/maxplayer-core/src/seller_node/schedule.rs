@@ -124,6 +124,11 @@ impl<E> WorkQueue<E> {
     }
 }
 
+/// The first queue-full episode starting this soon after the loop starts is the boot replay: the
+/// live subscriptions hand back their stored history at once, so it happens on every restart of a
+/// seat with any history and is not a problem to report.
+pub(crate) const BOOT_REPLAY_WINDOW: Duration = Duration::from_secs(120);
+
 /// One "WORK-LANE queue full" episode. On a boot re-read the lane frees a slot and the relay stream
 /// refills it at once, so a log line latched on "has room again" fired dozens of times in two
 /// seconds. The episode instead starts at the first fill, counts every refill, and ends only when
@@ -132,10 +137,25 @@ impl<E> WorkQueue<E> {
 pub(crate) struct QueueFullEpisode {
     started: Option<Instant>,
     fills: u32,
+    /// When the work loop started. `None` (`default()`): no episode is the boot replay.
+    loop_started: Option<Instant>,
+    /// An episode has started since the loop did: only the first can be the boot replay.
+    seen: bool,
+    /// The current (or, after [`Self::after_take`] ended it, the last) episode is the boot replay.
+    boot: bool,
 }
 
 impl QueueFullEpisode {
-    /// After an event was queued. `true` exactly once per episode: log the "queue full" line.
+    /// For a work loop that started at `loop_started`.
+    pub(crate) fn new(loop_started: Instant) -> Self {
+        Self {
+            loop_started: Some(loop_started),
+            ..Self::default()
+        }
+    }
+
+    /// After an event was queued. `true` exactly once per episode: log the "queue full" line
+    /// (quietly when [`Self::boot`] says it is the boot replay).
     pub(crate) fn after_push(&mut self, has_room: bool, now: Instant) -> bool {
         if has_room {
             return false;
@@ -145,7 +165,17 @@ impl QueueFullEpisode {
             return false;
         }
         self.started = Some(now);
+        self.boot = !self.seen
+            && self
+                .loop_started
+                .is_some_and(|at| now.saturating_duration_since(at) <= BOOT_REPLAY_WINDOW);
+        self.seen = true;
         true
+    }
+
+    /// Is the current episode (or the one [`Self::after_take`] just ended) the boot replay?
+    pub(crate) fn boot(&self) -> bool {
+        self.boot
     }
 
     /// With `queued` events left in the queue. When an episode is open and the queue is empty, it
@@ -987,6 +1017,29 @@ mod tests {
             logged += push(&mut queue, &mut episode, at);
         }
         assert_eq!(logged, 2);
+    }
+
+    /// The first episode right after start is the boot replay; a later one, or a first one past
+    /// the window, is not. `default()` (no start time) never marks one.
+    #[test]
+    fn only_the_first_episode_after_start_is_the_boot_replay() {
+        let t0 = Instant::now();
+        let mut episode = QueueFullEpisode::new(t0);
+        assert!(episode.after_push(false, t0 + Duration::from_secs(3)));
+        assert!(episode.boot(), "first fill seconds after start");
+        assert!(!episode.after_push(false, t0 + Duration::from_secs(4)), "same episode");
+        assert!(episode.after_take(0, t0 + Duration::from_secs(9)).is_some());
+        assert!(episode.boot(), "still readable after the episode ended");
+        assert!(episode.after_push(false, t0 + Duration::from_secs(30)));
+        assert!(!episode.boot(), "a second episode, even inside the window, is live");
+
+        let mut late = QueueFullEpisode::new(t0);
+        assert!(late.after_push(false, t0 + BOOT_REPLAY_WINDOW + Duration::from_secs(1)));
+        assert!(!late.boot(), "first episode past the window");
+
+        let mut unset = QueueFullEpisode::default();
+        assert!(unset.after_push(false, t0));
+        assert!(!unset.boot(), "no loop start: never the boot replay");
     }
 
     /// The status line's relay half names sign-in, the last heartbeat and how the last relay drop
