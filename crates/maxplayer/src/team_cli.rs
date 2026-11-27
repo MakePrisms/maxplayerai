@@ -55,30 +55,78 @@ team_list, team_invites, team_join, team_send, team_inbox and team_delete on the
 Exit codes: 0 done, 1 usage error, 2 refused or failed.
 ";
 
-/// The watchdog's action when `watch` made no progress for [`maxplayer_team::WATCH_STALL`]: say
-/// where it was stuck, then replace this process with a fresh `watch` (same pid, arguments,
-/// environment and output), so a watcher started without a supervisor still recovers.
-fn restart_stalled_watch(phase: &'static str, quiet: std::time::Duration) {
-    use std::os::unix::process::CommandExt;
-    eprintln!("maxplayer team watch: no progress for {}s (stuck in {phase}); restarting", quiet.as_secs());
-    let error = restart_command(std::env::args_os().collect()).exec();
-    eprintln!("maxplayer team watch: restart failed ({error}); exiting");
-    std::process::exit(RUNTIME_ERROR);
-}
-/// This binary again with `args` (`args[0]` kept as the program name). On Linux through
-/// `/proc/self/exe`, which still works after an upgrade replaced the file on disk.
-fn restart_command(args: Vec<std::ffi::OsString>) -> std::process::Command {
-    use std::os::unix::process::CommandExt;
+/// Exit code of a `watch` worker that its watchdog found stuck: the supervisor starts a new one.
+const WATCH_STALLED: i32 = 75;
+use maxplayer_team::WATCH_WORKER_ENV;
+
+/// `watch` is a small supervisor around a worker process (this binary, same arguments). A worker
+/// whose watchdog finds it stuck exits [`WATCH_STALLED`] and a fresh one starts, so a watcher
+/// launched without an init system (`nohup`) still recovers. Any other worker exit ends the
+/// supervisor with the same code. A separate process, not an `exec` of this one: macOS refuses
+/// `execve` from a process with more than one thread.
+fn supervise_watch(err: &mut dyn Write) -> i32 {
+    // On Linux through /proc/self/exe, which still works after an upgrade replaced the file.
     let exe = if cfg!(target_os = "linux") {
-        PathBuf::from("/proc/self/exe")
+        Ok(PathBuf::from("/proc/self/exe"))
     } else {
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from(args.first().cloned().unwrap_or_default()))
+        std::env::current_exe()
     };
-    let mut command = std::process::Command::new(exe);
-    if let Some((name, rest)) = args.split_first() {
-        command.arg0(name).args(rest);
+    let exe = match exe {
+        Ok(exe) => exe,
+        Err(error) => {
+            let _ = writeln!(err, "maxplayer team watch: cannot find this binary: {error}");
+            return RUNTIME_ERROR;
+        }
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let me = std::process::id();
+    supervise(
+        |restarts| {
+            std::process::Command::new(&exe)
+                .args(&args)
+                .env(WATCH_WORKER_ENV, format!("{me}:{restarts}"))
+                .status()
+        },
+        err,
+    )
+}
+fn supervise(mut run: impl FnMut(u32) -> std::io::Result<std::process::ExitStatus>, err: &mut dyn Write) -> i32 {
+    let mut restarts = 0;
+    loop {
+        match run(restarts) {
+            Ok(status) if status.code() == Some(WATCH_STALLED) => {
+                restarts += 1;
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Ok(status) => return status.code().unwrap_or(RUNTIME_ERROR),
+            Err(error) => {
+                let _ = writeln!(err, "maxplayer team watch: cannot start the watcher: {error}");
+                return RUNTIME_ERROR;
+            }
+        }
     }
-    command
+}
+/// The worker's watchdog: name the step it was stuck in and exit [`WATCH_STALLED`]. A raw
+/// write, because the stuck thread may hold the stderr lock; `_exit`, because nothing that thread
+/// holds can be trusted to unwind.
+fn stalled_worker_exit(phase: &'static str, quiet: std::time::Duration) -> ! {
+    let line = format!("maxplayer team watch: no progress for {}s (stuck in {phase}); restarting\n", quiet.as_secs());
+    // SAFETY: writes a valid buffer to fd 2, then ends the process without running destructors.
+    unsafe {
+        libc::write(2, line.as_ptr().cast(), line.len());
+        libc::_exit(WATCH_STALLED)
+    }
+}
+/// A worker whose supervisor is gone (killed) stops too, so no orphaned watcher keeps running.
+fn exit_with_supervisor(supervisor: u32) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name("team-watch-supervisor".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        // SAFETY: getppid has no preconditions.
+        if unsafe { libc::getppid() } as u32 != supervisor {
+            // SAFETY: ends the process; see stalled_worker_exit.
+            unsafe { libc::_exit(0) }
+        }
+    })
 }
 
 /// Entry point for `maxplayer team …`.
@@ -426,11 +474,20 @@ async fn execute(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> R
                 }
                 _ => return usage_error(err, "usage: watch [--notify <cmd> [args…]]"),
             };
+            let Some(worker) = std::env::var(WATCH_WORKER_ENV).ok() else {
+                return Ok(supervise_watch(err));
+            };
+            let (supervisor, restarts) = worker.split_once(':').unwrap_or((worker.as_str(), "0"));
+            if let Ok(supervisor) = supervisor.parse::<u32>() {
+                exit_with_supervisor(supervisor)?;
+            }
             let heartbeat = std::sync::Arc::new(maxplayer_team::Heartbeat::default());
-            maxplayer_team::spawn_watchdog(heartbeat.clone(), maxplayer_team::WATCH_STALL, restart_stalled_watch)?;
+            maxplayer_team::spawn_watchdog(heartbeat.clone(), maxplayer_team::WATCH_STALL, |phase, quiet| {
+                stalled_worker_exit(phase, quiet)
+            })?;
             let mut home = home;
             home.heartbeat = Some(heartbeat);
-            home.watch(notify).await?;
+            home.watch(notify, restarts != "0").await?;
         }
         ("clone", [team]) => writeln!(out, "{}", home.clone_repo(team, None).await?)?,
         ("clone", [team, dir]) => writeln!(out, "{}", home.clone_repo(team, Some(dir)).await?)?,
@@ -663,15 +720,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root_b);
     }
 
-    /// A stalled `watch` restarts as this same binary with the same arguments and program name.
+    /// The supervisor starts a new worker after a stalled exit (75) and passes its restart count;
+    /// any other worker exit ends it with that code.
     #[test]
-    fn a_stalled_watch_restarts_with_the_same_arguments() {
-        let args: Vec<std::ffi::OsString> =
-            ["maxplayer", "team", "--home", "/h", "watch", "--notify", "wake.sh"].iter().map(Into::into).collect();
-        let command = restart_command(args);
-        let exe = if cfg!(target_os = "linux") { PathBuf::from("/proc/self/exe") } else { std::env::current_exe().unwrap() };
-        assert_eq!(std::path::Path::new(command.get_program()), exe);
-        let rest: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(rest, ["team", "--home", "/h", "watch", "--notify", "wake.sh"]);
+    fn the_watch_supervisor_restarts_only_a_stalled_worker() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut seen = vec![];
+        let mut codes = vec![WATCH_STALLED, WATCH_STALLED, 3].into_iter();
+        let mut err = Vec::new();
+        let code = supervise(
+            |restarts| {
+                seen.push(restarts);
+                Ok(std::process::ExitStatus::from_raw(codes.next().unwrap() << 8))
+            },
+            &mut err,
+        );
+        assert_eq!((code, seen), (3, vec![0, 1, 2]));
+        let code = supervise(|_| Err(std::io::Error::other("no exe")), &mut err);
+        assert_eq!(code, RUNTIME_ERROR);
+        assert!(String::from_utf8_lossy(&err).contains("cannot start the watcher"));
     }
 }

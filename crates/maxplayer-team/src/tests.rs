@@ -853,19 +853,63 @@ async fn a_watch_step_that_never_finishes_is_given_up() {
     assert_eq!(bounded("x", Duration::from_secs(1), async { 7 }).await.unwrap(), 7);
 }
 
-/// With a lock wait (`watch`), a held state lock is an error after that wait, not a block.
-#[test]
-fn a_held_state_lock_is_given_up_after_the_lock_wait() {
+/// `watch`'s lock wait: a held state lock is an error after the wait, and the runtime's only
+/// thread keeps running other tasks meanwhile (no blocking sleep).
+#[tokio::test]
+async fn a_held_state_lock_is_given_up_without_blocking_the_runtime() {
     let dir = tempfile::tempdir().unwrap();
-    let mut h = home(dir.path(), "wss://relay.example");
+    let h = home(dir.path(), "wss://relay.example");
     let holder = home(dir.path(), "wss://relay.example");
     let held = holder.lock().unwrap();
-    h.lock_wait = Some(Duration::from_millis(200));
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || tx.send(h.lock().map(|_| ()).map_err(|e| e.to_string())).unwrap());
-    let r = rx.recv_timeout(Duration::from_secs(5)).expect("lock() returned");
-    assert!(r.unwrap_err().contains("team state is busy"));
+    let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let t = ticks.clone();
+    let ticker = tokio::spawn(async move {
+        loop {
+            t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(5), h.lock_async(Duration::from_millis(400))).await.expect("lock_async returned");
+    assert!(r.err().expect("busy").to_string().contains("team state is busy"));
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) >= 5, "runtime starved while waiting");
+    ticker.abort();
     drop(held);
+    assert!(h.lock_async(Duration::from_millis(400)).await.is_ok(), "free once released");
+}
+
+/// A record appended after a torn last line (a writer killed mid-line) starts on its own line,
+/// so it is read back; the torn line alone is skipped.
+#[test]
+fn an_append_after_a_torn_line_is_still_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = home(dir.path(), "wss://relay.example");
+    let first = msg_at(&Keys::generate(), "one", now());
+    h.append(&Stored { channel: CH.into(), event: first, verdict: None, error: None }).unwrap();
+    let mut f = OpenOptions::new().append(true).open(h.path("messages.jsonl")).unwrap();
+    f.write_all(br#"{"channel":"0b0e5f1c-9d4a"#).unwrap();
+    drop(f);
+    let second = msg_at(&Keys::generate(), "two", now());
+    h.append(&Stored { channel: CH.into(), event: second.clone(), verdict: None, error: None }).unwrap();
+    let ids: Vec<EventId> = h.stored().unwrap().into_iter().map(|s| s.event.id).collect();
+    assert_eq!(ids.len(), 2, "both whole records read back");
+    assert_eq!(ids[1], second.id);
+}
+
+/// A restarted worker wakes `--notify` for delivered messages `inbox` has not shown yet.
+#[test]
+fn unread_channels_lists_delivered_messages_not_yet_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(dir.path(), "wss://relay.example");
+    h.config.review.team_message = false;
+    join_crew(&h);
+    assert!(h.unread_channels().unwrap().is_empty());
+    let m = msg_at(&Keys::generate(), "hi", now());
+    h.append(&Stored { channel: CH.into(), event: m, verdict: None, error: None }).unwrap();
+    assert_eq!(h.unread_channels().unwrap(), vec![CH.to_owned()]);
+    h.take_inbox(|_| Ok(())).unwrap();
+    assert!(h.unread_channels().unwrap().is_empty(), "shown by inbox");
 }
 
 /// A CLOSED for a live subscription ends the connection (reconnect); others are ignored.
@@ -892,20 +936,23 @@ async fn watch_once_delivers_live_messages_and_ends_at_its_refresh() {
     join_crew(&h);
     let hb = Arc::new(Heartbeat::default());
     h.heartbeat = Some(hb.clone());
-    h.lock_wait = Some(WATCH_LOCK_WAIT);
     let woke = dir.path().join("woke");
     let mut notifier = Notifier::new(vec!["sh".into(), "-c".into(), format!("printf %s \"$MAXPLAYER_TEAM\" > {}", woke.display())]);
     let sender = client.clone();
+    let live = hb.clone();
+    // Sent once the watcher is subscribed (its first live-loop pass), not after a guessed delay.
     let send = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(11)).await;
+        while live.last().1 != "live" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         sender.send_event(&msg_at(&Keys::generate(), "live one", now())).await.unwrap();
     });
     let started = std::time::Instant::now();
     // The local relay asks for no sign-in, so connect waits out its 10 s sign-in window first.
-    let ended = tokio::time::timeout(Duration::from_secs(40), h.watch_once(&mut notifier, Duration::from_secs(2))).await;
+    let ended = tokio::time::timeout(Duration::from_secs(40), h.watch_once(&mut notifier, Duration::from_secs(3))).await;
     ended.unwrap_or_else(|_| panic!("watch_once did not end; last step {}", hb.last().1)).unwrap();
     send.await.unwrap();
-    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert!(started.elapsed() >= Duration::from_secs(3));
     assert_eq!(delivered(&h), 1);
     if let Some(mut child) = notifier.child.take() {
         child.wait().unwrap();
