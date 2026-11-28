@@ -1858,7 +1858,7 @@ fn claim_harness_tags(tags: &[crate::gateway::TagSpec]) -> Vec<Vec<String>> {
 }
 
 /// What [`SellerNodeRunner::adopt_own_earlier_claim`] found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AdoptOutcome {
     /// The awarded claim is now the claim on record and confirmed. `earlier`: it is an earlier claim
     /// of this seat, made before its claim row was lost (the seat may already have run the job);
@@ -1874,8 +1874,9 @@ enum AdoptOutcome {
     /// The award names a claim this seat did sign, but the seat will not bind it: its terms or
     /// harness are no longer offered (`notify_buyer`: the buyer is told, so it can re-post), or it is
     /// newer than the claim on record (another process holding this key signed it; that process
-    /// answers the award).
-    Declined { notify_buyer: bool },
+    /// answers the award). `claim` is the awarded claim: a private decline's feedback is bound to it
+    /// and the award, as the buyer's job view requires, without recording them as the selection.
+    Declined { notify_buyer: bool, claim: Box<nostr_sdk::Event> },
 }
 
 /// The shortest gap between two award-recovery passes, measured from the END of the previous pass
@@ -1922,6 +1923,70 @@ fn award_recovery_filters(waiting: &[(String, String)]) -> Vec<Filter> {
                 .limit(AWARD_RECOVERY_LIMIT)
         })
         .collect()
+}
+
+/// `[seller] min_claim_remaining_secs`: whether `offer` ends too soon for this seat to answer. Reads
+/// the OFFER's own deadline (never a job run deadline, which `[seller] job_timeout_secs` replaces
+/// with now + timeout); unset or 0 never skips. Both gates (before and after the offer review) use it.
+fn too_little_time_left(offer: &ParsedOffer, seller: Option<&crate::home::SellerConfig>, now_unix: u64) -> bool {
+    seller
+        .and_then(|seller| seller.min_claim_remaining_secs)
+        .filter(|min| *min > 0)
+        .is_some_and(|min| offer.deadline_unix.saturating_sub(now_unix) < min)
+}
+
+/// Whether one award-recovery read may have been cut at a relay's page limit: some filter matched
+/// `AWARD_RECOVERY_LIMIT` or more of the returned events. Each filter counts every event it matches
+/// (parseable or not, and an event matched by two chunks' filters counts for both), as the relay
+/// applies `limit` per filter.
+fn award_recovery_page_full(filters: &[Filter], events: &[nostr_sdk::Event]) -> bool {
+    filters.iter().any(|filter| {
+        events.iter().filter(|event| filter.match_event(event, Default::default())).count() >= AWARD_RECOVERY_LIMIT
+    })
+}
+
+/// The filters for [`SellerNodeRunner::relay_shows_settlement`]: this seat's result and the buyer's
+/// receipt for `offer_id`, one `limit(1)` filter each (one event is enough, and nobody else's event
+/// can fill the page).
+fn settlement_filters(offer_id: EventId, seller: nostr_sdk::PublicKey, buyer: Option<nostr_sdk::PublicKey>) -> Vec<Filter> {
+    let mut filters = vec![Filter::new()
+        .kind(Kind::Custom(JOB_RESULT_KIND))
+        .event(offer_id)
+        .author(seller)
+        .hashtag(crate::gateway::MAXPLAYER_TAG)
+        .limit(1)];
+    if let Some(buyer) = buyer {
+        filters.push(
+            Filter::new()
+                .kind(Kind::Custom(JOB_RECEIPT_KIND))
+                .event(offer_id)
+                .author(buyer)
+                .hashtag(crate::gateway::MAXPLAYER_TAG)
+                .limit(1),
+        );
+    }
+    filters
+}
+
+/// What a settlement read says: `Some(true)` when it holds this seat's verified result or the buyer's
+/// verified receipt (even from a cut read: what arrived is genuine), `Some(false)` only from a
+/// complete read without one, `None` from a cut read without one (absence proves nothing).
+fn settlement_from_read(read: StoredRead, seller_hex: &str, buyer_hex: Option<&str>) -> Option<bool> {
+    let (events, complete) = match read {
+        StoredRead::Complete(events) => (events, true),
+        StoredRead::Incomplete { events, .. } => (events, false),
+    };
+    // POSITIVE presence only. Our result is authored by THIS seller; a buyer receipt by the offer's
+    // buyer (#541: a forged receipt with a foreign author never counts). RC3-02: only a VERIFIED
+    // event counts — a forged result/receipt must never make the seller skip a live award's run.
+    let settled = events.iter().any(|event| {
+        let kind = event.kind.as_u16();
+        let Some(author) = crate::job_lifecycle::verified_author_hex(event) else {
+            return false;
+        };
+        (kind == JOB_RESULT_KIND && author == seller_hex) || (kind == JOB_RECEIPT_KIND && buyer_hex == Some(author.as_str()))
+    });
+    (settled || complete).then_some(settled)
 }
 
 /// Whether `award` names `seller_hex` as the seat it chose: a kind-3405 award carries
@@ -3608,9 +3673,7 @@ fn classify_offer(
     // next wakes. Claiming it anyway takes the award from a seat that could have answered. Checked
     // after every gate that says the offer is not this seat's at all (aged, buyer, mode, price,
     // targeting), so those keep their own reasons and only an offer it would take reads as this.
-    if let Some(min) = seller.min_claim_remaining_secs.filter(|min| *min > 0)
-        && offer.deadline_unix.saturating_sub(now_unix) < min
-    {
+    if too_little_time_left(offer, Some(seller), now_unix) {
         return ClaimDecision::Skip(SkipReason::TooLittleTime);
     }
     if !agents.serves(offer.requested_agent.as_deref()) {
@@ -8273,6 +8336,34 @@ impl SellerNodeRunner {
         status: Option<&str>,
         extra_tags: Vec<gateway::TagSpec>,
     ) -> bool {
+        self.publish_buyer_feedback_selected(
+            offer_id,
+            buyer_pubkey,
+            reason_code,
+            reason,
+            reason_detail,
+            status,
+            extra_tags,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::publish_buyer_feedback_tagged`] for a private job whose (claim, award) is not the
+    /// recorded selection: a declined adoption binds its feedback to the awarded claim and the award,
+    /// which are never recorded as the selection (the seat does not serve them).
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_buyer_feedback_selected(
+        &self,
+        offer_id: &str,
+        buyer_pubkey: &str,
+        reason_code: ReasonCode,
+        reason: &str,
+        reason_detail: Option<&str>,
+        status: Option<&str>,
+        extra_tags: Vec<gateway::TagSpec>,
+        selection: Option<(&nostr_sdk::Event, &nostr_sdk::Event)>,
+    ) -> bool {
         let mut draft = error_draft(
             offer_id,
             buyer_pubkey,
@@ -8298,7 +8389,7 @@ impl SellerNodeRunner {
                 .tags
                 .push(gateway::TagSpec::new(["reason_detail", reason_detail]));
         }
-        let draft = match super::privacy::project(self.node.home(), &self.seller_pubkey.to_hex(), offer_id, draft, None) {
+        let draft = match super::privacy::project_selected(self.node.home(), &self.seller_pubkey.to_hex(), offer_id, draft, None, None, selection) {
             Ok(draft) => draft,
             Err(e) => { opline!("seller private feedback not prepared: {e}"); return false; }
         };
@@ -8310,7 +8401,7 @@ impl SellerNodeRunner {
                     Ok(feedback) => {
                         if private {
                             if !self.private_authenticated.load(std::sync::atomic::Ordering::Relaxed) { return false; }
-                            if let Err(e) = super::privacy::record_publication(self.node.home(), &self.seller_pubkey.to_hex(), &feedback) {
+                            if let Err(e) = super::privacy::record_publication_selected(self.node.home(), &self.seller_pubkey.to_hex(), &feedback, selection) {
                                 opline!("seller private feedback not persisted: {e}"); return false;
                             }
                         }
@@ -8716,11 +8807,11 @@ impl SellerNodeRunner {
             opline!("seller node award job_id={job_id}: {what}; not adopting claim {claim_id} yet");
             AdoptOutcome::Defer
         };
-        let decline = |what: &str, notify_buyer: bool| {
+        let decline = |what: &str, notify_buyer: bool, claim: &nostr_sdk::Event| {
             opline!(
                 "seller node award job_id={job_id}: the buyer awarded claim {claim_id}, an earlier claim of this seat, but it {what}; declining the award"
             );
-            AdoptOutcome::Declined { notify_buyer }
+            AdoptOutcome::Declined { notify_buyer, claim: Box::new(claim.clone()) }
         };
         let refuse = |what: &str| {
             opline!("seller node award job_id={job_id}: earlier claim {claim_id} {what}; not adopting it");
@@ -8776,7 +8867,7 @@ impl SellerNodeRunner {
             Ok(None) => return AdoptOutcome::NotOurs,
             Err(error) => return defer(&format!("claim draft read failed ({error})")),
         };
-        let claimed_at = claim.created_at.as_u64() as i64;
+        let claimed_at = claim.created_at.as_secs() as i64;
         // The claim on record ITSELF, whose publish was never confirmed: same key, time and draft
         // give the same event. Its terms and harness are the ones on record; confirm it and bind.
         let earlier = !(claimed_at == on_record_at && draft == on_record_draft);
@@ -8786,7 +8877,7 @@ impl SellerNodeRunner {
             // award. (Partial: a sibling's OLDER claim cannot be told from this seat's own lost
             // claim. Two homes on one key are not a supported setup; `lock.rs` guards one home.)
             if claimed_at >= on_record_at {
-                return decline("is not older than the claim on record (another process with this key?)", false);
+                return decline("is not older than the claim on record (another process with this key?)", false, &claim);
             }
             let config = &self.node.home().config;
             if !earlier_claim_terms_still_accepted(
@@ -8797,10 +8888,10 @@ impl SellerNodeRunner {
                 config.allow_real_mints,
                 &config.accepted_mints,
             ) {
-                return decline("quotes payment terms this seat no longer accepts", true);
+                return decline("quotes payment terms this seat no longer accepts", true, &claim);
             }
             if claim_harness_tags(&on_record_draft.tags) != claim_harness_tags(&draft.tags) {
-                return decline("advertised a different harness than the claim on record", true);
+                return decline("advertised a different harness than the claim on record", true, &claim);
             }
         }
         let home = self.node.home();
@@ -8932,8 +9023,9 @@ impl SellerNodeRunner {
             }
         };
         let started = Instant::now();
+        let filters = award_recovery_filters(waiting);
         let (events, mut clean) =
-            match read_stored(&relay, award_recovery_filters(waiting), AWARD_RECOVERY_FETCH_TIMEOUT).await {
+            match read_stored(&relay, filters.clone(), AWARD_RECOVERY_FETCH_TIMEOUT).await {
                 StoredRead::Complete(events) => (events, true),
                 StoredRead::Incomplete { events, reason } => {
                     opline_verbose!("seller node award recovery: read incomplete ({reason})");
@@ -8942,27 +9034,8 @@ impl SellerNodeRunner {
             };
         let buyers: std::collections::HashMap<&str, &str> =
             waiting.iter().map(|(job, buyer)| (job.as_str(), buyer.as_str())).collect();
-        // A chunk whose filter came back full may have been cut at the limit.
-        let mut per_chunk = vec![0usize; waiting.len().div_ceil(AWARD_RECOVERY_CHUNK)];
-        let chunk_of: std::collections::HashMap<&str, usize> = waiting
-            .iter()
-            .enumerate()
-            .map(|(at, (job, _))| (job.as_str(), at / AWARD_RECOVERY_CHUNK))
-            .collect();
-        // Every returned event counts against its chunk's limit, parseable or not: match any `e` tag
-        // the filter could have matched, not only a well-formed award's root.
-        for event in &events {
-            let chunk = event.tags.iter().find_map(|tag| {
-                let fields = tag.as_slice();
-                (fields.first().map(String::as_str) == Some("e"))
-                    .then(|| fields.get(1).and_then(|id| chunk_of.get(id.as_str()).copied()))
-                    .flatten()
-            });
-            if let Some(chunk) = chunk {
-                per_chunk[chunk] += 1;
-            }
-        }
-        if per_chunk.iter().any(|count| *count >= AWARD_RECOVERY_LIMIT) {
+        // A filter that came back full may have been cut at the limit.
+        if award_recovery_page_full(&filters, &events) {
             opline_verbose!("seller node award recovery: a filter returned a full page; treating the read as cut short");
             clean = false;
         }
@@ -10199,11 +10272,10 @@ impl SellerNodeRunner {
         if deadline_unix <= now_unix() as u64 {
             return ClaimOutcome::ReachedReview;
         }
-        // The OFFER's deadline, as the first gate reads it: `deadline_unix` is the job's run
-        // deadline, which `[seller] job_timeout_secs` replaces with now + timeout.
-        if let Some(min) = self.node.home().config.seller.as_ref().and_then(|seller| seller.min_claim_remaining_secs).filter(|min| *min > 0)
-            && offer.deadline_unix.saturating_sub(now_unix() as u64) < min
-        {
+        // The OFFER's deadline, as the first gate reads it (one helper, which takes the offer): the
+        // `deadline_unix` here is the job's run deadline, which `[seller] job_timeout_secs` replaces
+        // with now + timeout.
+        if too_little_time_left(offer, self.node.home().config.seller.as_ref(), now_unix() as u64) {
             opline!("seller node skip job_id={job_id}: too little time left after its review ([seller] min_claim_remaining_secs)");
             return ClaimOutcome::ReachedReview;
         }
@@ -10760,7 +10832,7 @@ impl SellerNodeRunner {
                     }
                 }
                 AdoptOutcome::NotOurs => {}
-                AdoptOutcome::Declined { notify_buyer } => {
+                AdoptOutcome::Declined { notify_buyer, claim: declined_claim } => {
                     // This seat lost its claim row, so it cannot tell locally whether it already
                     // delivered this job. Ask the relay before telling the buyer to post it again:
                     // that message frees the buyer's reservation, and must not talk it out of paying
@@ -10799,7 +10871,16 @@ impl SellerNodeRunner {
                     };
                     if tell_buyer
                         && !self
-                            .publish_buyer_feedback(&job_id, &buyer, reason_code, ADOPTION_DECLINED_FEEDBACK, None)
+                            .publish_buyer_feedback_selected(
+                                &job_id,
+                                &buyer,
+                                reason_code,
+                                ADOPTION_DECLINED_FEEDBACK,
+                                None,
+                                None,
+                                Vec::new(),
+                                Some((&*declined_claim, event)),
+                            )
                             .await
                     {
                         opline!(
@@ -10913,7 +10994,7 @@ impl SellerNodeRunner {
                             .claim_created_at(&job_id)
                             .ok()
                             .flatten()
-                            .is_some_and(|claimed_at| (event.created_at.as_u64() as i64) < claimed_at);
+                            .is_some_and(|claimed_at| (event.created_at.as_secs() as i64) < claimed_at);
                         // And the adoption itself, recorded on this seat's clock alone (the award's
                         // time is the buyer's): immune to a buyer clock running ahead.
                         let adopted_earlier = self.node.store().claim_adopted_earlier(&job_id).unwrap_or(true);
@@ -11140,11 +11221,12 @@ impl SellerNodeRunner {
     /// replay (the receipt gate still holds the money line against double-pay; the lapse check bounds
     /// wasted compute). This is the money-adjacent inversion of fail-closed: RunAgent is the safe branch.
     ///
-    /// The read uses `fetch_events` (like the #560 offer/wrap backfills): a TRANSIENT REQ under a
-    /// pool-GENERATED sub id, returning events off the call itself and BYPASSING nostr-relay-pool's
-    /// per-connection seen-cache (a plain re-subscribe would be swallowed for already-seen ids). The
-    /// job is matched by an EXACT `#e` tag == the offer event id (never a substring — the #562 hazard
-    /// of a numeric token matching inside a 64-hex id), plus the `#t=maxplayer` namespace guard.
+    /// The read is [`Self::relay_shows_settlement`]: [`read_stored`] on this seat's relay connection
+    /// under a fresh subscription id (events come off the read itself, so nostr-relay-pool's
+    /// per-connection seen-cache cannot swallow already-seen ids), and an incomplete read (no EOSE) is
+    /// unknown, which here runs the agent. The job is matched by an EXACT `#e` tag == the offer event
+    /// id (never a substring — the #562 hazard of a numeric token matching inside a 64-hex id), plus
+    /// the `#t=maxplayer` namespace guard.
     ///
     /// arm-after-the-event: the durable marker is written ONLY once the settlement event is in hand,
     /// never on the way INTO the query, so a crash mid-derive leaves the row re-checkable next restart.
@@ -11199,42 +11281,17 @@ impl SellerNodeRunner {
                 return None;
             }
         };
-        // kind-3403 (our result) OR kind-3400 (buyer receipt), rooted at THIS offer, maxplayer
-        // namespace, by this seat or the offer's buyer only (nobody else's event can count, nor make
-        // the read incomplete).
-        let mut authors = vec![self.seller_pubkey];
-        if let Some(buyer) = buyer_pubkey.and_then(|hex| nostr_sdk::PublicKey::from_hex(hex).ok()) {
-            authors.push(buyer);
+        // kind-3403 (our result) and kind-3400 (buyer receipt), rooted at THIS offer, maxplayer
+        // namespace, one `limit(1)` filter each, by this seat and by the offer's buyer.
+        let buyer = buyer_pubkey.and_then(|hex| nostr_sdk::PublicKey::from_hex(hex).ok());
+        let filters = settlement_filters(offer_id, self.seller_pubkey, buyer);
+        let read = read_stored(&relay, filters, SETTLED_ELSEWHERE_FETCH_TIMEOUT).await;
+        if let StoredRead::Incomplete { reason, .. } = &read {
+            opline!(
+                "seller node job_id={job_id}: settled-elsewhere derive read incomplete ({reason}); only what arrived counts, absence is unknown (an execute runs the agent: absence never strands a live award)"
+            );
         }
-        let filter = Filter::new()
-            .kinds([Kind::Custom(JOB_RESULT_KIND), Kind::Custom(JOB_RECEIPT_KIND)])
-            .event(offer_id)
-            .authors(authors)
-            .hashtag(crate::gateway::MAXPLAYER_TAG);
-        let (events, complete) = match read_stored(&relay, vec![filter], SETTLED_ELSEWHERE_FETCH_TIMEOUT).await {
-            StoredRead::Complete(events) => (events, true),
-            StoredRead::Incomplete { events, reason } => {
-                opline!(
-                    "seller node job_id={job_id}: settled-elsewhere derive read incomplete ({reason}); only what arrived counts, absence is unknown (an execute runs the agent: absence never strands a live award)"
-                );
-                (events, false)
-            }
-        };
-        // POSITIVE presence only. Our result is authored by THIS seller; a buyer receipt is authored by
-        // the offer's buyer (the #541 buyer-binding — a forged receipt with a foreign author never
-        // counts). Absence of BOTH ⇒ false ⇒ RunAgent.
-        // RC3-02: only a VERIFIED event counts — a forged result/receipt must never make the seller
-        // skip a live award's run.
-        let settled = events.iter().any(|event| {
-            let kind = event.kind.as_u16();
-            let Some(author) = crate::job_lifecycle::verified_author_hex(event) else {
-                return false;
-            };
-            (kind == JOB_RESULT_KIND && author == self.seller_pubkey.to_hex())
-                || (kind == JOB_RECEIPT_KIND && buyer_pubkey.is_some_and(|buyer| author == buyer))
-        });
-        // A settlement that arrived counts even from a cut read; its absence counts only after EOSE.
-        (settled || complete).then_some(settled)
+        settlement_from_read(read, &self.seller_pubkey.to_hex(), buyer_pubkey)
     }
 
     /// Whether this process already holds a PASSED claim-time review for `job_id`. The claim-time
@@ -17262,8 +17319,9 @@ mod tests {
             .await;
     }
 
-    /// fable #1450 r2 L8: the buyer's own `p` tag does not make an award name a seat that shares
-    /// the buyer's key; only a second `p` naming it does.
+    /// fable #1450 r2 L8, advisor #1450 H1: for a seat that shares the buyer's key, an award naming
+    /// another key is that seat's win; otherwise (v1 with the key twice, or v2's single `p`) it names
+    /// this seat.
     #[test]
     fn award_names_seat_does_not_count_the_buyers_own_p_tag() {
         let buyer = Keys::generate();
@@ -17292,6 +17350,110 @@ mod tests {
         let mut none = crate::gateway::award_draft(&"1".repeat(64), &"2".repeat(64), &buyer_hex, &seat);
         none.tags.retain(|tag| tag.first() != Some("p"));
         assert!(!award_names_seat(&ReclaimFixture::signed(&none, &buyer, 0), &seat, &buyer_hex), "no p tag names nobody");
+    }
+
+    /// advisor #1450 r2 L-New-2 (M2): both \`min_claim_remaining_secs\` gates read the OFFER's
+    /// deadline through one helper that takes the offer, so a job run deadline (which
+    /// \`job_timeout_secs\` replaces with now + timeout) cannot be passed in its place.
+    #[test]
+    fn the_time_left_gate_reads_the_offer_deadline_whatever_the_job_timeout() {
+        let mut cfg = seller_cfg(2, false);
+        cfg.min_claim_remaining_secs = Some(600);
+        for timeout in [Some(60), Some(3_600), None] {
+            cfg.job_timeout_secs = timeout;
+            assert!(too_little_time_left(&offer(5, Some(SELLER), NOW + 599), Some(&cfg), NOW), "{timeout:?}: ends too soon");
+            assert!(!too_little_time_left(&offer(5, Some(SELLER), NOW + 600), Some(&cfg), NOW), "{timeout:?}: at the minimum");
+            assert!(!too_little_time_left(&offer(5, Some(SELLER), NOW + 7_200), Some(&cfg), NOW), "{timeout:?}: hours left");
+        }
+        assert!(!too_little_time_left(&offer(5, Some(SELLER), NOW + 1), None, NOW), "no [seller] config");
+        cfg.min_claim_remaining_secs = Some(0);
+        assert!(!too_little_time_left(&offer(5, Some(SELLER), NOW + 1), Some(&cfg), NOW), "0 never skips");
+    }
+
+    /// advisor #1450 r2 L-New-1 and L-New-2 (L2): a recovery read may be cut at a relay's page limit
+    /// when any filter matched that many returned events: unparseable awards count, and an event
+    /// matched by two chunks' filters counts for both.
+    #[test]
+    fn award_recovery_counts_a_full_page_per_filter() {
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let waiting: Vec<(String, String)> =
+            (0..AWARD_RECOVERY_CHUNK + 1).map(|n| (format!("{n:064x}"), buyer_hex.clone())).collect();
+        let filters = award_recovery_filters(&waiting);
+        assert_eq!(filters.len(), 2, "two chunks");
+        let first = waiting[0].0.clone();
+        let second = waiting[AWARD_RECOVERY_CHUNK].0.clone();
+        // Kind-3405 by the buyer, tagged, rooted at waiting offers, but no claim: not a parseable award.
+        let junk = |offers: &[&str], n: usize| {
+            let mut tags: Vec<crate::gateway::TagSpec> =
+                offers.iter().map(|offer| crate::gateway::TagSpec::new(["e", *offer])).collect();
+            tags.push(crate::gateway::TagSpec::new(["t", crate::gateway::MAXPLAYER_TAG]));
+            let event = ReclaimFixture::signed(
+                &crate::gateway::EventDraft { kind: JOB_AWARD_KIND, tags, content: format!("junk {n}") },
+                &buyer,
+                0,
+            );
+            assert!(parse_award(&event_to_draft(&event)).is_none());
+            event
+        };
+        let only_first: Vec<_> = (0..AWARD_RECOVERY_LIMIT).map(|n| junk(&[&first], n)).collect();
+        assert!(award_recovery_page_full(&filters, &only_first), "unparseable events fill a page");
+        assert!(!award_recovery_page_full(&filters, &only_first[1..]), "one short of the limit");
+        let half = AWARD_RECOVERY_LIMIT / 2;
+        let spanning: Vec<_> = (0..half)
+            .map(|n| junk(&[&second], n))
+            .chain((half..AWARD_RECOVERY_LIMIT).map(|n| junk(&[&first, &second], n)))
+            .collect();
+        assert!(award_recovery_page_full(&filters, &spanning), "an event in two chunks counts for both");
+    }
+
+    /// advisor #1450 r2 L-New-2 (H2) and L-New-3: what a settlement read proves. A verified result
+    /// of this seat or receipt of the buyer counts, even from a cut read; nobody else's does; absence
+    /// counts only from a complete read. A relay that withholds EOSE gives a cut read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settlement_read_counts_only_what_it_can_prove() {
+        let seller = Keys::generate();
+        let buyer = Keys::generate();
+        let (seller_hex, buyer_hex) = (seller.public_key().to_hex(), buyer.public_key().to_hex());
+        let offer_id = "1".repeat(64);
+        let event = |kind: u16, keys: &Keys| {
+            let tags = vec![
+                crate::gateway::TagSpec::new(["e", offer_id.as_str(), "", "root"]),
+                crate::gateway::TagSpec::new(["t", crate::gateway::MAXPLAYER_TAG]),
+            ];
+            ReclaimFixture::signed(&crate::gateway::EventDraft { kind, tags, content: "x".into() }, keys, 0)
+        };
+        let decide = |read: StoredRead| settlement_from_read(read, &seller_hex, Some(&buyer_hex));
+        let cut = |events: Vec<nostr_sdk::Event>| StoredRead::Incomplete { events, reason: "no EOSE".into() };
+        assert_eq!(decide(StoredRead::Complete(vec![])), Some(false), "complete, none");
+        assert_eq!(decide(cut(vec![])), None, "cut, none: unknown");
+        assert_eq!(decide(cut(vec![event(JOB_RESULT_KIND, &seller)])), Some(true), "our result from a cut read");
+        assert_eq!(decide(StoredRead::Complete(vec![event(JOB_RECEIPT_KIND, &buyer)])), Some(true), "the buyer's receipt");
+        assert_eq!(decide(StoredRead::Complete(vec![event(JOB_RESULT_KIND, &buyer)])), Some(false), "a result by the buyer");
+        assert_eq!(decide(StoredRead::Complete(vec![event(JOB_RECEIPT_KIND, &seller)])), Some(false), "a receipt by the seat");
+        assert_eq!(decide(cut(vec![event(JOB_RESULT_KIND, &buyer)])), None, "cut, nothing that counts");
+
+        let filters = settlement_filters(
+            nostr_sdk::EventId::from_hex(&offer_id).unwrap(),
+            seller.public_key(),
+            Some(buyer.public_key()),
+        );
+        assert_eq!(filters.len(), 2, "one filter per kind");
+        assert!(filters.iter().all(|filter| serde_json::to_value(filter).unwrap()["limit"] == 1));
+        let fixture = crate::seller_node::p_gate_relay_fixture::PGateRelay::start(Duration::from_millis(0)).await;
+        let client = Client::new(Keys::generate());
+        client.automatic_authentication(true);
+        client.add_relay(fixture.url()).await.expect("add relay");
+        let relay = client.relay(fixture.url()).await.expect("relay handle");
+        client.connect().await;
+        client.wait_for_connection(Duration::from_secs(5)).await;
+        let read = read_stored(&relay, filters.clone(), Duration::from_secs(5)).await;
+        assert_eq!(decide(read), Some(false), "the relay answered: none");
+        fixture.withhold_eose_for(&[JOB_RESULT_KIND as u64, JOB_RECEIPT_KIND as u64]);
+        let read = read_stored(&relay, filters, Duration::from_secs(2)).await;
+        assert!(!read.is_complete(), "withheld EOSE: a cut read");
+        assert_eq!(decide(read), None, "a stalled relay is unknown, never \"no result\"");
+        client.disconnect().await;
     }
 
     /// advisor #1450 H2: the settlement read is three-valued and only a complete read says "none".

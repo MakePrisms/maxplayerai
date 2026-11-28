@@ -1858,6 +1858,10 @@ impl SellerStore {
 
     /// [`Self::claim_and_enqueue`] with the claim's roster pin written in the SAME transaction as
     /// the claim row and its outbox draft, so the published claim and the pin can never disagree.
+    ///
+    /// Callers pass `created_at_unix == now_unix` (the claim is signed at the second it is recorded):
+    /// [`Self::claim_adopted_earlier`] reads an outbox time older than the claim row's as an adopted
+    /// earlier claim, so an older `created_at_unix` here would read as one.
     #[allow(clippy::too_many_arguments)]
     pub fn claim_and_enqueue_pinned(
         &self,
@@ -2133,7 +2137,8 @@ impl SellerStore {
 
     /// Whether the claim on record for `job_id` is an EARLIER claim this seat adopted (its outbox time,
     /// the claim's own, is older than the claim row's): the seat may have run the job before it lost
-    /// its claim row. Durable, and both times are this seat's.
+    /// its claim row. Durable, and both times are this seat's. Relies on a fresh claim being recorded
+    /// with its outbox time equal to its claim-row time ([`Self::claim_and_enqueue_pinned`]).
     pub fn claim_adopted_earlier(&self, job_id: &str) -> Result<bool, StoreError> {
         let conn = self.lock()?;
         Ok(conn
@@ -6166,6 +6171,12 @@ mod tests {
         assert!(!store.claim_adopted_earlier(&job).expect("read"), "precondition: the claim on record is the re-claim");
         assert!(store.adopt_claim(&job, "earlier-id", "creq-earlier", &earlier, 0, 2).expect("adopt"));
         assert!(store.claim_adopted_earlier(&job).expect("read"), "an earlier claim's time marks the adoption");
+        // Confirming the claim on record itself (its own time, equal to the claim row's) is not an
+        // earlier claim.
+        let same = "5".repeat(64);
+        store.claim_and_enqueue(&same, &same, Some("creq"), &claim(), 1, 9_999, 1).expect("claim");
+        assert!(store.adopt_claim(&same, "same-id", "creq", &claim(), 1, 2).expect("confirm"));
+        assert!(!store.claim_adopted_earlier(&same).expect("read"), "the claim on record is not an earlier claim");
         assert_eq!(store.job_creq(&job).expect("creq").as_deref(), Some("creq-earlier"));
         assert_eq!(
             store.outbox_row(&format!("claim:{job}")).expect("row").map(|(state, _, id)| (state, id)),

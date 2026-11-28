@@ -9400,6 +9400,90 @@ mod private_flow_tests {
         }
     }
 
+    /// advisor #1450 r2 M-New-1: a seller's private decline feedback for an award it does not serve
+    /// (a declined adoption: the awarded claim and the award are never its recorded selection) is
+    /// bound to that claim and award, so the buyer's job view accepts it and shows the error.
+    #[test]
+    fn a_private_decline_bound_to_the_awarded_claim_reaches_the_buyers_view() {
+        use crate::private_content::{builders, evidence, wire};
+        for targeted in [true, false] {
+            for bound in [true, false] {
+                let (e, _, buyer, policy) = evidence::inline_fixture_for(targeted);
+                let seller = nostr_sdk::Keys::parse(&format!("{:064x}", 2)).unwrap();
+                assert_eq!(seller.public_key(), e.claim.pubkey, "the fixture's seller");
+                let (seller_hex, buyer_hex) = (seller.public_key().to_hex(), buyer.public_key().to_hex());
+                let configure = |home: &mut home::MaxplayerHome| {
+                    home.config.privacy.private_content_v2 = true;
+                    home.config.privacy.private_job_repos = true;
+                    home.config.privacy.private_jobs = true;
+                    home.config.privacy.service_pubkey = Some(policy.service.clone());
+                    home.config.privacy.git_base = Some(policy.host.git_prefix.clone());
+                };
+                let now = 2_000_000_001;
+                let offer_id = e.offer.id.to_hex();
+                // The seller knows the offer, and nothing selected.
+                let seller_root = tempfile::tempdir().unwrap();
+                let mut seller_home = home::bootstrap(seller_root.path()).unwrap();
+                configure(&mut seller_home);
+                {
+                    let mut ctx = ContentContext::open(&seller_home, &seller_hex).unwrap();
+                    if let Some(task) = &e.task_envelope {
+                        ctx.stage(&PreparedContent::decode(task).unwrap(), now).unwrap();
+                    }
+                    ctx.resolve_offer(&e.offer, now).unwrap();
+                    assert!(ctx.store.selection(&offer_id).unwrap().is_none(), "no recorded selection");
+                }
+                let selection = bound.then_some((&e.claim, &e.award));
+                let draft = crate::gateway::error_draft(
+                    &offer_id,
+                    &buyer_hex,
+                    &seller_hex,
+                    crate::gateway::ReasonCode::ExecutionFailed,
+                    "seller can no longer serve the claim you awarded",
+                );
+                let draft = crate::seller_node::privacy::project_selected(
+                    &seller_home, &seller_hex, &offer_id, draft, None, None, selection,
+                )
+                .unwrap();
+                let feedback = builders::sign(&seller, draft).unwrap();
+                crate::seller_node::privacy::record_publication_selected(&seller_home, &seller_hex, &feedback, selection)
+                    .unwrap();
+                let tags = wire::validate_private(&feedback, &policy.host).unwrap();
+                let content = ContentContext::open(&seller_home, &seller_hex)
+                    .unwrap()
+                    .store
+                    .authored(tags.required("job").unwrap(), tags.required("content-id").unwrap(), &seller_hex)
+                    .unwrap()
+                    .expect("the sealed decline");
+                // The buyer receives the sealed content and reads its job.
+                let buyer_root = tempfile::tempdir().unwrap();
+                let mut buyer_home = home::bootstrap(buyer_root.path()).unwrap();
+                configure(&mut buyer_home);
+                let mut ctx = ContentContext::open(&buyer_home, &buyer_hex).unwrap();
+                if let Some(task) = &e.task_envelope {
+                    ctx.stage(&PreparedContent::decode(task).unwrap(), now).unwrap();
+                }
+                ctx.stage(&content, now).unwrap();
+                let view = private_view_from_events(
+                    &buyer_home,
+                    &mut ctx,
+                    &e.offer,
+                    vec![e.claim.clone(), feedback.clone()],
+                    vec![e.award.clone()],
+                    vec![],
+                    now,
+                )
+                .unwrap();
+                let errors = view.claims.iter().filter(|claim| claim.status == "error").count();
+                assert_eq!(
+                    errors,
+                    usize::from(bound),
+                    "targeted={targeted} bound={bound}: the decline shows only when bound to the awarded claim"
+                );
+            }
+        }
+    }
+
     #[test]
     fn private_content_missing_selection_dependencies_are_unknown_not_absent() {
         use crate::private_content::{evidence, builders, public_v2};

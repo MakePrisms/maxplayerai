@@ -96,13 +96,44 @@ pub fn project_keyed(
     dispatch: Option<pc::Dispatch>,
     turn_key: Option<&str>,
 ) -> pc::Result<EventDraft> {
+    project_selected(home, seller, id, draft, dispatch, turn_key, None)
+}
+
+/// The (claim, award) a private publication is bound to: `selection` when the caller supplies one
+/// that validates against the offer (the same check the buyer's job view applies, so both sides
+/// agree on the binding), otherwise the recorded selection. A supplied pair is never recorded.
+fn binding(
+    ctx: &pc::channel::ContentContext,
+    offer: &Event,
+    id: &str,
+    selection: Option<(&Event, &Event)>,
+) -> pc::Result<Option<(Event, Event)>> {
+    if let Some((claim, award)) = selection
+        && pc::lifecycle::validate_selection(offer, claim, award, &ctx.policy.host).is_ok()
+    {
+        return Ok(Some((claim.clone(), award.clone())));
+    }
+    ctx.store.selection(id)
+}
+
+/// [`project_keyed`] bound to `selection` when it validates (see [`binding`]): a declined
+/// adoption's feedback names the awarded claim and the award, which are not the recorded selection.
+pub fn project_selected(
+    home: &MaxplayerHome,
+    seller: &str,
+    id: &str,
+    draft: EventDraft,
+    dispatch: Option<pc::Dispatch>,
+    turn_key: Option<&str>,
+    selection: Option<(&Event, &Event)>,
+) -> pc::Result<EventDraft> {
     let Some((mut ctx, offer)) = known(home, seller, id)? else {
         if is_private(&draft) {
             return Err(pc::Error("private offer context unavailable"));
         }
         return pc::public_v2::project_local_keyed(home, id, draft, turn_key);
     };
-    let selected = ctx.store.selection(id)?;
+    let selected = binding(&ctx, &offer, id, selection)?;
     let (claim, award) = selected
         .as_ref()
         .map(|(c, a)| (Some(c), Some(a)))
@@ -195,12 +226,22 @@ pub fn bind_receipt_keyed(
 }
 
 pub fn record_publication(home: &MaxplayerHome, seller: &str, event: &Event) -> pc::Result<()> {
+    record_publication_selected(home, seller, event, None)
+}
+
+/// [`record_publication`] bound to `selection` when it validates (see [`binding`]).
+pub fn record_publication_selected(
+    home: &MaxplayerHome,
+    seller: &str,
+    event: &Event,
+    selection: Option<(&Event, &Event)>,
+) -> pc::Result<()> {
     let policy = pc::runtime::Policy::from_home(home)?;
     let tags = pc::wire::validate_private(event, &policy.host)?;
     let id = tags.required("root")?;
     let (mut ctx, offer) =
         known(home, seller, id)?.ok_or(pc::Error("private publication context missing"))?;
-    let selected = ctx.store.selection(id)?;
+    let selected = binding(&ctx, &offer, id, selection)?;
     let (claim, award) = selected
         .as_ref()
         .map(|(c, a)| (Some(c), Some(a)))
