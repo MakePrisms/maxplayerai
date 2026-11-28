@@ -172,6 +172,7 @@ pub async fn provision(
     State(state): State<Arc<AppState>>,
     OriginalUri(uri): OriginalUri,
     Path(job_id): Path<String>,
+    slot: crate::access::AccessSlot,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, Response> {
@@ -209,6 +210,7 @@ pub async fn provision(
     .map_err(|_| deny())?;
     let url = crate::api::bridge::nip98_expected_url(&state.config.relay_url, &tenant, uri.path());
     let verified = crate::api::bridge::verify_bridge_auth_with_options(
+        &slot,
         &headers,
         "PUT",
         &url,
@@ -247,13 +249,18 @@ pub async fn provision(
         .or_else(|| headers.get("x-auth-tag").and_then(|v| v.to_str().ok()));
     crate::api::relay_members::enforce_relay_membership(
         &state,
-        tenant.community(),
+        &tenant,
         pubkey.as_bytes(),
         auth_tag,
         verified.signed_created_at,
+        None,
     )
     .await
-    .map_err(|_| deny())?;
+    .map_err(|refusal| {
+        slot.finish(refusal.auth_result());
+        deny()
+    })?;
+    slot.finish(crate::access::AuthResult::Success);
     let digests: Vec<_> = token
         .tags
         .iter()

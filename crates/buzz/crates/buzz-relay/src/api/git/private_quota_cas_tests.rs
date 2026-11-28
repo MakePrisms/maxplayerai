@@ -157,9 +157,29 @@ async fn private_quota_cas_race_keeps_one_snapshot_and_rechecks_the_losers_retry
         max_pack_bytes: 100 * 1024 * 1024,
         max_repo_bytes: 100 * 1024 * 1024,
     };
+    let workspace_a = cas_publish::snapshot_workspace(a.path()).await.unwrap();
+    let workspace_b = cas_publish::snapshot_workspace(b.path()).await.unwrap();
     let (ra, rb) = tokio::join!(
-        cas_publish::cas_publish(&store, &tenant, a.path(), &buyer, &job, &parent, limits),
-        cas_publish::cas_publish(&store, &tenant, b.path(), &buyer, &job, &parent, limits)
+        cas_publish::cas_publish(
+            &store,
+            &tenant,
+            a.path(),
+            &buyer,
+            &job,
+            &parent,
+            &workspace_a,
+            limits
+        ),
+        cas_publish::cas_publish(
+            &store,
+            &tenant,
+            b.path(),
+            &buyer,
+            &job,
+            &parent,
+            &workspace_b,
+            limits
+        )
     );
     let (winner, loser, success) = match (ra, rb) {
         (Ok(success), Err(CasError::Conflict { .. })) => (&a, &b, success),

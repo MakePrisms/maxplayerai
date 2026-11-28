@@ -7,13 +7,14 @@ events + git + payments relay directly.
 
     Upstream:  github.com/block/buzz
     Branch:    main
-    Commit:    30873ba46b5e08602ae61a2a0592ecedd37f7289 (2026-10-11)
+    Commit:    298543f5555bf351785979b29d0c6f0d64b5bdc1 (2026-11-25)
     License:   Apache-2.0 (see ./LICENSE)
 
-The previous copy came from the github.com/gudnuf/buzz fork (branch
+The previous copy was block/buzz 30873ba46 (maxplayerai #1134), which itself
+merged upstream into the github.com/gudnuf/buzz fork (branch
 sync/upstream-recarry-2026-07-24, commit e18020a63, based on block/buzz
-3bd3a014c). This copy merges upstream into it, so that fork's open-relay
-changes (A below) and the Maxplayer changes (B) carry over.
+3bd3a014c). Each sync merges upstream into the vendored tree, so that fork's
+open-relay changes (A below) and the Maxplayer changes (B) carry over.
 
 Buzz is Copyright the Buzz / Block authors, licensed under the Apache License,
 Version 2.0. maxplayerai is MIT-OR-Apache-2.0; vendoring Apache-2.0 code in is
@@ -27,11 +28,24 @@ From upstream, in its own layout so `git diff` against block/buzz stays
 meaningful: `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `LICENSE`,
 `migrations/`, `schema/`, and the relay with every workspace crate it depends
 on: buzz-relay, buzz-audit, buzz-auth, buzz-conformance, buzz-core,
-buzz-datastore-tracing, buzz-db, buzz-deletion, buzz-media, buzz-pubsub,
-buzz-relay-mesh, buzz-sdk, buzz-search and buzz-workflow. Also three single
-files: `docs/nips/NIP-MP.fixtures.json` and
-`scripts/reconcile-schema-after-pgschema.sql`, which tests read, and
-`docs/thread-window-deployment.md`, which migration 0049 refers operators to.
+buzz-datastore-tracing, buzz-db, buzz-deletion, buzz-feature-flags,
+buzz-media, buzz-pubsub, buzz-relay-mesh, buzz-sdk, buzz-search and
+buzz-workflow. Also these single files:
+- `previews/invite-video/` (two files), which the relay embeds;
+- `.pgschemaignore`, `.env.example`, `test-fixtures/solo-creation.json`,
+  `docs/nips/NIP-MP.fixtures.json`, `docs/sql/private-media-edit-preflight.sql`,
+  `scripts/reconcile-schema-after-pgschema.sql`, `scripts/repair-events-pkey.sql`,
+  `scripts/drop-partitioned-foreign-keys.sql`, `scripts/start-relay-for-tests.sh`,
+  `scripts/seed-admin-dashboard.sh`,
+  `scripts/maintenance/plan_duplicate_listed_channel_renames.sql` and
+  `scripts/maintenance/rename_duplicate_listed_channel_names.sh`, which tests read;
+- `scripts/maintenance/prebuild-media-edit-index.sql` with the
+  `scripts/maintenance/verify-media-edit-index.sql` it includes, and the operator documents
+  migrations and startup refer to: `docs/database.md`,
+  `docs/thread-window-deployment.md`, `docs/artifact-sync-deployment.md`,
+  `docs/profile-search.md`, `docs/channel-name-uniqueness-deployment.md`,
+  `docs/private-media-index-deployment.md` and
+  `docs/trigger-retirement-deployment.md`.
 
 Maxplayer's own: `crates/maxplayer-private-protocol/` (MIT OR Apache-2.0),
 `NOTICE`, `README.md` and `.gitignore`.
@@ -40,7 +54,7 @@ Left behind (the relay does not build them): the AI-agent harness, push
 gateway, device pairing, desktop / mobile / web clients, CLIs, and the other
 upstream crates, scripts and docs.
 
-MODIFICATIONS relative to block/buzz 30873ba46
+MODIFICATIONS relative to block/buzz 298543f55
 ----------------------------------------------
 Every copied upstream file not named below is byte-verbatim. Paths under
 `crates/buzz-relay/src/` are shortened (`config.rs`, `api/git/transport.rs`).
@@ -48,25 +62,27 @@ Every copied upstream file not named below is byte-verbatim. Paths under
 Build and layout
 - `Cargo.toml`: workspace `members` trimmed to the crates above plus
   `crates/maxplayer-private-protocol`; `exclude = ["desktop/src-tauri"]`
-  dropped. Upstream's `[patch.crates-io]` entry pinning `sqlx-sqlite` to a
-  launchbadge/sqlx git revision (for MeshLLM, not vendored) is removed: it put
-  a second `sqlx-core 0.9.0` into the lock, which nixpkgs' fetchCargoVendor
-  cannot vendor, and the relay never builds sqlx-sqlite. No other dependency or
-  patch entry changed.
+  dropped. No dependency or patch entry changed: upstream now pins every sqlx
+  crate to one launchbadge/sqlx git revision, so the lock holds a single
+  `sqlx-core` and nixpkgs' fetchCargoVendor can vendor it.
 - `Cargo.lock`: upstream's lock, pruned to this workspace. Every version is
-  upstream's except `sqlx-sqlite 0.9.0` and `libsqlite3-sys 0.37.0`, now from
-  crates.io (both unbuilt), and the added `maxplayer-private-protocol`.
-- `crates/buzz-relay/Cargo.toml`: depends on `maxplayer-private-protocol`.
-- `crates/buzz-db/src/runtime/migration.rs`: two upstream tests skip the paths
-  that are not vendored (`.github/workflows`, `crates/buzz-push-gateway`).
+  upstream's; `maxplayer-private-protocol` is added.
+- `crates/buzz-relay/Cargo.toml`: depends on `maxplayer-private-protocol`. The
+  `buzz-cli` dev-dependency is dropped, and with it the one test module that
+  drives the CLI, `api/media_access_postgres_tests/cli_edit_postgres_tests.rs`
+  (removed; its `mod` line in `api/media_access_postgres_tests.rs` is a comment).
+  The CLI and its crates are not vendored.
+- `crates/buzz-db/src/runtime/migration.rs`: upstream tests that read paths not
+  vendored skip them.
 
 A. Open-relay fork (gudnuf/buzz)
 - `BUZZ_OPEN_READ` (`config.rs`, `connection.rs`, `handlers/req.rs`,
-  `api/bridge.rs`): an unauthenticated WebSocket connection may read stored
-  history outside channels. It gets EOSE but no live subscription, an
-  `#h`-scoped request gets an empty history, and the NIP-42 auth timeout does
-  not close it. HTTP `/query` skips the relay-membership check; its
-  authentication and channel checks still apply. Writes still need auth.
+  `api/bridge.rs`, `api/mod.rs`): an unauthenticated WebSocket connection may
+  read stored history outside channels. It gets EOSE but no live subscription
+  (it claims its ID like a one-shot search), an `#h`-scoped request gets an
+  empty history, and the NIP-42 auth timeout does not close it. HTTP `/query`
+  lifts only the relay-membership refusal; authentication, bans, NIP-FI
+  refusals and channel checks still apply. Writes still need auth.
 - `BUZZ_GIT_PUBLIC_READ` (off by default; `config.rs`, `api/bridge.rs`,
   `api/git/transport.rs`): git reads skip the relay-membership check, and HTTP
   `/query` serves repository events (kinds 30617/30618) to authenticated
@@ -75,7 +91,8 @@ A. Open-relay fork (gudnuf/buzz)
   event kinds with the messages-write scope.
 - DVM job kinds 3400, 5109, 6109 and 7000 (`handlers/ingest.rs`).
 - Git upload-pack fails closed (HTTP 500) on a non-zero exit or empty output,
-  instead of a silent empty 200 (`api/git/transport.rs`).
+  instead of a silent empty 200; its output is spooled to a file, not
+  streamed (`api/git/transport.rs`).
 
 B. Maxplayer
 - Kinds (`handlers/ingest.rs`): the trade block 3401–3406, execution reviews
@@ -88,10 +105,10 @@ B. Maxplayer
   update that does not name exactly that ref (`api/git/transport.rs`,
   `api/git/hook.rs`, `api/git/policy.rs`). A scoped token with a NIP-40
   expiration lives up to `BUZZ_SCOPED_TOKEN_MAX_LIFETIME_SECS` (default 6 h);
-  unscoped tokens keep the ±60 s window (`crates/buzz-auth/src/nip98.rs`,
+  unscoped tokens keep upstream's ±120 s window (`crates/buzz-auth/src/nip98.rs`,
   `crates/buzz-auth/src/lib.rs`, `config.rs`). NIP-11 advertises the cap as
   `limitation.scoped_token_max_lifetime_secs` (`nip11.rs`).
-- Private job repositories: the shared wire schemas
+- Private job and team repositories: the shared wire schemas
   (`crates/maxplayer-private-protocol/`), job ACLs
   (`crates/buzz-db/src/private_jobs.rs`, `crates/buzz-db/src/lib.rs`),
   provisioning and quotas (`api/git/private_jobs.rs`, `api/git/quota.rs`,
@@ -100,31 +117,38 @@ B. Maxplayer
   ref-state event (kind 30618; `api/git/transport.rs`), and a public
   announcement cannot use a private repository's id
   (`handlers/side_effects.rs`). Settings:
-  `MAXPLAYER_PRIVATE_JOB_REPOS`, `MAXPLAYER_PRIVATE_SERVICE_PUBKEY`
-  (`config.rs`). Upload-pack output is spooled to a file rather than held in
-  memory. See `docs/specs/private-offers-implementation.md` in maxplayerai.
+  `MAXPLAYER_PRIVATE_JOB_REPOS`, `MAXPLAYER_PRIVATE_SERVICE_PUBKEY`,
+  `MAXPLAYER_TEAM_REPOS` (`config.rs`). See
+  `docs/specs/private-offers-implementation.md` in maxplayerai.
 - Incomplete history is never reported complete: a row that cannot be decoded
-  fails the query (`crates/buzz-db/src/store/event.rs`), and the REQ handler
-  then ends the subscription with `CLOSED` ("error: historical query
-  failed"), never EOSE (`handlers/req.rs`).
+  fails the query (`crates/buzz-db/src/store/event.rs`). Upstream's REQ handler
+  now ends a subscription whose history read failed with `CLOSED` itself.
 - Tests: `api/git/private_jobs_http_tests.rs`,
   `api/git/private_quota_cas_tests.rs`, `handlers/req_maxplayer_tests.rs`,
   `crates/buzz-db/src/store/history_failure_tests.rs`, and a test helper in
   `state.rs`.
 
-C. This sync
-- Migrations: upstream's 0025 is `relay_invites`, so the private-job table
-  migration (formerly 0025) ships byte for byte as
-  `migrations/100025_private_job_repositories.sql`, and
-  `migrations/100026_private_job_repositories_write_fence.sql` attaches
-  upstream's community write fence to the table. Before migrating,
-  `crates/buzz-db/src/runtime/migration.rs` moves a database's version-25
-  record to 100025 when its stored checksum is that migration's; any other
-  version-25 record is left for sqlx to reject. Maxplayer migrations use
-  versions from 100000 up. The table joins the deletion catalog
-  (`crates/buzz-db/src/store/deletion.rs`) and the desired-state schema
-  (`schema/schema.sql`, `schema/tables/public/private_job_repositories.sql`,
-  `schema/triggers/private_job_repositories.sql`).
+C. Migrations
+- Maxplayer migrations use versions from 100000 up, after every upstream one.
+  `100025_private_job_repositories.sql` is the pre-merge fork's 0025 byte for
+  byte; before migrating, `crates/buzz-db/src/runtime/migration.rs` moves a
+  database's version-25 record to 100025 when its stored checksum is that
+  migration's (any other version-25 record is left for sqlx to reject).
+  `100027` adds the session column.
+- Upstream's 0090 retires the community write fence: it drops the fence
+  triggers it knows by name, then the fence functions without CASCADE. The
+  private-job table carries one more fence trigger, so `migration.rs` drops it
+  right before 0090 runs. `100026_private_job_repositories_write_fence.sql`,
+  which attached that trigger, is now a no-op (on a fresh database 0090 runs
+  first and the function is gone); a database that applied the original keeps
+  its record, and `migration.rs` moves its stored checksum to the new file's
+  only when it is the original's. `100028` drops the table's one foreign key,
+  as upstream's 0101–0104 do for theirs (docs/database.md Rule 2). The
+  schema-object lint exempts 100025–100027, which production applied before
+  the rule.
+- The table is in the deletion catalog (`crates/buzz-db/src/store/deletion.rs`)
+  and the desired-state schema (`schema/schema.sql`,
+  `schema/tables/public/private_job_repositories.sql`).
 - Upstream's git read gate (SEC-005) denies a repository not bound to a
   channel. Maxplayer binds none, so those stay readable to every caller the git
   auth admits; channel-bound repositories keep upstream's membership gate, and

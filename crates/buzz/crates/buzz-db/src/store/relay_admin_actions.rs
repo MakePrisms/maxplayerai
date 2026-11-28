@@ -143,7 +143,12 @@ pub async fn resolve_report_decision_atomic(
     channel_id: Option<Uuid>,
     reason: Option<&str>,
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
 
     // CAS: open → terminal. The update count tells us whether the report was open.
     let updated = sqlx::query(
@@ -157,7 +162,7 @@ pub async fn resolve_report_decision_atomic(
     .bind(report_id)
     .bind(terminal_status)
     .bind(actor_pubkey)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     if updated.rows_affected() == 0 {
@@ -165,7 +170,10 @@ pub async fn resolve_report_decision_atomic(
         return Ok(false);
     }
 
-    // Insert the decision audit row in the same transaction.
+    // Insert the decision audit row in the same transaction. A missing channel
+    // fails here, after the report-not-open outcome, and rolls the CAS back.
+    crate::store::reference_check::require_optional_channel(tx.conn(), community_id, channel_id)
+        .await?;
     sqlx::query(
         r#"
         INSERT INTO moderation_actions (
@@ -182,7 +190,7 @@ pub async fn resolve_report_decision_atomic(
     .bind(channel_id)
     .bind(reason)
     .bind(actor_authority)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     tx.commit().await?;
@@ -221,7 +229,12 @@ pub async fn claim_report(
     target_event_id: Option<&[u8]>,
     channel_id: Option<Uuid>,
 ) -> Result<ClaimResult> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
 
     // Lock the report row to serialize concurrent claims on the same report.
     let report_row = sqlx::query(
@@ -234,7 +247,7 @@ pub async fn claim_report(
     )
     .bind(community_id.as_uuid())
     .bind(report_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx.conn())
     .await?;
 
     let Some(report_row) = report_row else {
@@ -258,7 +271,7 @@ pub async fn claim_report(
         .bind(community_id.as_uuid())
         .bind(report_id)
         .bind(request_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
         if let Some(row) = existing {
@@ -272,6 +285,11 @@ pub async fn claim_report(
     if status != "open" {
         return Ok(ClaimResult::NotOpen(status));
     }
+
+    // The decision audit row below names `channel_id`. A missing channel fails
+    // after the not-found, retry and not-open outcomes, before any write.
+    crate::store::reference_check::require_optional_channel(tx.conn(), community_id, channel_id)
+        .await?;
 
     // Insert the action record first to get its ID.
     let action_row = sqlx::query(
@@ -296,7 +314,7 @@ pub async fn claim_report(
     .bind(timeout_until)
     .bind(target_pubkey)
     .bind(channel_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(tx.conn())
     .await?;
 
     let action_id: Uuid = action_row.try_get("id")?;
@@ -318,7 +336,7 @@ pub async fn claim_report(
     .bind(channel_id)
     .bind(reason)
     .bind(actor_authority)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     // CAS: set report to processing with active_action_id.
@@ -332,7 +350,7 @@ pub async fn claim_report(
     .bind(community_id.as_uuid())
     .bind(report_id)
     .bind(action_id)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     if updated.rows_affected() == 0 {
@@ -457,9 +475,15 @@ pub async fn execute_ban_with_marker(
     actor_pubkey: &[u8],
     reason: Option<&str>,
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
+    crate::relay_invite::lock_admission(tx.conn(), community_id).await?;
 
-    // Verify lease ownership first — abort without touching domain rows if the
+    // Verify lease ownership before domain writes — abort if the
     // lease is already gone. This prevents the commit entirely on a stale worker.
     let owned: bool = sqlx::query_scalar(
         r#"
@@ -474,7 +498,7 @@ pub async fn execute_ban_with_marker(
     )
     .bind(action_id)
     .bind(lease_token)
-    .fetch_one(&mut *tx)
+    .fetch_one(tx.conn())
     .await?;
 
     if !owned {
@@ -488,7 +512,7 @@ pub async fn execute_ban_with_marker(
     // under the lock, not before it.
     sqlx::query("SELECT id FROM relay_admin_actions WHERE id = $1 FOR UPDATE")
         .bind(action_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
     sqlx::query(
@@ -505,8 +529,11 @@ pub async fn execute_ban_with_marker(
     .bind(target_pubkey)
     .bind(actor_pubkey)
     .bind(reason)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
+
+    crate::relay_invite::revoke_banned_issuer_invites(tx.conn(), community_id, target_pubkey)
+        .await?;
 
     let marker = sqlx::query(
         r#"
@@ -521,7 +548,7 @@ pub async fn execute_ban_with_marker(
     )
     .bind(action_id)
     .bind(lease_token)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     if marker.rows_affected() == 0 {
@@ -548,7 +575,13 @@ pub async fn execute_timeout_with_marker(
     until: DateTime<Utc>,
     reason: Option<&str>,
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
+    crate::relay_invite::lock_admission(tx.conn(), community_id).await?;
 
     let owned: bool = sqlx::query_scalar(
         r#"
@@ -563,7 +596,7 @@ pub async fn execute_timeout_with_marker(
     )
     .bind(action_id)
     .bind(lease_token)
-    .fetch_one(&mut *tx)
+    .fetch_one(tx.conn())
     .await?;
 
     if !owned {
@@ -574,7 +607,7 @@ pub async fn execute_timeout_with_marker(
     // Acquire the action-row lock before evaluating the wall-clock expiry check.
     sqlx::query("SELECT id FROM relay_admin_actions WHERE id = $1 FOR UPDATE")
         .bind(action_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
     sqlx::query(
@@ -593,8 +626,11 @@ pub async fn execute_timeout_with_marker(
     .bind(until)
     .bind(actor_pubkey)
     .bind(reason)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
+
+    crate::relay_invite::revoke_banned_issuer_invites(tx.conn(), community_id, target_pubkey)
+        .await?;
 
     let marker = sqlx::query(
         r#"
@@ -609,7 +645,7 @@ pub async fn execute_timeout_with_marker(
     )
     .bind(action_id)
     .bind(lease_token)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     if marker.rows_affected() == 0 {
@@ -648,7 +684,12 @@ pub async fn execute_kick_with_marker(
     target_pubkey: &[u8],
     actor_pubkey: &[u8],
 ) -> Result<KickWithMarkerResult> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
 
     let owned: bool = sqlx::query_scalar(
         r#"
@@ -663,7 +704,7 @@ pub async fn execute_kick_with_marker(
     )
     .bind(action_id)
     .bind(lease_token)
-    .fetch_one(&mut *tx)
+    .fetch_one(tx.conn())
     .await?;
 
     if !owned {
@@ -676,13 +717,19 @@ pub async fn execute_kick_with_marker(
     // Acquire the action-row lock before evaluating the wall-clock expiry check.
     sqlx::query("SELECT id FROM relay_admin_actions WHERE id = $1 FOR UPDATE")
         .bind(action_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
+        .await?;
+    // Like every membership writer, remove under the channel's membership
+    // lock, so a roster publication either sees the member removed or
+    // commits before the removal. No channel lock is held yet, so the lock
+    // order holds.
+    crate::channel_members::acquire_channel_membership_lock(tx.conn(), community_id, channel_id)
         .await?;
 
     let kick = sqlx::query(
         r#"
         UPDATE channel_members
-        SET removed_at = NOW(), removed_by = $1
+        SET removed_at = clock_timestamp(), sync_modified_at = clock_timestamp(), removed_by = $1
         WHERE community_id = $2 AND channel_id = $3 AND pubkey = $4 AND removed_at IS NULL
         "#,
     )
@@ -690,13 +737,14 @@ pub async fn execute_kick_with_marker(
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(target_pubkey)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     if kick.rows_affected() == 0 {
         tx.rollback().await?;
         return Ok(KickWithMarkerResult::AlreadyGone);
     }
+    crate::dm::release_dm_identity(tx.conn(), community_id, channel_id, target_pubkey).await?;
 
     let marker = sqlx::query(
         r#"
@@ -711,7 +759,7 @@ pub async fn execute_kick_with_marker(
     )
     .bind(action_id)
     .bind(lease_token)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     if marker.rows_affected() == 0 {
@@ -729,6 +777,11 @@ pub async fn execute_kick_with_marker(
 ///
 /// The delete is idempotent: if the event is already deleted the marker is still
 /// committed (soft-delete is already-done = success).
+///
+/// A pinned target leaves its channel's NIP-PM pin list in the same
+/// transaction; the list is re-signed with `relay_signer`. Returns whether
+/// this call committed the marker, and the pin list it rewrote.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_delete_with_marker(
     pool: &PgPool,
     action_id: Uuid,
@@ -737,7 +790,8 @@ pub async fn execute_delete_with_marker(
     target_event_id: &[u8],
     parent_event_id: Option<&[u8]>,
     root_event_id: Option<&[u8]>,
-) -> Result<bool> {
+    relay_signer: &nostr::Keys,
+) -> Result<(bool, Option<buzz_core::StoredEvent>)> {
     let mut tx = crate::begin_community_event_write_transaction(
         pool,
         community_id,
@@ -763,7 +817,7 @@ pub async fn execute_delete_with_marker(
 
     if !owned {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok((false, None));
     }
 
     // Acquire the action-row lock before evaluating the wall-clock expiry check.
@@ -772,16 +826,40 @@ pub async fn execute_delete_with_marker(
         .fetch_optional(tx.conn())
         .await?;
 
+    // NIP-AR: an artifact revision leaves current state only through its own
+    // `op=delete` or a kind-9005 redaction. Both are fanned out, so open syncs
+    // see them; this delete would retire a head with no live signal.
+    let target: Option<(i32, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as("SELECT kind, created_at FROM events WHERE community_id = $1 AND id = $2")
+            .bind(community_id.as_uuid())
+            .bind(target_event_id)
+            .fetch_optional(tx.conn())
+            .await?;
+    if target.is_some_and(|(kind, _)| kind == 45010) {
+        return Err(crate::error::DbError::InvalidData(
+            "artifact revisions cannot be deleted by admin action; use op=delete or kind 9005 redaction"
+                .into(),
+        ));
+    }
+
     // Canonical delete + thread_metadata counters, fenced by this transaction.
     // Counters move only when the row transitions to deleted, so a second
     // action against an already-deleted target leaves them unchanged.
-    crate::event::soft_delete_event_and_update_thread_in_tx(
-        &mut tx,
-        target_event_id,
-        parent_event_id,
-        root_event_id,
-    )
-    .await?;
+    let mut message = None;
+    if let Some((_, created_at)) = target {
+        let (_, channel_id) = crate::event::soft_delete_event_and_update_thread_in_tx(
+            &mut tx,
+            target_event_id,
+            Some(created_at),
+            parent_event_id,
+            root_event_id,
+        )
+        .await?;
+        message = channel_id.map(|channel_id| (channel_id, target_event_id));
+    }
+    let pin_list = crate::pins::unpin_deleted_messages(&mut tx, message.as_slice(), relay_signer)
+        .await?
+        .pop();
 
     let marker = sqlx::query(
         r#"
@@ -801,11 +879,11 @@ pub async fn execute_delete_with_marker(
 
     if marker.rows_affected() == 0 {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok((false, None));
     }
 
     tx.commit().await?;
-    Ok(true)
+    Ok((true, pin_list))
 }
 
 /// Commit the core mutation step and advance the step_marker to
@@ -855,7 +933,12 @@ pub async fn finalize_success(
     reason: Option<&str>,
     timeout_until: Option<DateTime<Utc>>,
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
 
     // Require step_marker = 'mutation_committed' to prevent premature finalization.
     let updated_action = sqlx::query(
@@ -866,7 +949,7 @@ pub async fn finalize_success(
         "#,
     )
     .bind(action_id)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     if updated_action.rows_affected() == 0 {
@@ -893,7 +976,7 @@ pub async fn finalize_success(
         .bind(terminal_status)
         .bind(actor_pubkey)
         .bind(action_id)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
         if updated_report.rows_affected() == 0 {
@@ -930,7 +1013,7 @@ pub async fn finalize_success(
             .bind(action_id)
             .bind(payload)
             .bind(format!("tombstone:{action_str}"))
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         }
     }
@@ -953,7 +1036,7 @@ pub async fn finalize_success(
             .bind(action_id)
             .bind(payload)
             .bind(format!("system_message:{action_str}"))
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         }
     }
@@ -975,7 +1058,7 @@ pub async fn finalize_success(
         .bind(action_id)
         .bind(notice_payload)
         .bind(format!("reporter_notice:{action_str}"))
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
     }
 
@@ -1024,7 +1107,7 @@ pub async fn finalize_success(
         .bind(action_id)
         .bind(affected_payload)
         .bind(format!("affected_user_notice:{action_str}"))
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
     }
 
@@ -1124,7 +1207,12 @@ pub async fn cancel_action(
     report_id: Uuid,
     cancelled_by: &[u8],
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
 
     // Cancel only a pre-mutation `failed` action that BELONGS to the path
     // report and community. Fencing on report_id + report_community_id is what
@@ -1146,7 +1234,7 @@ pub async fn cancel_action(
     .bind(report_id)
     .bind(community_id.as_uuid())
     .bind(cancelled_by)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     if updated.rows_affected() != 1 {
@@ -1171,7 +1259,7 @@ pub async fn cancel_action(
     .bind(community_id.as_uuid())
     .bind(report_id)
     .bind(action_id)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     if reopened.rows_affected() != 1 {
@@ -1219,7 +1307,12 @@ pub async fn reopen_report(
     actor_role: &str,
     reason: Option<&str>,
 ) -> Result<ReopenResult> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
 
     // Lock the report row to serialize concurrent reopen/resolve on it.
     let report_row = sqlx::query(
@@ -1232,7 +1325,7 @@ pub async fn reopen_report(
     )
     .bind(community_id.as_uuid())
     .bind(report_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx.conn())
     .await?;
 
     let Some(report_row) = report_row else {
@@ -1252,7 +1345,7 @@ pub async fn reopen_report(
     .bind(community_id.as_uuid())
     .bind(report_id)
     .bind(request_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx.conn())
     .await?;
 
     if existing.is_some() {
@@ -1280,7 +1373,7 @@ pub async fn reopen_report(
     )
     .bind(community_id.as_uuid())
     .bind(report_id)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     // Durable audit row. Inserted as 'succeeded' so the recovery worker never
@@ -1299,7 +1392,7 @@ pub async fn reopen_report(
     .bind(actor_pubkey)
     .bind(actor_role)
     .bind(reason)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     tx.commit().await?;
@@ -1643,12 +1736,23 @@ pub async fn deploy_kick_member(
     target_pubkey: &[u8],
     actor_pubkey: &[u8],
 ) -> Result<KickResult> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
+    // Like every membership writer, remove under the channel's membership
+    // lock, so a roster publication either sees the member removed or
+    // commits before the removal.
+    crate::channel_members::acquire_channel_membership_lock(tx.conn(), community_id, channel_id)
+        .await?;
     // Use a direct UPDATE to avoid the tenant ownership check in channel::remove_member.
     // This is the deployment-authority primitive: no actor role check.
     let result = sqlx::query(
         r#"
         UPDATE channel_members
-        SET removed_at = NOW(), removed_by = $1
+        SET removed_at = clock_timestamp(), sync_modified_at = clock_timestamp(), removed_by = $1
         WHERE community_id = $2 AND channel_id = $3 AND pubkey = $4 AND removed_at IS NULL
         "#,
     )
@@ -1656,8 +1760,12 @@ pub async fn deploy_kick_member(
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(target_pubkey)
-    .execute(pool)
+    .execute(tx.conn())
     .await?;
+    if result.rows_affected() > 0 {
+        crate::dm::release_dm_identity(tx.conn(), community_id, channel_id, target_pubkey).await?;
+    }
+    tx.commit().await?;
 
     if result.rows_affected() > 0 {
         Ok(KickResult::Removed)
@@ -1765,7 +1873,12 @@ pub async fn claim_direct_action(
     pool: &PgPool,
     input: &DirectActionInput<'_>,
 ) -> Result<DirectClaim> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        input.community_id,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
     let inserted = sqlx::query(
         r#"
         INSERT INTO relay_admin_actions (
@@ -1788,7 +1901,7 @@ pub async fn claim_direct_action(
     .bind(input.target_pubkey)
     .bind(input.target_event_id)
     .bind(input.channel_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx.conn())
     .await?;
 
     let Some(row) = inserted else {
@@ -1802,6 +1915,14 @@ pub async fn claim_direct_action(
     } else {
         input.action
     };
+    // The audit row names `input.channel_id`. A missing channel fails after the
+    // idempotent-replay classification above and rolls the action row back.
+    crate::store::reference_check::require_optional_channel(
+        tx.conn(),
+        input.community_id,
+        input.channel_id,
+    )
+    .await?;
     sqlx::query(
         r#"
         INSERT INTO moderation_actions (
@@ -1818,7 +1939,7 @@ pub async fn claim_direct_action(
     .bind(input.channel_id)
     .bind(input.reason)
     .bind(input.actor_authority)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
     let rec = row_to_action(row)?;
     tx.commit().await?;
@@ -2101,8 +2222,10 @@ impl crate::Db {
     }
 
     /// Atomically execute a soft-delete mutation and commit the step marker.
-    /// Returns `true` if this driver committed the marker, `false` if already marked or lease lost.
+    /// Returns `true` if this driver committed the marker, `false` if already marked or lease lost,
+    /// and the NIP-PM pin list the delete rewrote.
     #[datastore_span(name = "execute_delete_with_marker", system = "postgresql")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_delete_with_marker(
         &self,
         action_id: uuid::Uuid,
@@ -2111,7 +2234,8 @@ impl crate::Db {
         target_event_id: &[u8],
         parent_event_id: Option<&[u8]>,
         root_event_id: Option<&[u8]>,
-    ) -> Result<bool> {
+        relay_signer: &nostr::Keys,
+    ) -> Result<(bool, Option<buzz_core::StoredEvent>)> {
         execute_delete_with_marker(
             &self.pool,
             action_id,
@@ -2120,6 +2244,7 @@ impl crate::Db {
             target_event_id,
             parent_event_id,
             root_event_id,
+            relay_signer,
         )
         .await
     }
@@ -3176,6 +3301,7 @@ mod postgres_tests {
             None,
             keys.public_key().to_bytes().as_slice(),
             None,
+            &[],
         )
         .await
         .expect("channel");
@@ -3274,9 +3400,11 @@ mod postgres_tests {
                 &nested,
                 Some(&reply),
                 Some(&root),
+                &nostr::Keys::generate(),
             )
             .await
-            .expect("delete");
+            .expect("delete")
+            .0;
             assert!(committed, "each action commits its own marker");
             assert_eq!(
                 counts(&pool, cid, &reply).await,
@@ -3309,9 +3437,11 @@ mod postgres_tests {
             &nested,
             Some(&reply),
             Some(&root),
+            &nostr::Keys::generate(),
         )
         .await
-        .expect("delete");
+        .expect("delete")
+        .0;
         assert!(!committed, "expired lease must not commit");
 
         let deleted: bool = sqlx::query_scalar(
@@ -3376,6 +3506,7 @@ mod postgres_tests {
                 &nr,
                 Some(&pr),
                 Some(&rr),
+                &nostr::Keys::generate(),
             )
             .await
         });
@@ -3444,7 +3575,7 @@ mod postgres_tests {
         // Release the event row without writing a new version.
         locker.rollback().await.expect("release event-row lock");
 
-        let committed = worker.await.expect("worker join").expect("worker result");
+        let committed = worker.await.expect("worker join").expect("worker result").0;
 
         let deleted: bool = sqlx::query_scalar(
             "SELECT deleted_at IS NOT NULL FROM events WHERE community_id = $1 AND id = $2",
@@ -3528,6 +3659,7 @@ mod postgres_tests {
                 &nr,
                 Some(&pr),
                 Some(&rr),
+                &nostr::Keys::generate(),
             )
             .await
         });
@@ -3595,7 +3727,7 @@ mod postgres_tests {
         // Release the row lock without writing a new tuple version.
         locker.rollback().await.expect("release row lock");
 
-        let committed = worker.await.expect("worker join").expect("worker result");
+        let committed = worker.await.expect("worker join").expect("worker result").0;
 
         let deleted: bool = sqlx::query_scalar(
             "SELECT deleted_at IS NOT NULL FROM events WHERE community_id = $1 AND id = $2",
@@ -3641,17 +3773,21 @@ mod postgres_tests {
         let lease_until = Utc::now() + chrono::Duration::seconds(60);
         let (action_id, token) = enforcing_action(&pool, community_id, lease_until).await;
 
-        assert!(execute_delete_with_marker(
-            &pool,
-            action_id,
-            token,
-            cid,
-            &reply,
-            Some(&root),
-            Some(&root)
-        )
-        .await
-        .expect("first delete"));
+        assert!(
+            execute_delete_with_marker(
+                &pool,
+                action_id,
+                token,
+                cid,
+                &reply,
+                Some(&root),
+                Some(&root),
+                &nostr::Keys::generate()
+            )
+            .await
+            .expect("first delete")
+            .0
+        );
         let second = execute_delete_with_marker(
             &pool,
             action_id,
@@ -3660,9 +3796,11 @@ mod postgres_tests {
             &nested,
             Some(&reply),
             Some(&root),
+            &nostr::Keys::generate(),
         )
         .await
-        .expect("second delete");
+        .expect("second delete")
+        .0;
         assert!(!second, "marker already set must roll back");
 
         let deleted: bool = sqlx::query_scalar(
@@ -3683,6 +3821,82 @@ mod postgres_tests {
             counts(&pool, cid, &root).await,
             (0, 1),
             "only the first delete counted"
+        );
+    }
+
+    /// A relay admin's delete of a pinned message takes it out of the
+    /// channel's NIP-PM pin list in the same transaction. The list itself is
+    /// not an admin's to delete.
+    /// Mutation: drop the `unpin_deleted_messages` call → RED; drop the pin
+    /// list check from the shared soft delete → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn admin_delete_unpins_the_message() {
+        use nostr::{EventBuilder, Keys, Kind};
+
+        let pool = setup_pool().await;
+        let community_id = make_community(&pool).await;
+        let cid = CommunityId::from_uuid(community_id);
+        let [root, _, _] = make_thread(&pool, cid).await;
+        let channel: Uuid =
+            sqlx::query_scalar("SELECT channel_id FROM events WHERE community_id = $1 AND id = $2")
+                .bind(community_id)
+                .bind(&root)
+                .fetch_one(&pool)
+                .await
+                .expect("channel");
+        let relay = Keys::generate();
+        let sign = |kind: u16, keys: &Keys| {
+            EventBuilder::new(Kind::Custom(kind), "")
+                .sign_with_keys(keys)
+                .expect("sign")
+        };
+        let notice = sign(40099, &relay);
+        let pinned = crate::Db::from_pool(pool.clone())
+            .apply_pin_command(
+                cid,
+                channel,
+                &sign(40010, &Keys::generate()),
+                &root,
+                crate::pins::PinChange::Pin { notice: &notice },
+                &relay,
+            )
+            .await
+            .expect("pin");
+        let list = pinned.list.expect("the pin writes the list");
+
+        let lease_until = Utc::now() + chrono::Duration::seconds(60);
+        let (action_id, token) = enforcing_action(&pool, community_id, lease_until).await;
+        let refused = execute_delete_with_marker(
+            &pool,
+            action_id,
+            token,
+            cid,
+            list.event.id.as_bytes(),
+            None,
+            None,
+            &relay,
+        )
+        .await
+        .expect_err("the list is not deleted");
+        assert!(refused.to_string().contains("pin list"), "{refused}");
+        let (committed, list) =
+            execute_delete_with_marker(&pool, action_id, token, cid, &root, None, None, &relay)
+                .await
+                .expect("delete");
+        assert!(committed);
+        let list = list.expect("the delete rewrites the pin list");
+        assert_eq!(list.event.pubkey, relay.public_key());
+        assert_eq!(
+            list.event
+                .tags
+                .iter()
+                .map(|tag| tag.as_slice().to_vec())
+                .collect::<Vec<_>>(),
+            [
+                vec!["d".to_owned(), channel.to_string()],
+                vec!["h".to_owned(), channel.to_string()],
+            ]
         );
     }
 
@@ -3787,14 +4001,27 @@ mod postgres_tests {
         };
 
         // First kick: member is present → Removed + step_marker committed.
-        let r1 = execute_kick_with_marker(
+        // It runs while a roster publication holds the member snapshot, and
+        // must wait for it.
+        let (kicked, kick_actor) = (target.clone(), actork.clone());
+        let r1 = assert_kick_waits_for_roster(
             &pool,
-            action_id,
-            lease_token1,
-            cid,
+            community_id,
             channel_id,
             &target,
-            &actork,
+            "marker-kick-vs-roster",
+            move |kick_pool| async move {
+                execute_kick_with_marker(
+                    &kick_pool,
+                    action_id,
+                    lease_token1,
+                    cid,
+                    channel_id,
+                    &kicked,
+                    &kick_actor,
+                )
+                .await
+            },
         )
         .await
         .expect("first kick");
@@ -3999,6 +4226,106 @@ mod postgres_tests {
             KickResult::AlreadyGone,
             "second kick must return AlreadyGone"
         );
+    }
+
+    /// Runs `kick` on its own session while a roster publication holds the
+    /// channel's member snapshot. The kick must wait for the snapshot's
+    /// membership lock, so the published roster cannot list a member whose
+    /// removal committed before it.
+    async fn assert_kick_waits_for_roster<F, T>(
+        pool: &PgPool,
+        community_id: Uuid,
+        channel_id: Uuid,
+        target: &[u8],
+        application_name: &str,
+        kick: impl FnOnce(PgPool) -> F,
+    ) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let snapshot = crate::channel_members::lock_member_snapshot(
+            pool,
+            CommunityId::from_uuid(community_id),
+            channel_id,
+            &[9u8; 32],
+        )
+        .await
+        .expect("capture locked roster");
+        assert!(
+            snapshot.members.iter().any(|m| m.pubkey == target),
+            "the captured roster lists the member before the kick"
+        );
+        let kick_pool = crate::test_support::named_pool(application_name).await;
+        let kick = tokio::spawn(kick(kick_pool));
+        crate::test_support::wait_for_lock_wait(pool, application_name).await;
+        assert!(!kick.is_finished(), "kick must wait for the roster fence");
+        let active: bool = sqlx::query_scalar(
+            "SELECT removed_at IS NULL FROM channel_members \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(target)
+        .fetch_one(pool)
+        .await
+        .expect("read membership");
+        assert!(active, "the member stays active while the roster is held");
+        snapshot.release().await.expect("release roster fence");
+        kick.await.expect("kick task")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn deploy_kick_member_waits_for_roster_publication() {
+        let pool = setup_pool().await;
+        let community_id = make_community(&pool).await;
+        let actor = actor();
+        let target = vec![4u8; 32];
+        let channel_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by)
+            VALUES ($1, $2, 'kick-vs-roster', 'stream', 'open', $3)
+            "#,
+        )
+        .bind(channel_id)
+        .bind(community_id)
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("create channel");
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) VALUES ($1, $2, $3, 'member')",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(&target)
+        .execute(&pool)
+        .await
+        .expect("add member");
+
+        let kicked = target.clone();
+        let result = assert_kick_waits_for_roster(
+            &pool,
+            community_id,
+            channel_id,
+            &target,
+            "deploy-kick-vs-roster",
+            move |kick_pool| async move {
+                deploy_kick_member(
+                    &kick_pool,
+                    CommunityId::from_uuid(community_id),
+                    channel_id,
+                    &kicked,
+                    &actor,
+                )
+                .await
+            },
+        )
+        .await
+        .expect("kick after roster publication");
+        assert_eq!(result, KickResult::Removed);
     }
 
     // ── Reopen: terminal → open CAS + durable audit row ───────────────────────

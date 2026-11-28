@@ -31,6 +31,13 @@ fn admin_hidden_kinds() -> Vec<i32> {
         .collect()
 }
 
+/// `k` values that make a NIP-09 deletion as private as the author-only event
+/// it deletes (see `buzz_core::kind::is_author_only_event_kind`). Admin reads
+/// hide such deletions with `NOT (kind = 5 AND tags name one of these)`.
+fn private_deletion_k_values() -> Vec<String> {
+    AUTHOR_ONLY_KINDS.iter().map(u32::to_string).collect()
+}
+
 fn bounded_limit(limit: i64) -> i64 {
     limit.clamp(1, MAX_PAGE_SIZE)
 }
@@ -225,6 +232,9 @@ pub async fn list_reports(
               AND e.community_id = r.community_id
               AND e.id = r.target_event_id
               AND e.kind <> ALL($10)
+              AND NOT (e.kind = 5 AND EXISTS (
+                  SELECT 1 FROM jsonb_array_elements(e.tags) t
+                  WHERE t->>0 = 'k' AND t->>1 = ANY($11::text[])))
             ORDER BY e.created_at DESC
             LIMIT 1
         ) target ON TRUE
@@ -249,17 +259,20 @@ pub async fn list_reports(
     .bind(cursor_id)
     .bind(bounded_limit(limit))
     .bind(admin_hidden_kinds())
+    .bind(private_deletion_k_values())
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(row_to_report).collect()
 }
 
 /// Fetch one report globally by its row id, including its event target content.
-/// Targets whose kind is in `hidden_kinds` come back as `message: None`.
+/// Targets whose kind is in `hidden_kinds`, and deletions whose `k` tag names
+/// one of `private_deletion_ks`, come back as `message: None`.
 async fn get_report(
     pool: &PgPool,
     report_id: Uuid,
     hidden_kinds: &[i32],
+    private_deletion_ks: &[String],
 ) -> Result<Option<AdminReportDetail>> {
     let row = sqlx::query(
         r#"
@@ -294,6 +307,9 @@ async fn get_report(
               AND e.community_id = r.community_id
               AND e.id = r.target_event_id
               AND e.kind <> ALL($2)
+              AND NOT (e.kind = 5 AND EXISTS (
+                  SELECT 1 FROM jsonb_array_elements(e.tags) t
+                  WHERE t->>0 = 'k' AND t->>1 = ANY($3::text[])))
             ORDER BY e.created_at DESC
             LIMIT 1
         ) target ON TRUE
@@ -314,11 +330,13 @@ async fn get_report(
     )
     .bind(report_id)
     .bind(hidden_kinds)
+    .bind(private_deletion_ks)
     .fetch_optional(pool)
     .await?;
     row.map(|row| {
         let message = row
             .try_get::<Option<Vec<u8>>, _>("message_author_pubkey")?
+            .filter(|key| !key.is_empty())
             .map(|author_pubkey| -> Result<AdminReportedMessage> {
                 Ok(AdminReportedMessage {
                     author_pubkey: hex::encode(author_pubkey),
@@ -381,6 +399,7 @@ fn row_to_report(row: sqlx::postgres::PgRow) -> Result<AdminReport> {
         target: hex::encode(target),
         target_author_pubkey: row
             .try_get::<Option<Vec<u8>>, _>("target_author_pubkey")?
+            .filter(|key| !key.is_empty())
             .map(hex::encode),
         channel_id: row.try_get("channel_id")?,
         report_type: row.try_get("report_type")?,
@@ -535,6 +554,10 @@ pub async fn get_event_preview(
         SELECT id, pubkey, kind, content, created_at, deleted_at, channel_id
         FROM events
         WHERE community_id = $1 AND id = $2 AND kind <> ALL($3)
+          AND pubkey <> ''::bytea
+          AND NOT (kind = 5 AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements(tags) t
+              WHERE t->>0 = 'k' AND t->>1 = ANY($4::text[])))
         ORDER BY created_at DESC
         LIMIT 1
         "#,
@@ -542,6 +565,7 @@ pub async fn get_event_preview(
     .bind(community_id)
     .bind(id)
     .bind(admin_hidden_kinds())
+    .bind(private_deletion_k_values())
     .fetch_optional(pool)
     .await?;
     row.map(|row| {
@@ -591,7 +615,13 @@ impl Db {
     /// back as `message: None`, exactly like a missing event.
     #[datastore_span(name = "admin_get_report", system = "postgresql")]
     pub async fn admin_get_report(&self, id: Uuid) -> Result<Option<AdminReportDetail>> {
-        get_report(&self.pool, id, &admin_hidden_kinds()).await
+        get_report(
+            &self.pool,
+            id,
+            &admin_hidden_kinds(),
+            &private_deletion_k_values(),
+        )
+        .await
     }
 
     /// Fetch one report with its target unfiltered, for report enforcement and
@@ -602,7 +632,7 @@ impl Db {
         &self,
         id: Uuid,
     ) -> Result<Option<AdminReportDetail>> {
-        get_report(&self.pool, id, &[]).await
+        get_report(&self.pool, id, &[], &[]).await
     }
 
     /// List feedback for the deployment-global read-only admin plane.
@@ -761,6 +791,46 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn erased_tombstone_is_unavailable_in_moderation() {
+        let pool = setup_pool().await;
+        let community = insert_community(&pool, "erased").await;
+        let id = vec![91_u8; 32];
+        insert_event(&pool, community, &id, &[], "", Some(Utc::now())).await;
+        let report = insert_event_report(&pool, community, &id).await;
+        let detail = get_report(
+            &pool,
+            report,
+            &admin_hidden_kinds(),
+            &private_deletion_k_values(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(detail.message.is_none());
+        assert!(detail.report.target_author_pubkey.is_none());
+        assert!(get_event_preview(&pool, community, &id)
+            .await
+            .unwrap()
+            .is_none());
+        // A normal moderation soft-delete still exposes its original content.
+        let normal = vec![92_u8; 32];
+        insert_event(
+            &pool,
+            community,
+            &normal,
+            &[5_u8; 32],
+            "moderated",
+            Some(Utc::now()),
+        )
+        .await;
+        assert!(get_event_preview(&pool, community, &normal)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn report_detail_reads_only_the_same_community_target_and_includes_deleted_content() {
         let pool = setup_pool().await;
         let report_community = insert_community(&pool, "reported").await;
@@ -787,10 +857,15 @@ mod postgres_tests {
         .await;
         let report_id = insert_event_report(&pool, report_community, &event_id).await;
 
-        let detail = get_report(&pool, report_id, &admin_hidden_kinds())
-            .await
-            .expect("query report")
-            .expect("report exists");
+        let detail = get_report(
+            &pool,
+            report_id,
+            &admin_hidden_kinds(),
+            &private_deletion_k_values(),
+        )
+        .await
+        .expect("query report")
+        .expect("report exists");
         let message = detail.message.expect("reported message exists");
         assert_eq!(message.content, "reported message");
         assert_eq!(message.author_pubkey, hex::encode([5_u8; 32]));
@@ -912,6 +987,52 @@ mod postgres_tests {
                 insert_event_report(&pool, community_id, &event_id).await,
             ));
         }
+        // Deletions of author-only events are private by their `k` tag alone,
+        // live or soft-deleted; a deletion with a public or non-canonical `k`
+        // stays readable, matching `buzz_core::kind::k_tag_kinds`.
+        // An unrelated tag that merely contains `"k"` and an author-only kind
+        // is not a marker: matching is positional, as in Rust.
+        let mut public_deletions = Vec::new();
+        let cases = AUTHOR_ONLY_KINDS
+            .iter()
+            .map(|k| (format!(r#"[["k","{k}"]]"#), true))
+            .chain(
+                [
+                    r#"[["k","1"]]"#,
+                    r#"[["k","030300"]]"#,
+                    r#"[["k","+30300"]]"#,
+                    r#"[["k","1"],["meta","k","30300"]]"#,
+                ]
+                .map(|tags| (tags.to_string(), false)),
+            );
+        for (i, (tags, private)) in cases.enumerate() {
+            let event_id = vec![0x60 + i as u8; 32];
+            sqlx::query(
+                r#"
+                INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, deleted_at)
+                VALUES ($1, $2, $3, now(), 5, $4::jsonb, '', $5, CASE WHEN $6 THEN now() END)
+                "#,
+            )
+            .bind(community_id)
+            .bind(&event_id)
+            .bind(author)
+            .bind(&tags)
+            .bind(vec![3_u8; 64])
+            .bind(i % 2 == 1)
+            .execute(&pool)
+            .await
+            .expect("insert deletion event");
+            let report = insert_event_report(&pool, community_id, &event_id).await;
+            let preview = get_event_preview(&pool, community_id, &event_id)
+                .await
+                .expect("preview");
+            assert_eq!(preview.is_none(), private, "preview, deletion tags {tags}");
+            if private {
+                hidden.push((5, report));
+            } else {
+                public_deletions.push((tags, report));
+            }
+        }
         let visible_id = vec![0x3f_u8; 32];
         insert_event(&pool, community_id, &visible_id, &author, "public", None).await;
         let visible = insert_event_report(&pool, community_id, &visible_id).await;
@@ -939,17 +1060,44 @@ mod postgres_tests {
         };
         for &(kind, report_id) in &hidden {
             assert_eq!(author_of(report_id), None, "list, kind {kind}");
-            let detail = get_report(&pool, report_id, &admin_hidden_kinds())
-                .await
-                .expect("query report")
-                .expect("report exists");
-            assert!(detail.message.is_none(), "detail, kind {kind}");
-        }
-        assert_eq!(author_of(visible), Some(hex::encode(author)));
-        let detail = get_report(&pool, visible, &admin_hidden_kinds())
+            let detail = get_report(
+                &pool,
+                report_id,
+                &admin_hidden_kinds(),
+                &private_deletion_k_values(),
+            )
             .await
             .expect("query report")
             .expect("report exists");
+            assert!(detail.message.is_none(), "detail, kind {kind}");
+        }
+        assert_eq!(author_of(visible), Some(hex::encode(author)));
+        for (tags, report_id) in public_deletions {
+            assert_eq!(
+                author_of(report_id),
+                Some(hex::encode(author)),
+                "list, deletion tags {tags}"
+            );
+            let detail = get_report(
+                &pool,
+                report_id,
+                &admin_hidden_kinds(),
+                &private_deletion_k_values(),
+            )
+            .await
+            .expect("query report")
+            .expect("report exists");
+            assert!(detail.message.is_some(), "detail, deletion tags {tags}");
+        }
+        let detail = get_report(
+            &pool,
+            visible,
+            &admin_hidden_kinds(),
+            &private_deletion_k_values(),
+        )
+        .await
+        .expect("query report")
+        .expect("report exists");
         assert_eq!(detail.message.expect("message shown").content, "public");
 
         sqlx::query("DELETE FROM events WHERE community_id = $1")
@@ -967,10 +1115,15 @@ mod postgres_tests {
         let community_id = insert_community(&pool, "pubkey-target").await;
         let report_id = insert_pubkey_report(&pool, community_id).await;
 
-        let detail = get_report(&pool, report_id, &admin_hidden_kinds())
-            .await
-            .expect("query report")
-            .expect("report exists");
+        let detail = get_report(
+            &pool,
+            report_id,
+            &admin_hidden_kinds(),
+            &private_deletion_k_values(),
+        )
+        .await
+        .expect("query report")
+        .expect("report exists");
         assert_eq!(detail.report.target_kind, "pubkey");
         assert!(detail.message.is_none());
 
@@ -985,10 +1138,15 @@ mod postgres_tests {
         let missing_event_id = vec![8_u8; 32];
         let report_id = insert_event_report(&pool, community_id, &missing_event_id).await;
 
-        let detail = get_report(&pool, report_id, &admin_hidden_kinds())
-            .await
-            .expect("query report")
-            .expect("report exists");
+        let detail = get_report(
+            &pool,
+            report_id,
+            &admin_hidden_kinds(),
+            &private_deletion_k_values(),
+        )
+        .await
+        .expect("query report")
+        .expect("report exists");
         assert_eq!(detail.report.target_kind, "event");
         assert_eq!(detail.report.target, hex::encode(missing_event_id));
         assert!(detail.message.is_none());
@@ -1052,10 +1210,15 @@ mod postgres_tests {
         .await;
         set_report_status(&pool, community_id, report_id, "dismissed").await;
 
-        let detail = get_report(&pool, report_id, &admin_hidden_kinds())
-            .await
-            .expect("query report")
-            .expect("report exists");
+        let detail = get_report(
+            &pool,
+            report_id,
+            &admin_hidden_kinds(),
+            &private_deletion_k_values(),
+        )
+        .await
+        .expect("query report")
+        .expect("report exists");
         assert_eq!(detail.report.status, "dismissed");
         let action = detail
             .active_action
@@ -1092,10 +1255,15 @@ mod postgres_tests {
         .await;
         set_report_status(&pool, community_id, report_id, "resolved").await;
 
-        let detail = get_report(&pool, report_id, &admin_hidden_kinds())
-            .await
-            .expect("query report")
-            .expect("report exists");
+        let detail = get_report(
+            &pool,
+            report_id,
+            &admin_hidden_kinds(),
+            &private_deletion_k_values(),
+        )
+        .await
+        .expect("query report")
+        .expect("report exists");
         let action = detail.active_action.expect("an action surfaces");
         assert_eq!(
             action.id,
@@ -1126,10 +1294,15 @@ mod postgres_tests {
         )
         .await;
 
-        let detail = get_report(&pool, report_id, &admin_hidden_kinds())
-            .await
-            .expect("query report")
-            .expect("report exists");
+        let detail = get_report(
+            &pool,
+            report_id,
+            &admin_hidden_kinds(),
+            &private_deletion_k_values(),
+        )
+        .await
+        .expect("query report")
+        .expect("report exists");
         assert!(
             detail.active_action.is_none(),
             "reopen audit row must not surface as an enforcement action"

@@ -138,11 +138,11 @@
           # (cmake builds aws-lc-sys, pulled by buzz's [patch.crates-io] aws-creds fork that the vendor
           # preserves; the relay links aws-lc, so there is no openssl input).
           #
-          # cargoHash (FOD vendor) rather than cargoLock.lockFile. Since the 2026-10 upstream sync the
-          # pruned lock has one git source, the rust-s3 fork behind the aws-creds [patch.crates-io]
-          # entry, so cargoLock.lockFile with one outputHash would also work. fetchCargoVendor cannot
-          # vendor two crates with the same name and version (it failed on a second sqlx-core 0.9.0
-          # from git); crates/buzz/NOTICE says why that patch was dropped.
+          # cargoHash (FOD vendor) rather than cargoLock.lockFile. The pruned lock has two git sources:
+          # the rust-s3 fork behind the aws-creds [patch.crates-io] entry and, since the 2026-11
+          # upstream sync, the one launchbadge/sqlx revision every sqlx crate is pinned to.
+          # fetchCargoVendor cannot vendor two crates with the same name and version (it failed on a
+          # second sqlx-core 0.9.0 from git when only sqlx-sqlite was patched); keep it that way.
           maxplayer-relay = buzzRustPlatform.buildRustPackage {
             pname = "maxplayer-relay";
             # From crates/buzz/crates/buzz-relay/Cargo.toml: it pins its own [package].version, not the nested workspace's.
@@ -150,9 +150,9 @@
               if builtins.isString m.package.version then m.package.version
               else (builtins.fromTOML (builtins.readFile ./crates/buzz/Cargo.toml)).workspace.package.version;
             src = ./crates/buzz;
-            # cargoHash of buzz's vendored dep set (crates.io + the rust-s3 git source). Recompute it
+            # cargoHash of buzz's vendored dep set (crates.io + the rust-s3 and sqlx git sources). Recompute it
             # whenever crates/buzz/Cargo.lock changes: set pkgs.lib.fakeHash, build, copy the reported hash.
-            cargoHash = "sha256-kya0F/OrHtiRAq9m6wIv3PNu0pUA/MelIkx5tyW6VUI=";
+            cargoHash = "sha256-IRIJeTgDGEyQrVbthrYZJc77Njg4g23bmSsZj9oqDCE=";
             cargoBuildFlags = [
               "-p"
               "buzz-relay"

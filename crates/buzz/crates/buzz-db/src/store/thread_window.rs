@@ -29,6 +29,9 @@ pub struct ThreadWindow {
     /// A supported conversation root exists in this channel, possibly as a
     /// tombstone. Only then may the bridge serve rows, auxiliary events or bounds.
     pub root_in_channel: bool,
+    /// The root's `created_at` when [`Self::root_in_channel`]. The root is
+    /// always an auxiliary target, so it anchors the auxiliary time bound.
+    pub root_created_at: Option<DateTime<Utc>>,
 }
 
 fn invalid(message: impl Into<String>) -> DbError {
@@ -87,17 +90,19 @@ async fn select_window(
     }
     // Retain tombstones: deleting a root must not make its readable replies
     // disappear. Never follow a root belonging to another channel/community.
-    let root_in_channel: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM events WHERE community_id = $1 AND channel_id = $2 AND id = $3 AND kind = ANY($4))")
+    let root_created_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT MIN(created_at) FROM events WHERE community_id = $1 AND channel_id = $2 AND id = $3 AND kind = ANY($4)")
         .bind(community.as_uuid()).bind(request.channel).bind(&root)
         .bind(ROW_KINDS.map(|k| k as i32).to_vec())
         .fetch_one(&mut *conn).await?;
+    let root_in_channel = root_created_at.is_some();
     if !root_in_channel {
         return Ok(ThreadWindow {
             rows: vec![],
             has_more: false,
             next_cursor: None,
             root_in_channel,
+            root_created_at,
         });
     }
     // Order metadata before event lookups. With stale statistics a root-wide
@@ -176,6 +181,7 @@ async fn select_window(
         has_more,
         next_cursor,
         root_in_channel,
+        root_created_at,
     })
 }
 
@@ -223,7 +229,7 @@ impl Db {
                 RoutePredicate::from_channel_cursor(request.channel, &cursor),
                 crate::observability::ReaderOperation::SubscriptionHistory,
             )
-            .await
+            .await?
         {
             let result = async {
                 set_deadline(&mut tx).await?;
@@ -249,6 +255,12 @@ impl Db {
                     ));
                 }
                 Err(error @ (DbError::InvalidData(_) | DbError::ThreadWindowBudgetExceeded(_))) => {
+                    return Err(error);
+                }
+                // Surface a cancel instead of re-running it on the writer; see
+                // `DbError::is_statement_cancelled` for the trade-off.
+                Err(error) if error.is_statement_cancelled() => {
+                    Self::record_route(path, "replica", "statement_cancelled");
                     return Err(error);
                 }
                 Err(error) => {
@@ -282,6 +294,9 @@ pub struct AuxQuery<'a> {
     pub accessible: &'a [Uuid],
     /// Last raw auxiliary scan position, not last delivered event.
     pub cursor: Option<Cursor>,
+    /// Optional lower `created_at` bound, so the `#e` probes can prune older
+    /// `events` partitions. `None` scans the community's whole history.
+    pub since: Option<DateTime<Utc>>,
 }
 
 /// Fixed raw auxiliary page budget (the probe is one extra row).
@@ -367,6 +382,9 @@ async fn select_aux(
     )
     .push_bind(query.targets)
     .push("))");
+    if let Some(since) = query.since {
+        q.push(" AND created_at >= ").push_bind(since);
+    }
     if let Some(cursor) = &query.cursor {
         let (ts, id) = cursor_key(cursor)?;
         q.push(" AND (created_at < ")
@@ -436,6 +454,8 @@ async fn writer_aux(
 impl ReadSession {
     /// Strict NIP-CW thread-mode auxiliary scan on the same proved snapshot, with the
     /// existing permanent writer degradation on mid-request replica failure.
+    /// Exception: a statement cancel (57014) is returned and the session stays
+    /// on the replica.
     #[datastore_span(name = "thread_window_aux", system = "postgresql")]
     pub async fn thread_window_aux(
         &mut self,
@@ -448,6 +468,10 @@ impl ReadSession {
                 Err(error @ (DbError::InvalidData(_) | DbError::ThreadWindowBudgetExceeded(_))) => {
                     return Err(error);
                 }
+                // Surface a cancel instead of re-running it on the writer (see
+                // `DbError::is_statement_cancelled`) and keep the proved
+                // replica session.
+                Err(error) if error.is_statement_cancelled() => return Err(error),
                 Err(error) => {
                     tracing::warn!(%error, "thread auxiliary read failed; degrading to writer");
                     metrics::counter!("buzz_db_read_session_degraded").increment(1);
