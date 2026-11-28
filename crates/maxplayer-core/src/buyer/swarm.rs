@@ -158,6 +158,43 @@ pub(crate) fn seats_left(hb: &ParsedHeartbeat, beat_at: u64, running: &[&TaskRow
     )
 }
 
+/// How far ahead of the buyer's clock a beat's `created_at` (the seller's clock) may be before
+/// [`idle_since_deadline`] stops trusting it.
+pub(crate) const BEAT_SKEW_SECS: u64 = 60;
+
+/// Is `t`, past its deadline, no longer running on its seller? Yes when the buyer's clock is past
+/// the deadline, the seller's beat was sent after it (and is not more than [`BEAT_SKEW_SECS`] ahead
+/// of the buyer's clock), and the beat states every seat free: a seat still executing `t` would
+/// count it as taken. The seller reads its seats when it builds the beat, and its own deadline
+/// gates use the same clock as `created_at`, so the seat-freed beat it sends a few seconds after
+/// the deadline already counts (the next one may be a full heartbeat interval later). Without such
+/// a beat (none since the deadline, a busy seat, or a beat stating no seats) the seller stays busy
+/// until deadline + [`EXPIRED_GRACE_SECS`], the latest its container can run. One free seat of
+/// several is not enough: the others may still be running `t`.
+///
+/// A session turn always keeps the grace: the seller's next task would ride the same session, and
+/// sending that turn marks this one `no_response` (`session_reply::sweep_no_response`), so its
+/// late delivery would never be collected and its failure would mark the session dead under the
+/// new turn.
+pub(crate) fn idle_since_deadline(
+    t: &TaskRow,
+    hb: Option<&ParsedHeartbeat>,
+    beat_at: u64,
+    now: u64,
+) -> bool {
+    if t.session_job_id.is_some() || t.turn.is_some() {
+        return false;
+    }
+    let (Some(deadline), Some(seats)) = (t.deadline_unix, hb.and_then(|h| h.slots)) else {
+        return false;
+    };
+    now > deadline
+        && beat_at > deadline
+        && beat_at <= now.saturating_add(BEAT_SKEW_SECS)
+        && seats.total > 0
+        && seats.free >= seats.total
+}
+
 /// The heartbeat shows a seat that can take work now.
 fn ready(hb: &ParsedHeartbeat) -> bool {
     hb.accepting && hb.serving_state != ServingState::NotServing
@@ -456,11 +493,25 @@ impl Engine {
         let (Some(seller), Some(job_id)) = (&t.seller, &t.session_job_id) else {
             return Ok(());
         };
-        let last = self
-            .store
-            .swarm_session(&t.job, seller)
-            .map_err(es)?
-            .map_or(1, |s| s.last_turn);
+        let stored = self.store.swarm_session(&t.job, seller).map_err(es)?;
+        // Only the session this turn rode, and only while no later turn of it is running: a failed
+        // old turn must not mark a newer session (or one already carrying the next turn) dead.
+        // Nor a turn the session already got past (a later turn settled, `last_turn` moved on).
+        if stored.as_ref().is_some_and(|s| {
+            s.job_id != *job_id || t.turn.is_some_and(|n| n <= s.last_turn)
+        }) {
+            return Ok(());
+        }
+        let later_running = self.store.swarm_tasks(&t.job).map_err(es)?.iter().any(|x| {
+            x.id != t.id
+                && x.state == "posted"
+                && x.session_job_id.as_deref() == Some(job_id.as_str())
+                && x.turn > t.turn
+        });
+        if later_running {
+            return Ok(());
+        }
+        let last = stored.map_or(1, |s| s.last_turn);
         self.store
             .put_swarm_session(&t.job, seller, job_id, last, "dead", now)
             .map_err(es)
@@ -853,6 +904,19 @@ impl Engine {
             .map_err(es)?
             .into_iter()
             .filter(|t| t.state == "posted" && t.seller.is_some())
+            .collect();
+        // A task past its deadline stops holding its seller once the seller's own beat, sent after
+        // that deadline, shows every seat free ([`idle_since_deadline`]). It stays `posted` (a late
+        // delivery is still collected) but no longer blocks the next task for the rest of the grace.
+        let running: Vec<TaskRow> = running
+            .into_iter()
+            .filter(|t| {
+                let Some(seller) = t.seller.as_deref() else {
+                    return true;
+                };
+                let beat_at = world.beat_at.get(seller).copied().unwrap_or(0);
+                !idle_since_deadline(t, world.heartbeats.get(seller), beat_at, now)
+            })
             .collect();
         // (swarm, seller) pairs with a running task.
         let mut in_swarm: BTreeSet<(String, String)> = running
