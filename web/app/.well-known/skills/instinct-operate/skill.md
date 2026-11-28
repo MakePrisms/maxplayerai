@@ -191,6 +191,13 @@ $MP review retry SUBJECT_ID --home SELLER_HOME
 
 Retry only an offer still inside its window. The running daemon picks the retry up; no restart.
 
+A `review blocked job_id=` line logged after the job's `awarded ... executing` line is a different
+check: the review a job gets just before it runs. On a seller without the pre-run review retry, a
+failure there leaves the job `awarded` with nothing run until its deadline, and `review retry` does
+not re-drive it; a seller restart does, while the deadline is still ahead. A seller with the retry
+reuses the review that passed at claim time, retries a timeout until the deadline, and otherwise
+fails the job so the buyer is told.
+
 ## 8. Upgrades
 
 The key, the wallet, the job store and team state live under the home. There is no other copy.
