@@ -1613,7 +1613,7 @@ mod tests {
                 contribution_enabled: true,
                 slots: 2,
                 claim_award_timeout_secs: Some(777),
-                min_claim_remaining_secs: None,
+                min_claim_remaining_secs: Some(900),
             });
         })
         .expect("seed existing [seller]");
@@ -1652,6 +1652,11 @@ mod tests {
             Some(777),
             "operator claim_award_timeout_secs must survive the write-back"
         );
+        assert_eq!(
+            seller.min_claim_remaining_secs,
+            Some(900),
+            "operator min_claim_remaining_secs must survive the write-back"
+        );
 
         // Disk-content proof, independent of the deserializer round-trip.
         let persisted =
@@ -1659,6 +1664,10 @@ mod tests {
         assert!(
             persisted.contains("slots = 2"),
             "config.toml must still carry slots = 2 after the write-back, got:\n{persisted}"
+        );
+        assert!(
+            persisted.contains("min_claim_remaining_secs = 900"),
+            "config.toml must still carry min_claim_remaining_secs = 900, got:\n{persisted}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
