@@ -170,6 +170,7 @@ Usage:
   maxplayer seller serve --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
   maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted
   maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm
+  maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]   # each job this seat won and whether it was paid: free / paid (fee remitted?) / awaiting payment / unpaid
   maxplayer seller drain [--home <dir>] [--no-wait | --timeout <secs>]   # finish in-flight jobs, then exit 0 (upgrade without interrupting a job)
   maxplayer seller hook test <entry> [--home <dir>]   # run an [agents.<entry>] hook through ping, two job turns, close; no relay, no money
   maxplayer seller [flags]   # deprecated alias for `maxplayer seller serve [flags]` (still works)
