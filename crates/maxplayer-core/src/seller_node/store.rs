@@ -2097,6 +2097,7 @@ impl SellerStore {
         claim_id: &str,
         creq: &str,
         draft: &EventDraft,
+        claim_created_at: i64,
         now_unix: i64,
     ) -> Result<bool, StoreError> {
         let draft_json = serde_json::to_string(draft)
@@ -2111,13 +2112,16 @@ impl SellerStore {
             tx.commit()?;
             return Ok(false);
         }
-        // The row keeps the re-claim's `created_at_unix`: nothing rebuilds an event from a
-        // `confirmed` row, and `published_event_id` (not draft + time) names the claim on record.
+        // The outbox row takes the adopted claim's own time (nothing rebuilds an event from a
+        // `confirmed` row; `published_event_id` names the claim on record), while `claims` keeps the
+        // re-claim's: an outbox time older than the claim row's is the durable mark that an EARLIER
+        // claim was adopted ([`Self::claim_adopted_earlier`]), both times on this seat's clock.
         let outbox = tx.execute(
             "UPDATE nostr_event_outbox
-             SET state = 'confirmed', published_event_id = ?2, draft_json = ?3, updated_at_unix = ?4
+             SET state = 'confirmed', published_event_id = ?2, draft_json = ?3, updated_at_unix = ?4,
+                 created_at_unix = ?5
              WHERE dedup_key = ?1",
-            params![format!("claim:{job_id}"), claim_id, draft_json, now_unix],
+            params![format!("claim:{job_id}"), claim_id, draft_json, now_unix, claim_created_at],
         )?;
         if outbox == 0 {
             // Dropping `tx` rolls the claim update back: the claim and its outbox row never disagree.
@@ -2125,6 +2129,23 @@ impl SellerStore {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Whether the claim on record for `job_id` is an EARLIER claim this seat adopted (its outbox time,
+    /// the claim's own, is older than the claim row's): the seat may have run the job before it lost
+    /// its claim row. Durable, and both times are this seat's.
+    pub fn claim_adopted_earlier(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT o.created_at_unix < c.created_at_unix FROM claims c
+                 JOIN nostr_event_outbox o ON o.dedup_key = 'claim:' || c.job_id
+                 WHERE c.job_id = ?1",
+                [job_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
     }
 
     /// When the claim on record for `job_id` was made (its `created_at_unix`), if there is one.
@@ -6142,7 +6163,9 @@ mod tests {
         assert_eq!(store.pending_outbox(10).expect("pending").len(), 1, "precondition: the re-claim is still pending");
         let mut earlier = claim();
         earlier.tags.push(TagSpec::new(["session", "1"]));
-        assert!(store.adopt_claim(&job, "earlier-id", "creq-earlier", &earlier, 2).expect("adopt"));
+        assert!(!store.claim_adopted_earlier(&job).expect("read"), "precondition: the claim on record is the re-claim");
+        assert!(store.adopt_claim(&job, "earlier-id", "creq-earlier", &earlier, 0, 2).expect("adopt"));
+        assert!(store.claim_adopted_earlier(&job).expect("read"), "an earlier claim's time marks the adoption");
         assert_eq!(store.job_creq(&job).expect("creq").as_deref(), Some("creq-earlier"));
         assert_eq!(
             store.outbox_row(&format!("claim:{job}")).expect("row").map(|(state, _, id)| (state, id)),
@@ -6153,7 +6176,7 @@ mod tests {
         assert_eq!(store.claim_outbox_draft(&job).expect("draft"), Some(earlier.clone()));
         assert!(store.claim_advertised_session(&job).expect("session"), "the adopted claim's draft counts");
         store.record_award(&"w".repeat(64), &job, "b", 3).expect("award");
-        assert!(!store.adopt_claim(&job, "other", "x", &claim(), 4).expect("no-op"), "an awarded claim is never rebound");
+        assert!(!store.adopt_claim(&job, "other", "x", &claim(), 0, 4).expect("no-op"), "an awarded claim is never rebound");
         assert_eq!(store.job_creq(&job).expect("creq").as_deref(), Some("creq-earlier"));
         assert_eq!(store.claim_outbox_draft(&job).expect("draft"), Some(earlier), "nor its draft replaced");
         // A released claim is not rebound either.
@@ -6162,15 +6185,15 @@ mod tests {
             .claim_and_enqueue(&released, &released, Some("creq"), &claim(), 1, 9_999, 1)
             .expect("claim");
         store.release_claim(&released, 2).expect("release");
-        assert!(!store.adopt_claim(&released, "x", "x", &claim(), 3).expect("no-op"));
-        assert!(!store.adopt_claim(&"9".repeat(64), "x", "x", &claim(), 3).expect("absent"), "no claim, nothing adopted");
+        assert!(!store.adopt_claim(&released, "x", "x", &claim(), 0, 3).expect("no-op"));
+        assert!(!store.adopt_claim(&"9".repeat(64), "x", "x", &claim(), 0, 3).expect("absent"), "no claim, nothing adopted");
         // A claim with no outbox row is an error, and the claim is left as it was.
         let orphan = "6".repeat(64);
         store
             .claim_and_enqueue(&orphan, &orphan, Some("creq-orphan"), &claim(), 1, 9_999, 1)
             .expect("claim");
         store.execute_for_test(&format!("DELETE FROM nostr_event_outbox WHERE dedup_key = 'claim:{orphan}'"));
-        assert!(store.adopt_claim(&orphan, "x", "creq-new", &claim(), 3).is_err(), "no outbox row: an error");
+        assert!(store.adopt_claim(&orphan, "x", "creq-new", &claim(), 0, 3).is_err(), "no outbox row: an error");
         assert_eq!(store.job_creq(&orphan).expect("creq").as_deref(), Some("creq-orphan"), "rolled back");
         let _ = std::fs::remove_file(&path);
     }
