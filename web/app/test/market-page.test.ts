@@ -230,6 +230,74 @@ test("the task text never reaches the page", async () => {
   } finally { h.stop(); }
 });
 
+// Bob (2026-11-28): an activity line opens its job (a summary, its status and every event of it), and a buyer or
+// expert with a job in progress links to that job.
+test("a job: its status, its people and every event of it, and the profiles that link to it while it runs", async () => {
+  globalThis.indexedDB = new IDBFactory();
+  const events = market();
+  const offer = (at: number, extra: string[][] = []) => ev(OFFER, BUYER, at, tagged([["i", SECRET], ["amount", "100"], ["param", "deadline", String(NOW + 3600)], ...extra]));
+  const running = offer(NOW - 300), open1 = offer(NOW - 200), claimed = offer(NOW - 100);
+  const rootOf = (o: RawEvent) => [["e", o.id, "", "root"]];
+  events.push(
+    running, ev(CLAIM, SELLERS[0], NOW - 290, tagged(rootOf(running))), ev(AWARD, BUYER, NOW - 280, tagged([...rootOf(running), ["p", SELLERS[0]]])),
+    open1,
+    claimed, ev(CLAIM, SELLERS[1], NOW - 90, tagged(rootOf(claimed))),
+  );
+  const done = events.find((e) => e.kind === OFFER && e.created_at < NOW - 600 && e.created_at > NOW - DAY)!;
+  const relay = new FakeRelay(events);
+  const { h, views } = await open(relay);
+  try {
+    relay.names.step();
+    relay.source.step(); relay.source.step();
+    assert.equal(h.ready(), "recent");
+    assert.ok(h.job(done.id), "a job of the week opens as soon as the week is whole");
+    relay.source.drain();
+    assert.equal(h.ready(), "all");
+
+    const j = h.job(running.id)!;
+    assert.equal(j.status, "working");
+    assert.equal(j.live, true);
+    assert.equal(j.buyer?.name, "north-desk");
+    assert.equal(j.expert?.name, "swift-code");
+    assert.equal(j.deadline, NOW + 3600);
+    assert.ok(j.price, "a priced job shows its price");
+    assert.deepEqual(j.events.map((f) => f.stage), ["offer", "claim", "award"], "every event of the job, oldest first");
+    assert.ok(j.events.every((f) => f.job === running.id));
+    assert.equal(h.job(running.id.toUpperCase())?.id, running.id, "the id is read in either case");
+
+    assert.equal(h.job(open1.id)!.status, "open");
+    assert.equal(h.job(open1.id)!.expert, null);
+    const c = h.job(claimed.id)!;
+    assert.equal(c.status, "claimed");
+    assert.equal(c.claimants, 1);
+
+    const d = h.job(done.id)!;
+    assert.equal(d.status, "paid");
+    assert.equal(d.live, false);
+    assert.deepEqual(d.events.map((f) => f.stage), ["offer", "claim", "award", "result", "accept", "receipt"]);
+    assert.ok(d.paid);
+
+    assert.equal(h.job("nonsense"), null);
+    assert.equal(h.job(hex("9")), null, "no such job");
+    assert.equal(h.job(SELLERS[0]), null, "a key is not a job");
+
+    // Every activity line knows its job.
+    const feed = views.at(-1)!.feed;
+    assert.ok(feed.length > 0 && feed.every((f) => typeof f.job === "string" && f.job.length === 64));
+    assert.equal(feed.find((f) => f.stage === "award" && f.job === running.id)?.actor.key, BUYER);
+
+    // The profiles link to the jobs in progress, newest first; a finished one is not among them.
+    assert.deepEqual(h.expert(SELLERS[0])!.live, [running.id]);
+    assert.deepEqual(h.expert(SELLERS[1])!.live, [claimed.id], "a claim not yet decided is the expert's job in progress");
+    assert.deepEqual(h.expert(SELLERS[2]!)!.live, []);
+    assert.deepEqual(h.buyer(BUYER)!.live, [claimed.id, open1.id, running.id]);
+    assert.deepEqual(h.buyer(BUYER2)!.live, []);
+
+    // No task text, here either (bob, 2026-11-20).
+    for (const id of [running.id, done.id]) assert.ok(!JSON.stringify(h.job(id)).includes(SECRET));
+  } finally { h.stop(); }
+});
+
 test("nothing is shown before the names are in, whichever comes first", async () => {
   globalThis.indexedDB = new IDBFactory();
   const relay = new FakeRelay(market());

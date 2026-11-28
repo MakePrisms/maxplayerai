@@ -17,6 +17,7 @@
  */
 import { RELAY_URL, TRANSPORT } from "../config.js";
 import { createEngine, type MarketView } from "../market/engine.js";
+import { openFollowUp } from "../market/trades.js";
 import { DEFAULT_WINDOW, WINDOWS, participantDetail } from "../market/participants.js";
 import { parseEvent, type ParsedEvent, type RawEvent } from "../model/events.js";
 import { createRelaySource } from "../source/relay.js";
@@ -45,6 +46,8 @@ export interface FeedRow {
   direct: boolean; closed: boolean; terminal: boolean;
   free: boolean; priv: boolean; self: boolean;
   turn: number | null; price: string | null;
+  /** The job (root offer id) this event belongs to; null when it names none. Opens the job's panel. */
+  job: string | null;
 }
 export interface PlainView {
   windowKey: string;
@@ -73,6 +76,8 @@ export interface ExpertProfile extends Who {
   agents: string[];
   models: { family: string; model: string }[];
   recent: FeedRow[];
+  /** Its jobs in progress now (root offer ids), newest first: the profile links to each. */
+  live: string[];
 }
 /** A buyer's profile (Bob, 2026-11-21: buyers are clickable like experts). Counted over all history, like an expert's. */
 export interface BuyerProfile extends Who {
@@ -83,6 +88,42 @@ export interface BuyerProfile extends Who {
   /** Jobs posted, jobs with a published receipt, and what those receipts add up to (all time). */
   posted: number; paid: number; spent: string;
   recent: FeedRow[];
+  /** Its jobs in progress now (root offer ids), newest first. */
+  live: string[];
+}
+/**
+ * One job, for its panel (Bob, 2026-11-28: an activity line opens the job, with a summary and all its activity).
+ * Like the activity lines, it carries the facts only: who, the price, the status and the events. The buyer's task
+ * text and messages are NOT passed on (bob, 2026-11-20).
+ */
+export interface JobDetail {
+  id: string;
+  buyer: Who | null;
+  /** The expert the buyer hired (or, with no buyer-signed record, the one that delivered or claimed first). */
+  expert: Who | null;
+  /** The buyer's own records name more than one expert: who did the work cannot be told. */
+  expertUnknown: boolean;
+  /**
+   * open: posted, nobody has claimed it. claimed: claimed, nobody hired yet. working: hired, not delivered.
+   * round: a session job sent back for another round. delivered: delivered, not accepted or paid (as far as the
+   * market can see). accepted, paid: done. stopped: the expert ended its work. closed: the buyer closed the session.
+   * ended: no delivery and it is over (its deadline passed, or a day went by with nothing).
+   */
+  status: "open" | "claimed" | "working" | "round" | "delivered" | "accepted" | "paid" | "stopped" | "closed" | "ended";
+  /** In progress now, by the same rule as the lamps (engine activeTradeJobs). */
+  live: boolean;
+  postedAt: number;
+  deadline: number | null;
+  /** The newest event of the job. */
+  lastAt: number;
+  price: string | null; paid: string | null;
+  free: boolean; priv: boolean;
+  /** Sent to one named expert rather than posted to all. */
+  direct: boolean;
+  rounds: number;
+  claimants: number;
+  /** Every event of the job, oldest first. */
+  events: FeedRow[];
 }
 export interface MarketHandle {
   /**
@@ -100,6 +141,11 @@ export interface MarketHandle {
   expert(id: string, recent?: number): ExpertProfile | null;
   /** One buyer by npub or 64-hex key; null as for `expert()`, or a key that has never posted a job here. */
   buyer(id: string, recent?: number): BuyerProfile | null;
+  /**
+   * One job by its offer id (64 hex). null: the reader does not hold it yet (an older job before the whole history
+   * is in; ready() says when that is), or no such job.
+   */
+  job(id: string): JobDetail | null;
   /**
    * "none": nothing whole yet. "recent": 24 hours and Week are whole. "all": everything is.
    * "stale": the relay is slow or cannot be reached, and a return visit shows what the browser holds (whole, but as
@@ -190,6 +236,7 @@ function feedRow(view: MarketView, e: ParsedEvent): FeedRow {
     self: stage === "offer" && !!e.selfTrade,
     turn: stage === "reply" ? (e.turn ?? null) : turnOf(view, e),
     price: (stage === "offer" && !e.free && e.amount != null) || (stage === "receipt" && e.amount != null) ? usd(e.amount) : null,
+    job: e.offerId ?? null,
   };
 }
 
@@ -252,6 +299,7 @@ function expertProfile(view: MarketView, id: string, recent: number): ExpertProf
       .map((e) => feedRow(view, e))
       .filter((f) => (SELLER_ACTS.has(f.stage) ? f.actor.key === pubkey : f.other?.key === pubkey))
       .slice(0, recent),
+    live: liveJobs(view.activeBySeller.get(pubkey)),
   };
 }
 
@@ -273,7 +321,53 @@ function buyerProfile(view: MarketView, id: string, recent: number): BuyerProfil
       .map((e) => feedRow(view, e))
       .filter((f) => (SELLER_ACTS.has(f.stage) ? f.other?.key : f.actor.key) === pubkey)
       .slice(0, recent),
+    live: liveJobs(view.activeByBuyer.get(pubkey)),
   };
+}
+
+const liveJobs = (jobs: { offerId: string; startedAt: number }[] | undefined): string[] =>
+  [...(jobs || [])].sort((a, b) => b.startedAt - a.startedAt).map((j) => j.offerId);
+
+/** Same-second order inside one job: the lifecycle's own (an offer before its claim). */
+const JOB_STAGE_RANK: Record<string, number> = { offer: 0, claim: 1, award: 2, result: 3, feedback: 4, accept: 5, receipt: 6, reply: 7 };
+let jobMemo: { view: MarketView; id: string; job: JobDetail | null } | null = null;
+function jobDetail(view: MarketView, id: string): JobDetail | null {
+  const key = String(id || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(key)) return null;
+  if (jobMemo && jobMemo.view === view && jobMemo.id === key) return jobMemo.job;     // drawn again on every redraw
+  const t = view.trades.get(key);
+  let job: JobDetail | null = null;
+  const events = t ? view.allEvents.map(parseEvent)
+    .filter((e): e is ParsedEvent => e != null && e.stage != null && TRADE_STAGE.has(e.stage) && (e.offerId === key || e.id === key))
+    .sort((a, b) => a.created_at - b.created_at || (JOB_STAGE_RANK[a.stage!] ?? 50) - (JOB_STAGE_RANK[b.stage!] ?? 50)) : [];
+  const offer = events.find((e) => e.stage === "offer" && e.id === key);
+  if (t && offer) {
+    const live = !!t.buyer && (view.activeByBuyer.get(t.buyer) || []).some((j) => j.offerId === key);
+    const closed = t.lastFollowUp?.status === "close";
+    const status: JobDetail["status"] = live
+      ? (openFollowUp(t) ? "round" : t.at.award != null ? "working" : t.claimants.length ? "claimed" : "open")
+      : t.at.receipt != null ? "paid" : t.at.accept != null ? "accepted" : closed ? "closed"
+      : t.declineReason ? "stopped" : t.at.result != null ? "delivered" : "ended";
+    job = {
+      id: key,
+      buyer: t.buyer ? who(view, t.buyer) : null,
+      expert: t.seller ? who(view, t.seller) : null,
+      expertUnknown: t.sellerConflict,
+      status, live,
+      postedAt: offer.created_at,
+      deadline: offer.deadline ?? null,
+      lastAt: events[events.length - 1]!.created_at,
+      price: !t.free && t.offerAmount != null ? usd(t.offerAmount) : null,
+      paid: t.receiptAmount != null ? usd(t.receiptAmount) : null,
+      free: t.free, priv: offer.executionVisibility === "private",
+      direct: !!offer.targetSeller,
+      rounds: t.turns,
+      claimants: t.claimants.length,
+      events: events.map((e) => feedRow(view, e)),
+    };
+  }
+  jobMemo = { view, id: key, job };
+  return job;
 }
 
 /**
@@ -605,6 +699,9 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
     view: () => last,
     expert: (id, n = 6) => ((full || stale) && namesDone && raw ? expertProfile(raw, id, n) : null),
     buyer: (id, n = 6) => ((full || stale) && namesDone && raw ? buyerProfile(raw, id, n) : null),
+    // A job of the week is whole as soon as the week is (fetchJobs read the older ones it touches); an older one
+    // answers once everything is in.
+    job: (id) => ((full || stale || recent) && namesDone && raw ? jobDetail(raw, id) : null),
     ready: () => (full && namesDone ? (partial ? "partial" : "all") : stale && namesDone ? "stale" : recent ? "recent" : "none"),
     computes: () => computes,
     stop: () => {

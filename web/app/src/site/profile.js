@@ -41,7 +41,16 @@ export function eventText(f) {
     default: return a;
   }
 }
-export const eventRow = (f, lit) => `<li class="row g-a${lit ? ' new' : ''}">${lamp(f.stage === 'feedback' && f.terminal ? 'stop' : EV_LAMP[f.stage] || 'step', f.stage)}<span class="ev">${eventText(f)}</span><span class="age">${age(f.at)}</span></li>`;
+// A line that belongs to a job opens the job's panel on /market (Bob, 2026-11-28): the whole row on a click, and its
+// age is a real link (/market?job=<id>), so it opens in a new tab, is reached by keyboard and works on /swarm too.
+// open = false: the job's own panel, where its lines open nothing.
+const jobId = f => (f.job && /^[0-9a-f]{64}$/.test(f.job) ? f.job : null);
+export const eventRow = (f, lit, open = true) => {
+  const job = open ? jobId(f) : null, when = age(f.at);
+  return `<li class="row g-a${job ? ' go' : ''}${lit ? ' new' : ''}"${job ? ` data-job="${job}"` : ''}>${lamp(f.stage === 'feedback' && f.terminal ? 'stop' : EV_LAMP[f.stage] || 'step', f.stage)}<span class="ev">${eventText(f)}</span>${job
+    ? `<a class="age" href="/market?job=${job}" data-job="${job}" title="Open the job">${when}</a>`
+    : `<span class="age">${when}</span>`}</li>`;
+};
 
 const FAMILY = { 'claude-code': 'Claude Code', claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', muse: 'Muse', grokbot: 'Grok Bot', opencode: 'OpenCode', gemini: 'Gemini', hermes: 'Hermes', goose: 'Goose', openclaw: 'OpenClaw', instinct: 'Instinct', cue: 'Cue' };
 const fam = k => (Object.hasOwn(FAMILY, k) ? FAMILY[k] : k);   // not FAMILY[k]: 'constructor' would name a function
@@ -73,6 +82,17 @@ function profileHead(x) {                   // the description and the npub chip
 }
 const kvRows = kv => kv.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
 const recentRows = x => (x.recent.length ? x.recent.map(f => eventRow(f, false)).join('') : '<li class="note">No jobs yet.</li>');
+// A job in progress now: a link to it under the status line (Bob, 2026-11-28). #pf-live is in both panels that show a
+// profile; on /swarm the link goes to /market, on /market it opens the job's panel (market.js).
+const LIVE_MAX = 5;
+function liveLinks(x) {
+  const el = $('#pf-live');
+  if (!el) return;
+  const ids = (x.live || []).filter(id => /^[0-9a-f]{64}$/.test(id)), n = ids.length;
+  paint(el, ids.slice(0, LIVE_MAX).map((id, i) => `<a class="pf-job" href="/market?job=${id}" data-job="${id}">${n === 1 ? 'See the live job' : `Live job ${i + 1}`}</a>`).join('')
+    + (n > LIVE_MAX ? `<span class="pf-more">+${n - LIVE_MAX} more</span>` : ''));
+  el.hidden = !n;
+}
 
 /* An expert's profile. Bob's key attributes: the description, online or working, the npub to copy, the rate, jobs
    delivered, who it takes jobs from, and the agent and model. A value the expert never published has no row. */
@@ -101,6 +121,7 @@ export function fillExpert(x, title) {
     ['Takes jobs from', takesFrom(x)],
     ['Runs on', esc(runsOn(x))],
   ].filter(r => r[1])));
+  liveLinks(x);
   paint($('#pf-rows'), recentRows(x));
 }
 /* A buyer's profile (Bob, 2026-11-21): what it posted and paid, whether it is active, and its recent jobs. */
@@ -114,5 +135,6 @@ export function fillBuyer(x, title) {
     ['Jobs paid', `${nf.format(x.paid)} <small>all time</small>`],
     ['Paid to experts', `${esc(x.spent)} <small>published receipts</small>`],
   ]));
+  liveLinks(x);
   paint($('#pf-rows'), recentRows(x));
 }

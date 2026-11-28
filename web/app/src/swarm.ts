@@ -168,6 +168,13 @@ sheet.addEventListener("click", (e) => {
   e.preventDefault();
   openProfile(a.dataset.pk!, a.dataset.kind === "buyer" ? "buyer" : "expert", a);
 });
+// A line of a profile's recent jobs (or a live-job link) opens that job on /market: its age and the live link are
+// real links already; the rest of the line goes there too, like a click on the line does on /market.
+sheet.addEventListener("click", (e) => {
+  const row = (e.target as HTMLElement).closest<HTMLElement>("li[data-job]");
+  if (!row || e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || (e.target as HTMLElement).closest("a")) return;
+  location.href = "/market?job=" + row.dataset.job;
+});
 wireNpubChip(writeClipboard);
 
 function state(s: "wait" | "ok" | "none", note = ""): void {
