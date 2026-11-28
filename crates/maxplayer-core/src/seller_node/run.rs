@@ -14856,57 +14856,6 @@ mod tests {
         assert_eq!(decision, ClaimDecision::Claim { deadline_unix: NOW + 600 });
     }
 
-    /// An answer the hook hands over AT its cutoff (deadline − PUBLISH_MARGIN_SECS) whose first
-    /// publish is slow: the result row stays pending past the offer deadline, keeps the authored-at
-    /// second it was staged with (before the deadline, so the event id and the buyer's pay window
-    /// are fixed by it), and expires only after the result publish window. The buyer side of the
-    /// same case is `job_lifecycle`'s `a_delivery_staged_at_the_hook_cutoff_and_received_late_is_payable`.
-    #[test]
-    fn a_result_staged_at_the_hook_cutoff_survives_a_slow_first_publish() {
-        let root = temp_dir("cutoff-slow-publish");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let store = super::super::store::SellerStore::open(&root.join("seller.sqlite")).unwrap();
-        let deadline: i64 = 1_700_000_000;
-        let staged = deadline - crate::hook::PUBLISH_MARGIN_SECS as i64;
-        let job = "1".repeat(64);
-        let claim = claim_draft(&job, &"b".repeat(64), &"5".repeat(64), crate::gateway::ClaimPayment::None, &[], &Default::default());
-        store.claim_and_enqueue(&job, &job, None, &claim, staged - 600, staged + 600, staged - 600).unwrap();
-        store.record_award(&"a".repeat(64), &job, &"b".repeat(64), staged - 500).unwrap();
-        let result = crate::gateway::EventDraft::new(JOB_RESULT_KIND, vec![], "answer");
-        assert!(store
-            .deliver_and_enqueue(
-                &job,
-                "inline",
-                crate::gateway::PaymentMode::None,
-                &result,
-                staged,
-                staged + RESULT_PUBLISH_WINDOW_SECS,
-                staged,
-            )
-            .unwrap());
-        // The first publish did not land by the deadline; the next drain runs 40 s after it.
-        let later = deadline + 40;
-        store.expire_outbox(later).unwrap();
-        let pending: Vec<_> = store
-            .pending_outbox(later)
-            .unwrap()
-            .into_iter()
-            .filter(|item| item.dedup_key == format!("result:{job}"))
-            .collect();
-        assert_eq!(pending.len(), 1, "the result is still owed to the relay after the deadline");
-        assert_eq!(pending[0].created_at_unix, staged, "it keeps the second it was staged at");
-        assert!(pending[0].created_at_unix < deadline);
-        // Only the result publish window ends it.
-        store.expire_outbox(staged + RESULT_PUBLISH_WINDOW_SECS).unwrap();
-        assert!(store
-            .pending_outbox(staged + RESULT_PUBLISH_WINDOW_SECS)
-            .unwrap()
-            .iter()
-            .all(|item| item.dedup_key != format!("result:{job}")));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     // MONEY-SAFETY ORDER: a lapsed offer (deadline already passed) is refused BEFORE the rate gate —
     // it is never resurrected with a fresh window, even though it clears the rate floor.
     #[test]

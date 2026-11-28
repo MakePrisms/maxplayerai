@@ -17,8 +17,8 @@ const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
 const FAILED: i32 = 2;
 
-/// How long a test `job` call may run: the deadline the event states is this far ahead, and the
-/// cutoff is that minus the publish margin, exactly as for a real job.
+/// How long a test `job` call may run: the raw deadline is this far ahead; the event states it
+/// minus the publish margin, and the cutoff is at that same instant, exactly as for a real job.
 const TEST_JOB_SECS: u64 = 300;
 const SAMPLE_INPUT: &str = "sample.txt";
 const SAMPLE_INPUT_TEXT: &str = "maxplayer seller hook test: a sample input file.\n";

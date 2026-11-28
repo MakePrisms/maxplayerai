@@ -6621,20 +6621,6 @@ mod tests {
         assert!(claims[0].live);
     }
 
-    // The hook answered AT its cutoff (deadline − the publish margin) and the first publish was
-    // slow: the buyer receives the result 40 s after the offer deadline. The result carries the
-    // second it was staged at, so the claim reads DELIVERED (payable), not EXPIRED.
-    #[test]
-    fn a_delivery_staged_at_the_hook_cutoff_and_received_late_is_payable() {
-        let deadline = 1_700_000_000u64;
-        let mut claims = vec![claim_view("cutoff-claim", 100, "processing")];
-        let staged = deadline - crate::hook::PUBLISH_MARGIN_SECS;
-        let results = vec![delivery_result(SELLER_HEX, staged)];
-        let live = derive_claim_liveness(&mut claims, &results, Some(deadline), deadline + 40);
-        assert_eq!(claims[0].status, CLAIM_STATUS_DELIVERED);
-        assert_eq!(live.as_deref(), Some("cutoff-claim"));
-    }
-
     // Past the offer deadline AND past the delivery pay window ⇒ EXPIRED even with a delivery.
     // The pay window is generous but bounded.
     #[test]

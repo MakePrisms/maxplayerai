@@ -337,7 +337,7 @@ container turn; on a single-turn job they fail the job (§5.0 rule 3).
   (hook exited early) is not itself an error; the exit status decides.
 - Stdout is capped at 1 MiB (first overflow ⇒ kill, violation). Stderr keeps only its last 4 KiB,
   which goes to the seller log, never to the buyer.
-- Cutoff (monotonic): `job` ⇒ the offer's (or follow-up's) deadline − the publish margin (15 s,
+- Cutoff (monotonic): `job` ⇒ the offer's (or follow-up's) deadline − the publish margin (30 s,
   time to sign and publish). That is exactly the `deadline_unix` the hook receives (§5.1); a hook
   must not subtract the margin again. `ping`/`close` ⇒ 30 s. At the cutoff, or on daemon shutdown: `SIGTERM` to the group, 2 s grace, `SIGKILL` to
   the group, reap the child. The grace is the group's: it ends early only once the leader has
@@ -713,10 +713,9 @@ turn-1 answer arriving while turn 2 waits.
 
 ## 14. Open questions (with proposed defaults)
 
-1. **Publish margin before the deadline.** 15 s (§5.1; was 30 s). After the cutoff the daemon
-   needs the 2 s kill grace and the 2 s stdout drain before it signs; the outbox keeps
-   publishing past the deadline and a delivered result stays payable, so the margin covers only a
-   normal sign + first publish.
+1. **Publish margin before the deadline.** Default 30 s (§5.1), already subtracted from the
+   `deadline_unix` a hook receives. A shorter margin first needs buyer-side grace for a result
+   that lands just after the deadline (turn-2+ no-response sweep, reservation reconcile).
 2. **Capability tokens for hooks.** Default: a hook entry advertises none (§3, §9), so buyers
    requiring `node`/`python`/`rust` never match it. A `capabilities = [...]` self-report in the
    preset can be added later without a wire change.
