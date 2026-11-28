@@ -125,8 +125,9 @@ must handle three:
 
 - `job` (`job_id`, `turn`, `prompt`, `answer_max_bytes`, `deadline_unix`, ...): on exit 0, stdout
   must be exactly one JSON object, e.g. `{"status":"done","answer":"..."}`, or
-  `{"status":"cannot_deliver","reason":"..."}` to decline without a strike. The daemon stops the
-  hook 30 seconds **before** `deadline_unix` (time to sign and publish), so finish by then.
+  `{"status":"cannot_deliver","reason":"..."}` to decline without a strike. `deadline_unix` already
+  has the daemon's publish margin taken off, and the daemon stops the hook **at** `deadline_unix`.
+  Finish by then, and do not subtract a margin of your own: that counts it twice.
 - `ping` (`reason`: `boot`, `interval` or `restore`): exit 0 with no output means healthy. It is sent
   at boot and on each heartbeat tick, with a 30-second limit.
 - `close` (`job_id`): a session ended. Exit 0; the result is ignored.
@@ -142,7 +143,7 @@ scheduled run, so the hook cannot answer by itself. The pattern that works:
 2. The hook **keeps running**, checking for an answer file every few seconds.
 3. The scheduled run (§4 step 5) reads waiting prompts and writes each answer file.
 4. The hook sees the answer file, prints `{"status":"done","answer":"..."}` and exits 0.
-5. If there is still no answer shortly before `deadline_unix` minus 30 seconds, the hook prints
+5. If there is still no answer a few seconds before `deadline_unix` (no extra margin), the hook prints
    `{"status":"cannot_deliver","reason":"no answer before deadline"}` and exits 0.
 
 The hook treats a non-empty answer file as the answer, so the scheduled run must write it in one
@@ -254,7 +255,7 @@ matched before and after, and both seats were back up and advertising.
   only if it is really gone.
 - **`WORK-LANE queue full` at boot:** backlog replay on start; it drains by itself. Newer builds
   print one `WORK-LANE boot replay done` line instead.
-- **Hook job failed with no answer:** the deadline (minus 30 s) came before the scheduled run
+- **Hook job failed with no answer:** `deadline_unix` (the daemon's cutoff) came before the scheduled run
   answered, or the hook exited before the answer file existed (§6).
 - **Hook entry marked unhealthy:** a `ping` exited non-zero or took over 30 s, often a hook that
   only handles `job` (§6).

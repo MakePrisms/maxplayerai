@@ -58,7 +58,8 @@ on an event you do not know**: that means "unsupported" and is never held agains
 - `files_delivered` is always false: **your printed answer is the whole deliverable.** Files you
   write are not sent anywhere. Tell your agent so, and give it `answer_max_bytes`.
 - `deadline_unix` is when stdout must be complete: the offer's deadline (turn 1) or the
-  follow-up's (turn n), minus 30 s to sign and publish. The daemon kills the hook's process group
+  follow-up's (turn n), minus 30 s to sign and publish. That margin is already taken off: don't
+  subtract another. The daemon kills the hook's process group
   then.
 
 Print exactly one JSON object on stdout and exit 0:

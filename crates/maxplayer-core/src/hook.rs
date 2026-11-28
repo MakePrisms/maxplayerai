@@ -46,6 +46,8 @@ pub const KILL_GRACE: Duration = Duration::from_secs(2);
 /// The fixed budget of a `ping` or `close` call.
 pub const CONTROL_EVENT_BUDGET: Duration = Duration::from_secs(30);
 /// Seconds before the job deadline at which a `job` call is cut, leaving time to sign + publish.
+/// The hook is handed `deadline_unix` with this margin ALREADY subtracted ([`job_event`]), so a
+/// hook must not subtract it again.
 pub const PUBLISH_MARGIN_SECS: u64 = 30;
 /// How long stdout/stderr get to reach EOF after the hook exits. Stdout still open then is incomplete.
 const READER_JOIN_BUDGET: Duration = Duration::from_secs(2);
@@ -143,6 +145,9 @@ pub struct RunReport {
 }
 
 /// The JSON line for a `job` event (§5.1). `inputs_dir`/`output` are `null` when absent.
+/// `deadline_unix` is what the hook sees: the offer's (or follow-up's) deadline with
+/// [`PUBLISH_MARGIN_SECS`] already taken off, the same instant [`job_cutoff`] computes from the
+/// raw deadline.
 #[allow(clippy::too_many_arguments)]
 pub fn job_event(
     invocation: &str,
@@ -214,10 +219,12 @@ pub fn close_event(job_id: &str) -> Vec<u8> {
     line
 }
 
-/// The cutoff of a `job` call: `deadline_unix − PUBLISH_MARGIN_SECS`, as a monotonic instant.
-/// A deadline already inside the margin yields `now` (the call is refused without spawning).
-pub fn job_cutoff(deadline_unix: u64, now_unix: u64, now: Instant) -> Instant {
-    let remaining = deadline_unix
+/// The cutoff of a `job` call: the RAW offer (or follow-up) deadline minus
+/// `PUBLISH_MARGIN_SECS`, as a monotonic instant. Pass the raw deadline here and the
+/// margin-subtracted one to [`job_event`]. A deadline already inside the margin yields `now` (the
+/// call is refused without spawning).
+pub fn job_cutoff(offer_or_turn_deadline_unix: u64, now_unix: u64, now: Instant) -> Instant {
+    let remaining = offer_or_turn_deadline_unix
         .saturating_sub(PUBLISH_MARGIN_SECS)
         .saturating_sub(now_unix);
     now + Duration::from_secs(remaining)
