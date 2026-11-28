@@ -10914,12 +10914,22 @@ impl SellerNodeRunner {
             .accepts_delivery
             .iter()
             .any(|m| m == gateway::DELIVERY_MODE_INLINE);
+        // A hook has no Git route, so it keeps the offer as the buyer declared it; when only the
+        // worst-case inline reservation failed, its real answer is size-checked before delivery
+        // (dot-bot, rc3 swarm round 2: the fallback to Git failed a hook that never ran).
+        let hook_offer = offer.clone();
+        let mut inline_ceiling_short = false;
         match crate::review::private::seller_delivery_budget(
             self.node.home(), self.node.signer(), job_id, inline_requested,
         ).await {
             Ok(false) if inline_requested => {
                 offer.accepts_delivery.retain(|m| m != gateway::DELIVERY_MODE_INLINE);
-                opline!("seller job_id={job_id}: reserving delivery review space; agent must deliver files through Git");
+                inline_ceiling_short = true;
+                opline!(
+                    "seller job_id={job_id}: reserving delivery review space; agent must deliver files through Git \
+                     (the largest inline answer would not fit one delivery review together with this offer's task; \
+                     a hook still answers inline and its answer is size-checked before delivery)"
+                );
             }
             Ok(_) => {}
             Err(error) => {
@@ -10969,7 +10979,7 @@ impl SellerNodeRunner {
         // that cannot be read is not an absent one: defer rather than run the hook again.
         match self.node.store().hook_outcome(job_id) {
             Ok(Some(row)) => {
-                self.redeliver_staged_hook_outcome(job_id, &offer, &stored_creq, row).await;
+                self.redeliver_staged_hook_outcome(job_id, &hook_offer, &stored_creq, row, inline_ceiling_short).await;
                 return;
             }
             Ok(None) => {}
@@ -11037,7 +11047,8 @@ impl SellerNodeRunner {
         if agent_kind.is_hook() {
             self.execute_hook_job(
                 job_id,
-                &offer,
+                &hook_offer,
+                inline_ceiling_short,
                 &stored_creq,
                 harness,
                 &agent_command,
@@ -21732,6 +21743,522 @@ esac"#,
         }
         relay.shutdown();
     }
+
+    // BEGIN #1441 private hook delivery-review size tests
+    /// An answer whose delivery body is exactly `n` bytes: a control byte escapes to six body bytes
+    /// (`\u0001`), so `n / 6` of them and `n % 6` letters. Each step adds one body byte, and the raw
+    /// answer stays far under the inline answer cap.
+    fn answer_of_body(n: usize) -> String {
+        format!("{}{}", "\u{1}".repeat(n / 6), "x".repeat(n % 6))
+    }
+
+    /// A free targeted private offer to key 2 with a `task_len`-byte task, after its award.
+    fn private_hook_fixture(
+        task_len: usize,
+    ) -> (
+        crate::private_content::evidence::PrivateEvidence,
+        crate::private_content::runtime::Policy,
+    ) {
+        let (evidence, _, _, policy) = crate::private_content::evidence::inline_fixture_with_text(
+            true,
+            false,
+            2_000_000_000,
+            vec!["https://testnut.cashu.space".to_owned()],
+            &"t".repeat(task_len),
+            "x",
+        );
+        (evidence, policy)
+    }
+
+    /// Configure `home` as the fixture's seat (key 2) with the offer's task staged and its
+    /// claim/award selected, as a private job stands after its award.
+    fn stage_private_hook_home(
+        home: &mut crate::home::MaxplayerHome,
+        evidence: &crate::private_content::evidence::PrivateEvidence,
+        policy: &crate::private_content::runtime::Policy,
+    ) {
+        home.config.privacy.service_pubkey = Some(policy.service.clone());
+        home.config.privacy.git_base = Some(policy.host.git_prefix.clone());
+        home.config.accepted_mints = policy.host.accepted_mints.clone();
+        std::fs::write(&home.key_path, format!("{:064x}", 2)).expect("seller key");
+        let seller = crate::home::public_key_hex(home).expect("seller pubkey");
+        let now = nostr_sdk::Timestamp::now().as_secs();
+        let mut ctx =
+            crate::private_content::channel::ContentContext::open(home, &seller).expect("ctx");
+        if let Some(task) = &evidence.task_envelope {
+            ctx.stage(
+                &crate::private_content::PreparedContent::decode(task).expect("task"),
+                now,
+            )
+            .expect("stage task");
+        }
+        ctx.resolve_offer(&evidence.offer, now)
+            .expect("resolve offer");
+        ctx.select(&evidence.offer, &evidence.claim, &evidence.award)
+            .expect("select");
+    }
+
+    /// The largest `n` in `0..15000` whose `answer_of_body(n)` fits the job's delivery review with
+    /// `tags`, as the seller's own probe measures it.
+    async fn largest_fitting_answer(
+        home: &crate::home::MaxplayerHome,
+        signer: &crate::seller_node::signer::SignerHandle,
+        job_id: &str,
+        tags: crate::review::private::ResultTags<'_>,
+    ) -> usize {
+        let fits = |n: usize| async move {
+            crate::review::private::seller_inline_answer_fits(
+                home,
+                signer,
+                job_id,
+                &answer_of_body(n),
+                tags,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("probe {n}: {error}"))
+        };
+        assert!(fits(0).await, "harness check: an empty answer fits");
+        assert!(
+            !fits(15_000).await,
+            "harness check: a 15000-byte answer body does not fit"
+        );
+        let (mut lo, mut hi) = (0, 15_000);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if fits(mid).await {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// The shortest task (in 1 KB steps) that fails the worst-case inline reservation AND leaves
+    /// less than 15000 answer bytes: the long private task the PR is about.
+    async fn long_private_hook_task() -> usize {
+        for task_len in (4_000..=crate::private_content::MAX_BODY_BYTES - 600).step_by(1_000) {
+            let (evidence, policy) = private_hook_fixture(task_len);
+            let root = temp_dir(&format!("hook-1441-probe-{task_len}"));
+            let _ = std::fs::remove_dir_all(&root);
+            let mut home = crate::home::bootstrap(&root).expect("bootstrap");
+            stage_private_hook_home(&mut home, &evidence, &policy);
+            let signer = crate::seller_node::signer::spawn(&home).expect("signer");
+            let job_id = evidence.offer.id.to_hex();
+            let ceiling =
+                crate::review::private::seller_delivery_budget(&home, &signer, &job_id, true)
+                    .await
+                    .expect("ceiling probe");
+            let fits_max = crate::review::private::seller_inline_answer_fits(
+                &home,
+                &signer,
+                &job_id,
+                &answer_of_body(15_000),
+                crate::review::private::ResultTags::NONE,
+            )
+            .await
+            .expect("answer probe");
+            let _ = std::fs::remove_dir_all(&root);
+            if !ceiling && !fits_max {
+                return task_len;
+            }
+        }
+        panic!("harness check: no task length exhausts the inline reservation");
+    }
+
+    /// Boot a 1-slot hook seller staged as the fixture's private seat. Its hook answers turn 1 with
+    /// `<root>/turn1.json` and turn n ≥ 2 with `<root>/turn2.json`, verbatim.
+    async fn boot_private_hook_seller(
+        label: &str,
+        relay_url: &str,
+        evidence: &crate::private_content::evidence::PrivateEvidence,
+        policy: &crate::private_content::runtime::Policy,
+        sessions: bool,
+    ) -> (SellerNodeRunner, std::path::PathBuf) {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        // `Store::open` refuses a symlink, and the macOS temp path holds one.
+        let root = root.canonicalize().expect("canonical root");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay_url.to_string();
+        let mut seller = seller_cfg(1, false);
+        seller.claim_award_timeout_secs = Some(0);
+        seller.offer_backfill_secs = 0;
+        seller.agents = vec!["my-hook".to_owned()];
+        home.config.seller = Some(seller);
+        // No reviewer on the fixture relay: offer and follow-up review are switched off.
+        home.config.review.seller_offer = false;
+        home.config.sessions.enabled = Some(sessions);
+        stage_private_hook_home(&mut home, evidence, policy);
+        let script = format!(
+            r#"line=$(cat); printf '%s\n' "$line" >> '{root}/events'
+case "$line" in
+  *'"event":"close"'*) exit 0;;
+  *'"event":"ping"'*) exit 0;;
+  *'"turn":1'*) cat '{root}/turn1.json';;
+  *) cat '{root}/turn2.json';;
+esac"#,
+            root = root.display()
+        );
+        let mut preset =
+            crate::home::AgentPresetConfig::hook(vec!["sh".into(), "-c".into(), script]);
+        preset.model = Some("my-model".into());
+        home.config.agents.insert("my-hook".to_owned(), preset);
+        let runner = SellerNodeRunner::boot(home)
+            .await
+            .expect("boot the private hook seller");
+        (runner, root)
+    }
+
+    fn set_hook_answer(root: &std::path::Path, turn: u32, status: &str, answer: &str) {
+        let body = serde_json::json!({ "status": status, "answer": answer }).to_string();
+        std::fs::write(root.join(format!("turn{turn}.json")), body).expect("hook answer");
+    }
+
+    /// Hook calls made so far (ping and close excluded).
+    fn private_hook_calls(root: &std::path::Path) -> usize {
+        std::fs::read_to_string(root.join("events"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| {
+                !line.contains(r#""event":"ping""#) && !line.contains(r#""event":"close""#)
+            })
+            .count()
+    }
+
+    /// Record the fixture's offer, this seat's claim (advertising a session when `session`) and
+    /// the award in the seller store, pinned to the hook.
+    fn seed_private_hook_job(
+        runner: &SellerNodeRunner,
+        evidence: &crate::private_content::evidence::PrivateEvidence,
+        task_len: usize,
+        session: bool,
+    ) -> String {
+        let now = now_unix();
+        let job_id = evidence.offer.id.to_hex();
+        let buyer_hex = evidence.offer.pubkey.to_hex();
+        let store = runner.node.store();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    accepts_delivery: vec![gateway::DELIVERY_MODE_INLINE.to_owned()],
+                    payment_mode: crate::gateway::PaymentMode::None,
+                    offer_id: job_id.clone(),
+                    buyer_pubkey: buyer_hex.clone(),
+                    amount_sats: 0,
+                    unit: "sat".to_owned(),
+                    task: "t".repeat(task_len),
+                    deadline_unix: now + 3_600,
+                    targeted: true,
+                    capability_request: Some(Default::default()),
+                    requested_agent: None,
+                    output: Some("text/markdown".to_owned()),
+                },
+                now,
+            )
+            .expect("record offer");
+        let mut draft = claim_draft(
+            &job_id,
+            &buyer_hex,
+            &"s".repeat(64),
+            crate::gateway::ClaimPayment::None,
+            &[],
+            &Default::default(),
+        );
+        if session {
+            crate::session::advertise_on_claim(
+                &mut draft,
+                &runner.node.home().config.sessions,
+                true,
+                &crate::session::RunscOverlayGate::NotApplicable,
+            );
+            assert!(
+                crate::session::claim_supports_sessions(&draft.tags),
+                "premise: a session claim"
+            );
+        }
+        store
+            .claim_and_enqueue_pinned(
+                &job_id,
+                &job_id,
+                None,
+                &draft,
+                now,
+                now + 3_600,
+                now,
+                Some(&hook_pin(runner)),
+            )
+            .expect("claim");
+        store
+            .record_award(
+                &Keys::generate().public_key().to_hex(),
+                &job_id,
+                &buyer_hex,
+                now,
+            )
+            .expect("award");
+        job_id
+    }
+
+    /// #1441 advisor r1 (Finding 2): drive the hook runner on a long private task, where the
+    /// worst-case inline reservation fails before the hook runs. The hook still runs, and its
+    /// answer is delivered exactly when that result fits the buyer's delivery review: at the
+    /// largest fitting answer it is delivered; one body byte more and nothing is delivered and the
+    /// job fails with its hook state cleared, never a result the buyer's review must refuse.
+    /// RED ON REVERT: drop the size check in `deliver_hook_answer` (the oversized answer is
+    /// delivered), or keep the old Git fallback (the hook never runs).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_on_a_long_private_task_delivers_only_an_answer_its_review_can_hold() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let task_len = long_private_hook_task().await;
+        let (evidence, policy) = private_hook_fixture(task_len);
+        let mut limit = None;
+        for oversized in [false, true] {
+            let label = format!("hook-1441-oneshot-{oversized}");
+            let (runner, root) =
+                boot_private_hook_seller(&label, &relay_url, &evidence, &policy, false).await;
+            let job_id = seed_private_hook_job(&runner, &evidence, task_len, false);
+            let (home, signer) = (runner.node.home(), runner.node.signer());
+            assert!(
+                !crate::review::private::seller_delivery_budget(home, signer, &job_id, true)
+                    .await
+                    .expect("ceiling"),
+                "premise: the worst-case inline reservation fails on this {task_len}-byte task"
+            );
+            let fits = match limit {
+                Some(limit) => limit,
+                None => *limit.insert(
+                    largest_fitting_answer(
+                        home,
+                        signer,
+                        &job_id,
+                        crate::review::private::ResultTags::NONE,
+                    )
+                    .await,
+                ),
+            };
+            let n = if oversized { fits + 1 } else { fits };
+            set_hook_answer(&root, 1, "done", &answer_of_body(n));
+
+            runner.execute_job(&job_id, None, false).await;
+
+            let store = runner.node.store();
+            assert_eq!(
+                private_hook_calls(&root),
+                1,
+                "{n}-byte answer: the hook ran once (the long task did not stop it)"
+            );
+            let delivered = store.has_delivery(&job_id).expect("has_delivery");
+            let result_row = store
+                .outbox_row(&format!("result:{job_id}"))
+                .expect("outbox");
+            if oversized {
+                assert!(
+                    !delivered && result_row.is_none(),
+                    "a {n}-byte answer (limit {fits}) must not be delivered"
+                );
+                assert_eq!(
+                    store.job_state(&job_id).expect("state"),
+                    Some(crate::seller_node::store::JobState::Failed)
+                );
+                assert!(
+                    store.hook_job_ids().expect("ids").is_empty(),
+                    "the refused answer's hook state is cleared"
+                );
+            } else {
+                assert!(
+                    delivered && result_row.is_some(),
+                    "the {n}-byte answer at the limit is delivered"
+                );
+            }
+            runner.client.disconnect().await;
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        relay.shutdown();
+    }
+
+    /// #1441 advisor r1 (Findings 1 and 2): a session's turn 1 that asks a question carries
+    /// `["turn_status","needs_input"]`, and the size check counts it. An answer that fits as a
+    /// `done` result is refused with that tag; the largest answer that fits WITH the tag is
+    /// delivered and the session parks. RED ON REVERT: size the answer without its turn status.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_status_tag_counts_toward_a_long_private_hook_answer() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let task_len = long_private_hook_task().await;
+        let (evidence, policy) = private_hook_fixture(task_len);
+        let mut limits = None;
+        for over_with_tag in [true, false] {
+            let label = format!("hook-1441-turn-status-{over_with_tag}");
+            let (runner, root) =
+                boot_private_hook_seller(&label, &relay_url, &evidence, &policy, true).await;
+            let job_id = seed_private_hook_job(&runner, &evidence, task_len, true);
+            let (home, signer) = (runner.node.home(), runner.node.signer());
+            let (done, needs_input) = match limits {
+                Some(limits) => limits,
+                None => *limits.insert((
+                    largest_fitting_answer(
+                        home,
+                        signer,
+                        &job_id,
+                        crate::review::private::ResultTags::NONE,
+                    )
+                    .await,
+                    largest_fitting_answer(
+                        home,
+                        signer,
+                        &job_id,
+                        crate::review::private::ResultTags {
+                            status: crate::session::TurnStatus::NeedsInput,
+                            ..crate::review::private::ResultTags::NONE
+                        },
+                    )
+                    .await,
+                )),
+            };
+            assert!(
+                needs_input < done,
+                "premise: the tag costs answer bytes ({needs_input} vs {done})"
+            );
+            let n = if over_with_tag { done } else { needs_input };
+            set_hook_answer(&root, 1, "needs_input", &answer_of_body(n));
+
+            runner.execute_job(&job_id, None, false).await;
+
+            let store = runner.node.store();
+            assert_eq!(
+                private_hook_calls(&root),
+                1,
+                "{n}-byte needs_input answer: the hook ran once"
+            );
+            let delivered = store.has_delivery(&job_id).expect("has_delivery");
+            let session = store.session(&job_id).expect("session read");
+            if over_with_tag {
+                assert!(
+                    !delivered && session.is_none(),
+                    "a {n}-byte needs_input answer fits only without its tag (limit with it {needs_input}): not delivered"
+                );
+                assert_eq!(
+                    store.job_state(&job_id).expect("state"),
+                    Some(crate::seller_node::store::JobState::Failed)
+                );
+            } else {
+                assert!(
+                    delivered,
+                    "the {n}-byte needs_input answer at its limit is delivered"
+                );
+                assert_eq!(
+                    session.map(|s| s.state),
+                    Some(crate::session::SessionState::Parked)
+                );
+            }
+            runner.client.disconnect().await;
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        relay.shutdown();
+    }
+
+    /// #1441 advisor r1 (Finding 3): a hook session parked on a long private task reaches turn
+    /// n ≥ 2, whose RESULT also carries `["e", <follow-up>, "", "reply"]`. That turn is size-checked
+    /// with its own tags: a reply that would have fit turn 1 is refused (the turn fails, nothing is
+    /// published, the session stays), and the largest reply that fits turn 2 is delivered.
+    /// RED ON REVERT: drop the size check in `publish_turn_result`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_private_hook_turn_two_is_size_checked_with_its_reply_tags() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let task_len = long_private_hook_task().await;
+        let (evidence, policy) = private_hook_fixture(task_len);
+        let fid = "f".repeat(64);
+        let mut limits = None;
+        for oversized in [true, false] {
+            let label = format!("hook-1441-turn-two-{oversized}");
+            let (runner, root) =
+                boot_private_hook_seller(&label, &relay_url, &evidence, &policy, true).await;
+            let runner = Arc::new(runner);
+            let job_id = seed_private_hook_job(&runner, &evidence, task_len, true);
+            set_hook_answer(&root, 1, "done", "first");
+            runner.execute_job(&job_id, None, false).await;
+            let store = runner.node.store();
+            assert_eq!(
+                store.session(&job_id).expect("read").map(|s| s.state),
+                Some(crate::session::SessionState::Parked),
+                "premise: turn 1 delivered and the hook session parked"
+            );
+            let (home, signer) = (runner.node.home(), runner.node.signer());
+            let (one_shot, turn_two) = match limits {
+                Some(limits) => limits,
+                None => *limits.insert((
+                    largest_fitting_answer(
+                        home,
+                        signer,
+                        &job_id,
+                        crate::review::private::ResultTags::NONE,
+                    )
+                    .await,
+                    largest_fitting_answer(
+                        home,
+                        signer,
+                        &job_id,
+                        crate::review::private::ResultTags {
+                            followup_id: Some(&fid),
+                            ..crate::review::private::ResultTags::NONE
+                        },
+                    )
+                    .await,
+                )),
+            };
+            assert!(
+                turn_two < one_shot,
+                "premise: the reply tag costs answer bytes ({turn_two} vs {one_shot})"
+            );
+            let n = if oversized { one_shot } else { turn_two };
+            set_hook_answer(&root, 2, "done", &answer_of_body(n));
+            record_hook_followup(&runner, &fid, &job_id, 2, "and now the follow-up");
+            tokio::task::LocalSet::new()
+                .run_until(runner.run_turn(&fid))
+                .await;
+
+            let turn = store.turn(&fid).expect("read").expect("turn row");
+            assert_eq!(
+                private_hook_calls(&root),
+                2,
+                "{n}-byte reply: the hook ran for turn 2"
+            );
+            let result_row = store.outbox_row(&format!("result:{fid}")).expect("outbox");
+            if oversized {
+                assert!(
+                    turn.state != crate::session::TurnState::Delivered && result_row.is_none(),
+                    "a {n}-byte reply fits turn 1 but not turn 2 (limit {turn_two}): nothing published, got {:?}",
+                    turn.state
+                );
+                assert_eq!(
+                    store.session(&job_id).expect("read").map(|s| s.state),
+                    Some(crate::session::SessionState::Parked),
+                    "the session stays open for a shorter reply"
+                );
+            } else {
+                assert_eq!(
+                    turn.state,
+                    crate::session::TurnState::Delivered,
+                    "the {n}-byte reply at the turn-2 limit is delivered"
+                );
+                assert!(result_row.is_some());
+            }
+            runner.client.disconnect().await;
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        relay.shutdown();
+    }
+    // END #1441 private hook delivery-review size tests
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hook_job_runs_once_and_its_exact_answer_is_the_signed_result() {

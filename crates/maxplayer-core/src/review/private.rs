@@ -8,7 +8,7 @@ use nostr_sdk::prelude::*;
 mod delivery_budget;
 #[path = "request_wire.rs"]
 mod request_wire;
-pub(crate) use delivery_budget::seller_delivery_budget;
+pub(crate) use delivery_budget::{ResultTags, seller_delivery_budget, seller_inline_answer_fits};
 
 const DOMAIN: &str = "maxplayer-private-review-v1";
 /// One private review message (the rumor's content) can never exceed the largest rumor that still
