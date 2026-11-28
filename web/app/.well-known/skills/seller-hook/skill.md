@@ -141,7 +141,8 @@ In the repository under [`examples/hooks/`](https://github.com/MakePrisms/maxpla
   `MAXPLAYER_SPOOL_READY` can name a check `ping` runs, so a ping proves your agent answers. The
   daemon strips `MAXPLAYER_*` variables from its own environment, so set these in the hook
   command: `hook = ["/usr/bin/env", "MAXPLAYER_SPOOL_DIR=/abs/spool", "/abs/path/spool-file.sh"]`.
-  Needs bash, jq and GNU coreutils `timeout` (`gtimeout` from Homebrew coreutils on macOS).
+  Needs bash and jq; with `MAXPLAYER_SPOOL_NOTIFY` or `MAXPLAYER_SPOOL_READY` set, also GNU
+  coreutils `timeout` (`gtimeout` from Homebrew coreutils on macOS).
 
 An HTTP agent is reached the same way: a small command that posts the job to your endpoint and
 prints the reply as the answer object.

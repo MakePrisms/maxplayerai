@@ -1015,23 +1015,36 @@ exit $rc
         assert_eq!((code, answer_of(&out)), (0, serde_json::json!({"status": "done", "answer": "kept answer"})), "{err}");
         assert!(answers.join(format!("{key2}.txt")).exists(), "put back for a later restart");
 
-        // The notify command runs without any MAXPLAYER_* setting in its environment.
+        // The notify command runs without the script's own MAXPLAYER_SPOOL_* settings, but with
+        // the daemon's variables (a restarted daemon finds what a hook left running by
+        // MAXPLAYER_HOOK_RUN).
         let seen = tmp.join("seen-env");
         let notify = tmp.join("notify");
         executable(
             &notify,
             &format!(
-                "#!/bin/sh\nenv | grep -c '^MAXPLAYER_' > '{seen}'\nk=$(basename \"$1\" .json); d=$(dirname \"$(dirname \"$1\")\")\necho ok > \"$d/answers/.$k\" && mv \"$d/answers/.$k\" \"$d/answers/$k.txt\"\n",
+                "#!/bin/sh\nenv | grep '^MAXPLAYER_' | sort > '{seen}'\nk=$(basename \"$1\" .json); d=$(dirname \"$(dirname \"$1\")\")\necho ok > \"$d/answers/.$k\" && mv \"$d/answers/.$k\" \"$d/answers/$k.txt\"\n",
                 seen = seen.display()
             ),
         );
         let (code, out, err) = spool_call(
             &spool,
-            &[("MAXPLAYER_SPOOL_NOTIFY", notify.display().to_string())],
+            &[
+                ("MAXPLAYER_SPOOL_NOTIFY", notify.display().to_string()),
+                ("MAXPLAYER_SPOOL_NOTIFY_RETRY_SECS", "15".to_owned()),
+                ("MAXPLAYER_HOOK_V", "1".to_owned()),
+                ("MAXPLAYER_HOOK_RUN", "run-env-test".to_owned()),
+                ("MAXPLAYER_HOME", "/seat-home".to_owned()),
+            ],
             &spool_event(&job, &inv(3), 3, false, 100, now_unix() + 30),
         );
         assert_eq!((code, answer_of(&out)["answer"].clone()), (0, serde_json::json!("ok\n")), "{err}");
-        assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "0");
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        let seen: Vec<&str> = seen.lines().collect();
+        assert!(!seen.iter().any(|line| line.starts_with("MAXPLAYER_SPOOL_")), "{seen:?}");
+        for kept in ["MAXPLAYER_HOME=/seat-home", "MAXPLAYER_HOOK_RUN=run-env-test", "MAXPLAYER_HOOK_V=1"] {
+            assert!(seen.contains(&kept), "only the MAXPLAYER_SPOOL_* settings are removed: {kept} in {seen:?}");
+        }
 
         // A leading zero is refused before bash can read it as octal.
         let (code, _, err) = spool_call(
@@ -1068,7 +1081,12 @@ exit $rc
         // output file, and takes the notify command down with it.
         let hang = tmp.join("hang");
         let hang_pid = tmp.join("hang-pid");
-        executable(&hang, &format!("#!/bin/sh\necho $$ > '{}'\nsleep 30\n", hang_pid.display()));
+        // The pid file appears whole (written, then renamed), so its presence means the notify
+        // command is running.
+        executable(
+            &hang,
+            &format!("#!/bin/sh\necho $$ > '{pid}.tmp' && mv '{pid}.tmp' '{pid}'\nsleep 30\n", pid = hang_pid.display()),
+        );
         let child = {
             use std::io::Write as _;
             let mut child = std::process::Command::new(&script)
@@ -1090,23 +1108,52 @@ exit $rc
                 .count()
         };
         let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while bounded_files() == 0 && std::time::Instant::now() < until {
+        while !hang_pid.exists() && std::time::Instant::now() < until {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert_eq!(bounded_files(), 1, "the notify command is running");
+        assert!(hang_pid.exists(), "the notify command is running");
+        let pid = std::fs::read_to_string(&hang_pid).unwrap().trim().to_owned();
+        assert!(pid.parse::<u32>().is_ok(), "the notify command's pid: {pid:?}");
+        assert_eq!(bounded_files(), 1, "its output goes to a temporary file");
         let started = std::time::Instant::now();
         std::process::Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
         let mut child = child;
-        child.wait().unwrap();
+        let status = child.wait().unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(status.code(), Some(143), "SIGTERM exits 143");
         assert_eq!(bounded_files(), 0, "SIGTERM still runs the cleanup");
-        let pid = std::fs::read_to_string(&hang_pid).unwrap().trim().to_owned();
         let alive = || std::process::Command::new("kill").args(["-0", &pid]).stderr(std::process::Stdio::null()).status().unwrap().success();
         let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while alive() && std::time::Instant::now() < until {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(!alive(), "the notify command did not outlive the hook");
+
+        // Once the answer is printed nothing may fail the hook: here pending/ turns read-only
+        // before the answer is taken, so removing the request fails (not for root).
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let pending_read_only = std::fs::write(pending.join("probe"), "").is_err();
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if pending_read_only {
+            let lock = tmp.join("lock-pending");
+            executable(
+                &lock,
+                "#!/bin/sh\nk=$(basename \"$1\" .json); d=$(dirname \"$(dirname \"$1\")\")\nchmod 0500 \"$d/pending\"\necho locked > \"$d/answers/.$k\" && mv \"$d/answers/.$k\" \"$d/answers/$k.$2\"\n",
+            );
+            for (n, status) in [(20u32, "txt"), (21, "decline")] {
+                let wrapper = tmp.join(format!("lock-{status}"));
+                executable(&wrapper, &format!("#!/bin/sh\nexec '{}' \"$1\" {status}\n", lock.display()));
+                let (code, out, err) = spool_call(
+                    &spool,
+                    &[("MAXPLAYER_SPOOL_NOTIFY", wrapper.display().to_string())],
+                    &spool_event(&job, &inv(n), n, false, 100, now_unix() + 30),
+                );
+                std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert_eq!(code, 0, "{status}: an answer already printed is not a failure: {err}");
+                let want = if status == "txt" { "done" } else { "cannot_deliver" };
+                assert_eq!(answer_of(&out)["status"], serde_json::json!(want), "{status}: {out}");
+            }
+        }
 
         // Permission checks mean nothing to root.
         std::fs::set_permissions(&expired, std::fs::Permissions::from_mode(0o500)).unwrap();

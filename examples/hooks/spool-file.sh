@@ -81,7 +81,11 @@ FINISH="${MAXPLAYER_SPOOL_FINISH_SECS:-3}"
 NOTIFY_RETRY="${MAXPLAYER_SPOOL_NOTIFY_RETRY_SECS:-15}"
 NOTIFY="${MAXPLAYER_SPOOL_NOTIFY:-}"
 READY="${MAXPLAYER_SPOOL_READY:-}"
-while read -r name; do unset "$name"; done < <(compgen -e | grep '^MAXPLAYER_' || true)
+# The operator commands get the daemon's environment without our own settings. Only
+# MAXPLAYER_SPOOL_*: MAXPLAYER_HOOK_RUN and the other daemon variables must reach them (a restarted
+# daemon finds what a hook left running by MAXPLAYER_HOOK_RUN). ${!prefix@} needs no compgen, which
+# some bash builds (Nix) leave out.
+for name in ${!MAXPLAYER_SPOOL_@}; do unset "$name"; done
 # Whole numbers without a leading zero: bash arithmetic would read 08 as (bad) octal.
 WHOLE='^(0|[1-9][0-9]*)$'
 [[ "$POLL" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ && ! "$POLL" =~ ^0(\.0+)?$ ]] || fail "MAXPLAYER_SPOOL_POLL_SECS must be a positive number"
@@ -117,7 +121,7 @@ trap 'exit 130' INT
 bounded() { # <seconds> <command> [args...]
   local secs="$1" rc=0
   shift
-  bounded_out="$(mktemp "$SPOOL/pending/.bounded.XXXXXX")"
+  bounded_out="$(mktemp "$SPOOL/pending/.bounded.XXXXXX")" || { bounded_out=""; return 1; }
   if command -v setsid >/dev/null 2>&1; then
     setsid "$TIMEOUT" -k 2 "$secs" "$@" </dev/null >"$bounded_out" 2>&1 &
   else
@@ -263,7 +267,8 @@ deliver() { # <file> <status>
   if jq -e 'has("ok")' >/dev/null <<<"$out"; then
     mv -f -- "$taken" "$file"
     jq -c '.ok' <<<"$out"
-    rm -f -- "$request" "$error"
+    # The answer is out: nothing after it may fail the hook.
+    rm -f -- "$request" "$error" 2>/dev/null || true
     exit 0
   fi
   refuse "$taken" "$file" "$(jq -r '.refuse' <<<"$out")"
@@ -288,7 +293,7 @@ while :; do
     # An unreadable reason still declines (no strike), without one.
     reason="$(jq -Rsc '.[0:500] | rtrimstr("\n")' <"$decline" 2>/dev/null)" || reason='""'
     jq -nc --argjson r "$reason" '{status: "cannot_deliver", reason: $r}'
-    rm -f -- "$request" "$error"
+    rm -f -- "$request" "$error" 2>/dev/null || true
     exit 0
   fi
   now="$(date +%s)"
