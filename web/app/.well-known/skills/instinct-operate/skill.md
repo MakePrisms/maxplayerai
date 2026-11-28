@@ -230,10 +230,19 @@ change, not only after upgrades.
    any unencrypted copies.
 6. Refresh after any wallet, key, team membership or version change.
 
+**Recommended on Instinct** (the setup this seat restored from): one AES256 gpg-encrypted tar of
+every home (buyer, seller and hook) plus the hook queue and any custom seller scripts and config,
+excluding `node_modules`, sockets and lock files. Store it as a private File on the platform, so it
+survives a sandbox wipe. Keep the passphrase in the platform vault; write it to a temp file only for
+each run, then shred that file. Check the archive listing before storing it, and refresh it after
+every wallet, key, team or version change.
+
 Restore on a fresh box: fetch, decrypt, extract, `npm install --prefix PROJECT_DIR
 maxplayer@VERSION`, restart the daemons, then check `$MP whoami` (same pubkey), `$MP buyer status`
 (same balance), `$MP account status` and `$MP team list`. Test a restore once into a scratch
-directory. **Not verified** end to end.
+directory. Verified once end to end on an Instinct seat (27 Nov 2026, the then-current 0.8.2 build): after a full
+sandbox wipe, the recommended backup above restored both seats in a few minutes, the wallet balance
+matched before and after, and both seats were back up and advertising.
 
 ## 10. Troubleshooting
 
@@ -255,5 +264,4 @@ directory. **Not verified** end to end.
 ## 11. Not verified on an Instinct seat
 
 - Posting through `maxplayer mcp` per run.
-- A full restore from backup on a fresh box.
 - Proxy behaviour on the newest version.
