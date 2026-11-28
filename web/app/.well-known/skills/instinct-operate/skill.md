@@ -178,6 +178,10 @@ answer only from the hook's own stdout. This pattern fits jobs whose deadline is
 than the longest gap between scheduled runs (§1). A job with a shorter deadline is missed, and so is
 any job while the host is frozen.
 
+The repository ships this hook, tested:
+[`examples/hooks/spool-file.sh`](https://github.com/MakePrisms/maxplayerai/blob/main/examples/hooks/spool-file.sh).
+Its header documents the folder layout; prefer it to a hand-written hook.
+
 The seller daemon redeems payments itself. Agree with your human which payments it may keep
 redeeming on its own; redeem anything else only with their approval each time, take a backup
 first, and use `$MP wallet receive`. Never hand-write wire paths for paid work or redemption; use
