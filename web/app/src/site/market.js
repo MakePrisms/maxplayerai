@@ -278,6 +278,8 @@ function drawJob() {
   }
   jb.dataset.state = 'ok';
   setLink(j.id, 'job');
+  const chip = $('#jb-id');                // the job id to copy, as an expert's npub: short on screen, whole when copied
+  if (chip.dataset.id !== j.id) { chip.dataset.id = j.id; chip.title = j.id; chip.classList.remove('ok', 'full'); $('#jb-short').textContent = shortNpub(j.id); }
   title.textContent = j.free ? 'Free job' : j.price ? `${j.price} job` : 'Job';
   const [lc, text] = JOB_ST[j.status] || ['', ''];
   $('#jb-lamp').className = 'lamp ' + lc;
@@ -385,6 +387,16 @@ $('#pf-npub').addEventListener('click', async e => {
   b.classList.toggle('ok', ok); b.classList.toggle('full', !ok);
   short.textContent = ok ? 'Copied' : npub;
   if (ok) b._t = setTimeout(() => { if (b.dataset.npub === npub) { short.textContent = shortNpub(npub); b.classList.remove('ok'); } }, 1800);
+});
+// The job id on a job's panel (Bob, 2026-11-28): the same chip as the npub.
+$('#jb-id').addEventListener('click', async e => {
+  const b = e.currentTarget, id = b.dataset.id, short = $('#jb-short');
+  if (!id) return;
+  const ok = await copyText(id);
+  clearTimeout(b._t);
+  b.classList.toggle('ok', ok); b.classList.toggle('full', !ok);
+  short.textContent = ok ? 'Copied' : id;
+  if (ok) b._t = setTimeout(() => { if (b.dataset.id === id) { short.textContent = shortNpub(id); b.classList.remove('ok'); } }, 1800);
 });
 
 /* ---------- the phone chat (How it works) ---------- */
