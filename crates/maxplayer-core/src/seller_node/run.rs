@@ -21036,6 +21036,9 @@ esac"#,
         let relay = LocalRelay::new(RelayBuilder::default());
         relay.run().await.expect("relay run");
         let relay_url = relay.url().await.to_string();
+        // A reviewer key that never answers: the request goes out and times out on the relay
+        // (without one the review stops at "configure a reviewer key" before any request).
+        let reviewer_url = relay_url.clone();
         let (runner, root) = boot_hook_session_seller_tweaked(
             "pre-run-review-fails",
             &relay_url,
@@ -21043,7 +21046,12 @@ esac"#,
             0,
             true,
             true,
-            |home| home.config.review.timeout_seconds = 1,
+            move |home| {
+                home.config.review.timeout_seconds = 1;
+                home.config.review
+                    .reviewers
+                    .insert(reviewer_url, Keys::generate().public_key().to_hex());
+            },
         )
         .await;
         let buyer_hex = Keys::generate().public_key().to_hex();
@@ -21076,10 +21084,11 @@ esac"#,
         );
         let status = crate::review::state::read(&runner.node.home().root, &job_id).unwrap();
         assert_eq!(status.state, "error", "review status names the failure: {status:?}");
-        // The relay request ran and timed out on its own `timeout_seconds`; the deadline budget
-        // did not cut it off before it left the process (advisor #1448 r3 L2).
-        assert_ne!(
-            status.detail, PRE_RUN_REVIEW_DEADLINE_TIMEOUT,
+        // The relay accepted a real review request, which then timed out on its own
+        // `timeout_seconds`: the deadline budget did not cut it off before it left the process
+        // (advisor #1448 r3 L2, r4 L1).
+        assert!(
+            status.detail.contains("the relay accepted the review request"),
             "a real review request ran: {status:?}"
         );
         let feedback = pre_run_feedback(&relay_url, &job_id).await;
