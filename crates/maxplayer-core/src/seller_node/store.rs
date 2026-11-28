@@ -1046,7 +1046,8 @@ pub enum Claimed {
 pub enum Awarded {
     /// First time this award id was seen: the claim moved to `awarded` and a job row was created.
     New,
-    /// This award id was already recorded — a duplicate, ignored (no second job).
+    /// This award id was already recorded, or the job already has its job row (a second award
+    /// event for one job, #279) — a duplicate, ignored (no second job).
     Duplicate,
     /// The award names a claim this node never parked — recorded, but no job created.
     NoClaim,
@@ -1857,6 +1858,10 @@ impl SellerStore {
 
     /// [`Self::claim_and_enqueue`] with the claim's roster pin written in the SAME transaction as
     /// the claim row and its outbox draft, so the published claim and the pin can never disagree.
+    ///
+    /// Callers pass `created_at_unix == now_unix` (the claim is signed at the second it is recorded):
+    /// [`Self::claim_adopted_earlier`] reads an outbox time older than the claim row's as an adopted
+    /// earlier claim, so an older `created_at_unix` here would read as one.
     #[allow(clippy::too_many_arguments)]
     pub fn claim_and_enqueue_pinned(
         &self,
@@ -2040,17 +2045,137 @@ impl SellerStore {
                 return Ok(Awarded::NoClaim);
             }
         };
-        tx.execute(
-            "UPDATE claims SET state = 'awarded', updated_at_unix = ?2 WHERE job_id = ?1",
-            params![job_id, now_unix],
-        )?;
-        tx.execute(
+        // #279: one job row per job. A second, DIFFERENT award event for a job that already has one
+        // (a buyer re-publishing its award, or two awards in one recovery read) is recorded, but it
+        // is not a new award: returning `New` here is what started a second execution of a job
+        // already running.
+        let created = tx.execute(
             "INSERT OR IGNORE INTO jobs (job_id, offer_id, agent_name, state, created_at_unix, updated_at_unix)
              VALUES (?1, ?2, NULL, 'awarded', ?3, ?3)",
             params![job_id, offer_id, now_unix],
         )?;
+        if created == 0 {
+            tx.commit()?;
+            return Ok(Awarded::Duplicate);
+        }
+        tx.execute(
+            "UPDATE claims SET state = 'awarded', updated_at_unix = ?2 WHERE job_id = ?1",
+            params![job_id, now_unix],
+        )?;
         tx.commit()?;
         Ok(Awarded::New)
+    }
+
+    /// Claims this node parked that no award has reached yet, for offers still inside their
+    /// deadline: `(job_id, claim created_at_unix)`, oldest first. The award-recovery source: the
+    /// live award subscription is the only other route to an award, so an award that arrived while
+    /// its handling failed (our claim not yet confirmed on the relay, a private provisioning error)
+    /// would otherwise wait for a reconnect or a restart. Bounded by the offer deadline, so the set
+    /// cannot grow without limit; a claim that lapses is `released` and leaves it.
+    pub fn claims_awaiting_award(&self, now_unix: i64) -> Result<Vec<(String, i64)>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT claims.job_id, claims.created_at_unix
+             FROM claims JOIN offers ON offers.offer_id = claims.job_id
+             WHERE claims.state = 'claimed' AND offers.deadline_unix > ?1
+             ORDER BY claims.created_at_unix, claims.job_id",
+        )?;
+        let rows = stmt.query_map([now_unix], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Make `claim_id`, an earlier claim this seat signed for `job_id`, the claim on record: its
+    /// payment terms (`creq`, `""` for free), its id as the published claim id and its draft as the
+    /// journaled claim (what [`Self::claim_advertised_session`] reads), so the award that names it
+    /// binds and the job runs as that claim said. The outbox row becomes `confirmed`: the earlier
+    /// claim is already on the relay, and a still-pending re-claim must not be published over it.
+    /// Only while the claim is still `claimed`; returns whether it was adopted. An acceptance that
+    /// names an earlier claim without an award is not reconciled here (it releases as before).
+    pub fn adopt_claim(
+        &self,
+        job_id: &str,
+        claim_id: &str,
+        creq: &str,
+        draft: &EventDraft,
+        claim_created_at: i64,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        let draft_json = serde_json::to_string(draft)
+            .map_err(|error| StoreError(format!("outbox draft encode: {error}")))?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE claims SET creq = ?2, updated_at_unix = ?3 WHERE job_id = ?1 AND state = 'claimed'",
+            params![job_id, creq, now_unix],
+        )?;
+        if updated == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        // The outbox row takes the adopted claim's own time (nothing rebuilds an event from a
+        // `confirmed` row; `published_event_id` names the claim on record), while `claims` keeps the
+        // re-claim's: an outbox time older than the claim row's is the durable mark that an EARLIER
+        // claim was adopted ([`Self::claim_adopted_earlier`]), both times on this seat's clock.
+        let outbox = tx.execute(
+            "UPDATE nostr_event_outbox
+             SET state = 'confirmed', published_event_id = ?2, draft_json = ?3, updated_at_unix = ?4,
+                 created_at_unix = ?5
+             WHERE dedup_key = ?1",
+            params![format!("claim:{job_id}"), claim_id, draft_json, now_unix, claim_created_at],
+        )?;
+        if outbox == 0 {
+            // Dropping `tx` rolls the claim update back: the claim and its outbox row never disagree.
+            return Err(StoreError(format!("adopt_claim job_id={job_id}: no claim outbox row")));
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Whether the claim on record for `job_id` is an EARLIER claim this seat adopted (its outbox time,
+    /// the claim's own, is older than the claim row's): the seat may have run the job before it lost
+    /// its claim row. Durable, and both times are this seat's. Relies on a fresh claim being recorded
+    /// with its outbox time equal to its claim-row time ([`Self::claim_and_enqueue_pinned`]).
+    pub fn claim_adopted_earlier(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT o.created_at_unix < c.created_at_unix FROM claims c
+                 JOIN nostr_event_outbox o ON o.dedup_key = 'claim:' || c.job_id
+                 WHERE c.job_id = ?1",
+                [job_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// When the claim on record for `job_id` was made (its `created_at_unix`), if there is one.
+    pub fn claim_created_at(&self, job_id: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row("SELECT created_at_unix FROM claims WHERE job_id = ?1", [job_id], |row| row.get(0))
+            .optional()?)
+    }
+
+    /// The claim draft journaled for `job_id` (the claim on record), if any.
+    pub fn claim_outbox_draft(&self, job_id: &str) -> Result<Option<EventDraft>, StoreError> {
+        let conn = self.lock()?;
+        let draft: Option<String> = conn
+            .query_row(
+                "SELECT draft_json FROM nostr_event_outbox WHERE dedup_key = ?1",
+                [format!("claim:{job_id}")],
+                |row| row.get(0),
+            )
+            .optional()?;
+        draft
+            .map(|draft| {
+                serde_json::from_str(&draft).map_err(|error| StoreError(format!("claim draft decode: {error}")))
+            })
+            .transpose()
     }
 
     /// Buyer pubkey carried by the recorded AWARD for this job.
@@ -5986,6 +6111,101 @@ mod tests {
                 row.job_id
             );
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claims_awaiting_award_lists_only_live_unawarded_claims() {
+        let (store, path) = fresh_store("awaiting-award");
+        let buyer = "b".repeat(64);
+        let now = 5_000;
+        let offer_at = |id: &str, deadline: i64| {
+            let mut offer = sample_offer(id);
+            offer.buyer_pubkey = buyer.clone();
+            offer.deadline_unix = deadline;
+            store.record_offer(&offer, 1).expect("record offer");
+        };
+        let claim_at = |id: &str, at: i64| {
+            store
+                .claim_and_enqueue(id, id, Some("creq"), &claim(), at, 9_999, at)
+                .expect("claim");
+        };
+        // (1) THE CASE: claimed, no award, still live.
+        offer_at(&"1".repeat(64), 10_000);
+        claim_at(&"1".repeat(64), 30);
+        // (2) claimed and live, but the award already arrived.
+        offer_at(&"2".repeat(64), 10_000);
+        claim_at(&"2".repeat(64), 10);
+        store.record_award(&"w2".repeat(32), &"2".repeat(64), &buyer, 40).expect("award 2");
+        // (3) claimed, no award, but its deadline has passed.
+        offer_at(&"3".repeat(64), 4_000);
+        claim_at(&"3".repeat(64), 10);
+        // (4) recorded, never claimed.
+        offer_at(&"4".repeat(64), 10_000);
+        // (5) claimed earlier than (1), no award, live: listed first.
+        offer_at(&"5".repeat(64), 10_000);
+        claim_at(&"5".repeat(64), 20);
+        // (6) claimed and live, but released (lapsed, or another seat won).
+        offer_at(&"6".repeat(64), 10_000);
+        claim_at(&"6".repeat(64), 15);
+        assert_eq!(store.release_claim(&"6".repeat(64), 50).expect("release"), 1);
+
+        assert_eq!(
+            store.claims_awaiting_award(now).expect("read"),
+            vec![("5".repeat(64), 20), ("1".repeat(64), 30)],
+            "only claimed + unawarded + live claims, oldest first"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn adopt_claim_rebinds_only_a_claim_still_claimed() {
+        let (store, path) = fresh_store("adopt-claim");
+        let job = "1".repeat(64);
+        store
+            .claim_and_enqueue(&job, &job, Some("creq-new"), &claim(), 1, 9_999, 1)
+            .expect("claim");
+        assert_eq!(store.pending_outbox(10).expect("pending").len(), 1, "precondition: the re-claim is still pending");
+        let mut earlier = claim();
+        earlier.tags.push(TagSpec::new(["session", "1"]));
+        assert!(!store.claim_adopted_earlier(&job).expect("read"), "precondition: the claim on record is the re-claim");
+        assert!(store.adopt_claim(&job, "earlier-id", "creq-earlier", &earlier, 0, 2).expect("adopt"));
+        assert!(store.claim_adopted_earlier(&job).expect("read"), "an earlier claim's time marks the adoption");
+        // Confirming the claim on record itself (its own time, equal to the claim row's) is not an
+        // earlier claim.
+        let same = "5".repeat(64);
+        store.claim_and_enqueue(&same, &same, Some("creq"), &claim(), 1, 9_999, 1).expect("claim");
+        assert!(store.adopt_claim(&same, "same-id", "creq", &claim(), 1, 2).expect("confirm"));
+        assert!(!store.claim_adopted_earlier(&same).expect("read"), "the claim on record is not an earlier claim");
+        assert_eq!(store.job_creq(&job).expect("creq").as_deref(), Some("creq-earlier"));
+        assert_eq!(
+            store.outbox_row(&format!("claim:{job}")).expect("row").map(|(state, _, id)| (state, id)),
+            Some(("confirmed".to_owned(), Some("earlier-id".to_owned()))),
+            "the adopted claim is on record as published"
+        );
+        assert!(store.pending_outbox(10).expect("pending").is_empty(), "the re-claim is not published over it");
+        assert_eq!(store.claim_outbox_draft(&job).expect("draft"), Some(earlier.clone()));
+        assert!(store.claim_advertised_session(&job).expect("session"), "the adopted claim's draft counts");
+        store.record_award(&"w".repeat(64), &job, "b", 3).expect("award");
+        assert!(!store.adopt_claim(&job, "other", "x", &claim(), 0, 4).expect("no-op"), "an awarded claim is never rebound");
+        assert_eq!(store.job_creq(&job).expect("creq").as_deref(), Some("creq-earlier"));
+        assert_eq!(store.claim_outbox_draft(&job).expect("draft"), Some(earlier), "nor its draft replaced");
+        // A released claim is not rebound either.
+        let released = "8".repeat(64);
+        store
+            .claim_and_enqueue(&released, &released, Some("creq"), &claim(), 1, 9_999, 1)
+            .expect("claim");
+        store.release_claim(&released, 2).expect("release");
+        assert!(!store.adopt_claim(&released, "x", "x", &claim(), 0, 3).expect("no-op"));
+        assert!(!store.adopt_claim(&"9".repeat(64), "x", "x", &claim(), 0, 3).expect("absent"), "no claim, nothing adopted");
+        // A claim with no outbox row is an error, and the claim is left as it was.
+        let orphan = "6".repeat(64);
+        store
+            .claim_and_enqueue(&orphan, &orphan, Some("creq-orphan"), &claim(), 1, 9_999, 1)
+            .expect("claim");
+        store.execute_for_test(&format!("DELETE FROM nostr_event_outbox WHERE dedup_key = 'claim:{orphan}'"));
+        assert!(store.adopt_claim(&orphan, "x", "creq-new", &claim(), 0, 3).is_err(), "no outbox row: an error");
+        assert_eq!(store.job_creq(&orphan).expect("creq").as_deref(), Some("creq-orphan"), "rolled back");
         let _ = std::fs::remove_file(&path);
     }
 

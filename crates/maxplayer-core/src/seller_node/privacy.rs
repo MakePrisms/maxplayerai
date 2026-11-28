@@ -96,13 +96,44 @@ pub fn project_keyed(
     dispatch: Option<pc::Dispatch>,
     turn_key: Option<&str>,
 ) -> pc::Result<EventDraft> {
+    project_selected(home, seller, id, draft, dispatch, turn_key, None)
+}
+
+/// The (claim, award) a private publication is bound to: `selection` when the caller supplies one
+/// that validates against the offer (the same check the buyer's job view applies, so both sides
+/// agree on the binding), otherwise the recorded selection. A supplied pair is never recorded.
+fn binding(
+    ctx: &pc::channel::ContentContext,
+    offer: &Event,
+    id: &str,
+    selection: Option<(&Event, &Event)>,
+) -> pc::Result<Option<(Event, Event)>> {
+    if let Some((claim, award)) = selection
+        && pc::lifecycle::validate_selection(offer, claim, award, &ctx.policy.host).is_ok()
+    {
+        return Ok(Some((claim.clone(), award.clone())));
+    }
+    ctx.store.selection(id)
+}
+
+/// [`project_keyed`] bound to `selection` when it validates (see [`binding`]): a declined
+/// adoption's feedback names the awarded claim and the award, which are not the recorded selection.
+pub fn project_selected(
+    home: &MaxplayerHome,
+    seller: &str,
+    id: &str,
+    draft: EventDraft,
+    dispatch: Option<pc::Dispatch>,
+    turn_key: Option<&str>,
+    selection: Option<(&Event, &Event)>,
+) -> pc::Result<EventDraft> {
     let Some((mut ctx, offer)) = known(home, seller, id)? else {
         if is_private(&draft) {
             return Err(pc::Error("private offer context unavailable"));
         }
         return pc::public_v2::project_local_keyed(home, id, draft, turn_key);
     };
-    let selected = ctx.store.selection(id)?;
+    let selected = binding(&ctx, &offer, id, selection)?;
     let (claim, award) = selected
         .as_ref()
         .map(|(c, a)| (Some(c), Some(a)))
@@ -195,12 +226,22 @@ pub fn bind_receipt_keyed(
 }
 
 pub fn record_publication(home: &MaxplayerHome, seller: &str, event: &Event) -> pc::Result<()> {
+    record_publication_selected(home, seller, event, None)
+}
+
+/// [`record_publication`] bound to `selection` when it validates (see [`binding`]).
+pub fn record_publication_selected(
+    home: &MaxplayerHome,
+    seller: &str,
+    event: &Event,
+    selection: Option<(&Event, &Event)>,
+) -> pc::Result<()> {
     let policy = pc::runtime::Policy::from_home(home)?;
     let tags = pc::wire::validate_private(event, &policy.host)?;
     let id = tags.required("root")?;
     let (mut ctx, offer) =
         known(home, seller, id)?.ok_or(pc::Error("private publication context missing"))?;
-    let selected = ctx.store.selection(id)?;
+    let selected = binding(&ctx, &offer, id, selection)?;
     let (claim, award) = selected
         .as_ref()
         .map(|(c, a)| (Some(c), Some(a)))
@@ -257,14 +298,41 @@ pub fn contribution(pin: &pc::Contribution) -> pc::Result<crate::contribution::C
 pub fn input_cache(home: &MaxplayerHome, offer: &str) -> std::path::PathBuf {
     home.root.join("private-inputs").join(offer)
 }
-/// Prove the exact inputs are readable before CLAIM. Cache only verified Git
-/// objects; execution later uses this pinned baseline instead of fetching a new tip.
+/// Whether a private job can run without its per-job Git repository. Only a HOOK seat qualifies:
+/// a hook delivers inline and nothing else (a hook job whose inline delivery is withdrawn refuses
+/// before the hook runs), so with inline accepted, no Git inputs and no contribution base nothing
+/// is fetched from or pushed to the repository. The offer's `accepts_delivery` alone cannot say
+/// this: Git is always accepted, and a buyer's default offer lists `["inline"]`, so an agent seat
+/// that leaves files would still push them to the repository.
+pub fn needs_no_job_repo(resolved: &pc::lifecycle::ResolvedOffer, hook_seat: bool) -> bool {
+    delivers_without_job_repo(
+        hook_seat,
+        &resolved.offer.accepts_delivery,
+        !resolved.attachments.is_empty(),
+        resolved.contribution.is_some(),
+    )
+}
+
+pub(crate) fn delivers_without_job_repo(
+    hook_seat: bool,
+    accepts_delivery: &[String],
+    has_inputs: bool,
+    has_contribution: bool,
+) -> bool {
+    hook_seat
+        && !has_inputs
+        && !has_contribution
+        && accepts_delivery.iter().any(|mode| mode == crate::gateway::DELIVERY_MODE_INLINE)
+}
+
 /// Whether [`preflight`] has anything to stage. Offers without inputs or a contribution
 /// base skip the off-loop gate entirely.
 pub fn needs_preflight(resolved: &pc::lifecycle::ResolvedOffer) -> bool {
     !resolved.attachments.is_empty() || resolved.contribution.is_some()
 }
 
+/// Prove the exact inputs are readable before CLAIM. Cache only verified Git
+/// objects; execution later uses this pinned baseline instead of fetching a new tip.
 pub async fn preflight(
     home: &MaxplayerHome,
     signer: &super::signer::SignerHandle,
@@ -516,6 +584,22 @@ pub fn execution(home: &MaxplayerHome, seller: &str, id: &str) -> pc::Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_a_hook_seat_answering_inline_without_git_inputs_needs_no_job_repo() {
+        let modes = |list: &[&str]| list.iter().map(|m| (*m).to_owned()).collect::<Vec<_>>();
+        // A hook seat (inline delivery only), on a default offer or one also naming Git.
+        assert!(delivers_without_job_repo(true, &modes(&["inline"]), false, false));
+        assert!(delivers_without_job_repo(true, &modes(&["inline", "git"]), false, false));
+        // An agent seat on the buyer's DEFAULT offer (`["inline"]`): Git is always accepted and the
+        // agent may leave files, so it still needs the repository.
+        assert!(!delivers_without_job_repo(false, &modes(&["inline"]), false, false));
+        // Git-dependent controls on a hook seat: inputs, a contribution base, or no inline mode.
+        assert!(!delivers_without_job_repo(true, &modes(&["inline"]), true, false));
+        assert!(!delivers_without_job_repo(true, &modes(&["inline"]), false, true));
+        assert!(!delivers_without_job_repo(true, &modes(&[]), false, false));
+        assert!(!delivers_without_job_repo(true, &modes(&["git"]), false, false));
+    }
+
     #[test]
     fn only_an_existing_claim_with_a_recorded_award_skips_the_replay() {
         // A first claim (no claim row) is never skipped, whatever the content store says.

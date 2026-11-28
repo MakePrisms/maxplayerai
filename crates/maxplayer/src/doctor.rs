@@ -5676,6 +5676,7 @@ mod tests {
             contribution_enabled: true,
             slots: 1,
             claim_award_timeout_secs: None,
+            min_claim_remaining_secs: None,
         };
 
         // Boot's verdict: the registry the seller node actually boots with.
@@ -5724,6 +5725,7 @@ mod tests {
             contribution_enabled: true,
             slots: 1,
             claim_award_timeout_secs: None,
+            min_claim_remaining_secs: None,
         };
 
         let check = checks::check_agent_registry(
@@ -5777,6 +5779,7 @@ mod tests {
             contribution_enabled: true,
             slots: 1,
             claim_award_timeout_secs: None,
+            min_claim_remaining_secs: None,
         };
 
         let boot =
@@ -5899,6 +5902,7 @@ mod tests {
             contribution_enabled: true,
             slots: 1,
             claim_award_timeout_secs: None,
+            min_claim_remaining_secs: None,
         }
     }
 

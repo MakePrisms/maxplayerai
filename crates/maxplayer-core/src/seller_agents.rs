@@ -483,6 +483,7 @@ mod tests {
             contribution_enabled: true,
             slots: 1,
             claim_award_timeout_secs: None,
+            min_claim_remaining_secs: None,
         }
     }
 

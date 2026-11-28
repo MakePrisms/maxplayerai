@@ -1067,6 +1067,7 @@ offer_backfill_secs = {backfill}
                 contribution_enabled: true,
                 slots: 1,
                 claim_award_timeout_secs: None,
+                min_claim_remaining_secs: None,
             });
         })
         .expect("save");
@@ -1573,6 +1574,7 @@ mod free_lane_tests {
                 contribution_enabled: true,
                 slots: 1,
                 claim_award_timeout_secs: None,
+                min_claim_remaining_secs: None,
             }
         }
 
