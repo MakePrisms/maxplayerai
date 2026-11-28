@@ -77,9 +77,11 @@ const RESULT_PUBLISH_WINDOW_SECS: i64 = 86_400;
 /// failed instead of waiting on a delivery that will never come.
 const EXEC_FAILURE_FEEDBACK: &str = "seller could not complete the job (execution failed before delivery)";
 /// Buyer-facing reason when the award names an earlier claim of this seat whose payment terms or
-/// harness the seat no longer offers: nothing ran, and the buyer can post the job again.
+/// harness the seat no longer offers, and the relay shows no result of this seat for the job: the
+/// buyer can post the job again. (Absence on the relay is not proof nothing ran, so the text does
+/// not claim it.)
 const ADOPTION_DECLINED_FEEDBACK: &str =
-    "seller can no longer serve the claim you awarded (its terms or harness changed since); nothing ran, post the job again";
+    "seller can no longer serve the claim you awarded (its terms or harness changed since); post the job again";
 /// Buyer-facing reason when the offer review an awarded job needs before it runs got no passing
 /// answer in time (a refusal uses [`PRE_RUN_REVIEW_REFUSED_FEEDBACK`]). Generic like
 /// [`EXEC_FAILURE_FEEDBACK`]: the operator log names the review error.
@@ -1858,8 +1860,10 @@ fn claim_harness_tags(tags: &[crate::gateway::TagSpec]) -> Vec<Vec<String>> {
 /// What [`SellerNodeRunner::adopt_own_earlier_claim`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdoptOutcome {
-    /// The earlier claim is now the claim on record.
-    Adopted,
+    /// The awarded claim is now the claim on record and confirmed. `earlier`: it is an earlier claim
+    /// of this seat, made before its claim row was lost (the seat may already have run the job);
+    /// false when it is the claim on record itself, whose publish was not yet confirmed.
+    Adopted { earlier: bool },
     /// The relay answered and the claim is not one this seat can bind: another seat's, malformed,
     /// terms or harness the seat no longer offers, a selection that does not validate, an offer past
     /// its deadline, or our claim already left `claimed`.
@@ -1921,13 +1925,19 @@ fn award_recovery_filters(waiting: &[(String, String)]) -> Vec<Filter> {
 }
 
 /// Whether `award` names `seller_hex` as the seat it chose: a kind-3405 award carries
-/// `["p", <winning seller>]` (protocol §6.3). An award that does not name this seat is another
-/// seat's win, whatever claim id it carries.
-fn award_names_seat(award: &nostr_sdk::Event, seller_hex: &str) -> bool {
-    award.tags.iter().any(|tag| {
-        let fields = tag.as_slice();
-        fields.first().map(String::as_str) == Some("p") && fields.get(1).map(String::as_str) == Some(seller_hex)
-    })
+/// `["p", <buyer>]` and `["p", <winning seller>]` (protocol §6.3). An award that does not name this
+/// seat is another seat's win, whatever claim id it carries. The buyer's own `p` tag does not count:
+/// for a seat that shares the buyer's key, only a second `p` naming it does.
+fn award_names_seat(award: &nostr_sdk::Event, seller_hex: &str, buyer_hex: &str) -> bool {
+    let naming = award
+        .tags
+        .iter()
+        .filter(|tag| {
+            let fields = tag.as_slice();
+            fields.first().map(String::as_str) == Some("p") && fields.get(1).map(String::as_str) == Some(seller_hex)
+        })
+        .count();
+    naming > usize::from(seller_hex == buyer_hex)
 }
 
 /// When the next award-recovery pass is due. The gap is counted from when a pass FINISHES, so a
@@ -8746,31 +8756,43 @@ impl SellerNodeRunner {
         let Some(terms) = own_earlier_claim_terms(&claim, job_id, &seller_hex, buyer) else {
             return AdoptOutcome::NotOurs;
         };
-        // An EARLIER claim: one signed after the claim on record was not made before this seat lost
-        // its claim row, but by another process holding the same key, which answers this award.
-        match store.claim_created_at(job_id) {
-            Ok(Some(on_record)) if (claim.created_at.as_u64() as i64) < on_record => {}
-            Ok(Some(_)) => return decline("is not older than the claim on record (another process with this key?)", false),
+        let draft = event_to_draft(&claim);
+        let on_record_at = match store.claim_created_at(job_id) {
+            Ok(Some(at)) => at,
             Ok(None) => return AdoptOutcome::NotOurs,
             Err(error) => return defer(&format!("claim read failed ({error})")),
-        }
-        let config = &self.node.home().config;
-        if !earlier_claim_terms_still_accepted(
-            &terms,
-            job_id,
-            offer.amount_sats,
-            offer.payment_mode.is_free(),
-            config.allow_real_mints,
-            &config.accepted_mints,
-        ) {
-            return decline("quotes payment terms this seat no longer accepts", true);
-        }
-        let draft = event_to_draft(&claim);
-        match store.claim_outbox_draft(job_id) {
-            Ok(Some(current)) if claim_harness_tags(&current.tags) == claim_harness_tags(&draft.tags) => {}
-            Ok(Some(_)) => return decline("advertised a different harness than the claim on record", true),
+        };
+        let on_record_draft = match store.claim_outbox_draft(job_id) {
+            Ok(Some(current)) => current,
             Ok(None) => return AdoptOutcome::NotOurs,
             Err(error) => return defer(&format!("claim draft read failed ({error})")),
+        };
+        let claimed_at = claim.created_at.as_u64() as i64;
+        // The claim on record ITSELF, whose publish was never confirmed: same key, time and draft
+        // give the same event. Its terms and harness are the ones on record; confirm it and bind.
+        let earlier = !(claimed_at == on_record_at && draft == on_record_draft);
+        if earlier {
+            // An EARLIER claim. One signed after the claim on record was not made before this seat
+            // lost its claim row, but by another process holding the same key, which answers this
+            // award. (Partial: a sibling's OLDER claim cannot be told from this seat's own lost
+            // claim. Two homes on one key are not a supported setup; `lock.rs` guards one home.)
+            if claimed_at >= on_record_at {
+                return decline("is not older than the claim on record (another process with this key?)", false);
+            }
+            let config = &self.node.home().config;
+            if !earlier_claim_terms_still_accepted(
+                &terms,
+                job_id,
+                offer.amount_sats,
+                offer.payment_mode.is_free(),
+                config.allow_real_mints,
+                &config.accepted_mints,
+            ) {
+                return decline("quotes payment terms this seat no longer accepts", true);
+            }
+            if claim_harness_tags(&on_record_draft.tags) != claim_harness_tags(&draft.tags) {
+                return decline("advertised a different harness than the claim on record", true);
+            }
         }
         let home = self.node.home();
         let cached: Result<(), AdoptOutcome> = match super::privacy::known(home, &seller_hex, job_id) {
@@ -8825,10 +8847,16 @@ impl SellerNodeRunner {
         }
         match store.adopt_claim(job_id, claim_id, &terms, &draft, now_unix()) {
             Ok(true) => {
-                opline!(
-                    "seller node award job_id={job_id}: the award names claim {claim_id}, an earlier claim this seat signed for the same job; adopting it"
-                );
-                AdoptOutcome::Adopted
+                if earlier {
+                    opline!(
+                        "seller node award job_id={job_id}: the award names claim {claim_id}, an earlier claim this seat signed for the same job; adopting it"
+                    );
+                } else {
+                    opline!(
+                        "seller node award job_id={job_id}: the award names claim {claim_id}, the claim on record, on the relay though its publish was not confirmed; confirming it"
+                    );
+                }
+                AdoptOutcome::Adopted { earlier }
             }
             Ok(false) => AdoptOutcome::NotOurs,
             Err(error) => defer(&format!("adopting it failed ({error})")),
@@ -8860,6 +8888,10 @@ impl SellerNodeRunner {
             self.award_recovery_pace.lock().unwrap_or_else(|p| p.into_inner()).idle();
             return;
         }
+        // The pace first: a tick that will not run a pass reads nothing more.
+        if !self.award_recovery_pace.lock().unwrap_or_else(|p| p.into_inner()).due(Instant::now()) {
+            return;
+        }
         let due: Vec<(String, String)> = waiting
             .into_iter()
             .filter(|(_, claimed_at)| now.saturating_sub(*claimed_at) >= AWARD_RECOVERY_MIN_AGE_SECS)
@@ -8869,9 +8901,6 @@ impl SellerNodeRunner {
             })
             .collect();
         if due.is_empty() {
-            return;
-        }
-        if !self.award_recovery_pace.lock().unwrap_or_else(|p| p.into_inner()).due(Instant::now()) {
             return;
         }
         let clean = self.recover_awards_for(&due).await;
@@ -10664,7 +10693,7 @@ impl SellerNodeRunner {
                 // claim of this seat, made before its claim row was lost, before it has claimed
                 // again. Not "taken elsewhere": leave the offer claimable, so a re-claim can adopt
                 // that claim when award recovery reads this award again.
-                if award_author == buyer && award_names_seat(event, &self.seller_pubkey.to_hex()) {
+                if award_author == buyer && award_names_seat(event, &self.seller_pubkey.to_hex(), &buyer) {
                     opline!(
                         "seller node award job_id={job_id}: the buyer's award names this seat, which holds no claim for it yet; leaving the offer claimable (an earlier claim of this seat?)"
                     );
@@ -10697,18 +10726,65 @@ impl SellerNodeRunner {
         // earlier claim is on the relay, and it is the one the buyer awarded. Only for an award that
         // names this seat (`p`): any other award is another seat's win, the normal losing case of an
         // open-pool seat, and releases at once without a relay read.
-        let mut adopted = false;
-        if award_author == buyer
-            && our_claim_id.as_deref() != Some(award.claim_id.as_str())
-            && award_names_seat(event, &self.seller_pubkey.to_hex())
-        {
+        let names_seat = award_names_seat(event, &self.seller_pubkey.to_hex(), &buyer);
+        if award_author == buyer && our_claim_id.as_deref() != Some(award.claim_id.as_str()) && names_seat {
             match self.adopt_own_earlier_claim(&job_id, &award.claim_id, event, &buyer).await {
-                AdoptOutcome::Adopted => {
+                AdoptOutcome::Adopted { earlier } => {
                     our_claim_id = Some(award.claim_id.clone());
-                    adopted = true;
+                    if earlier {
+                        // At once, not only when the award binds below: a return before that
+                        // (private award pending, a store error) must not lose the relay check.
+                        self.relay_check_before_run
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(job_id.clone());
+                    }
                 }
                 AdoptOutcome::NotOurs => {}
                 AdoptOutcome::Declined { notify_buyer } => {
+                    // This seat lost its claim row, so it cannot tell locally whether it already
+                    // delivered this job. Ask the relay before telling the buyer to post it again:
+                    // that message frees the buyer's reservation, and must not talk it out of paying
+                    // for delivered work.
+                    let tell_buyer = if notify_buyer {
+                        match self.relay_shows_settlement(&job_id, Some(&buyer)).await {
+                            Some(false) => true,
+                            Some(true) => {
+                                opline!(
+                                    "seller node award job_id={job_id}: declining claim {}, but the relay already shows our result or the buyer's receipt for this job; not asking the buyer to post it again",
+                                    award.claim_id
+                                );
+                                false
+                            }
+                            None => {
+                                opline!(
+                                    "seller node award pending job_id={job_id}: could not read the relay before declining claim {}; keeping the claim for award recovery",
+                                    award.claim_id
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    // Tell the buyer BEFORE releasing: an unconfirmed send keeps the claim, so the
+                    // next award-recovery pass declines (and tells) again instead of a silent forfeit.
+                    if tell_buyer
+                        && !self
+                            .publish_buyer_feedback(
+                                &job_id,
+                                &buyer,
+                                ReasonCode::CapabilityMissing,
+                                ADOPTION_DECLINED_FEEDBACK,
+                                None,
+                            )
+                            .await
+                    {
+                        opline!(
+                            "seller node award pending job_id={job_id}: the decline was not confirmed on the relay; keeping the claim so award recovery tells the buyer again"
+                        );
+                        return;
+                    }
                     self.slots.release(&job_id);
                     match self.node.store().release_claim(&job_id, now_unix()) {
                         Ok(1..) => opline!("seller node released claim job_id={job_id}: award declined"),
@@ -10717,16 +10793,6 @@ impl SellerNodeRunner {
                             self.claim_state_label(&job_id)
                         ),
                         Err(error) => opline!("seller node release failed job_id={job_id}: {error}"),
-                    }
-                    if notify_buyer {
-                        self.publish_buyer_feedback(
-                            &job_id,
-                            &buyer,
-                            ReasonCode::CapabilityMissing,
-                            ADOPTION_DECLINED_FEEDBACK,
-                            None,
-                        )
-                        .await;
                     }
                     return;
                 }
@@ -10739,7 +10805,14 @@ impl SellerNodeRunner {
                 }
             }
         }
-        match match_award(&award.claim_id, our_claim_id.as_deref(), &award_author, &buyer) {
+        let decision = match match_award(&award.claim_id, our_claim_id.as_deref(), &award_author, &buyer) {
+            // The buyer's award names another seat: that seat won, final for this one, whether or not
+            // our claim's publish is confirmed yet. Waiting would only keep award recovery unclean
+            // (and, after a restart, nothing else releases the claim).
+            AwardMatch::Ignore if award_author == buyer && !names_seat => AwardMatch::Release,
+            decision => decision,
+        };
+        match decision {
             AwardMatch::Execute => {
                 let private: Result<(), crate::private_content::hosting::SendError> = async {
                     let Some((mut ctx, offer)) = super::privacy::known(self.node.home(), &self.seller_pubkey.to_hex(), &job_id)? else {
@@ -10808,7 +10881,18 @@ impl SellerNodeRunner {
                         // Except an award bound through an adopted earlier claim: this seat lost the
                         // state that would say whether it already ran the job, so its first run asks
                         // the relay first.
-                        if adopted {
+                        // An award older than the claim on record is the durable form of the same
+                        // fact: the claim it names predates the claim row, so the seat may have run
+                        // the job before it lost that row. It survives a return between adoption and
+                        // here, and a restart (the in-memory mark set at adoption does not).
+                        let award_predates_claim = self
+                            .node
+                            .store()
+                            .claim_created_at(&job_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|claimed_at| (event.created_at.as_u64() as i64) < claimed_at);
+                        if award_predates_claim {
                             self.relay_check_before_run
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
@@ -11047,13 +11131,35 @@ impl SellerNodeRunner {
         buyer_pubkey: Option<&str>,
         now: i64,
     ) -> bool {
+        // An unanswered read never strands a live award: unknown runs the agent.
+        let settled = self.relay_shows_settlement(job_id, buyer_pubkey).await.unwrap_or(false);
+        if settled {
+            // arm-after-the-event: the settlement event is in hand — persist the durable marker so a
+            // later restart short-circuits without re-querying. A persist failure does not change THIS
+            // run's skip (it re-derives next restart), so it is logged, not propagated.
+            if let Err(error) = self.node.store().mark_settled_elsewhere(job_id, now) {
+                opline!(
+                    "seller node execute job_id={job_id}: settled-elsewhere marker persist failed ({error}); skipping this run anyway (re-derives next restart)"
+                );
+            }
+            opline!(
+                "seller node execute skip job_id={job_id}: settled elsewhere (relay-derived: our result or a buyer receipt present) — NOT re-running the agent (#563)"
+            );
+        }
+        settled
+    }
+
+    /// Whether the relay holds this seat's result (kind-3403) or the buyer's receipt (kind-3400) for
+    /// the offer `job_id`: `Some(true)`/`Some(false)` when it answered, `None` when the read failed
+    /// or timed out (the caller decides what unknown means). No store writes.
+    async fn relay_shows_settlement(&self, job_id: &str, buyer_pubkey: Option<&str>) -> Option<bool> {
         let offer_id = match EventId::from_hex(job_id) {
             Ok(id) => id,
             Err(error) => {
                 opline!(
-                    "seller node execute job_id={job_id}: settled-elsewhere derive skipped (offer id not hex: {error}); running agent"
+                    "seller node job_id={job_id}: settled-elsewhere derive skipped (offer id not hex: {error})"
                 );
-                return false;
+                return None;
             }
         };
         // kind-3403 (our result) OR kind-3400 (buyer receipt), rooted at THIS offer, maxplayer namespace.
@@ -11071,16 +11177,16 @@ impl SellerNodeRunner {
             Ok(Ok(events)) => events,
             Ok(Err(error)) => {
                 opline!(
-                    "seller node execute job_id={job_id}: settled-elsewhere derive fetch failed ({error}); running agent (absence never strands a live award)"
+                    "seller node job_id={job_id}: settled-elsewhere derive fetch failed ({error}); treated as unknown (an execute runs the agent: absence never strands a live award)"
                 );
-                return false;
+                return None;
             }
             Err(_) => {
                 opline!(
-                    "seller node execute job_id={job_id}: settled-elsewhere derive timed out after {}s; running agent (absence never strands a live award)",
+                    "seller node job_id={job_id}: settled-elsewhere derive timed out after {}s; treated as unknown (an execute runs the agent: absence never strands a live award)",
                     SETTLED_ELSEWHERE_FETCH_TIMEOUT.as_secs()
                 );
-                return false;
+                return None;
             }
         };
         // POSITIVE presence only. Our result is authored by THIS seller; a buyer receipt is authored by
@@ -11096,20 +11202,7 @@ impl SellerNodeRunner {
             (kind == JOB_RESULT_KIND && author == self.seller_pubkey.to_hex())
                 || (kind == JOB_RECEIPT_KIND && buyer_pubkey.is_some_and(|buyer| author == buyer))
         });
-        if settled {
-            // arm-after-the-event: the settlement event is in hand — persist the durable marker so a
-            // later restart short-circuits without re-querying. A persist failure does not change THIS
-            // run's skip (it re-derives next restart), so it is logged, not propagated.
-            if let Err(error) = self.node.store().mark_settled_elsewhere(job_id, now) {
-                opline!(
-                    "seller node execute job_id={job_id}: settled-elsewhere marker persist failed ({error}); skipping this run anyway (re-derives next restart)"
-                );
-            }
-            opline!(
-                "seller node execute skip job_id={job_id}: settled elsewhere (relay-derived: our result or a buyer receipt present) — NOT re-running the agent (#563)"
-            );
-        }
-        settled
+        Some(settled)
     }
 
     /// Whether this process already holds a PASSED claim-time review for `job_id`. The claim-time
@@ -16972,6 +17065,187 @@ mod tests {
                 f.finish();
             })
             .await;
+    }
+
+    /// This seat's kind-3403 result for the fixture's job, signed `age_secs` ago and posted: the
+    /// seat delivered the job before it lost its claim row.
+    async fn post_seat_result(f: &ReclaimFixture, age_secs: u64) {
+        let result = crate::gateway::EventDraft {
+            kind: JOB_RESULT_KIND,
+            tags: vec![
+                crate::gateway::TagSpec::new(["e", f.job_id.as_str(), "", "root"]),
+                crate::gateway::TagSpec::new(["p", f.buyer.public_key().to_hex().as_str()]),
+                crate::gateway::TagSpec::new(["t", crate::gateway::MAXPLAYER_TAG]),
+            ],
+            content: "the answer delivered before the claim row was lost".to_owned(),
+        };
+        let result = ReclaimFixture::signed(&result, &f.seller_keys, age_secs);
+        f.publisher.send_event(&result).await.expect("post the earlier result");
+    }
+
+    /// The claim on record is on the relay, but its OK was never recorded and it can no longer be
+    /// re-sent: pending, no published id, its publish window over.
+    fn unconfirm_claim_on_record(f: &ReclaimFixture) {
+        f.runner.node.store().execute_for_test(&format!(
+            "UPDATE nostr_event_outbox SET state = 'pending', published_event_id = NULL, expires_at_unix = 0 WHERE dedup_key = 'claim:{}'",
+            f.job_id
+        ));
+        assert!(
+            matches!(f.runner.node.store().outbox_row(&format!("claim:{}", f.job_id)), Ok(Some((_, _, None)))),
+            "precondition: the claim on record has no published id"
+        );
+    }
+
+    async fn wait_settled_elsewhere(f: &ReclaimFixture) -> bool {
+        let store = f.runner.node.store();
+        let until = std::time::Instant::now() + Duration::from_secs(15);
+        while !store.has_settled_elsewhere(&f.job_id).unwrap_or(false) && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        store.has_settled_elsewhere(&f.job_id).expect("marker read")
+    }
+
+    /// fable #1450 r2 N1: an award naming the claim on record ITSELF, while that claim's publish is
+    /// unconfirmed, is not "a claim no older than the claim on record": it is the same event. It is
+    /// confirmed and binds; it is never declined and released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_award_for_the_claim_on_record_binds_while_its_publish_is_unconfirmed() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let f = ReclaimFixture::new("award-unconfirmed-own").await;
+                unconfirm_claim_on_record(&f);
+                f.runner.on_award(&f.award(&f.current, 0)).await;
+                assert_eq!(f.claim_state().as_deref(), Some("awarded"), "the award on our own claim binds");
+                match f.runner.node.store().outbox_row(&format!("claim:{}", f.job_id)) {
+                    Ok(Some((state, _, Some(published)))) => {
+                        assert_eq!((state.as_str(), published.as_str()), ("confirmed", f.current.as_str()));
+                    }
+                    other => panic!("claim outbox row: {other:?}"),
+                }
+                f.relay.shutdown();
+                f.finish();
+            })
+            .await;
+    }
+
+    /// fable #1450 r2 N2: adoption is durable, so the relay check it calls for must survive a return
+    /// between adoption and binding. Here the first award handling adopts the earlier claim and then
+    /// fails to record the award; the next one binds it. With the in-memory mark kept (same process)
+    /// and with it lost (a restart), the run asks the relay and does not run a delivered job again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_adopted_award_bound_on_a_later_try_still_asks_the_relay() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for (label, restart) in [("adopted-retry", false), ("adopted-restart", true)] {
+                    let f = ReclaimFixture::new(label).await;
+                    post_seat_result(&f, 800).await;
+                    let earlier = f.earlier_claim(900, &[]);
+                    f.publisher.send_event(&earlier).await.expect("post the earlier claim");
+                    let award = f.award(&earlier.id.to_hex(), 850);
+                    let store = f.runner.node.store();
+                    store.execute_for_test(
+                        "CREATE TRIGGER fail_award BEFORE INSERT ON awards BEGIN SELECT RAISE(ABORT, 'test: award insert fails'); END",
+                    );
+                    f.runner.on_award(&award).await;
+                    assert_eq!(f.claim_state().as_deref(), Some("claimed"), "{label}: adopted, not yet bound");
+                    match store.outbox_row(&format!("claim:{}", f.job_id)) {
+                        Ok(Some((_, _, Some(published)))) => {
+                            assert_eq!(published, earlier.id.to_hex(), "{label}: the earlier claim is on record")
+                        }
+                        other => panic!("{label}: claim outbox row: {other:?}"),
+                    }
+                    store.execute_for_test("DROP TRIGGER fail_award");
+                    if restart {
+                        f.runner.relay_check_before_run.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                    }
+                    f.runner.on_award(&award).await;
+                    assert_eq!(f.claim_state().as_deref(), Some("awarded"), "{label}: the award binds");
+                    assert!(wait_settled_elsewhere(&f).await, "{label}: the run asked the relay and found our result");
+                    f.relay.shutdown();
+                    f.finish();
+                }
+            })
+            .await;
+    }
+
+    /// fable #1450 r2 N3: a declined adoption asks the relay before telling the buyer to post the
+    /// job again. When the relay shows this seat's result, the claim is released without that
+    /// message (it would free the buyer's reservation for work already delivered).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declined_adoption_of_a_delivered_job_does_not_tell_the_buyer_to_repost() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let f = ReclaimFixture::new("declined-delivered").await;
+                post_seat_result(&f, 800).await;
+                let mut draft = f
+                    .runner
+                    .node
+                    .store()
+                    .claim_outbox_draft(&f.job_id)
+                    .expect("draft read")
+                    .expect("draft");
+                draft.tags.retain(|tag| tag.first() != Some(crate::seller_agents::AGENT_TAG));
+                draft.tags.push(crate::gateway::TagSpec::new([crate::seller_agents::AGENT_TAG, "some-other-harness"]));
+                let earlier = ReclaimFixture::signed(&draft, &f.seller_keys, 900);
+                f.publisher.send_event(&earlier).await.expect("post the earlier claim");
+                f.runner.on_award(&f.award(&earlier.id.to_hex(), 850)).await;
+                assert_eq!(f.claim_state().as_deref(), Some("released"), "declined and released");
+                let feedback = seat_feedback(&f).await;
+                assert!(
+                    !feedback.iter().any(|event| reason_code_of(event).as_deref() == Some("capability_missing")),
+                    "the buyer is not told to post a delivered job again: {feedback:?}"
+                );
+                f.relay.shutdown();
+                f.finish();
+            })
+            .await;
+    }
+
+    /// fable #1450 r2 N4: the buyer's award naming another seat is final for this one even while our
+    /// claim's publish is unconfirmed: the claim is released and the recovery pass is clean (it
+    /// would otherwise stay unclean until the deadline after a restart).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_award_naming_another_seat_releases_an_unconfirmed_claim() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let f = ReclaimFixture::new("lost-race-unconfirmed").await;
+                unconfirm_claim_on_record(&f);
+                let other = Keys::generate().public_key().to_hex();
+                let draft = crate::gateway::award_draft(&f.job_id, &"5".repeat(64), &f.buyer.public_key().to_hex(), &other);
+                let award = ReclaimFixture::signed(&draft, &f.buyer, 0);
+                f.publisher.send_event(&award).await.expect("post the award");
+                assert!(f.runner.recover_awards_for(&[f.waiting()]).await, "a clean pass");
+                assert_eq!(f.claim_state().as_deref(), Some("released"), "another seat won");
+                f.relay.shutdown();
+                f.finish();
+            })
+            .await;
+    }
+
+    /// fable #1450 r2 L8: the buyer's own `p` tag does not make an award name a seat that shares
+    /// the buyer's key; only a second `p` naming it does.
+    #[test]
+    fn award_names_seat_does_not_count_the_buyers_own_p_tag() {
+        let buyer = Keys::generate();
+        let seat = Keys::generate().public_key().to_hex();
+        let other = Keys::generate().public_key().to_hex();
+        let buyer_hex = buyer.public_key().to_hex();
+        let award = |winner: &str| {
+            ReclaimFixture::signed(
+                &crate::gateway::award_draft(&"1".repeat(64), &"2".repeat(64), &buyer_hex, winner),
+                &buyer,
+                0,
+            )
+        };
+        assert!(award_names_seat(&award(&seat), &seat, &buyer_hex));
+        assert!(!award_names_seat(&award(&other), &seat, &buyer_hex));
+        // A seat on the buyer's key.
+        assert!(!award_names_seat(&award(&other), &buyer_hex, &buyer_hex), "only the buyer's p tag");
+        assert!(award_names_seat(&award(&buyer_hex), &buyer_hex, &buyer_hex), "named as the winner too");
     }
 
     /// fable #1450 M1: an award that names another seat is that seat's win, the normal losing case:

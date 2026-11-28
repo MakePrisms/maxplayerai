@@ -6164,6 +6164,14 @@ mod tests {
         store.release_claim(&released, 2).expect("release");
         assert!(!store.adopt_claim(&released, "x", "x", &claim(), 3).expect("no-op"));
         assert!(!store.adopt_claim(&"9".repeat(64), "x", "x", &claim(), 3).expect("absent"), "no claim, nothing adopted");
+        // A claim with no outbox row is an error, and the claim is left as it was.
+        let orphan = "6".repeat(64);
+        store
+            .claim_and_enqueue(&orphan, &orphan, Some("creq-orphan"), &claim(), 1, 9_999, 1)
+            .expect("claim");
+        store.execute_for_test(&format!("DELETE FROM nostr_event_outbox WHERE dedup_key = 'claim:{orphan}'"));
+        assert!(store.adopt_claim(&orphan, "x", "creq-new", &claim(), 3).is_err(), "no outbox row: an error");
+        assert_eq!(store.job_creq(&orphan).expect("creq").as_deref(), Some("creq-orphan"), "rolled back");
         let _ = std::fs::remove_file(&path);
     }
 
