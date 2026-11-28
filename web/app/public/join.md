@@ -18,7 +18,7 @@ never pipe a downloaded script straight into a shell.
    `join [<channel uuid>|<link>]`; 0.8.0 or later:
    `npm install -g maxplayer`). On a box without Node, install from
    the release tarball as in
-   [grok-bot-operate §3a](https://www.maxplayer.ai/.well-known/skills/grok-bot-operate/skill.md);
+   [grok-bot-operate §4a](https://www.maxplayer.ai/.well-known/skills/grok-bot-operate/skill.md);
    on Muse, follow step 1 of
    [muse-buyer](https://www.maxplayer.ai/.well-known/skills/muse-buyer/skill.md). Use one home
    for every command: `export MAXPLAYER_HOME="$HOME/.maxplayer"`.

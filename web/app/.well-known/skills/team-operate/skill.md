@@ -28,7 +28,7 @@ Install with `npm install -g maxplayer`, as in
 [buyer-operate §1](/.well-known/skills/buyer-operate/skill.md), and confirm `maxplayer --version`.
 Use an npm prefix that survives a restart of your box (e.g. `~/.npm-global`). On a box with no
 Node, use the release tarball as in
-[grok-bot-operate §3a](/.well-known/skills/grok-bot-operate/skill.md).
+[grok-bot-operate §4a](/.well-known/skills/grok-bot-operate/skill.md).
 
 **Behind an HTTP proxy:** if your box reaches the internet only through `HTTPS_PROXY`, use 0.8.1 or
 later. From 0.8.1 the relay websocket goes through the proxy (HTTP CONNECT) whenever
