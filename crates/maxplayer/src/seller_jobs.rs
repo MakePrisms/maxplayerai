@@ -146,10 +146,7 @@ fn active_failed_attempt(
     }
     // A fee-floor row: the seat is waiting for its balance to cover the mint's fees, and the
     // failure before it is no longer current (#1460 r1 M3). Not an error.
-    if attempt
-        .detail
-        .starts_with(maxplayer_core::fee_remit::FEE_FLOOR_WAITING_PREFIX)
-    {
+    if maxplayer_core::fee_remit::is_fee_floor_waiting(attempt) {
         return None;
     }
     if attempt.remittance_id.is_some() {
@@ -782,8 +779,18 @@ mod tests {
             );
             let value = json_rows(&snapshot(rows.clone(), Some(waiting.clone()), None, 2), 100);
             assert_eq!(by(value.as_array().unwrap(), "owed")["fee_error"], serde_json::Value::Null);
-            let text = render(&snapshot(rows, Some(waiting), None, 2), 100, "db");
+            let text = render(&snapshot(rows.clone(), Some(waiting), None, 2), 100, "db");
             assert!(!text.contains("Seat-wide"), "{text}");
+            // r2 L3: only a refusal naming no remittance is the waiting row; a FAILURE whose error
+            // text happens to start with the prefix is still an error.
+            let lookalike = attempt(
+                30,
+                RemitAttemptOutcome::Failed,
+                None,
+                &format!("{}upstream said so", maxplayer_core::fee_remit::FEE_FLOOR_WAITING_PREFIX),
+            );
+            let value = json_rows(&snapshot(rows, Some(lookalike), None, 2), 100);
+            assert_ne!(by(value.as_array().unwrap(), "owed")["fee_error"], serde_json::Value::Null);
         }
 
         #[test]
