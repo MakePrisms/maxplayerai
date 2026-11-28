@@ -962,6 +962,176 @@ exit $rc
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// Advisor #1452 r2: a 0-byte answer is refused (not ignored); an answer left as `.taking` by
+    /// a run that was stopped is delivered by the next; the files handed to the agent follow the
+    /// umask; the notify command never sees MAXPLAYER_* settings; a leading-zero setting is refused
+    /// up front; an `expired/` that cannot be written fails `ping` but never the timeout; an
+    /// unreadable `.decline` still declines; `timeout` is needed only for the operator commands;
+    /// a SIGTERM still cleans up.
+    #[test]
+    fn the_spool_file_adapter_survives_empty_answers_restarts_and_odd_settings() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = scratch("spool-r2");
+        let spool = tmp.join("spool");
+        let (pending, answers, expired) = (spool.join("pending"), spool.join("answers"), spool.join("expired"));
+        for dir in [&pending, &answers, &expired] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let script = examples_dir().join("spool-file.sh").canonicalize().unwrap();
+        let job = "a1".repeat(32);
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        // A 0-byte answer, under umask 007: refused with an .error, and at the deadline the request
+        // moves to expired/. Both files are group-readable (0660), not mktemp's 0600.
+        let key1 = spool_key(&job, 1, &inv(1));
+        std::fs::write(answers.join(format!("{key1}.txt")), b"").unwrap();
+        let out = {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "umask 007 && exec \"$0\""])
+                .arg(&script)
+                .env("MAXPLAYER_SPOOL_DIR", &spool)
+                .env("MAXPLAYER_SPOOL_POLL_SECS", "0.1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let event = spool_event(&job, &inv(1), 1, false, 100, now_unix() + 5);
+            child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(answer_of(&String::from_utf8_lossy(&out.stdout))["status"], "cannot_deliver", "{err}");
+        assert!(err.contains("the answer is empty"), "a 0-byte answer is refused, not ignored: {err}");
+        assert!(answers.join(format!("{key1}.txt.refused")).exists());
+        assert_eq!(mode(&pending.join(format!("{key1}.error"))), 0o660);
+        assert_eq!(mode(&expired.join(format!("{key1}.json"))), 0o660);
+
+        // A run stopped while taking an answer left it as <file>.taking: the next run delivers it.
+        let key2 = spool_key(&job, 2, &inv(2));
+        std::fs::write(answers.join(format!("{key2}.txt.taking")), "kept answer").unwrap();
+        let (code, out, err) = spool_call(&spool, &[], &spool_event(&job, &inv(2), 2, false, 100, now_unix() + 6));
+        assert_eq!((code, answer_of(&out)), (0, serde_json::json!({"status": "done", "answer": "kept answer"})), "{err}");
+        assert!(answers.join(format!("{key2}.txt")).exists(), "put back for a later restart");
+
+        // The notify command runs without any MAXPLAYER_* setting in its environment.
+        let seen = tmp.join("seen-env");
+        let notify = tmp.join("notify");
+        executable(
+            &notify,
+            &format!(
+                "#!/bin/sh\nenv | grep -c '^MAXPLAYER_' > '{seen}'\nk=$(basename \"$1\" .json); d=$(dirname \"$(dirname \"$1\")\")\necho ok > \"$d/answers/.$k\" && mv \"$d/answers/.$k\" \"$d/answers/$k.txt\"\n",
+                seen = seen.display()
+            ),
+        );
+        let (code, out, err) = spool_call(
+            &spool,
+            &[("MAXPLAYER_SPOOL_NOTIFY", notify.display().to_string())],
+            &spool_event(&job, &inv(3), 3, false, 100, now_unix() + 30),
+        );
+        assert_eq!((code, answer_of(&out)["answer"].clone()), (0, serde_json::json!("ok\n")), "{err}");
+        assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "0");
+
+        // A leading zero is refused before bash can read it as octal.
+        let (code, _, err) = spool_call(
+            &spool,
+            &[("MAXPLAYER_SPOOL_FINISH_SECS", "08".to_owned())],
+            &spool_event(&job, &inv(4), 4, false, 100, now_unix() + 30),
+        );
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("MAXPLAYER_SPOOL_FINISH_SECS must be whole seconds"), "{err}");
+
+        // No `timeout` on PATH: without a notify or readiness command the hook still answers.
+        let no_timeout = tmp.join("no-timeout-bin");
+        std::fs::create_dir_all(&no_timeout).unwrap();
+        for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let name = entry.file_name();
+                let link = no_timeout.join(&name);
+                if name == "timeout" || name == "gtimeout" || link.exists() {
+                    continue;
+                }
+                let _ = std::os::unix::fs::symlink(entry.path(), link);
+            }
+        }
+        let key5 = spool_key(&job, 5, &inv(5));
+        std::fs::write(answers.join(format!("{key5}.txt")), "no timeout needed").unwrap();
+        let (code, out, err) = spool_call(
+            &spool,
+            &[("PATH", no_timeout.display().to_string())],
+            &spool_event(&job, &inv(5), 5, false, 100, now_unix() + 30),
+        );
+        assert_eq!((code, answer_of(&out)["answer"].clone()), (0, serde_json::json!("no timeout needed")), "{err}");
+
+        // A SIGTERM while a notify command runs: the script exits at once, removes its temporary
+        // output file, and takes the notify command down with it.
+        let hang = tmp.join("hang");
+        let hang_pid = tmp.join("hang-pid");
+        executable(&hang, &format!("#!/bin/sh\necho $$ > '{}'\nsleep 30\n", hang_pid.display()));
+        let child = {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new(&script)
+                .env("MAXPLAYER_SPOOL_DIR", &spool)
+                .env("MAXPLAYER_SPOOL_NOTIFY", &hang)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let event = spool_event(&job, &inv(6), 6, false, 100, now_unix() + 60);
+            child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).unwrap();
+            child
+        };
+        let bounded_files = || {
+            walk(&pending)
+                .into_iter()
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(".bounded."))
+                .count()
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while bounded_files() == 0 && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(bounded_files(), 1, "the notify command is running");
+        let started = std::time::Instant::now();
+        std::process::Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+        let mut child = child;
+        child.wait().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(bounded_files(), 0, "SIGTERM still runs the cleanup");
+        let pid = std::fs::read_to_string(&hang_pid).unwrap().trim().to_owned();
+        let alive = || std::process::Command::new("kill").args(["-0", &pid]).stderr(std::process::Stdio::null()).status().unwrap().success();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while alive() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!alive(), "the notify command did not outlive the hook");
+
+        // Permission checks mean nothing to root.
+        std::fs::set_permissions(&expired, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let as_root = std::fs::write(expired.join("probe"), "").is_ok();
+        if !as_root {
+            let ping = serde_json::json!({"v": 1, "event": "ping", "reason": "boot"});
+            let (code, _, err) = spool_call(&spool, &[], &ping);
+            assert_eq!(code, 1, "ping checks expired/ too: {err}");
+            assert!(err.contains("not writable"), "{err}");
+            // The timeout's move into expired/ fails; still a plain decline, never a strike.
+            let (code, out, err) = spool_call(&spool, &[], &spool_event(&job, &inv(7), 7, false, 100, now_unix() + 4));
+            assert_eq!((code, answer_of(&out)["status"].clone()), (0, serde_json::json!("cannot_deliver")), "{err}");
+        }
+        std::fs::set_permissions(&expired, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !as_root {
+            // An unreadable .decline still declines, without a reason.
+            let decline = answers.join(format!("{}.decline", spool_key(&job, 8, &inv(8))));
+            std::fs::write(&decline, "secret").unwrap();
+            std::fs::set_permissions(&decline, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let (code, out, err) = spool_call(&spool, &[], &spool_event(&job, &inv(8), 8, false, 100, now_unix() + 30));
+            assert_eq!((code, answer_of(&out)), (0, serde_json::json!({"status": "cannot_deliver", "reason": ""})), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     fn walk(dir: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {

@@ -30,17 +30,22 @@
 #   answers/<key>.decline      a reason (may be empty) to decline the job (`cannot_deliver`, no strike).
 #                              Write every answer file IN ONE GO: a temporary file in answers/ whose
 #                              name does not start with <key>., then rename it.
+#                              Even an empty file counts: it is refused, like an all-whitespace one.
 #   pending/<key>.error        written by this script when an answer was refused (empty, too long,
 #                              or a session-only status on a single-turn job); the refused file is
 #                              renamed <file>.refused. The request stays pending, and the notify
 #                              command (if any) runs again, until a corrected answer arrives.
 #   expired/<key>.json         a request the deadline passed on (your agent can skip these).
 # Housekeeping on `ping` removes files older than a week from those three folders only.
+# The files this script writes get the usual permissions under its umask (0644 under 022, 0660
+# under 007), so an agent user in a group-shared spool folder can read them.
 #
 # The buyer's prompt is a stranger's text: your agent must treat it as data, not instructions.
 #
-# Needs: bash, jq, GNU coreutils `timeout` (on macOS: `brew install coreutils`, which provides
-# gtimeout). Optional settings:
+# Needs: bash, jq; with MAXPLAYER_SPOOL_NOTIFY or MAXPLAYER_SPOOL_READY set, also GNU coreutils
+# `timeout` (on macOS: `brew install coreutils`, which provides gtimeout). Optional settings (whole
+# seconds are plain decimals: no leading zero). They are read, then removed from the environment, so
+# the commands below never see them (a `maxplayer` they run refuses unknown MAXPLAYER_* settings):
 #   MAXPLAYER_SPOOL_DIR          spool folder (default: ${XDG_STATE_HOME:-~/.local/state}/maxplayer-spool).
 #                                Created 0700 when missing; an existing folder's permissions are left
 #                                as they are (e.g. a group-shared folder for an agent user).
@@ -74,10 +79,35 @@ fi
 POLL="${MAXPLAYER_SPOOL_POLL_SECS:-2}"
 FINISH="${MAXPLAYER_SPOOL_FINISH_SECS:-3}"
 NOTIFY_RETRY="${MAXPLAYER_SPOOL_NOTIFY_RETRY_SECS:-15}"
-[[ "$POLL" =~ ^[0-9]+(\.[0-9]+)?$ && ! "$POLL" =~ ^0+(\.0+)?$ ]] || fail "MAXPLAYER_SPOOL_POLL_SECS must be a positive number"
-[[ "$FINISH" =~ ^[0-9]+$ ]] || fail "MAXPLAYER_SPOOL_FINISH_SECS must be whole seconds"
-[[ "$NOTIFY_RETRY" =~ ^[0-9]+$ ]] || fail "MAXPLAYER_SPOOL_NOTIFY_RETRY_SECS must be whole seconds"
+NOTIFY="${MAXPLAYER_SPOOL_NOTIFY:-}"
+READY="${MAXPLAYER_SPOOL_READY:-}"
+while read -r name; do unset "$name"; done < <(compgen -e | grep '^MAXPLAYER_' || true)
+# Whole numbers without a leading zero: bash arithmetic would read 08 as (bad) octal.
+WHOLE='^(0|[1-9][0-9]*)$'
+[[ "$POLL" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ && ! "$POLL" =~ ^0(\.0+)?$ ]] || fail "MAXPLAYER_SPOOL_POLL_SECS must be a positive number"
+[[ "$FINISH" =~ $WHOLE ]] || fail "MAXPLAYER_SPOOL_FINISH_SECS must be whole seconds"
+[[ "$NOTIFY_RETRY" =~ $WHOLE ]] || fail "MAXPLAYER_SPOOL_NOTIFY_RETRY_SECS must be whole seconds"
 TIMEOUT="$(command -v timeout || command -v gtimeout || true)"
+# Only the operator commands need `timeout`.
+needs_timeout() {
+  [[ -z "$NOTIFY$READY" || -n "$TIMEOUT" ]] || { echo "MAXPLAYER_SPOOL_NOTIFY/READY need timeout (GNU coreutils; gtimeout on macOS)" >&2; return 1; }
+}
+# mktemp makes 0600 files; the files we hand to the agent get the umask's usual mode instead.
+FILE_MODE="$(printf '%o' $((0666 & ~$(umask))))"
+
+# Files to remove and an operator command's process group to kill, however the script ends (a
+# SIGTERM from the daemon included).
+tmp=""
+bounded_out=""
+bounded_pid=""
+cleanup() {
+  if [[ -n "$bounded_pid" ]]; then kill -KILL -- "-$bounded_pid" "$bounded_pid" 2>/dev/null || true; fi
+  if [[ -n "$tmp" ]]; then rm -f -- "$tmp"; fi
+  if [[ -n "$bounded_out" ]]; then rm -f -- "$bounded_out"; fi
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # Run an operator command (notify, readiness check) for at most <seconds> plus a 2 s kill grace.
 # Its output goes to a file, then to our stderr, never straight onto the daemon's pipe: some
@@ -85,19 +115,21 @@ TIMEOUT="$(command -v timeout || command -v gtimeout || true)"
 # hold that pipe open past the deadline. Where setsid exists, it runs in its own process group,
 # which is killed once the call is over.
 bounded() { # <seconds> <command> [args...]
-  local secs="$1" out pid rc=0
+  local secs="$1" rc=0
   shift
-  out="$(mktemp "$SPOOL/pending/.bounded.XXXXXX")"
+  bounded_out="$(mktemp "$SPOOL/pending/.bounded.XXXXXX")"
   if command -v setsid >/dev/null 2>&1; then
-    setsid "$TIMEOUT" -k 2 "$secs" "$@" </dev/null >"$out" 2>&1 &
+    setsid "$TIMEOUT" -k 2 "$secs" "$@" </dev/null >"$bounded_out" 2>&1 &
   else
-    "$TIMEOUT" -k 2 "$secs" "$@" </dev/null >"$out" 2>&1 &
+    "$TIMEOUT" -k 2 "$secs" "$@" </dev/null >"$bounded_out" 2>&1 &
   fi
-  pid=$!
-  wait "$pid" || rc=$?
-  kill -KILL -- "-$pid" 2>/dev/null || true
-  head -c 4000 -- "$out" >&2 || true
-  rm -f -- "$out"
+  bounded_pid=$!
+  wait "$bounded_pid" || rc=$?
+  kill -KILL -- "-$bounded_pid" 2>/dev/null || true
+  bounded_pid=""
+  head -c 4000 -- "$bounded_out" >&2 || true
+  rm -f -- "$bounded_out"
+  bounded_out=""
   return "$rc"
 }
 
@@ -115,11 +147,11 @@ case "$kind" in
     # Housekeeping: drop spool files older than a week (a delivered result stays payable 7 days),
     # in the spool's own folders only: an operator's scripts next to them are never touched.
     find "$SPOOL/pending" "$SPOOL/answers" "$SPOOL/expired" -maxdepth 1 -type f -mtime +7 -delete 2>/dev/null || true
-    [[ -w "$SPOOL/pending" && -w "$SPOOL/answers" ]] || { echo "spool folder not writable" >&2; exit 1; }
-    [[ -n "$TIMEOUT" ]] || { echo "needs timeout (GNU coreutils; gtimeout on macOS)" >&2; exit 1; }
-    if [[ -n "${MAXPLAYER_SPOOL_READY:-}" ]]; then
+    [[ -w "$SPOOL/pending" && -w "$SPOOL/answers" && -w "$SPOOL/expired" ]] || { echo "spool folder not writable" >&2; exit 1; }
+    needs_timeout || exit 1
+    if [[ -n "$READY" ]]; then
       rc=0
-      bounded 25 "$MAXPLAYER_SPOOL_READY" || rc=$?
+      bounded 25 "$READY" || rc=$?
       ((rc == 0)) || { echo "readiness check failed ($rc)" >&2; exit 1; }
     fi
     exit 0
@@ -144,34 +176,46 @@ deadline="$(jq -r '.deadline_unix' <<<"$event")"
 session="$(jq -r '.session // false' <<<"$event")"
 [[ "$job_id" =~ ^[0-9a-f]{64}$ ]] || fail "bad job_id"
 [[ "$invocation" =~ ^[0-9a-f]{64}$ ]] || fail "bad invocation"
-[[ "$turn" =~ ^[0-9]+$ && "$cap" =~ ^[0-9]+$ && "$deadline" =~ ^[0-9]+$ ]] || fail "bad event"
-[[ -n "$TIMEOUT" ]] || fail "needs timeout (GNU coreutils; gtimeout on macOS)"
+[[ "$turn" =~ $WHOLE && "$cap" =~ $WHOLE && "$deadline" =~ $WHOLE ]] || fail "bad event"
+needs_timeout || exit 2
 
 spool_dirs
 key="$job_id-$turn-${invocation:0:16}"
 request="$SPOOL/pending/$key.json"
 error="$SPOOL/pending/$key.error"
 decline="$SPOOL/answers/$key.decline"
-tmp=""
-trap 'if [[ -n "$tmp" ]]; then rm -f -- "$tmp"; fi' EXIT
 
 # The answer files this job may use, in the order they are taken.
 statuses=(txt)
 if [[ "$session" == "true" ]]; then statuses+=(needs_input out_of_time); fi
+
+# An answer an earlier run of this script was taking when it was stopped (see deliver) goes back
+# under its own name, unless the agent has written a new one since.
+for s in "${statuses[@]}"; do
+  f="$SPOOL/answers/$key.$s"
+  if [[ -f "$f.taking" && ! -e "$f" ]]; then mv -f -- "$f.taking" "$f" 2>/dev/null || true; fi
+done
+
 answered() {
   local s
-  for s in "${statuses[@]}"; do [[ -s "$SPOOL/answers/$key.$s" ]] && return 0; done
+  for s in "${statuses[@]}"; do [[ -f "$SPOOL/answers/$key.$s" ]] && return 0; done
   [[ -f "$decline" ]]
+}
+
+# A new file in pending/ with the given content, put in place atomically.
+put() { # <path> <content>
+  tmp="$(mktemp "$SPOOL/pending/.$key.XXXXXX")"
+  printf '%s\n' "$2" >"$tmp"
+  chmod "$FILE_MODE" -- "$tmp"
+  mv -f -- "$tmp" "$1"
+  tmp=""
 }
 
 # Write the request (atomically) unless it is already there: a retry of the same request (daemon
 # restart) finds it.
 write_request() {
   [[ -e "$request" ]] && return 0
-  tmp="$(mktemp "$SPOOL/pending/.$key.XXXXXX")"
-  printf '%s\n' "$event" >"$tmp"
-  mv -f -- "$tmp" "$request"
-  tmp=""
+  put "$request" "$event"
 }
 answered || write_request
 
@@ -179,11 +223,11 @@ answered || write_request
 # is notified until one call succeeds, and again after an answer is refused.
 notified=yes
 next_notify=0
-renotify() { if [[ -n "${MAXPLAYER_SPOOL_NOTIFY:-}" ]]; then notified=no; next_notify=0; fi; }
+renotify() { if [[ -n "$NOTIFY" ]]; then notified=no; next_notify=0; fi; }
 if [[ -e "$request" ]] && ! answered; then renotify; fi
 notify() { # <seconds allowed>
   local rc=0
-  bounded "$1" "$MAXPLAYER_SPOOL_NOTIFY" "$request" || rc=$?
+  bounded "$1" "$NOTIFY" "$request" || rc=$?
   if ((rc == 0)); then
     notified=yes
   else
@@ -197,10 +241,7 @@ notify() { # <seconds allowed>
 refuse() { # <file now holding it> <its answer-file name> <reason>
   mv -f -- "$1" "$2.refused" 2>/dev/null || true
   write_request
-  tmp="$(mktemp "$SPOOL/pending/.$key.XXXXXX")"
-  printf '%s\n' "$3" >"$tmp"
-  mv -f -- "$tmp" "$error"
-  tmp=""
+  put "$error" "$3"
   echo "refused $(basename -- "$2"): $3" >&2
   renotify
 }
@@ -208,8 +249,9 @@ refuse() { # <file now holding it> <its answer-file name> <reason>
 # Print one answer file as the given status, or refuse it. The file is first renamed to a name of
 # this script's own, so the bytes checked are the bytes printed (or refused) even if the agent
 # replaces the file meanwhile. One read: jq checks that it has non-whitespace text and that its
-# UTF-8 size (after any invalid byte is replaced) fits the cap. A delivered answer is put back, so a
-# restart that calls the same request again delivers it again.
+# UTF-8 size (after any invalid byte is replaced) fits the cap. A delivered answer is put back
+# before it is printed, so a restart that calls the same request again delivers it again; one left
+# as <file>.taking by a run that was stopped meanwhile is put back when the next run starts.
 deliver() { # <file> <status>
   local file="$1" status="$2" taken="$1.taking" out
   mv -f -- "$file" "$taken" 2>/dev/null || return 0
@@ -219,8 +261,8 @@ deliver() { # <file> <status>
     else {ok: {status: $s, answer: .}}
     end' <"$taken")" || { refuse "$taken" "$file" "the answer could not be read."; return 0; }
   if jq -e 'has("ok")' >/dev/null <<<"$out"; then
-    jq -c '.ok' <<<"$out"
     mv -f -- "$taken" "$file"
+    jq -c '.ok' <<<"$out"
     rm -f -- "$request" "$error"
     exit 0
   fi
@@ -231,7 +273,7 @@ give_up=$((deadline - FINISH))
 while :; do
   for s in "${statuses[@]}"; do
     f="$SPOOL/answers/$key.$s"
-    [[ -s "$f" ]] || continue
+    [[ -f "$f" ]] || continue
     if [[ "$s" == txt ]]; then deliver "$f" "done"; else deliver "$f" "$s"; fi
   done
   if [[ "$session" != "true" ]]; then
@@ -243,13 +285,16 @@ while :; do
     done
   fi
   if [[ -f "$decline" ]]; then
-    jq -Rsc '{status: "cannot_deliver", reason: (.[0:500] | rtrimstr("\n"))}' <"$decline"
+    # An unreadable reason still declines (no strike), without one.
+    reason="$(jq -Rsc '.[0:500] | rtrimstr("\n")' <"$decline" 2>/dev/null)" || reason='""'
+    jq -nc --argjson r "$reason" '{status: "cannot_deliver", reason: $r}'
     rm -f -- "$request" "$error"
     exit 0
   fi
   now="$(date +%s)"
   if ((now >= give_up)); then
-    if [[ -e "$request" ]]; then mv -f -- "$request" "$SPOOL/expired/$key.json"; fi
+    # A move that fails (expired/ not writable) must not turn the timeout into a strike.
+    if [[ -e "$request" ]]; then mv -f -- "$request" "$SPOOL/expired/$key.json" 2>/dev/null || true; fi
     jq -nc '{status: "cannot_deliver", reason: "no answer before the deadline"}'
     exit 0
   fi
