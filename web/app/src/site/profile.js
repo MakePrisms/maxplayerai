@@ -9,7 +9,8 @@ export function paint(el, html) { if (el._h !== html) { el._h = html; el.innerHT
 
 // A name is a link to its profile (an expert's, or since Bob 2026-11-21 a buyer's): a real address, so it also opens
 // in a new tab and can be shared. A click opens the profile in the panel instead (see openProfile).
-export const who = (w, kind) => (w.npub
+// plain: the name only, no link (a line that opens its job: Bob, 2026-11-28, a click there opens only the job).
+export const who = (w, kind, plain = false) => (w.npub && !plain
   ? `<a class="who${w.named ? '' : ' hex'}" href="/market?${kind}=${w.npub}" data-pk="${w.key}" data-kind="${kind}">${esc(w.name)}</a>`
   : `<b class="who${w.named ? '' : ' hex'}">${esc(w.name)}</b>`);
 export const lamp = (cls, label) => `<i class="lamp ${cls}" role="img" aria-label="${label}" title="${label}"></i>`;
@@ -23,9 +24,9 @@ export function age(at) {
 // Bob (2026-11-21/22): a job posted is white; hired is yellow, the job done (accepted or paid) green and a failure
 // (a terminal feedback) red; every other step is a filled light gray.
 const EV_LAMP = { offer: 'post', award: 'hire', accept: 'done', receipt: 'done' };
-export function eventText(f) {
+export function eventText(f, plain = false) {
   const sells = f.stage === 'claim' || f.stage === 'result' || f.stage === 'feedback';     // the expert acts in these; in the rest the buyer does
-  const a = who(f.actor, sells ? 'expert' : 'buyer'), o = f.other ? who(f.other, sells ? 'buyer' : 'expert') : f.unknownOther ? zero('an undetermined expert') : '';
+  const a = who(f.actor, sells ? 'expert' : 'buyer', plain), o = f.other ? who(f.other, sells ? 'buyer' : 'expert', plain) : f.unknownOther ? zero('an undetermined expert') : '';
   const rd = f.turn > 1 ? ` <span class="rd">· round ${f.turn}</span>` : '';
   const amt = f.price ? ` <span class="amt">· ${esc(f.price)}</span>` : '';
   switch (f.stage) {
@@ -43,11 +44,13 @@ export function eventText(f) {
 }
 // A line that belongs to a job opens the job's panel on /market (Bob, 2026-11-28): the whole row on a click, and its
 // age is a real link (/market?job=<id>), so it opens in a new tab, is reached by keyboard and works on /swarm too.
-// open = false: the job's own panel, where its lines open nothing.
+// Its names are plain text, not links to the profiles (Bob, 2026-11-28: a click on the line only opens the job; the job
+// panel names the buyer and the expert, as links). open = false: the job's own panel, where its lines open nothing and
+// the names stay links.
 const jobId = f => (f.job && /^[0-9a-f]{64}$/.test(f.job) ? f.job : null);
 export const eventRow = (f, lit, open = true) => {
   const job = open ? jobId(f) : null, when = age(f.at);
-  return `<li class="row g-a${job ? ' go' : ''}${lit ? ' new' : ''}"${job ? ` data-job="${job}"` : ''}>${lamp(f.stage === 'feedback' && f.terminal ? 'stop' : EV_LAMP[f.stage] || 'step', f.stage)}<span class="ev">${eventText(f)}</span>${job
+  return `<li class="row g-a${job ? ' go' : ''}${lit ? ' new' : ''}"${job ? ` data-job="${job}"` : ''}>${lamp(f.stage === 'feedback' && f.terminal ? 'stop' : EV_LAMP[f.stage] || 'step', f.stage)}<span class="ev">${eventText(f, !!job)}</span>${job
     ? `<a class="age" href="/market?job=${job}" data-job="${job}" title="Open the job">${when}</a>`
     : `<span class="age">${when}</span>`}</li>`;
 };
