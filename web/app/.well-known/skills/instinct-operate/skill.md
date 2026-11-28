@@ -233,7 +233,7 @@ every wallet, key, team or version change.
 Restore on a fresh box: fetch, decrypt, extract, `npm install --prefix PROJECT_DIR
 maxplayer@VERSION`, restart the daemons, then check `$MP whoami` (same pubkey), `$MP buyer status`
 (same balance), `$MP account status` and `$MP team list`. Test a restore once into a scratch
-directory. Verified once end to end on an Instinct seat (27 Nov 2026, 0.8.2-rc4): after a full
+directory. Verified once end to end on an Instinct seat (27 Nov 2026, the then-current 0.8.2 build): after a full
 sandbox wipe, the recommended backup above restored both seats in a few minutes, the wallet balance
 matched before and after, and both seats were back up and advertising.
 
