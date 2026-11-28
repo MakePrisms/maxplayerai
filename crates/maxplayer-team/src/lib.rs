@@ -20,6 +20,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -89,6 +90,75 @@ pub const CLOCK_SKEW: u64 = 900;
 /// `watch` waits this long for one verdict while it holds the state lock; a later verdict is
 /// picked up by the retry (30 s).
 pub const WATCH_REVIEW_WAIT: Duration = Duration::from_secs(5);
+/// A relay read is given up this long after its own timeout, should the SDK not honour it.
+const READ_GRACE: Duration = Duration::from_secs(10);
+/// `watch` gives up one relay step (connect, subscribe, shutdown) after this long and reconnects.
+pub const WATCH_STEP: Duration = Duration::from_secs(20);
+/// `watch` waits this long for the state lock before it reconnects and tries again.
+pub const WATCH_LOCK_WAIT: Duration = Duration::from_secs(30);
+/// A `watch` that has made no progress for this long is stuck: its watchdog restarts it. Every
+/// bounded step above, a page fetch and a review are all far shorter.
+pub const WATCH_STALL: Duration = Duration::from_secs(120);
+/// Set by the `watch` supervisor on its worker process (`<supervisor pid>:<restarts>`); removed
+/// from the `--notify` command's environment.
+pub const WATCH_WORKER_ENV: &str = "MAXPLAYER_TEAM_WATCH_WORKER";
+/// How often `watch` drops its connection and reconnects with a catch-up.
+pub const WATCH_REFRESH: Duration = Duration::from_secs(300);
+
+/// Progress marker for `watch`: the time and name of its last step, read by [`spawn_watchdog`].
+pub struct Heartbeat(Mutex<(std::time::Instant, &'static str)>);
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self(Mutex::new((std::time::Instant::now(), "start")))
+    }
+}
+impl Heartbeat {
+    pub fn beat(&self, phase: &'static str) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = (std::time::Instant::now(), phase);
+    }
+    fn last(&self) -> (std::time::Instant, &'static str) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// A thread that calls `on_stall(phase, quiet)` once `heartbeat` has not beaten for `stall`, then
+/// ends. It runs outside the async runtime, so it still fires when a step blocks that runtime's
+/// only thread.
+pub fn spawn_watchdog(
+    heartbeat: Arc<Heartbeat>,
+    stall: Duration,
+    on_stall: impl FnOnce(&'static str, Duration) + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let poll = (stall / 10).clamp(Duration::from_millis(10), Duration::from_secs(5));
+    std::thread::Builder::new().name("team-watch-watchdog".into()).spawn(move || loop {
+        std::thread::sleep(poll);
+        let (at, phase) = heartbeat.last();
+        let quiet = at.elapsed();
+        if quiet >= stall {
+            on_stall(phase, quiet);
+            return;
+        }
+    })
+}
+
+/// One `watch` step given up after `wait`: a relay call that never returns would otherwise hold
+/// the watcher, and its five-minute reconnect, forever.
+async fn bounded<T>(step: &str, wait: Duration, fut: impl std::future::Future<Output = T>) -> Result<T> {
+    tokio::time::timeout(wait, fut).await.map_err(|_| format!("{step} did not finish within {}s", wait.as_secs()).into())
+}
+
+/// The relay's reason when it closed one of the live subscriptions (`ids`): the watcher no longer
+/// receives that source and must reconnect.
+fn closed_live(note: &RelayPoolNotification, ids: &[SubscriptionId]) -> Option<String> {
+    match note {
+        RelayPoolNotification::Message { message: RelayMessage::Closed { subscription_id, message }, .. }
+            if ids.contains(subscription_id.as_ref()) =>
+        {
+            Some(display_text(message))
+        }
+        _ => None,
+    }
+}
 /// Default follow on the default relay (spec §6): Team Maxplayer, posted by maxie-agent for now.
 /// The channel must exist on the relay before a release ships this.
 pub const TEAM_MAXPLAYER: (&str, &str) = (
@@ -357,6 +427,7 @@ impl Notifier {
             match Command::new(&self.cmd[0])
                 .args(&self.cmd[1..])
                 .env("MAXPLAYER_TEAM", team)
+                .env_remove(WATCH_WORKER_ENV)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -382,6 +453,8 @@ pub struct Home {
     /// Longest wait for one verdict (`watch`: [`WATCH_REVIEW_WAIT`]); a review still waiting
     /// counts as unavailable and is retried.
     pub review_wait: Option<Duration>,
+    /// `watch`'s progress marker, beaten at each step (see [`spawn_watchdog`]).
+    pub heartbeat: Option<Arc<Heartbeat>>,
     /// The team invite key: [`INVITE_PUBKEY`], or a test deployment's [`INVITE_PUBKEY_ENV`],
     /// resolved once by [`Home::open`].
     pub invite_key: String,
@@ -408,13 +481,18 @@ impl Home {
         http_base(relay)?;
         let var = std::env::var_os(INVITE_PUBKEY_ENV).map(|v| v.to_string_lossy().into_owned());
         let invite_key = resolve_invite_key(var, relay, &config.registration_url)?;
-        Ok(Self { root, keys, relay: relay.to_owned(), config, sync_deadline: None, review_wait: None, invite_key })
+        Ok(Self { root, keys, relay: relay.to_owned(), config, sync_deadline: None, review_wait: None, heartbeat: None, invite_key })
     }
     /// One relay read: 10 s, or what is left before [`Home::sync_deadline`] (at least 100 ms).
     fn read_wait(&self) -> Duration {
         match self.sync_deadline {
             None => Duration::from_secs(10),
             Some(d) => d.saturating_duration_since(std::time::Instant::now()).clamp(Duration::from_millis(100), Duration::from_secs(10)),
+        }
+    }
+    fn beat(&self, phase: &'static str) {
+        if let Some(h) = &self.heartbeat {
+            h.beat(phase);
         }
     }
     fn past_deadline(&self) -> bool {
@@ -492,6 +570,27 @@ impl Home {
             }
         }
     }
+    /// The state lock for `watch`: polled with an async sleep, so the runtime's only thread keeps
+    /// serving the relay connection while another command holds it, and given up after `wait`.
+    async fn lock_async(&self, wait: Duration) -> Result<Lock> {
+        self.beat("lock");
+        let file = private_file(&self.path("state.lock"))?;
+        let give_up = tokio::time::Instant::now() + wait;
+        loop {
+            // SAFETY: valid owned descriptor; flock changes only its advisory lock.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Lock(file));
+            }
+            let e = std::io::Error::last_os_error();
+            if !matches!(e.raw_os_error(), Some(libc::EWOULDBLOCK) | Some(libc::EINTR)) {
+                return Err(e.into());
+            }
+            if tokio::time::Instant::now() >= give_up {
+                return Err(format!("team state is busy (another `maxplayer team` command held it for {}s)", wait.as_secs()).into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
     /// True once a [`Home::sync_deadline`] has passed: a catch-up that ran into it stopped early
     /// and more messages may be waiting on the relay.
     pub fn deadline_reached(&self) -> bool {
@@ -528,12 +627,19 @@ impl Home {
         };
         let mut out: Vec<Stored> = vec![];
         let mut at: BTreeMap<EventId, usize> = BTreeMap::new();
-        for line in BufReader::new(file).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+        let mut reader = BufReader::new(file);
+        let mut line = vec![];
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let Ok(s) = serde_json::from_str::<Stored>(&line) else {
+            // Bytes, not lines(): a record cut mid-character is invalid UTF-8 and must be skipped
+            // like any damaged line, not fail every read after it.
+            let Ok(s) = serde_json::from_slice::<Stored>(&line) else {
                 eprintln!("warning: skipping a damaged line in team/messages.jsonl");
                 continue;
             };
@@ -548,15 +654,56 @@ impl Home {
         Ok(out)
     }
     fn append(&self, s: &Stored) -> Result<()> {
+        use std::os::unix::fs::FileExt;
         let mut f = OpenOptions::new()
+            .read(true)
             .append(true)
             .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.path("messages.jsonl"))?;
-        writeln!(f, "{}", serde_json::to_string(s)?)?;
+        let mut line = serde_json::to_string(s)?;
+        line.push('\n');
+        // A writer killed mid-line (a stalled watcher's worker) leaves a torn last line, which
+        // [`Home::stored`] skips: start on a fresh line so this record is not glued onto it.
+        let len = f.metadata()?.len();
+        let mut last = [0u8; 1];
+        if len > 0 && f.read_exact_at(&mut last, len - 1).is_ok() && last[0] != b'\n' {
+            line.insert(0, '\n');
+        }
+        f.write_all(line.as_bytes())?;
         f.sync_all()?;
         Ok(())
+    }
+    /// Claim this home's single `watch`: an exclusive lock on `team/watch.lock`, held while the
+    /// returned file is open. Refused while another `watch` holds it.
+    pub fn claim_watch(&self) -> Result<File> {
+        let file = private_file(&self.path("watch.lock"))?;
+        // SAFETY: valid owned descriptor; flock changes only its advisory lock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err("another `maxplayer team watch` is already running for this home".into());
+            }
+            return Err(e.into());
+        }
+        Ok(file)
+    }
+    /// Channels with a delivered message from someone else that `inbox` has not shown yet: a
+    /// restarted watcher wakes `--notify` for them, since a wake-up due when the stuck worker
+    /// was stopped is otherwise lost.
+    pub fn unread_channels(&self) -> Result<Vec<String>> {
+        let state = self.load()?;
+        let mut out = BTreeSet::new();
+        for s in self.stored()? {
+            if s.event.pubkey.to_hex() != self.me()
+                && !state.read.contains(&s.event.id.to_hex())
+                && self.status(&state, &s) == Status::Delivered
+            {
+                out.insert(s.channel);
+            }
+        }
+        Ok(out.into_iter().collect())
     }
     pub fn follows(&self, state: &State) -> Vec<Follow> {
         state.follows.clone().unwrap_or_else(|| {
@@ -969,6 +1116,7 @@ impl Home {
     }
 
     async fn review(&self, client: &Client, state: &mut State, request: &review::Request, counterparty: &str) -> Outcome {
+        self.beat("review");
         let t = now();
         state.review_times.retain(|x| x + REVIEW_WINDOW > t);
         if state.review_times.len() >= REVIEW_CAP {
@@ -1007,6 +1155,7 @@ impl Home {
         event: Event,
         available: &mut bool,
     ) -> Result<bool> {
+        self.beat("ingest");
         // The cursor passes what is already stored (the reader's own sends too) and a newly
         // admitted message, never one that fails admission.
         let seen = known.contains(&event.id);
@@ -1112,7 +1261,9 @@ impl Home {
             let mut events: BTreeMap<EventId, Event> = BTreeMap::new();
             match state.cursors.get(&channel) {
                 None => {
-                    for e in client.fetch_events(base.limit(FIRST_SYNC), self.read_wait()).await? {
+                    self.beat("catch-up");
+                    let read = client.fetch_events(base.limit(FIRST_SYNC), self.read_wait());
+                    for e in bounded("catch-up read", self.read_wait() + READ_GRACE, read).await?? {
                         events.insert(e.id, e);
                     }
                 }
@@ -1130,7 +1281,9 @@ impl Home {
                         if let Some(u) = until {
                             f = f.until(u);
                         }
-                        let page: Vec<Event> = client.fetch_events(f, self.read_wait()).await?.into_iter().collect();
+                        self.beat("catch-up");
+                        let read = client.fetch_events(f, self.read_wait());
+                        let page: Vec<Event> = bounded("catch-up read", self.read_wait() + READ_GRACE, read).await??.into_iter().collect();
                         let full = page.len() >= 1000;
                         let oldest = page.iter().map(|e| e.created_at).min();
                         let before = events.len();
@@ -1178,18 +1331,27 @@ impl Home {
     }
 
     /// Stay connected; reconnect fresh every five minutes. Never returns except on a fatal error.
-    pub async fn watch(mut self, notify: Vec<String>) -> Result<()> {
+    /// Every relay step and lock wait is bounded, so a hung one ends this connection with an error
+    /// line and a reconnect; a [`Home::heartbeat`] lets a [`spawn_watchdog`] catch anything else
+    /// (the CLI then stops this worker and its supervisor starts a fresh one).
+    /// With `wake_unread` (a restarted worker), `--notify` runs first for any unread message.
+    pub async fn watch(mut self, notify: Vec<String>, wake_unread: bool) -> Result<()> {
         self.review_wait = Some(WATCH_REVIEW_WAIT);
         let mut notifier = Notifier::new(notify);
+        if wake_unread {
+            self.unread_channels()?.into_iter().for_each(|c| notifier.note(c));
+        }
         let mut failures = 0u32;
         loop {
-            match self.watch_once(&mut notifier).await {
+            self.beat("connect");
+            match self.watch_once(&mut notifier, WATCH_REFRESH).await {
                 Ok(()) => failures = 0,
                 Err(e) => {
                     failures += 1;
                     eprintln!("maxplayer team watch: {}", display_text(&e.to_string()));
                     let until = tokio::time::Instant::now() + Duration::from_secs((2u64 << failures.min(5)).min(60));
                     while tokio::time::Instant::now() < until {
+                        self.beat("back-off");
                         notifier.tick();
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
@@ -1197,13 +1359,24 @@ impl Home {
             }
         }
     }
-    async fn watch_once(&self, notifier: &mut Notifier) -> Result<()> {
-        let client = self.connect().await?;
+    /// One connection: catch up, subscribe, deliver live messages until `refresh` has passed. The
+    /// client is shut down on every path, a shutdown that hangs is abandoned.
+    async fn watch_once(&self, notifier: &mut Notifier, refresh: Duration) -> Result<()> {
+        // `connected`: a relay not reached after the sign-in wait is an error, not a deaf client.
+        let client = bounded("relay connect", WATCH_STEP, self.connected()).await??;
+        let result = self.watch_live(&client, notifier, refresh).await;
+        self.beat("shutdown");
+        if let Err(e) = bounded("relay shutdown", WATCH_STEP, client.shutdown()).await {
+            eprintln!("maxplayer team watch: {e}; abandoning the old connection");
+        }
+        result
+    }
+    async fn watch_live(&self, client: &Client, notifier: &mut Notifier, refresh: Duration) -> Result<()> {
         let start = Timestamp::from(now().saturating_sub(CLOCK_SKEW));
         let sources = {
-            let _lock = self.lock()?;
+            let _lock = self.lock_async(WATCH_LOCK_WAIT).await?;
             let mut state = self.load()?;
-            let caught = self.catch_up(&client, &mut state).await;
+            let caught = self.catch_up(client, &mut state).await;
             self.save(&state)?;
             caught?.into_iter().for_each(|c| notifier.note(c));
             self.sources(&state)
@@ -1214,22 +1387,31 @@ impl Home {
             .map(|(c, o)| Self::source_filter(c, o.as_deref()).map(|f| f.since(start)))
             .collect::<Result<Vec<_>>>()?;
         let mut notes = client.notifications();
+        let mut ids = vec![];
         for f in filters {
-            client.subscribe(f, None).await?;
+            self.beat("subscribe");
+            let sub = bounded("relay subscribe", WATCH_STEP, client.subscribe(f, None)).await??;
+            // The pool answers Ok with no successful relay when the REQ could not be sent.
+            if sub.success.is_empty() {
+                let why: Vec<String> = sub.failed.values().map(|e| display_text(e)).collect();
+                return Err(format!("relay refused the live subscription: {}", why.join("; ")).into());
+            }
+            ids.push(sub.val);
         }
         let mut known: BTreeSet<EventId> = self.stored()?.into_iter().map(|s| s.event.id).collect();
-        let refresh = tokio::time::Instant::now() + Duration::from_secs(300);
+        let refresh = tokio::time::Instant::now() + refresh;
         let mut retry_tick = tokio::time::Instant::now() + Duration::from_secs(30);
-        let result = loop {
+        loop {
+            self.beat("live");
             notifier.tick();
             if tokio::time::Instant::now() > refresh {
-                break Ok(());
+                return Ok(());
             }
             if tokio::time::Instant::now() > retry_tick {
                 retry_tick = tokio::time::Instant::now() + Duration::from_secs(30);
-                let _lock = self.lock()?;
+                let _lock = self.lock_async(WATCH_LOCK_WAIT).await?;
                 let mut state = self.load()?;
-                let delivered = self.retry_due(&client, &mut state).await;
+                let delivered = self.retry_due(client, &mut state).await;
                 self.save(&state)?;
                 delivered?.into_iter().for_each(|c| notifier.note(c));
             }
@@ -1238,7 +1420,7 @@ impl Home {
                 Ok(Ok(RelayPoolNotification::Event { event, .. })) => {
                     let Some(channel) = tag_value(&event, "h") else { continue };
                     let Some((_, owner)) = sources.iter().find(|(c, _)| *c == channel) else { continue };
-                    let _lock = self.lock()?;
+                    let _lock = self.lock_async(WATCH_LOCK_WAIT).await?;
                     // Another process (send, inbox) may have stored it since `known` was read.
                     if !known.contains(&event.id) {
                         known.extend(self.stored()?.into_iter().map(|s| s.event.id));
@@ -1246,23 +1428,23 @@ impl Home {
                     let mut state = self.load()?;
                     let mut available = true;
                     let delivered = self
-                        .ingest(&client, &mut state, &mut known, &channel, owner.as_deref(), *event, &mut available)
+                        .ingest(client, &mut state, &mut known, &channel, owner.as_deref(), *event, &mut available)
                         .await;
                     self.save(&state)?;
-                    match delivered {
-                        Ok(true) => notifier.note(channel),
-                        Ok(false) => {}
-                        Err(e) => break Err(e),
+                    if delivered? {
+                        notifier.note(channel);
                     }
                 }
-                Ok(Ok(RelayPoolNotification::Shutdown)) => break Err("relay pool shut down".into()),
-                Ok(Ok(_)) => {}
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => break Ok(()),
-                Ok(Err(e)) => break Err(e.into()),
+                Ok(Ok(RelayPoolNotification::Shutdown)) => return Err("relay pool shut down".into()),
+                Ok(Ok(note)) => {
+                    if let Some(reason) = closed_live(&note, &ids) {
+                        return Err(format!("relay closed the live subscription: {reason}").into());
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => return Ok(()),
+                Ok(Err(e)) => return Err(e.into()),
             }
-        };
-        client.shutdown().await;
-        result
+        }
     }
 
     /// Inbox lines not shown before, oldest first: delivered messages, and each withheld state

@@ -820,3 +820,176 @@ async fn delete_refuses_a_non_owner_and_deletes_nothing_without_a_revoke() {
     assert!(h.load().unwrap().teams.contains_key(CH));
 }
 // END team delete tests
+
+
+// ---- watch liveness ----------------------------------------------------------------------
+
+/// The watchdog stays quiet while beats arrive, then fires once with the last phase when they stop.
+#[test]
+fn watchdog_fires_once_with_the_last_phase_after_beats_stop() {
+    let hb = Arc::new(Heartbeat::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    spawn_watchdog(hb.clone(), Duration::from_millis(300), move |phase, quiet| tx.send((phase, quiet)).unwrap()).unwrap();
+    for _ in 0..10 {
+        hb.beat("live");
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    assert!(rx.try_recv().is_err(), "fired while beating");
+    hb.beat("subscribe");
+    let (phase, quiet) = rx.recv_timeout(Duration::from_secs(3)).expect("fires after beats stop");
+    assert_eq!(phase, "subscribe");
+    assert!(quiet >= Duration::from_millis(300), "{quiet:?}");
+    assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "fires once");
+}
+
+/// A relay step that never finishes is given up with an error naming it.
+#[tokio::test]
+async fn a_watch_step_that_never_finishes_is_given_up() {
+    let r = tokio::time::timeout(Duration::from_secs(5), bounded("relay subscribe", Duration::from_millis(100), std::future::pending::<()>()))
+        .await
+        .expect("bounded returns");
+    let e = r.unwrap_err().to_string();
+    assert!(e.contains("relay subscribe did not finish"), "{e}");
+    assert_eq!(bounded("x", Duration::from_secs(1), async { 7 }).await.unwrap(), 7);
+}
+
+/// `watch`'s lock wait: a held state lock is an error after the wait, and the runtime's only
+/// thread keeps running other tasks meanwhile (no blocking sleep).
+#[tokio::test]
+async fn a_held_state_lock_is_given_up_without_blocking_the_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = home(dir.path(), "wss://relay.example");
+    let holder = home(dir.path(), "wss://relay.example");
+    let held = holder.lock().unwrap();
+    let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let t = ticks.clone();
+    let ticker = tokio::spawn(async move {
+        loop {
+            t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(5), h.lock_async(Duration::from_millis(400))).await.expect("lock_async returned");
+    assert!(r.err().expect("busy").to_string().contains("team state is busy"));
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) >= 5, "runtime starved while waiting");
+    ticker.abort();
+    drop(held);
+    assert!(h.lock_async(Duration::from_millis(400)).await.is_ok(), "free once released");
+}
+
+/// A record appended after a torn last line (a writer killed mid-line) starts on its own line,
+/// so it is read back; the torn line alone is skipped.
+#[test]
+fn an_append_after_a_torn_line_is_still_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = home(dir.path(), "wss://relay.example");
+    let first = msg_at(&Keys::generate(), "one", now());
+    h.append(&Stored { channel: CH.into(), event: first, verdict: None, error: None }).unwrap();
+    let mut f = OpenOptions::new().append(true).open(h.path("messages.jsonl")).unwrap();
+    f.write_all(br#"{"channel":"0b0e5f1c-9d4a"#).unwrap();
+    drop(f);
+    let second = msg_at(&Keys::generate(), "two", now());
+    h.append(&Stored { channel: CH.into(), event: second.clone(), verdict: None, error: None }).unwrap();
+    let ids: Vec<EventId> = h.stored().unwrap().into_iter().map(|s| s.event.id).collect();
+    assert_eq!(ids.len(), 2, "both whole records read back");
+    assert_eq!(ids[1], second.id);
+}
+
+/// A record cut mid-character (invalid UTF-8) is skipped like any damaged line; the records
+/// around it still read.
+#[test]
+fn a_torn_line_with_invalid_utf8_does_not_break_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = home(dir.path(), "wss://relay.example");
+    let first = msg_at(&Keys::generate(), "one", now());
+    h.append(&Stored { channel: CH.into(), event: first, verdict: None, error: None }).unwrap();
+    let mut f = OpenOptions::new().append(true).open(h.path("messages.jsonl")).unwrap();
+    f.write_all(b"{\"channel\":\"caf\xc3").unwrap();
+    drop(f);
+    let second = msg_at(&Keys::generate(), "two", now());
+    h.append(&Stored { channel: CH.into(), event: second, verdict: None, error: None }).unwrap();
+    assert_eq!(h.stored().unwrap().len(), 2);
+}
+
+/// One `watch` per home: a second claim is refused while the first is held, and free after.
+#[test]
+fn only_one_watch_per_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = home(dir.path(), "wss://relay.example");
+    let first = h.claim_watch().unwrap();
+    let e = home(dir.path(), "wss://relay.example").claim_watch().unwrap_err().to_string();
+    assert!(e.contains("already running"), "{e}");
+    drop(first);
+    h.claim_watch().unwrap();
+}
+
+/// A restarted worker wakes `--notify` for delivered messages `inbox` has not shown yet.
+#[test]
+fn unread_channels_lists_delivered_messages_not_yet_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(dir.path(), "wss://relay.example");
+    h.config.review.team_message = false;
+    join_crew(&h);
+    assert!(h.unread_channels().unwrap().is_empty());
+    let m = msg_at(&Keys::generate(), "hi", now());
+    h.append(&Stored { channel: CH.into(), event: m, verdict: None, error: None }).unwrap();
+    assert_eq!(h.unread_channels().unwrap(), vec![CH.to_owned()]);
+    h.take_inbox(|_| Ok(())).unwrap();
+    assert!(h.unread_channels().unwrap().is_empty(), "shown by inbox");
+}
+
+/// A CLOSED for a live subscription ends the connection (reconnect); others are ignored.
+#[test]
+fn a_closed_live_subscription_is_detected() {
+    let ours = SubscriptionId::new("live");
+    let closed = |id: &str| RelayPoolNotification::Message {
+        relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
+        message: RelayMessage::closed(SubscriptionId::new(id), "auth-required: sign in"),
+    };
+    assert_eq!(closed_live(&closed("live"), std::slice::from_ref(&ours)).as_deref(), Some("auth-required: sign in"));
+    assert_eq!(closed_live(&closed("fetch"), std::slice::from_ref(&ours)), None);
+    assert_eq!(closed_live(&RelayPoolNotification::Shutdown, std::slice::from_ref(&ours)), None);
+}
+
+/// One `watch` connection: a message sent after it subscribed is delivered and wakes the notify
+/// command, the connection ends at its refresh, beating the heartbeat throughout.
+#[tokio::test]
+async fn watch_once_delivers_live_messages_and_ends_at_its_refresh() {
+    let (_relay, url, client) = local_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(dir.path(), &url);
+    h.config.review.team_message = false;
+    join_crew(&h);
+    let hb = Arc::new(Heartbeat::default());
+    h.heartbeat = Some(hb.clone());
+    let woke = dir.path().join("woke");
+    let mut notifier = Notifier::new(vec!["sh".into(), "-c".into(), format!("printf %s \"$MAXPLAYER_TEAM\" > {}", woke.display())]);
+    let sender = client.clone();
+    let live = hb.clone();
+    // Sent once the watcher is subscribed (its first live-loop pass), not after a guessed delay.
+    let send = tokio::spawn(async move {
+        while live.last().1 != "live" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let live_at = std::time::Instant::now();
+        sender.send_event(&msg_at(&Keys::generate(), "live one", now())).await.unwrap();
+        live_at
+    });
+    let started = std::time::Instant::now();
+    // The local relay asks for no sign-in, so connect waits out its 10 s sign-in window first.
+    let ended = tokio::time::timeout(Duration::from_secs(40), h.watch_once(&mut notifier, Duration::from_secs(3))).await;
+    ended.unwrap_or_else(|_| panic!("watch_once did not end; last step {}", hb.last().1)).unwrap();
+    let live_at = send.await.unwrap();
+    // The refresh counts from the subscription, not from the start of the (slow) connect.
+    assert!(live_at.elapsed() >= Duration::from_millis(2500), "{:?}", live_at.elapsed());
+    assert!(started.elapsed() >= Duration::from_secs(3));
+    assert_eq!(delivered(&h), 1);
+    if let Some(mut child) = notifier.child.take() {
+        child.wait().unwrap();
+    }
+    assert_eq!(fs::read_to_string(&woke).unwrap(), CH, "notify woken for the team");
+    assert_eq!(hb.last().1, "shutdown");
+}
+

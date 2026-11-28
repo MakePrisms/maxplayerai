@@ -2600,6 +2600,10 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_TEAM",
     // Test deployments only: the team invite key their registration service holds.
     "MAXPLAYER_TEAM_INVITE_PUBKEY",
+    // `maxplayer team watch`: set by its supervisor on the worker process it starts.
+    "MAXPLAYER_TEAM_WATCH_WORKER",
+    // Tests only: a shorter `team watch` stall limit.
+    "MAXPLAYER_TEAM_WATCH_STALL_SECS",
     // `maxplayer account link`: where the website's legal versions manifest is read (tests point it
     // at a fake; empty = this build's terms and privacy versions only).
     "MAXPLAYER_LEGAL_VERSIONS_URL",
