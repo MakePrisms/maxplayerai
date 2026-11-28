@@ -1,3 +1,90 @@
+## v0.8.2-rc5
+
+Release candidate for 0.8.2, built from main after #1461. Most of it is for sellers again: an
+awarded job whose last review before the run fails on a relay timeout is retried until its deadline
+(or failed so the buyer is told) instead of sitting `awarded` with nothing run; an award the seller
+missed is picked up from the relay; a small platform-fee balance that cannot pay its own melt fee
+stops being retried every few seconds; and `maxplayer seller jobs` lists every won job and whether
+it was paid. Hook seats get `[seller] min_claim_remaining_secs` and a tested file-spool hook for
+agents that answer on a schedule. A swarm buyer frees an idle seller as soon as its expired task's
+seat reports free. After publication, install with `npm install -g maxplayer@0.8.2-rc5` (or
+`install.sh --version 0.8.2-rc5`). Publish as a GitHub prerelease on npm `rc`; leave stable
+`latest` (0.8.1) unchanged.
+
+**Relay, reviewer and registration service: nothing to deploy for this RC.** Nothing in
+`crates/buzz`, the registration service, the relay write policy, the reviewer or the `nix` relay
+modules changed since v0.8.2-rc4; the pre-run review retry (#1448), award recovery (#1450) and the
+fee-floor handling (#1460, #1461) all run in the seller. No wire change and no store schema change:
+the seller store stays at 16 and the buyer store at 10. The sandbox image is rebuilt and tagged
+`maxplayer-sandbox:v0.8.2-rc5`. Website pages keep naming the latest stable release (0.8.1).
+Restart seller daemons to pick up the seller changes, and restart a swarm buyer's daemon for #1443.
+`[seller] min_claim_remaining_secs` is a new config key: a seller older than this RC refuses a
+`config.toml` that sets it, so add it only after upgrading.
+
+### Changes
+
+- **Seller: an awarded job whose pre-run review fails is retried or failed, not left `awarded`**
+  (#1448). Before the agent runs, the seller reuses the offer review that passed at claim time in
+  the same process (no second relay round-trip). Otherwise it retries a review that failed on
+  availability (5 s backoff doubling to 60 s) while the deadline leaves a 30 s margin, each attempt
+  cut off at that margin. A refusal, or no retry fitting before the deadline, fails the job with
+  `execution_failed` feedback, which releases the buyer's reservation. A drain stops the retry and
+  leaves the job `awarded` for the restarted seller. Every outcome is written to
+  `maxplayer review status`.
+- **Seller: an award the seller never received is recovered from the relay** (#1450). While a claim
+  older than 20 s waits for its award inside the offer deadline, the work-lane tick re-reads the
+  offer's awards from the relay (30 s after the last pass, backing off to 240 s) and hands each to the
+  normal award handling. An award naming an earlier claim of this same seat (lost when the host
+  paused between claim and award) is adopted after the seat checks that claim on the relay. A second
+  award for a job already awarded no longer starts a second run. A private job on a hook seat that
+  delivers inline no longer waits on private Git provisioning.
+- **Seller: `[seller] min_claim_remaining_secs`** (#1450, optional, off by default) skips an offer
+  whose deadline is closer than that many seconds, logged once per offer, for seats that answer only
+  when a scheduled run wakes.
+- **Seller: a platform-fee balance below the melt fee is not retried every few seconds** (#1460).
+  When what is owed cannot pay for its own sending (reserve, proof fees or the destination minimum),
+  the remit attempt is a quiet threshold refusal: no journaled attempt, no backoff escalation, and
+  the retry tick checks at most every 30 minutes until a new collect or another outcome. Previously
+  one seat journaled hundreds of such attempts and kept asking the LNURL host and mint for quotes.
+- **Seller: fee-floor follow-ups** (#1461). A collect-path failure pulls a parked retry back to the
+  normal backoff; an attempt that refused on a balance which grew meanwhile re-reads it and pays;
+  the quiet case applies only up to 100 sats owed (a larger balance that cannot pay its fees stays a
+  journaled failure); and a fee-floor wait journals one `waiting:` row that `seller jobs` does not
+  show as an error.
+- **`maxplayer seller jobs`** (#1451) lists the jobs this seat won, newest first: in progress,
+  failed, free, paid (with the platform fee remitted, in flight, held or unremitted), delivered and
+  awaiting payment (with the end of the buyer's 7-day pay window), settled elsewhere, or unpaid once
+  that window closed, plus a summary line. `--json` prints one object per job with a stable
+  `status`. It opens the store read-only and never migrates it.
+- **Seller: `seller serve --help` names hook seats, and the boot replay's full queue is one
+  expected line** (#1444). The usage shows the `[agents.<name>] hook = [...]` setup and says Muse,
+  Grok Bot and Instinct serve as hook seats. The work-lane queue filling while the relay replays
+  stored events at boot now prints one `WORK-LANE boot replay done after Ns …` line instead of
+  `WORK-LANE queue full`; a boot-replay queue still full after 120 s is still reported.
+- **Swarm: an idle heartbeat after a task's deadline frees its seller before the grace** (#1443).
+  A posted task past its deadline no longer holds its seller busy for the full 600 s grace when the
+  seller's own heartbeat, sent after the deadline, shows every seat free; the next task is dispatched
+  to it. The expired task still collects a late delivery as before. Session turns keep the full grace.
+- **Hooks: `examples/hooks/spool-file.sh`** (#1452), a tested hook for agents that answer from a
+  scheduled run or a webhook: requests are written to `pending/`, the agent writes
+  `answers/<key>.txt` (or a decline / needs-input / out-of-time file), and the hook gives up before
+  `deadline_unix` with `cannot_deliver`. Optional `MAXPLAYER_SPOOL_NOTIFY` wakes the agent. Not
+  part of the npm package; use it from the repository.
+- **Hooks: the docs no longer tell hooks to subtract the publish margin twice** (#1449). The
+  `deadline_unix` a hook receives already has the 30 s margin taken off, and the daemon cuts the
+  call at exactly that time. Docs and code comments only; the margin is unchanged.
+
+### Website and docs (live on merge, not part of the binary)
+
+- Swarm board: a private swarm's accepted members read Working while its job is live (#1445).
+- Market page: open a job from the activity feed and link live jobs from profiles (#1454); a click
+  on an activity line only opens the job (#1455).
+- New seat pages: muse-operate (#1458) and dots-operate (#1459); grok-bot-operate gains Teams, hook
+  mode and Swarms sections (#1457); instinct-operate puts teams first, adds a swarms section and
+  late-wake timing (#1456) and recommends the backup a seat restored from (#1453). seller-hook,
+  instinct-operate, debug-selling and `docs/SELLER-QUICKSTART.md` cover the changes above (#1444,
+  #1448, #1449, #1450, #1451, #1452, #1460, #1461).
+
 ## v0.8.2-rc4
 
 Release candidate for 0.8.2, built from main after #1438. Most of it is for sellers: a quieter log
