@@ -592,6 +592,9 @@ pub struct JobPaymentsSnapshot {
     /// The CURRENT state of the remittance that attempt names (`planned`, `spending`, `settled`,
     /// `failed`), so a reader can tell a failure a later reconciliation already resolved.
     pub last_attempt_remittance_state: Option<String>,
+    /// When that remittance was planned: the receipts it pinned were all collected by then, so a
+    /// released (`failed`) plan's error covers no receipt collected after it (#1451 r2 M-1).
+    pub last_attempt_remittance_created_at_unix: Option<i64>,
     /// Platform fee on this seat not yet confirmed sent: every receipt with a fee whose remittance
     /// is absent or not `settled`, across all jobs (not only the listed ones).
     pub unsent_fee_sats: u64,
@@ -1103,8 +1106,10 @@ impl SellerStore {
     }
 
     /// Open an existing state DB READ-ONLY, for inspection commands (`maxplayer seller jobs`): no
-    /// WAL switch, no schema creation, no migration, so it works on a read-only mount and never
-    /// migrates a store a running (possibly older) `seller serve` owns. A store older than
+    /// WAL switch, no schema creation, no migration, so it never migrates a store a running
+    /// (possibly older) `seller serve` owns and reads safely alongside it. It still needs write
+    /// access to the store's directory while a `-wal` file is present (SQLite keeps WAL read marks
+    /// in `-shm`): a read-only mount works only for a cleanly closed store. A store older than
     /// [`SCHEMA_VERSION`] is refused with a hint rather than read with missing columns.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let conn = Connection::open_with_flags(
@@ -3546,19 +3551,26 @@ impl SellerStore {
         let tx = conn.unchecked_transaction()?;
         let rows = query_job_payments(&tx, limit)?;
         let last_attempt = query_remit_attempts(&tx, 1)?.into_iter().next();
-        let last_attempt_remittance_state = match last_attempt
+        let last_attempt_remittance = match last_attempt
             .as_ref()
             .and_then(|attempt| attempt.remittance_id.as_deref())
         {
             Some(id) => tx
                 .query_row(
-                    &format!("SELECT {REMITTANCE_STATE_SQL} FROM fee_remittances WHERE remittance_id = ?1"),
+                    &format!(
+                        "SELECT {REMITTANCE_STATE_SQL}, created_at_unix FROM fee_remittances WHERE remittance_id = ?1"
+                    ),
                     [id],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?,
             None => None,
         };
+        let (last_attempt_remittance_state, last_attempt_remittance_created_at_unix) =
+            match last_attempt_remittance {
+                Some((state, created_at)) => (Some(state), Some(created_at)),
+                None => (None, None),
+            };
         let unsent_fee_sats: i64 = tx.query_row(
             "SELECT COALESCE(SUM(r.fee_sats), 0) FROM receipts r
              LEFT JOIN fee_remittances f ON f.remittance_id = r.remittance_id
@@ -3571,6 +3583,7 @@ impl SellerStore {
             rows,
             last_attempt,
             last_attempt_remittance_state,
+            last_attempt_remittance_created_at_unix,
             unsent_fee_sats: u64::try_from(unsent_fee_sats).unwrap_or(0),
         })
     }
@@ -5850,14 +5863,18 @@ mod tests {
         let attempt = snapshot.last_attempt.as_ref().expect("attempt");
         assert_eq!((attempt.detail.as_str(), attempt.remittance_id.as_deref()), ("melt failed", Some("m1")));
         assert_eq!(snapshot.last_attempt_remittance_state.as_deref(), Some("spending"));
+        assert_eq!(snapshot.last_attempt_remittance_created_at_unix, Some(6));
         assert_eq!(snapshot.unsent_fee_sats, 13, "m1's 10 plus the unremitted 3; settled and zero fees excluded");
         {
             let conn = store.lock().expect("lock");
-            conn.execute("UPDATE fee_remittances SET state = 'settled', spending_since_unix = NULL WHERE remittance_id = 'm1'", [])
+            // As `settle_remittance` does: `spending_since_unix` is kept (#1451 r2 L-2).
+            conn.execute("UPDATE fee_remittances SET state = 'settled', settled_at_unix = 8 WHERE remittance_id = 'm1'", [])
                 .expect("reconcile");
         }
         let snapshot = store.job_payments_snapshot(10).expect("snapshot");
         assert_eq!(snapshot.last_attempt_remittance_state.as_deref(), Some("settled"));
+        let by = |id: &str| snapshot.rows.iter().find(|row| row.job_id == id).expect(id).clone();
+        assert_eq!(by("held").receipt.unwrap().remittance_state.as_deref(), Some("settled"));
         assert_eq!(snapshot.unsent_fee_sats, 3);
         let _ = std::fs::remove_file(&path);
     }
@@ -5884,6 +5901,56 @@ mod tests {
             .query_row("SELECT value FROM seller_meta WHERE key = 'schema_version'", [], |row| row.get(0))
             .expect("version");
         assert_eq!(version, "3");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1451 r2 M-2: the read-only handle reads while a `seller serve` connection keeps writing in
+    /// WAL mode: every snapshot opens, never errors, and sees each job together with its receipt
+    /// (one transaction on each side), never one without the other.
+    #[test]
+    fn open_read_only_reads_consistent_snapshots_while_a_writer_is_open() {
+        let (writer, path) = fresh_store("open-read-only-live-writer");
+        {
+            let conn = writer.lock().expect("lock");
+            conn.execute_batch(
+                "INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+                     VALUES ('j0', 'j0', 'paid', 1, 1);
+                 INSERT INTO receipts (receipt_id, job_id, amount_sats, received_at_unix, fee_bps, fee_sats, remittance_id)
+                     VALUES ('c0', 'j0', 10, 1, 1000, 1, NULL);",
+            )
+            .expect("seed");
+        }
+        let read_only = SellerStore::open_read_only(&path).expect("opens beside a live writer");
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        assert!(wal.exists(), "the writer keeps a -wal file open");
+        let writes = std::thread::spawn(move || {
+            for i in 1..200 {
+                let conn = writer.lock().expect("lock");
+                conn.execute_batch(&format!(
+                    "BEGIN IMMEDIATE;
+                     INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+                         VALUES ('j{i}', 'j{i}', 'paid', {i}, {i});
+                     INSERT INTO receipts (receipt_id, job_id, amount_sats, received_at_unix, fee_bps, fee_sats, remittance_id)
+                         VALUES ('c{i}', 'j{i}', 10, {i}, 1000, 1, NULL);
+                     COMMIT;"
+                ))
+                .expect("write");
+            }
+            writer
+        });
+        let mut seen = 0;
+        while !writes.is_finished() {
+            let snapshot = read_only.job_payments_snapshot(1_000).expect("read beside the writer");
+            assert!(snapshot.rows.len() >= seen, "snapshots never go back");
+            seen = snapshot.rows.len();
+            for row in &snapshot.rows {
+                assert!(row.receipt.is_some(), "{} read without its receipt", row.job_id);
+            }
+            assert_eq!(snapshot.unsent_fee_sats, snapshot.rows.len() as u64, "fee sum agrees with the rows");
+        }
+        let writer = writes.join().expect("writer");
+        assert_eq!(read_only.job_payments_snapshot(1_000).expect("read").rows.len(), 200);
+        drop(writer);
         let _ = std::fs::remove_file(&path);
     }
 

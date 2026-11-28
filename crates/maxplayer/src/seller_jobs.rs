@@ -94,7 +94,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
 fn usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]\n\nLists the jobs this seat won, newest first (default {DEFAULT_LIMIT}), each with its state and\nwhether it was paid: free, paid (with the platform fee's remittance), delivered and awaiting\npayment (the buyer can pay for 7 days after delivery), or unpaid once that window closed. When the\nlatest platform-fee remittance attempt did not pay, it prints that attempt's error too; see\n`maxplayer seller fees remit` to retry it. Moves no sats (it only opens, reads and prints the\nseller store). --json prints a flat array, one object per job: job_id, buyer,\nstatus (in_progress | failed | free | paid | awaiting_payment | settled_elsewhere | unpaid),\namount_sats, mint (null until paid), created_at_unix, delivered_at_unix, paid_at_unix,\npay_by_unix (awaiting_payment and unpaid only), fee_sats, fee_status (null unless paid; none |\nin_flight | spending | remitted | unremitted), fee_sent (true once nothing is owed) and fee_error.\nA session job is listed by its first turn only. The store is opened read-only; one an older\nbinary left is refused until `seller serve` from this binary migrates it. A seat that never ran\n`seller serve` has no store: that is an error (exit 2), not an empty list. Exit 0 = printed;\n1 = usage; 2 = error."
+        "Usage:\n  maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]\n\nLists the jobs this seat won, newest first (default {DEFAULT_LIMIT}), each with its state and\nwhether it was paid: free, paid (with the platform fee's remittance), delivered and awaiting\npayment (the buyer can pay for 7 days after delivery), or unpaid once that window closed. When the\nlatest platform-fee remittance attempt (automatic or `seller fees remit`) did not pay, it prints that attempt's error too; see\n`maxplayer seller fees remit` to retry it. Moves no sats (it only opens, reads and prints the\nseller store). --json prints a flat array, one object per job: job_id, buyer,\nstatus (in_progress | failed | free | paid | awaiting_payment | settled_elsewhere | unpaid),\namount_sats, mint (null until paid), created_at_unix, delivered_at_unix, paid_at_unix,\npay_by_unix (awaiting_payment and unpaid only), fee_sats, fee_status (null unless paid; none |\nin_flight | spending | remitted | unremitted), fee_sent (true on a paid job once nothing is owed; false otherwise) and fee_error.\nA session job is listed by its first turn only. The store is opened read-only; one an older\nbinary left is refused until `seller serve` from this binary migrates it. A seat that never ran\n`seller serve` has no store: that is an error (exit 2), not an empty list. Exit 0 = printed;\n1 = usage; 2 = error."
     );
 }
 
@@ -144,34 +144,53 @@ fn active_failed_attempt(
     if attempt.outcome == RemitAttemptOutcome::Paid || snapshot.unsent_fee_sats == 0 {
         return None;
     }
-    if attempt.remittance_id.is_some()
-        && snapshot.last_attempt_remittance_state.as_deref() == Some("settled")
-    {
-        return None;
+    if attempt.remittance_id.is_some() {
+        match snapshot.last_attempt_remittance_state.as_deref() {
+            Some("settled") => return None,
+            // A refusal that found an OLDER plan (held by another live process, settling, changed
+            // under it) is resolved once that plan is released: its error is stale (#1451 r2 M-1).
+            Some("failed")
+                if attempt.outcome == RemitAttemptOutcome::Refused
+                    && snapshot
+                        .last_attempt_remittance_created_at_unix
+                        .is_some_and(|planned| attempt.started_at_unix > planned) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
     }
     Some(attempt)
 }
 
 /// Whether the failed attempt applies to this paid job's fee. An attempt that names a remittance
 /// applies to the receipts pinned to it (a melt that failed or is held leaves them pinned, the
-/// remittance `planned`/`spending`). One that names none — it failed before planning, or its plan
-/// was released — applies to the fees still unremitted when it started (same-second ties count as
-/// covered: the store keeps whole seconds).
+/// remittance `planned`/`spending`). Once that plan is released (`failed`) its receipts are
+/// unremitted again: it applies to those collected by the time the plan was made, never to newer
+/// ones (#1451 r2 M-1). One that names none failed before planning and applies to the fees still
+/// unremitted when it started (same-second ties count as covered: the store keeps whole seconds).
 #[cfg(feature = "wallet")]
 fn attempt_covers(
     attempt: &maxplayer_core::seller_node::store::RemitAttempt,
-    attempt_remittance_state: Option<&str>,
+    snapshot: &maxplayer_core::seller_node::store::JobPaymentsSnapshot,
     receipt: &maxplayer_core::seller_node::store::JobReceipt,
 ) -> bool {
     let fee = fee_status(receipt);
     if matches!(fee, FeeStatus::NoFee | FeeStatus::Remitted) {
         return false;
     }
-    let by_time = fee == FeeStatus::Unremitted && attempt.started_at_unix >= receipt.received_at_unix;
+    let unremitted_by = |at: i64| fee == FeeStatus::Unremitted && at >= receipt.received_at_unix;
     match attempt.remittance_id.as_deref() {
         Some(id) if receipt.remittance_id.as_deref() == Some(id) => true,
-        Some(_) => attempt_remittance_state == Some("failed") && by_time,
-        None => by_time,
+        Some(_) => {
+            snapshot.last_attempt_remittance_state.as_deref() == Some("failed")
+                && unremitted_by(
+                    snapshot
+                        .last_attempt_remittance_created_at_unix
+                        .unwrap_or(attempt.started_at_unix),
+                )
+        }
+        None => unremitted_by(attempt.started_at_unix),
     }
 }
 
@@ -202,7 +221,7 @@ fn json_rows(snapshot: &maxplayer_core::seller_node::store::JobPaymentsSnapshot,
                     (Some(receipt), Some(attempt))
                         if attempt_covers(
                             attempt,
-                            snapshot.last_attempt_remittance_state.as_deref(),
+                            snapshot,
                             receipt,
                         ) =>
                     {
@@ -371,8 +390,8 @@ fn render(
     let mut unpaid = 0usize;
     for row in &snapshot.rows {
         let amount = match paid_or_offered_sats(row) {
-            Some(sats) if row.payment != "none" => format!("{sats} sats"),
-            Some(_) => "free".to_owned(),
+            _ if row.payment == "none" => "free".to_owned(),
+            Some(sats) => format!("{sats} sats"),
             None => "amount unknown".to_owned(),
         };
         let status = match pay_status(row, now) {
@@ -400,7 +419,7 @@ fn render(
                     Some(attempt)
                         if attempt_covers(
                             attempt,
-                            snapshot.last_attempt_remittance_state.as_deref(),
+                            snapshot,
                             receipt,
                         ) =>
                     {
@@ -442,7 +461,7 @@ fn render(
     }
     if let Some(attempt) = attempt {
         text.push_str(&format!(
-            "Seat-wide: the latest platform-fee remittance attempt {} at {}: {}\n  {} sats of platform fee on this seat are not sent yet. Run `maxplayer seller fees remit` to see the plan and retry.\n",
+            "Seat-wide: the latest platform-fee remittance attempt {} at {}: {}\n  {} sats of platform fee on this seat are not settled yet. Run `maxplayer seller fees remit` to see the plan and retry.\n",
             attempt.outcome.as_str(),
             utc(attempt.started_at_unix),
             attempt.detail,
@@ -544,6 +563,7 @@ mod tests {
                 rows,
                 last_attempt,
                 last_attempt_remittance_state: remittance_state.map(str::to_owned),
+                last_attempt_remittance_created_at_unix: None,
                 unsent_fee_sats,
             }
         }
@@ -653,7 +673,48 @@ mod tests {
             let text = render(&snapshot(rows, Some(failed), Some("spending"), 18), 100, "db");
             assert!(text.contains("platform fee 9 sats held: its payment awaits the mint's answer"), "{text}");
             assert!(text.contains("(the last remittance attempt for it did not pay; see below)"), "{text}");
-            assert!(text.contains("18 sats of platform fee on this seat are not sent yet"), "{text}");
+            assert!(text.contains("18 sats of platform fee on this seat are not settled yet"), "{text}");
+        }
+
+        /// r2 M-1: a hold refusal (journaled at 25) names an OLDER plan m1 (made at 10, pinning
+        /// "pinned"); a dry run then released m1 without journaling. The hold is resolved: no job,
+        /// not even the newer one paid at 20, carries it, and there is no footer.
+        #[test]
+        fn a_hold_on_a_released_older_plan_is_not_reported() {
+            let rows = vec![paid_row("pinned", 10, 10, None), paid_row("newer", 20, 5, None)];
+            let held = attempt(25, RemitAttemptOutcome::Refused, Some("m1"), "remittance m1 is planned by another live process");
+            let mut released = snapshot(rows, Some(held), Some("failed"), 15);
+            released.last_attempt_remittance_created_at_unix = Some(10);
+            for job in json_rows(&released, 100).as_array().unwrap() {
+                assert_eq!(job["fee_error"], serde_json::Value::Null, "{job}");
+            }
+            assert!(!render(&released, 100, "db").contains("Seat-wide"));
+        }
+
+        /// r2 M-1: an attempt whose own plan m1 (made at 10) failed and was released covers the
+        /// receipts m1 pinned (collected by 10), not one paid later — even when the attempt that
+        /// journaled it started after that payment.
+        #[test]
+        fn a_released_plans_failure_covers_only_the_receipts_it_pinned() {
+            let rows = vec![paid_row("pinned", 10, 10, None), paid_row("newer", 20, 5, None)];
+            for started in [10, 25] {
+                let failed = attempt(started, RemitAttemptOutcome::Failed, Some("m1"), "quote failed");
+                let mut released = snapshot(rows.clone(), Some(failed), Some("failed"), 15);
+                released.last_attempt_remittance_created_at_unix = Some(10);
+                let value = json_rows(&released, 100);
+                let jobs = value.as_array().unwrap();
+                assert_eq!(by(jobs, "pinned")["fee_error"], "failed: quote failed", "started {started}");
+                assert_eq!(by(jobs, "newer")["fee_error"], serde_json::Value::Null, "started {started}");
+            }
+        }
+
+        /// r2 N-2: a free job whose offer row is gone is still "free" in the header.
+        #[test]
+        fn a_free_job_without_its_offer_row_reads_free() {
+            let mut free = row("free", "delivered", "none", Some(10));
+            free.offer_sats = None;
+            let text = render(&snapshot(vec![free], None, None, 0), 100, "db");
+            assert!(!text.contains("amount unknown"), "{text}");
         }
 
         /// r1 H3: reconciliation settles the remittance a failed attempt named and journals nothing

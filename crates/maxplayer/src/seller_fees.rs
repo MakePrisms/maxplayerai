@@ -136,7 +136,7 @@ fn usage(w: &mut dyn Write) {
 }
 
 #[cfg(feature = "wallet")]
-pub(crate) fn open_store(
+fn open_store(
     home: &Option<PathBuf>,
 ) -> Result<
     (

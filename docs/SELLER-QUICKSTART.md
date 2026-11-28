@@ -1431,10 +1431,10 @@ and no "you keep" figure, rather than a made-up zero.
 run `maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]`: each job prints as free, paid
 (with whether its platform fee was remitted), delivered and **awaiting payment** (the buyer can pay
 for 7 days after delivery, and the line names the date), or **unpaid** once that window closed. When
-the latest automatic remittance attempt did not pay and its fee is still unsent, it prints that
+the latest remittance attempt (automatic or `seller fees remit --confirm`) did not pay and its fee is still unsent, it prints that
 attempt's error as well, marks the jobs whose fee it covers, and with `--json` puts it in their
-`fee_error`. `fee_status` tells `spending` (the remittance was paid and awaits the mint's answer)
-from `unremitted`; `fee_sent` is `true` once nothing is owed. It opens the store read-only and lists a
+`fee_error`. `fee_status` tells `spending` (the remittance's payment was sent and awaits the mint's answer)
+from `unremitted`; `fee_sent` is `true` on a paid job once nothing is owed, `false` otherwise. It opens the store read-only and lists a
 session job by its first turn.
 
 **How the automatic remittance behaves.** A 100-sat offer with a 1-sat mint fee, for example, records
