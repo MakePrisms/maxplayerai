@@ -144,6 +144,14 @@ fn active_failed_attempt(
     if attempt.outcome == RemitAttemptOutcome::Paid || snapshot.unsent_fee_sats == 0 {
         return None;
     }
+    // A fee-floor row: the seat is waiting for its balance to cover the mint's fees, and the
+    // failure before it is no longer current (#1460 r1 M3). Not an error.
+    if attempt
+        .detail
+        .starts_with(maxplayer_core::fee_remit::FEE_FLOOR_WAITING_PREFIX)
+    {
+        return None;
+    }
     if attempt.remittance_id.is_some() {
         match snapshot.last_attempt_remittance_state.as_deref() {
             Some("settled") => return None,
@@ -753,6 +761,29 @@ mod tests {
             assert_eq!(by(jobs, "same-second")["fee_error"], "failed: mint quote failed");
             assert_eq!(by(jobs, "after")["fee_error"], serde_json::Value::Null);
             assert_eq!(by(jobs, "tiny")["fee_error"], serde_json::Value::Null);
+        }
+
+        /// #1460 r1 M3: once the seat settles at the fee floor, the one "waiting" row it journals is
+        /// the latest attempt, and no job (nor the seat-wide footer) reports the earlier failure.
+        #[test]
+        fn a_fee_floor_waiting_row_clears_an_earlier_failure() {
+            let rows = vec![paid_row("owed", 10, 2, None)];
+            let failed = attempt(20, RemitAttemptOutcome::Failed, None, "mint quote failed");
+            let value = json_rows(&snapshot(rows.clone(), Some(failed), None, 2), 100);
+            assert_eq!(by(value.as_array().unwrap(), "owed")["fee_error"], "failed: mint quote failed");
+            let waiting = attempt(
+                30,
+                RemitAttemptOutcome::Refused,
+                None,
+                &format!(
+                    "{}unremitted 2 sats does not yet cover the cost of sending it (the mint's melt fee reserve of 2 sats)",
+                    maxplayer_core::fee_remit::FEE_FLOOR_WAITING_PREFIX
+                ),
+            );
+            let value = json_rows(&snapshot(rows.clone(), Some(waiting.clone()), None, 2), 100);
+            assert_eq!(by(value.as_array().unwrap(), "owed")["fee_error"], serde_json::Value::Null);
+            let text = render(&snapshot(rows, Some(waiting), None, 2), 100, "db");
+            assert!(!text.contains("Seat-wide"), "{text}");
         }
 
         #[test]

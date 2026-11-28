@@ -19,9 +19,10 @@
 //!    30 s, doubling to a 30-minute cap, full jitter — for as long as the node runs, and stops with
 //!    the loop. [`RemitBackoff`] is the pacing; [`RemitFlight`] keeps the two node paths to one
 //!    attempt in flight. A balance too small to pay for its own sending
-//!    ([`Refusal::BelowFeeFloor`]) is not a failure: it is not journaled, does not lengthen the
-//!    streak, and parks the tick at the cap — only a new collect (which tries on its own) can change
-//!    it, so asking the LNURL host and the mint again every 30 s would only repeat the refusal.
+//!    ([`Refusal::BelowFeeFloor`], up to [`FEE_FLOOR_QUIET_MAX_SATS`]) is not a failure: it is not
+//!    journaled (beyond one row clearing an earlier failure), does not lengthen the streak, and parks
+//!    the tick at the cap — only a new collect (which tries on its own) can change it, so asking the
+//!    LNURL host and the mint again every 30 s would only repeat the refusal.
 //! 3. **`maxplayer seller fees remit`** (`crates/maxplayer/src/seller_fees.rs`): inspection (the
 //!    default dry run resolves, quotes, prints the plan and the recent attempts, and moves nothing),
 //!    recovery (`--confirm` forces an attempt now, for an operator whose automatic path has been
@@ -93,7 +94,7 @@
 //! twice, before any fee-bearing effect: **planning** ([`plan_confirmable_invoice`]) searches down
 //! from gross − reserve for the largest invoice whose post-swap arithmetic holds and whose worst
 //! case (invoice + reserve + actual input fee + swap fee) fits the gross — none ⇒
-//! [`Refusal::FeesDoNotFit`] — and re-checks the quote actually raised; **before the fence**
+//! [`Refusal::BelowFeeFloor`] (or [`Refusal::FeesDoNotFit`] above [`FEE_FLOOR_QUIET_MAX_SATS`]) — and re-checks the quote actually raised; **before the fence**
 //! ([`confirm_would_succeed`]) the same check runs on the prepared figures and the keyset's
 //! `input_fee_ppk` ([`crate::wallet_ops::MeltPreparation::input_fee_ppk`]) and refuses — prepared
 //! melt cancelled, row left planned with its receipts pinned, one line — when the SDK would refuse
@@ -557,12 +558,19 @@ pub enum Refusal {
     /// reserve on the gross leaves nothing, no invoice fits once the SDK's proof fees are counted,
     /// or what is left after the fees is below the destination's minimum. Like
     /// [`Self::BelowMinimum`] this is the steady state of a small balance — more collected fees
-    /// clear it — so it is at the threshold ([`Self::is_threshold`]): not journaled, not a pacing
-    /// failure, and it parks the retry tick at the cap ([`RemitBackoff::observe`]).
+    /// clear it — so it is at the threshold ([`Self::is_threshold`]): not a pacing failure, and it
+    /// parks the retry tick at the cap ([`RemitBackoff::observe`]). It journals nothing, except ONE
+    /// [`FEE_FLOOR_WAITING_PREFIX`] row when the latest journaled attempt did not pay, so that
+    /// attempt stops reading as the current state. Only up to [`FEE_FLOOR_QUIET_MAX_SATS`]: a larger
+    /// balance that still cannot pay for its own sending is not waiting for sales (a reserve of 100%
+    /// or more, a wallet of dust proofs on a fee-bearing keyset) and is refused as
+    /// [`Self::ReserveDoesNotFit`] / [`Self::FeesDoNotFit`], a journaled failure.
     BelowFeeFloor {
         unremitted: u64,
         reserve: u64,
         expected_fees: u64,
+        /// Set when the fees leave something, but less than the destination's minimum.
+        min_sats: Option<u64>,
     },
     /// The quote raised for the planned invoice carries a reserve that would take more out of the
     /// wallet than was accrued (a mint whose reserve grows on the smaller amount). More balance
@@ -629,6 +637,44 @@ pub enum Refusal {
     PlanRefused(String),
 }
 
+/// The largest unremitted balance a planning-time fee refusal is treated as "not enough yet"
+/// ([`Refusal::BelowFeeFloor`]). Lightning melt reserves and NUT-02 proof fees on a healthy wallet are a few
+/// sats; a balance above this that still cannot pay for its own sending is stuck for a reason more
+/// sales will not fix (#1460 r1 M2), so it stays a journaled, paced failure.
+pub const FEE_FLOOR_QUIET_MAX_SATS: u64 = 100;
+
+/// The [`RemitAttempt::detail`] prefix of the one row a fee-floor refusal journals when the latest
+/// attempt did not pay: the seat is waiting for its balance to cover the fees, and the earlier
+/// failure is no longer current (`maxplayer seller jobs` reads it so; #1460 r1 M3).
+pub const FEE_FLOOR_WAITING_PREFIX: &str = "waiting: ";
+
+/// The refusal for a balance whose fees leave nothing (or less than the destination's minimum) at
+/// planning: [`Refusal::BelowFeeFloor`] up to [`FEE_FLOOR_QUIET_MAX_SATS`], the journaled failures
+/// [`Refusal::FeesDoNotFit`] / [`Refusal::ReserveDoesNotFit`] above it.
+fn planning_fee_refusal(
+    gross: u64,
+    reserve: u64,
+    expected_fees: u64,
+    min_sats: Option<u64>,
+) -> Refusal {
+    if gross <= FEE_FLOOR_QUIET_MAX_SATS {
+        Refusal::BelowFeeFloor {
+            unremitted: gross,
+            reserve,
+            expected_fees,
+            min_sats,
+        }
+    } else if expected_fees > 0 {
+        Refusal::FeesDoNotFit {
+            gross,
+            reserve,
+            expected_fees,
+        }
+    } else {
+        Refusal::ReserveDoesNotFit { gross, reserve }
+    }
+}
+
 impl Refusal {
     /// The refusals that are the expected steady state for a small seller: not an error, not an
     /// attempt, nothing to journal — the balance accumulates until it clears the minimum and pays
@@ -663,18 +709,25 @@ impl fmt::Display for Refusal {
                 unremitted,
                 reserve,
                 expected_fees,
+                min_sats,
             } => {
-                write!(
-                    formatter,
-                    "unremitted {unremitted} sats does not yet cover the cost of sending it (the mint's melt fee reserve of {reserve} sats"
-                )?;
-                if *expected_fees > 0 {
-                    write!(
+                let fees = if *expected_fees > 0 {
+                    format!(
+                        "the mint's melt fee reserve of {reserve} sats plus {expected_fees} sats of expected proof fees"
+                    )
+                } else {
+                    format!("the mint's melt fee reserve of {reserve} sats")
+                };
+                match min_sats {
+                    Some(min_sats) => write!(
                         formatter,
-                        " plus {expected_fees} sats of expected proof fees"
-                    )?;
+                        "unremitted {unremitted} sats leaves less than the destination's minimum of {min_sats} sats after {fees}"
+                    ),
+                    None => write!(
+                        formatter,
+                        "unremitted {unremitted} sats does not yet cover the cost of sending it ({fees})"
+                    ),
                 }
-                write!(formatter, ")")
             }
             Self::ReserveDoesNotFit { gross, reserve } => write!(
                 formatter,
@@ -1015,6 +1068,25 @@ fn attempt_record(
 ) -> Option<RemitAttempt> {
     let (outcome, detail, remittance_id) = match result {
         Ok(RemitOutcome::DryRun) => return None,
+        Ok(RemitOutcome::Refused(refusal @ Refusal::BelowFeeFloor { unremitted, .. })) => {
+            // Quiet, except once after an attempt that did not pay: that attempt is no longer the
+            // seat's state, and readers of the journal take the latest row as current (M3).
+            let latest = store.recent_remit_attempts(1).ok()?.into_iter().next()?;
+            if latest.outcome == RemitAttemptOutcome::Paid
+                || latest.detail.starts_with(FEE_FLOOR_WAITING_PREFIX)
+            {
+                return None;
+            }
+            return Some(RemitAttempt {
+                attempt_id: 0,
+                started_at_unix: now_unix,
+                trigger,
+                unremitted_sats: *unremitted,
+                outcome: RemitAttemptOutcome::Refused,
+                detail: format!("{FEE_FLOOR_WAITING_PREFIX}{refusal}"),
+                remittance_id: None,
+            });
+        }
         Ok(RemitOutcome::Refused(refusal)) if refusal.is_threshold() => return None,
         Ok(RemitOutcome::Paid {
             remittance_id,
@@ -1277,7 +1349,7 @@ fn remit_inner(
     // `reserve + expected ≥ gross` refused remittances a smaller invoice pays (verdict 1ee5cb2 §4.2:
     // 3/0/1000/[32] ⇒ probe expects 2 ≥ 3 − 0 … refused; invoice 1 pays with a 3-sat debit). Fees
     // are checked by the exact search over candidate invoices (`plan_confirmable_invoice`), then
-    // re-checked on the quote actually raised; `FeesDoNotFit` is returned only when NO candidate
+    // re-checked on the quote actually raised; `BelowFeeFloor` (`FeesDoNotFit` above the quiet bound) is returned only when NO candidate
     // fits. So a payment that can fit within the gross IS planned (the largest such invoice), and
     // one that never can is refused here at planning, not at payment. The probe's figure is kept
     // for the printed lines only.
@@ -1295,11 +1367,9 @@ fn remit_inner(
             "REFUSED — mint {} needs a melt fee reserve of {reserve} sats to pay {gross} sats, which leaves nothing for the destination. The balance accumulates. Nothing moved.",
             probe_estimate.mint_url
         );
-        return Ok(RemitOutcome::Refused(Refusal::BelowFeeFloor {
-            unremitted: gross,
-            reserve,
-            expected_fees: expected,
-        }));
+        return Ok(RemitOutcome::Refused(planning_fee_refusal(
+            gross, reserve, expected, None,
+        )));
     }
     // Addendum 9 §1.2: the invoice is the largest one `confirm` can actually pay within the gross —
     // the SDK's swap target must cover invoice + reserve + the input fee it RECOMPUTES on the
@@ -1321,11 +1391,9 @@ fn remit_inner(
                 gross - reserve,
                 expected_clause(expected)
             );
-            return Ok(RemitOutcome::Refused(Refusal::BelowFeeFloor {
-                unremitted: gross,
-                reserve,
-                expected_fees: expected,
-            }));
+            return Ok(RemitOutcome::Refused(planning_fee_refusal(
+                gross, reserve, expected, None,
+            )));
         }
     };
     if net < min_sats {
@@ -1335,11 +1403,12 @@ fn remit_inner(
             expected_clause(expected),
             min_sats - net
         );
-        return Ok(RemitOutcome::Refused(Refusal::BelowFeeFloor {
-            unremitted: gross,
+        return Ok(RemitOutcome::Refused(planning_fee_refusal(
+            gross,
             reserve,
-            expected_fees: expected,
-        }));
+            expected,
+            Some(min_sats),
+        )));
     }
     let (invoice, estimate) = if reserve == 0 && expected == 0 {
         (probe, probe_estimate)
@@ -2193,7 +2262,26 @@ pub fn remit_best_effort(
         "the node's best-effort attempt runs under a node trigger, never the operator's"
     );
     let mut out = Vec::new();
-    let outcome = remit(store, effects, trigger, now_unix, &mut out);
+    let mut outcome = remit(store, effects, trigger, now_unix, &mut out);
+    // A fee-floor refusal parks the retry tick at the cap. A collect that landed while this attempt
+    // ran skipped its own attempt (single flight), so the balance this run read may be stale:
+    // re-run while the ledger shows more than was refused, a bounded number of times (#1460 r1 M1).
+    for _ in 0..FEE_FLOOR_RERUNS {
+        let Ok(RemitOutcome::Refused(Refusal::BelowFeeFloor { unremitted, .. })) = &outcome else {
+            break;
+        };
+        let grew = store
+            .accrued_fees()
+            .is_ok_and(|accrued| accrued.unremitted_fee_sats > *unremitted);
+        if !grew {
+            break;
+        }
+        let _ = writeln!(
+            out,
+            "The unremitted balance grew while this attempt ran; trying again with the new balance."
+        );
+        outcome = remit(store, effects, trigger, now_unix, &mut out);
+    }
     let lines = String::from_utf8_lossy(&out)
         .lines()
         .map(str::to_owned)
@@ -2239,6 +2327,9 @@ pub fn remit_live_best_effort(
         }
     }
 }
+
+/// How many times [`remit_best_effort`] re-runs a fee-floor refusal whose balance grew under it.
+const FEE_FLOOR_RERUNS: usize = 3;
 
 // ---- retry pacing (stage 2a, addendum 2) ------------------------------------------------------
 
@@ -2341,6 +2432,11 @@ impl RemitBackoff {
         if self.parked {
             return self.cap;
         }
+        self.streak_delay()
+    }
+
+    /// `base × 2^streak`, capped: the streak's own ceiling, parked or not.
+    fn streak_delay(&self) -> Duration {
         let mut delay = self.base;
         for _ in 0..self.streak {
             if delay >= self.cap {
@@ -2357,9 +2453,9 @@ impl RemitBackoff {
         self.parked
     }
 
-    /// Whether the doubling has reached the cap.
+    /// Whether the doubling has reached the cap (a park at the cap is not the doubling).
     pub fn at_cap(&self) -> bool {
-        self.computed_delay() >= self.cap
+        self.streak_delay() >= self.cap
     }
 
     /// The delay to actually sleep before the next attempt: full jitter over
@@ -4045,8 +4141,9 @@ mod tests {
     }
 
     // §3.3: the fee reserve is taken OUT of the gross — and when what is left is below the minimum,
-    // or nothing at all, the attempt refuses rather than paying more than the seller accrued. These
-    // refusals ARE journaled: an operator should see a mint whose fees eat the fee.
+    // or nothing at all, the attempt refuses rather than paying more than the seller accrued. For a small
+    // balance that is the fee floor (quiet, not journaled); a reserve that grows on the net invoice
+    // IS journaled: an operator should see a mint whose fees eat the fee.
     #[test]
     fn a_fee_reserve_that_leaves_too_little_or_nothing_is_a_quiet_fee_floor_but_one_that_grows_on_the_net_is_journaled()
      {
@@ -4062,6 +4159,7 @@ mod tests {
                 unremitted: 3,
                 reserve: 2,
                 expected_fees: 0,
+                min_sats: Some(2),
             }),
             "{out}"
         );
@@ -4090,6 +4188,7 @@ mod tests {
                 unremitted: 2,
                 reserve: 2,
                 expected_fees: 0,
+                min_sats: None,
             }),
             "{out}"
         );
@@ -6144,7 +6243,7 @@ mod tests {
     // §1): a 1000-ppk mint against a 3-sat gross with a 1-sat reserve. No probe-side fee veto any
     // more — the exact search runs every candidate: invoice 2 ⇒ need 3, prepared 2, target 5 =
     // [4, 1], actual 2, worst 2 + 1 + 2 + 1 = 6 > 3; invoice 1 ⇒ need 2, prepared 1, target 3 =
-    // [2, 1], actual 2, worst 1 + 1 + 2 + 1 = 5 > 3. NO candidate fits ⇒ FeesDoNotFit with the
+    // [2, 1], actual 2, worst 1 + 1 + 2 + 1 = 5 > 3. NO candidate fits ⇒ BelowFeeFloor with the
     // probe's expected 2 (popcount(4) = 1 + swap 1) on the "no invoice fits" line, no invoice for
     // any net, nothing journaled, the balance intact.
     #[test]
@@ -6160,6 +6259,7 @@ mod tests {
                 unremitted: 3,
                 reserve: 1,
                 expected_fees: 2,
+                min_sats: None,
             }),
             "{out}"
         );
@@ -6188,10 +6288,26 @@ mod tests {
             Refusal::BelowFeeFloor {
                 unremitted: 3,
                 reserve: 1,
-                expected_fees: 2
+                expected_fees: 2,
+                min_sats: None,
             }
             .to_string(),
             "unremitted 3 sats does not yet cover the cost of sending it (the mint's melt fee reserve of 1 sats plus 2 sats of expected proof fees)"
+        );
+        // r1 L2: the below-minimum branch says so, not that the fees are not covered.
+        assert_eq!(
+            Refusal::BelowFeeFloor {
+                unremitted: 3,
+                reserve: 2,
+                expected_fees: 0,
+                min_sats: Some(2),
+            }
+            .to_string(),
+            "unremitted 3 sats leaves less than the destination's minimum of 2 sats after the mint's melt fee reserve of 2 sats"
+        );
+        assert!(
+            store.recent_remit_attempts(10).expect("attempts").is_empty(),
+            "a fee floor journals nothing when no earlier attempt failed"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8621,6 +8737,7 @@ mod tests {
             unremitted: 2,
             reserve: 2,
             expected_fees: 0,
+            min_sats: None,
         });
         assert!(!floor.is_failure(), "a fee floor is not a pacing failure");
         assert!(floor.is_quiet(), "a fee floor is logged verbose-only");
@@ -8634,6 +8751,7 @@ mod tests {
         assert!(pacing.is_parked());
         assert_eq!(pacing.streak(), 0);
         assert_eq!(pacing.computed_delay(), RETRY_CAP);
+        assert!(!pacing.at_cap(), "r1 L1: a park at the cap is not the doubling at the cap");
         for at in 2..200 {
             assert_eq!(pacing.observe(&floor, at), Pacing::Idle);
         }
@@ -8710,6 +8828,7 @@ mod tests {
                     unremitted: 2,
                     reserve: 2,
                     expected_fees: 0,
+                    min_sats: None,
                 })),
                 "{:?}",
                 report.lines
@@ -8766,6 +8885,189 @@ mod tests {
         assert!(!pacing.is_parked());
         assert_eq!(pacing.computed_delay(), RETRY_BASE);
         assert_eq!(store.accrued_fees().expect("read").unremitted_fee_sats, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1460 r1 M3: a seat that settles at the fee floor after a failed attempt journals ONE
+    // "waiting" row (so readers stop taking the failure as current), and no more while it waits.
+    #[test]
+    fn a_fee_floor_after_a_failure_journals_one_waiting_row_and_then_nothing() {
+        let (store, root) = store_with_fees("fee-floor-waiting", &[2]);
+        let mut fake = Fake::new(|_| 2);
+        fake.pay_request_error = Some("lnurl: 503".to_owned());
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Collect, 100);
+        assert!(report.is_failure());
+        for at in 0..5 {
+            let mut fake = Fake::new(|_| 2);
+            let report = remit_best_effort(&store, &mut fake, RemitTrigger::Retry, 200 + at);
+            assert!(report.is_quiet() && !report.is_failure(), "{:?}", report.outcome);
+        }
+        let attempts = store.recent_remit_attempts(10).expect("attempts");
+        assert_eq!(attempts.len(), 2, "the failure, then exactly one waiting row");
+        assert_eq!(attempts[0].outcome, RemitAttemptOutcome::Refused);
+        assert_eq!(attempts[0].trigger, RemitAttemptTrigger::Retry);
+        assert_eq!(attempts[0].unremitted_sats, 2);
+        assert_eq!(
+            attempts[0].detail,
+            "waiting: unremitted 2 sats does not yet cover the cost of sending it (the mint's melt fee reserve of 2 sats)"
+        );
+        assert_eq!(attempts[1].outcome, RemitAttemptOutcome::Failed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1460 r1 M2: the quiet fee floor is for SMALL balances. 150 sats owed against a mint that
+    // wants a 150-sat reserve (or more) is not waiting for sales: it is the journaled, paced
+    // ReserveDoesNotFit it was before, and so is the no-invoice-fits case above the bound.
+    #[test]
+    fn a_large_balance_that_cannot_pay_its_fees_stays_a_journaled_failure() {
+        let (store, root) = store_with_fees("fee-floor-large", &[150]);
+        let mut fake = Fake::new(|amount| amount);
+        let report = remit_best_effort(&store, &mut fake, RemitTrigger::Retry, 100);
+        assert_eq!(
+            report.outcome,
+            Ok(RemitOutcome::Refused(Refusal::ReserveDoesNotFit {
+                gross: 150,
+                reserve: 150,
+            }))
+        );
+        assert!(report.is_failure() && !report.is_quiet());
+        assert_eq!(store.recent_remit_attempts(10).expect("attempts").len(), 1);
+        assert_eq!(
+            planning_fee_refusal(FEE_FLOOR_QUIET_MAX_SATS, 3, 2, None),
+            Refusal::BelowFeeFloor {
+                unremitted: FEE_FLOOR_QUIET_MAX_SATS,
+                reserve: 3,
+                expected_fees: 2,
+                min_sats: None,
+            }
+        );
+        assert_eq!(
+            planning_fee_refusal(FEE_FLOOR_QUIET_MAX_SATS + 1, 3, 2, None),
+            Refusal::FeesDoNotFit {
+                gross: FEE_FLOOR_QUIET_MAX_SATS + 1,
+                reserve: 3,
+                expected_fees: 2,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Effects that collect one more fee into the store the first time the attempt asks the mint for
+    /// an estimate: a collect landing mid-attempt, whose own attempt single-flight skipped.
+    struct CollectDuringAttempt {
+        inner: Fake,
+        store: SellerStore,
+        collected: bool,
+    }
+
+    impl RemitEffects for CollectDuringAttempt {
+        fn owner(&self) -> &str {
+            self.inner.owner()
+        }
+        fn pay_request(&mut self, address: &LightningAddress) -> Result<PayRequest, String> {
+            self.inner.pay_request(address)
+        }
+        fn invoice(&mut self, pay: &PayRequest, amount_sats: u64) -> Result<ResolvedInvoice, String> {
+            self.inner.invoice(pay, amount_sats)
+        }
+        fn melt_estimate(&mut self, bolt11: &str) -> Result<MeltEstimate, String> {
+            if !self.collected {
+                self.collected = true;
+                self.store
+                    .collect_receipt(
+                        "receipt-mid-attempt",
+                        "job-mid-attempt",
+                        100,
+                        ReceiptFees {
+                            mint_fee_sats: 1,
+                            fee_bps: 1000,
+                            fee_sats: 10,
+                        },
+                        150,
+                    )
+                    .expect("collect");
+            }
+            self.inner.melt_estimate(bolt11)
+        }
+        fn melt_quote(&mut self, bolt11: &str) -> Result<MeltEstimate, String> {
+            self.inner.melt_quote(bolt11)
+        }
+        fn prepare_melt(
+            &mut self,
+            quote_id: &str,
+            ceiling: &MeltCeiling,
+        ) -> Result<PreparedMelt, MeltFailure> {
+            self.inner.prepare_melt(quote_id, ceiling)
+        }
+        fn confirm_melt(&mut self, prepared: PreparedMelt) -> Result<MeltOutcome, MeltFailure> {
+            self.inner.confirm_melt(prepared)
+        }
+        fn cancel_melt(&mut self, prepared: PreparedMelt) -> Result<(), MeltFailure> {
+            self.inner.cancel_melt(prepared)
+        }
+        fn melt_status(&mut self, bolt11: &str) -> Result<Option<MeltQuoteStatus>, String> {
+            self.inner.melt_status(bolt11)
+        }
+        fn melt_status_for_quote(&mut self, quote_id: &str) -> Result<Option<MeltQuoteStatus>, String> {
+            self.inner.melt_status_for_quote(quote_id)
+        }
+        fn after_plan(&mut self, planned: &FeeRemittance) {
+            self.inner.after_plan(planned);
+        }
+        fn after_quote(&mut self, planned: &FeeRemittance, quote: &MeltEstimate) {
+            self.inner.after_quote(planned, quote);
+        }
+        fn after_admit(&mut self, admitted: &FeeRemittance) {
+            self.inner.after_admit(admitted);
+        }
+        fn after_decision(&mut self, row: &FeeRemittance, decision: &Reconcile) {
+            self.inner.after_decision(row, decision);
+        }
+        fn now_unix(&self) -> i64 {
+            self.inner.now_unix()
+        }
+    }
+
+    // #1460 r1 M1: the retry tick reads 2 sats and is refused at the fee floor while a collect
+    // (skipped by single flight) lifts the balance to 12. Parking on the stale read would leave a
+    // payable balance up to 30 minutes; the attempt re-reads the ledger and pays the 12 at once.
+    #[test]
+    fn a_fee_floor_refusal_on_a_balance_that_grew_mid_attempt_re_runs_and_pays() {
+        let (store, root) = store_with_fees("fee-floor-grew", &[2]);
+        let mut inner = Fake::new(|_| 2);
+        inner.melt_results = vec![Ok((10, 2))];
+        let mut effects = CollectDuringAttempt {
+            inner,
+            store: store.clone(),
+            collected: false,
+        };
+        let report = remit_best_effort(&store, &mut effects, RemitTrigger::Retry, 200);
+        assert!(
+            matches!(
+                report.outcome,
+                Ok(RemitOutcome::Paid {
+                    net_sats: 10,
+                    melt_fee_sats: 2,
+                    ..
+                })
+            ),
+            "{:?} {:?}",
+            report.outcome,
+            report.lines
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.contains("The unremitted balance grew while this attempt ran")),
+            "{:?}",
+            report.lines
+        );
+        assert_eq!(effects.inner.melts.len(), 1, "paid once");
+        assert_eq!(store.accrued_fees().expect("read").unremitted_fee_sats, 0);
+        let mut pacing = RemitBackoff::new();
+        assert_eq!(pacing.observe(&report, 200), Pacing::Paid);
+        assert!(!pacing.is_parked());
         let _ = std::fs::remove_dir_all(&root);
     }
 
