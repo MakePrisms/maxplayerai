@@ -875,7 +875,7 @@ impl SellOptions {
 fn sell_usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller serve   # zero-prompt relaunch from config.toml\n  maxplayer seller serve --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n  maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted\n  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm\n  maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]   # each job this seat won and whether it was paid: free / paid (fee remitted?) / awaiting payment / unpaid\n  maxplayer seller drain [--home <dir>] [--no-wait | --timeout <secs>]   # finish in-flight jobs, then exit 0 (upgrade without interrupting a job)\n  maxplayer seller hook test <entry> [--home <dir>]   # run an [agents.<entry>] hook through ping, two job turns, close; no relay, no money\n  maxplayer seller [flags]   # deprecated alias for `maxplayer seller serve [flags]` (still works)\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)\n  - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named\n  - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)\n{}",
+        "Usage:\n  maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller serve   # zero-prompt relaunch from config.toml\n  maxplayer seller serve --agent <name> --rate-sats <n>   # hook seat (Muse, Grok Bot, Instinct or your own command): add only [agents.<name>] hook = [...] to config.toml, check it with `maxplayer seller hook test <name>`, then serve (the first serve writes [seller]; an existing seat sets [seller] agents = [\"<name>\"] instead)\n  maxplayer seller serve --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n  maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted\n  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm\n  maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]   # each job this seat won and whether it was paid: free / paid (fee remitted?) / awaiting payment / unpaid\n  maxplayer seller drain [--home <dir>] [--no-wait | --timeout <secs>]   # finish in-flight jobs, then exit 0 (upgrade without interrupting a job)\n  maxplayer seller hook test <entry> [--home <dir>]   # run an [agents.<entry>] hook through ping, two job turns, close; no relay, no money\n  maxplayer seller [flags]   # deprecated alias for `maxplayer seller serve [flags]` (still works)\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - --agent takes a built-in harness preset (claude, cursor, codex) or an [agents.<name>] entry from config.toml; Muse, Grok Bot and Instinct are not presets, they serve as hook seats (seller-hook skill)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)\n  - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named\n  - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)\n{}",
         crate::skill::docs_pointer_line()
     );
 }
@@ -1001,6 +1001,80 @@ mod tests {
                 && !help.to_lowercase().contains("real mint"),
             "seller --help must not fork mint classes or say 'real':\n{help}"
         );
+    }
+
+    /// `seller serve --help` lists only the built-in presets after `--agent`; an operator of Muse,
+    /// Grok Bot or Instinct read that as "not supported". The help names them as hook seats and
+    /// the two config keys that start one, and keeps the preset list unchanged.
+    #[test]
+    fn sell_usage_names_hook_seats_and_their_config() {
+        let mut buf = Vec::new();
+        sell_usage(&mut buf);
+        let help = String::from_utf8_lossy(&buf);
+        for needle in [
+            "hook seat (Muse, Grok Bot, Instinct",
+            "[agents.<name>] hook = [...]",
+            "[seller] agents = [\"<name>\"]",
+            "maxplayer seller hook test <name>",
+            "seller serve --agent <name> --rate-sats <n>",
+            "add only [agents.<name>] hook = [...] to config.toml",
+            "the first serve writes [seller]",
+            "or an [agents.<name>] entry from config.toml",
+            "Muse, Grok Bot and Instinct are not presets",
+            "--agent <claude|cursor|codex>",
+        ] {
+            assert!(help.contains(needle), "missing {needle:?}:\n{help}");
+        }
+    }
+
+    /// The fresh-seat snippet the usage gives (only an `[agents.<name>]` entry) loads; a `[seller]`
+    /// table holding only `agents` does not (`rate_sats` is required), which is why the usage says
+    /// the first serve writes `[seller]`.
+    #[test]
+    fn the_hook_seat_usage_snippet_loads_on_a_fresh_home() {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-hook-usage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        home::bootstrap(&root).expect("bootstrap temp home");
+        let config = root.join("config.toml");
+        let base = std::fs::read_to_string(&config).unwrap_or_default();
+        let entry = "[agents.my-hook]\nhook = [\"/bin/true\"]\n";
+        std::fs::write(&config, format!("{base}\n{entry}")).unwrap();
+        let mut home = home::bootstrap(&root).expect("the usage's snippet loads");
+        assert!(home.config.agents.contains_key("my-hook"));
+        // The usage's serve command then writes [seller] and the home reloads.
+        let options = SellOptions {
+            non_interactive: true,
+            agent: Some("my-hook".to_owned()),
+            agents: vec!["my-hook".to_owned()],
+            rate_sats: Some(100),
+            ..SellOptions::default()
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        ensure_seller_config(&mut home, &options, &mut out, &mut err).unwrap_or_else(|code| {
+            panic!("first serve failed code={code} err={}", String::from_utf8_lossy(&err))
+        });
+        let seller = home::bootstrap(&root)
+            .expect("reload after the first serve")
+            .config
+            .seller
+            .expect("[seller] written");
+        assert_eq!(seller.agents, vec!["my-hook".to_owned()]);
+        assert_eq!(seller.rate_sats, 100);
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert!(written.contains("[seller]"), "{written}");
+        std::fs::write(&config, format!("{base}\n{entry}[seller]\nagents = [\"my-hook\"]\n")).unwrap();
+        match home::bootstrap(&root) {
+            Ok(_) => panic!("a [seller] table with only agents loaded"),
+            Err(error) => assert!(format!("{error:?}").contains("rate_sats"), "{error:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// #488: picking a preset must surface the underlying CLI's auth requirement, so the seller

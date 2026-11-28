@@ -6623,18 +6623,25 @@ impl SellerNodeRunner {
     /// (see [`probe_relay_serves_our_reqs`]), so that REQ could only ever have returned nothing.
     /// Liveness is asserted by the probe instead.
     async fn subscribe_all(&self, since: Option<nostr_sdk::Timestamp>) -> Result<(), NodeError> {
-        for id in [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID] {
+        for id in self.long_lived_sub_ids() {
             self.subscribe_one(id, since).await?;
         }
+        Ok(())
+    }
+
+    /// The long-lived subscriptions [`Self::subscribe_all`] issues, in order (the boot replay tracks
+    /// the same set).
+    fn long_lived_sub_ids(&self) -> Vec<&'static str> {
+        let mut ids = vec![OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID];
         // #541: the settlement-receipt sub feeds the terminal-offer gate, and the gate only matters for
         // offers we can LOSE — the open pool. A targeted seller is covered by local claim idempotency
         // (its own settlements are in its store) and cannot lose a targeted-to-it offer to another
         // seat, so it never carries the sub. Registered here so boot AND the watchdog's reconnect keep
         // the same set.
         if self.claim_open_pool() {
-            self.subscribe_one(RECEIPT_SUB_ID, since).await?;
+            ids.push(RECEIPT_SUB_ID);
         }
-        Ok(())
+        ids
     }
 
     /// Issue (or re-issue) the REQ for ONE named subscription, so a single leg can be repaired
@@ -6870,6 +6877,10 @@ impl SellerNodeRunner {
         // backfill re-feeds is already gated. After the subscribe it would be a race against our own
         // recovery path.
         self.rehydrate_suppressions();
+        // The boot replay (stored history on these subscriptions) is told apart from a live queue
+        // fill by their EOSEs, not by a timer (#1444 advisor r1).
+        let boot_subs = self.long_lived_sub_ids();
+        let boot_replay_started = tokio::time::Instant::now();
         self.subscribe_all(None).await?;
         opline!(
             "seller node live: pubkey={} relay={}",
@@ -7076,7 +7087,10 @@ impl SellerNodeRunner {
         // reads a recovery cut off is re-run, not reported as a failed read (finding 1).
         let mut lane_started_at = tokio::time::Instant::now();
         let mut last_recovery_end: Option<tokio::time::Instant> = None;
-        let mut queue_full = schedule::QueueFullEpisode::default();
+        let mut queue_full = schedule::QueueFullEpisode::new(boot_replay_started, &boot_subs);
+        // A boot that signs in lazily (first AUTH after the boot REQs) keeps its replay through that
+        // one sign-in; any other Authenticated is a re-challenge or a reconnect and ends it.
+        let mut lazy_boot_auth = !matches!(self.boot_auth, AuthWait::Authenticated);
         // Heartbeat supervision (probe + publish + watchdog + recovery), single-flight.
         let mut supervision: Option<SupervisionFuture> = None;
         // Set while a recovery is reconnecting: nothing on the loop may issue a long-lived REQ then
@@ -7116,6 +7130,8 @@ impl SellerNodeRunner {
         macro_rules! notice_loop_gap {
             ($firing_heartbeat:expr) => {
                 if let Some(gap) = loop_turns.turn(std::time::Instant::now(), schedule::wall_ms()) {
+                    // After a gap (host sleep included) nothing that arrives is the boot replay.
+                    queue_full.end_boot_replay();
                     // The sockets are presumed dead after a long gap; the watchdog's monotonic
                     // clock cannot see a host sleep, so it would not reconnect for intervals.
                     let reconnect = heartbeat_enabled
@@ -7157,14 +7173,23 @@ impl SellerNodeRunner {
                     lane = Some(Box::pin(Arc::clone(&self).lane_work(work, drain, flush_private)));
                 }
             }
+            // A recovery reconnects and resubscribes: what it brings is not the boot replay.
+            if recovering.get() {
+                queue_full.end_boot_replay();
+            }
             if let Some((fills, took)) =
                 queue_full.after_take(queue.queued_events(), tokio::time::Instant::now())
             {
-                opline!(
-                    "seller node WORK-LANE queue empty again after {}s (it filled {fills} time(s) \
-                     meanwhile)",
-                    took.as_secs()
-                );
+                // The boot replay's end prints one line worded as the expected event it is.
+                opline!("{}", queue_full.ended_line(fills, took));
+            }
+            // After the end check, so an episode that drained on this turn is not called stuck.
+            if let Some(line) = queue_full.overdue(
+                tokio::time::Instant::now(),
+                queue.queued_events(),
+                queue.has_room(),
+            ) {
+                opline!("{line}");
             }
             tokio::select! {
                 // #747: leave the selling role. Breaking here — rather than exiting the process
@@ -7486,6 +7511,9 @@ impl SellerNodeRunner {
                     );
                     liveness = report.clock;
                     if report.recovered.is_some() {
+                        // A recovery ran (even one too quick for the loop to see it in flight):
+                        // what its resubscribe brings is not the boot replay.
+                        queue_full.end_boot_replay();
                         last_recovery_end = Some(tokio::time::Instant::now());
                     }
                     match report.recovered {
@@ -7615,12 +7643,18 @@ impl SellerNodeRunner {
                             if handled_event_kind(event.kind) {
                                 queue.push_event(event);
                                 if queue_full
-                                    .after_push(queue.has_room(), tokio::time::Instant::now())
+                                    .after_push(
+                                        queue.has_room(),
+                                        subscription_id.as_str(),
+                                        tokio::time::Instant::now(),
+                                    )
                                 {
-                                    opline!(
-                                        "seller node WORK-LANE queue full ({EVENT_QUEUE_CAP} events): \
-                                         relay reads pause until it drains"
-                                    );
+                                    match queue_full.full_line(EVENT_QUEUE_CAP) {
+                                        schedule::LaneLine::Default(line) => opline!("{line}"),
+                                        schedule::LaneLine::Verbose(line) => {
+                                            opline_verbose!("{line}")
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -7637,6 +7671,9 @@ impl SellerNodeRunner {
                             ..
                         }) => {
                             let id = subscription_id.to_string();
+                            // No more of this subscription's stored history comes (a re-issued REQ's
+                            // replay then reads as live: louder, never hidden).
+                            queue_full.stored_history_ended(&id);
                             let label = subscription_label(&id);
                             if is_our_subscription(&id) {
                                 opline!(
@@ -7790,8 +7827,11 @@ impl SellerNodeRunner {
                         Ok(RelayPoolNotification::Message {
                             message: nostr_sdk::RelayMessage::EndOfStoredEvents(eose_id),
                             ..
-                        }) if eose_id.to_string() == OFFER_SUB_ID => {
-                            if open_pool.is_some_and(|state| state.attempt_pending) {
+                        }) => {
+                            queue_full.stored_history_ended(eose_id.as_str());
+                            if eose_id.as_str() == OFFER_SUB_ID
+                                && open_pool.is_some_and(|state| state.attempt_pending)
+                            {
                                 open_pool = None;
                                 opline!(
                                     "seller node RELAY-CLOSED RE-ARMED: the open-pool half of the \
@@ -7803,6 +7843,8 @@ impl SellerNodeRunner {
                         Ok(_) => {}
                         Err(error) => {
                             // A broadcast lag is recoverable — never go permanently deaf.
+                            // A lag may have dropped a boot EOSE.
+                            queue_full.end_boot_replay();
                             opline!("seller node WARN: notification stream {error}; continuing");
                             continue;
                         }
@@ -7815,6 +7857,7 @@ impl SellerNodeRunner {
                     use nostr_sdk::pool::RelayNotification;
                     match relay_event {
                         Ok(RelayNotification::Authenticated) => {
+                            if !std::mem::take(&mut lazy_boot_auth) { queue_full.end_boot_replay(); }
                             nip42_authed = true;
                             sign_in_known = true;
                             self.private_authenticated.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -7872,28 +7915,37 @@ impl SellerNodeRunner {
                                      the money leg silently deaf",
                                     overlap.as_secs()
                                 ),
-                                Err(error) => opline!(
-                                    "seller node RELAY-AUTH RESUBSCRIBE failed ({error}); the next \
-                                     completed auth or the wrap backfill retries"
-                                ),
+                                Err(error) => {
+                                    queue_full.end_boot_replay();
+                                    opline!(
+                                        "seller node RELAY-AUTH RESUBSCRIBE failed ({error}); the \
+                                         next completed auth or the wrap backfill retries"
+                                    )
+                                }
                             }
                         }
-                        Ok(RelayNotification::AuthenticationFailed) => { nip42_authed = false; sign_in_known = true; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
+                        Ok(RelayNotification::AuthenticationFailed) => { queue_full.end_boot_replay(); nip42_authed = false; sign_in_known = true; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
                         // A socket that went away takes its NIP-42 state with it — whatever comes
                         // back starts unauthenticated.
                         Ok(RelayNotification::RelayStatus { status })
                             if status != nostr_sdk::prelude::RelayStatus::Connected =>
                         {
+                            // A reconnect follows: its resubscribe is not the boot replay.
+                            queue_full.end_boot_replay();
                             nip42_authed = false;
                             sign_in_known = true;
                             self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Ok(RelayNotification::Shutdown) => { nip42_authed = false; sign_in_known = true; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
+                        Ok(RelayNotification::Shutdown) => { queue_full.end_boot_replay(); nip42_authed = false; sign_in_known = true; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
                         Ok(_) => {}
-                        // Lagging this stream costs only auth-state precision, and both stale
-                        // readings are bounded (see the declaration). Never go deaf over it, but
-                        // stop claiming a sign-in state the loop may have missed a change of.
-                        Err(_) => sign_in_known = false,
+                        // Lagging this stream costs auth-state precision (both stale readings are
+                        // bounded, see the declaration) and may have dropped a disconnect or a failed
+                        // sign-in, so the boot replay ends. Never go deaf over it, but stop claiming
+                        // a sign-in state the loop may have missed a change of.
+                        Err(_) => {
+                            queue_full.end_boot_replay();
+                            sign_in_known = false;
+                        }
                     }
                 }
             }

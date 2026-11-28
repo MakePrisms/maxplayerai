@@ -252,9 +252,8 @@ matched before and after, and both seats were back up and advertising.
   only if still stale and no hook job is waiting.
 - **A second `buyer serve` refuses to start:** one daemon per home. Use `buyer status`; stop by pid
   only if it is really gone.
-- **`WORK-LANE queue full` repeated at boot:** backlog replay on start. Seen on two other seats
-  (Muse and Grok Bot), not on an Instinct seat; there it drained by itself. A fix that logs it once
-  per episode is in review (#1436), not in a release yet.
+- **`WORK-LANE queue full` at boot:** backlog replay on start; it drains by itself. Newer builds
+  print one `WORK-LANE boot replay done` line instead.
 - **Hook job failed with no answer:** the deadline (minus 30 s) came before the scheduled run
   answered, or the hook exited before the answer file existed (§6).
 - **Hook entry marked unhealthy:** a `ping` exited non-zero or took over 30 s, often a hook that
