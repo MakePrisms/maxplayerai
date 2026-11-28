@@ -94,6 +94,7 @@ a.who:hover{text-decoration:underline;text-decoration-color:rgba(255,255,255,.5)
 .ev .amt{color:#fff;font-variant-numeric:tabular-nums}
 .ev .rd{color:var(--dim)}
 .row .age{font-size:13px;color:var(--dim);font-variant-numeric:tabular-nums}
+.row a.age{text-decoration:none} .row a.age:hover{color:var(--ink2);text-decoration:underline;text-underline-offset:3px}   /* a line's age opens its job */
 .row.new{animation:rowin .7s ease backwards}
 @keyframes rowin{from{opacity:0;background-color:rgba(255,255,255,.07)}40%{opacity:1;background-color:rgba(255,255,255,.07)}to{background-color:rgba(255,255,255,0)}}
 .row.sk{display:flex}
@@ -144,7 +145,15 @@ html.sheet-open .sheet{opacity:1;visibility:visible;transform:translate3d(-50%,-
 html.mk .sheet .scrollable{overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
 /* one expert's profile, in the same panel */
 .sheet[data-mode="expert"] .sheet-w,.sheet[data-mode="expert"] #sheet-ch,.sheet[data-mode="expert"] #sheet-rows,.sheet[data-mode="list"] .pf{display:none}
+.sheet[data-mode="job"] .sheet-w,.sheet[data-mode="job"] #sheet-ch,.sheet[data-mode="job"] #sheet-rows,.sheet[data-mode="job"] #pf,.sheet:not([data-mode="job"]) #jb{display:none}
 .pf{flex:1;min-height:0;padding:10px 20px 26px}
+/* a profile's jobs in progress: a link to each (Bob, 2026-11-28) */
+.pf-live{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:14px}
+.pf-live[hidden]{display:none}
+.pf-job{display:inline-flex;align-items:center;height:30px;padding:0 13px;border-radius:15px;background:rgba(255,223,0,.12);color:var(--giallo);font-size:14px;letter-spacing:-.01em;transition:background-color .15s}
+.pf-job::after{content:"\2192";margin-left:7px}
+.pf-job:hover{background:rgba(255,223,0,.2)}
+.pf-more{font-size:13px;color:var(--dim)}
 .pf[data-state="ok"] .pf-note,.pf[data-state="ok"] .pf-wait,.pf[data-state="none"] .pf-wait,.pf[data-state="none"] .pf-body,.pf[data-state="wait"] .pf-body,.pf[data-state="wait"] .pf-note{display:none}
 .pf-note{font-size:15.5px;line-height:1.5;color:var(--mut)}
 .pf-wait i{position:relative;overflow:hidden;display:block;height:11px;margin-top:16px;border-radius:6px;background:rgba(255,255,255,.07)}

@@ -216,7 +216,7 @@
   </section>
 </main>
 
-<!-- the panel over the market: the full list of one column, or one expert's profile (market.js sets data-mode) -->
+<!-- the panel over the market: the full list of one column, a profile, or one job (market.js sets data-mode) -->
 <div class="sheet-bg" id="sheet-bg"></div>
 <aside class="sheet" id="sheet" data-mode="list" role="dialog" aria-modal="true" tabindex="-1" aria-hidden="true" aria-labelledby="sheet-t">
   <div class="sheet-h"><button type="button" class="sheet-back" id="sheet-back" hidden>Back</button><h2 id="sheet-t">Experts</h2><button type="button" class="sheet-x" id="sheet-x">Close</button></div>
@@ -228,10 +228,21 @@
     <div class="pf-wait" aria-hidden="true"><i></i><i></i><i></i></div>
     <div class="pf-body">
       <p class="pf-st"><i class="lamp" id="pf-lamp"></i><span id="pf-st"></span><button type="button" class="pf-npub" id="pf-npub" aria-label="Copy npub"><code id="pf-short"></code><svg aria-hidden="true"><use href="#i-copy"/></svg></button></p>
+      <p class="pf-live" id="pf-live" hidden></p>
       <p class="pf-about" id="pf-about"></p>
       <dl class="pf-kv" id="pf-kv"></dl>
       <h3 class="pf-h">Recent jobs</h3>
       <ol class="rows" id="pf-rows"></ol>
+    </div>
+  </div>
+  <div class="pf jb scrollable" id="jb" data-state="wait">
+    <p class="pf-note" id="jb-note"></p>
+    <div class="pf-wait" aria-hidden="true"><i></i><i></i><i></i></div>
+    <div class="pf-body">
+      <p class="pf-st"><i class="lamp" id="jb-lamp"></i><span id="jb-st"></span></p>
+      <dl class="pf-kv" id="jb-kv"></dl>
+      <h3 class="pf-h">Activity</h3>
+      <ol class="rows" id="jb-rows"></ol>
     </div>
   </div>
 </aside>

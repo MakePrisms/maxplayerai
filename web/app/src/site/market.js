@@ -16,7 +16,7 @@
    - No style="" attributes in generated HTML: production's CSP is style-src 'self'. Styles set from script are fine. */
 import { startMarket } from './market-data.ts';
 import { refocus } from './refocus.ts';
-import { who, lamp, zero, eventRow, shortNpub, fillExpert, fillBuyer } from './profile.js';
+import { who, lamp, zero, eventRow, shortNpub, fillExpert, fillBuyer, ago } from './profile.js';
 
 const $ = (s, r = document) => r.querySelector(s), $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -54,6 +54,10 @@ let seen = null;                           // activity rows already drawn once; 
 let sheetTab = null, sheetFrom = null;
 let profileKey = null;                    // the profile that is open: an npub or a 64-hex key
 let profileKind = 'expert';               // whose: 'expert' or 'buyer'
+let jobKey = null;                        // the job that is open: its offer id (Bob, 2026-11-28)
+let backTo = [];                          // what Back returns to: the panels opened before this one, newest last
+const panelNow = () => ({ tab: sheetTab, pk: profileKey, kind: profileKind, job: jobKey });
+const panelOpen = () => !!(sheetTab || profileKey || jobKey);
 
 const num = n => (n ? nf.format(n) : zero('0'));
 const money = v => (v === '$0' ? zero('$0') : esc(v));
@@ -112,7 +116,7 @@ function draw() {
       L.meta.textContent = '';
       $(`.more[data-more="${k}"]`).hidden = true;
     }
-    if (sheetTab || profileKey) drawSheet();
+    if (panelOpen()) drawSheet();
     alignSk();
     return;
   }
@@ -126,7 +130,7 @@ function draw() {
     more.textContent = L.all(rows.length);
   }
   seen = new Set(v.feed.map(f => f.id));
-  if (sheetTab || profileKey) drawSheet();
+  if (panelOpen()) drawSheet();
 }
 // A period button. The reader answers at once if that period is whole; if it is not (All time in the first seconds
 // of a first visit), the board shows placeholders and the reader calls back when it is.
@@ -139,8 +143,9 @@ function pickWindow(key) {
 /* the panel: the full list of a column, or one expert's profile. A dialog on a wide page, a sheet on a phone-size page */
 const sheet = $('#sheet'), main = $('.mk-main');
 function drawSheet() {
-  sheet.dataset.mode = profileKey ? 'expert' : 'list';
-  $('#sheet-back').hidden = !(profileKey && sheetTab);
+  sheet.dataset.mode = jobKey ? 'job' : profileKey ? 'expert' : 'list';
+  $('#sheet-back').hidden = !backTo.length;
+  if (jobKey) { drawJob(); return; }
   if (profileKey) { drawProfile(); return; }
   const L = LISTS[sheetTab];
   $('#sheet-t').textContent = L.title;
@@ -160,14 +165,14 @@ function showSheet() {
   sheet.focus({ preventScroll: true });
 }
 function openSheet(tab, from) {
-  sheetTab = tab; profileKey = null; sheetFrom = from || null;
+  sheetTab = tab; profileKey = null; jobKey = null; backTo = []; sheetFrom = from || null;
   drawSheet();
   $('#sheet-rows').scrollTop = 0;
   showSheet();
 }
 function closeSheet() {
-  if (!sheetTab && !profileKey) return;
-  sheetTab = null; profileKey = null;
+  if (!panelOpen()) return;
+  sheetTab = null; profileKey = null; jobKey = null; backTo = [];
   setLink(null);
   root.classList.remove('sheet-open');
   main.inert = false; nav.inert = false;
@@ -184,13 +189,14 @@ function closeSheet() {
 
 /* An expert's profile. Bob's key attributes: the description, online or working, the npub to copy, the rate, jobs
    delivered, who it takes jobs from, and the agent and model. A value the expert never published has no row. */
-function setLink(npub, kind = 'expert') {   // the address names the open profile, so the page can be shared as it is
-  const u = new URL(location.href);
-  if (npub ? u.searchParams.get(kind) === npub && !u.searchParams.has(kind === 'buyer' ? 'expert' : 'buyer')
-    : !u.searchParams.has('expert') && !u.searchParams.has('buyer') && !u.searchParams.has('seller')) return;
-  u.searchParams.delete('expert'); u.searchParams.delete('buyer');
-  u.searchParams.delete('seller');          // the old page's name for an expert's link
-  if (npub) u.searchParams.set(kind, npub);
+// The address names the open profile or job, so the page can be shared as it is. kind: expert, buyer or job.
+// 'seller' is the old page's name for an expert's link: it is dropped like the others.
+const LINK_KEYS = ['expert', 'buyer', 'job', 'seller'];
+function setLink(id, kind = 'expert') {
+  const u = new URL(location.href), want = id ? kind : null;
+  if (LINK_KEYS.every(k => (k === want ? u.searchParams.get(k) === id : !u.searchParams.has(k)))) return;
+  LINK_KEYS.forEach(k => u.searchParams.delete(k));
+  if (id) u.searchParams.set(kind, id);
   history.replaceState(null, '', u);
 }
 function drawProfile() {
@@ -228,22 +234,98 @@ function drawBuyer() {
   fillBuyer(x, title);
 }
 function openProfile(id, from, kind = 'expert') {
-  if (!root.classList.contains('sheet-open')) sheetFrom = from || null;
-  profileKey = id; profileKind = kind === 'buyer' ? 'buyer' : 'expert';
+  if (!root.classList.contains('sheet-open')) { sheetFrom = from || null; backTo = []; } else if (panelOpen()) backTo.push(panelNow());
+  jobKey = null; profileKey = id; profileKind = kind === 'buyer' ? 'buyer' : 'expert';
   $('#pf').dataset.state = 'wait';
   drawSheet();
   $('#pf').scrollTop = 0;
   showSheet();
 }
-$('#sheet-back').addEventListener('click', () => {      // from a profile back to the list it was opened from
-  profileKey = null; setLink(null); drawSheet();
+
+/* One job (Bob, 2026-11-28): an activity line opens it. A summary (status, buyer, expert, price, times) and every event
+   of the job, oldest first. Like the lines, no task text: the data layer does not pass it (market-data.ts). */
+const JOB_ST = {
+  open: ['post', 'Open · waiting for an expert'],
+  claimed: ['post', 'Claimed · waiting for the buyer to hire'],
+  working: ['busy', 'Working now'],
+  round: ['busy', ''],
+  delivered: ['step', 'Delivered'],
+  accepted: ['done', 'Done · accepted'],
+  paid: ['done', 'Done · paid'],
+  stopped: ['stop', 'Stopped by the expert'],
+  closed: ['step', 'Closed by the buyer'],
+  ended: ['', 'Ended without a delivery'],
+};
+function until(at) {
+  const s = at - Date.now() / 1000;
+  if (s <= 0) return `passed ${ago(at)}`;
+  const m = Math.ceil(s / 60), h = Math.round(m / 60), d = Math.round(m / 1440);
+  return m < 60 ? `in ${m} min` : m < 1440 ? `in ${h} hour${h === 1 ? '' : 's'}` : `in ${d} day${d === 1 ? '' : 's'}`;
+}
+const kv = rows => rows.filter(r => r[1]).map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+function drawJob() {
+  const jb = $('#jb'), title = $('#sheet-t');
+  const j = handle ? handle.job(jobKey) : null;       // null until the reader holds the job
+  title.classList.remove('hex');
+  if (!j) {
+    // Not found only once the market has answered in full: an older job is read with the whole history.
+    const r = handle?.ready(), down = failed || state === 'failed', none = !down && view && state === 'live' && (r === 'all' || r === 'partial');
+    title.textContent = none ? 'Job not found' : 'Job';
+    jb.dataset.state = none || down ? 'none' : 'wait';
+    alignSk();
+    $('#jb-note').textContent = down ? 'The live market is not reachable right now.' : !none ? '' : r === 'partial' ? 'Not found in the part of the market’s history that could be read.' : 'No job with this id is on the market.';
+    return;
+  }
+  jb.dataset.state = 'ok';
+  setLink(j.id, 'job');
+  title.textContent = j.free ? 'Free job' : j.price ? `${j.price} job` : 'Job';
+  const [lc, text] = JOB_ST[j.status] || ['', ''];
+  $('#jb-lamp').className = 'lamp ' + lc;
+  $('#jb-st').textContent = (j.status === 'round' ? `Working on round ${j.rounds}` : text) + (j.live ? '' : ` · ${ago(j.lastAt)}`);
+  const expert = j.expert ? who(j.expert, 'expert')
+    : j.expertUnknown ? zero('Unclear: the buyer named two') : zero(j.claimants ? 'Not hired yet' : 'None yet');
+  paint($('#jb-kv'), kv([
+    ['Buyer', j.buyer ? who(j.buyer, 'buyer') : zero('–')],
+    ['Expert', expert],
+    ['Price', j.free ? 'Free' : j.price ? esc(j.price) : zero('–')],
+    ['Paid', j.paid && !j.free ? `${esc(j.paid)} <small>published receipt</small>` : ''],
+    ['Posted', esc(ago(j.postedAt))],
+    ['Deadline', j.live && j.deadline ? esc(until(j.deadline)) : ''],
+    ['Rounds', j.rounds > 1 ? String(j.rounds) : ''],
+    ['Claimed by', j.claimants > 1 ? `${j.claimants} experts` : ''],
+    ['Sent to', j.direct ? 'One expert, by name' : ''],
+    ['Visibility', j.priv ? 'Private' : ''],
+  ]));
+  paint($('#jb-rows'), j.events.map(f => eventRow(f, false, false)).join(''));
+}
+function openJob(id, from) {
+  if (!root.classList.contains('sheet-open')) { sheetFrom = from || null; backTo = []; } else if (panelOpen()) backTo.push(panelNow());
+  jobKey = String(id).toLowerCase();
+  $('#jb').dataset.state = 'wait';
+  drawSheet();
+  $('#jb').scrollTop = 0;
+  showSheet();
+}
+$('#sheet-back').addEventListener('click', () => {      // back to the list, profile or job this panel was opened from
+  const p = backTo.pop();
+  if (!p) return;
+  sheetTab = p.tab; profileKey = p.pk; profileKind = p.kind; jobKey = p.job;
+  if (!profileKey && !jobKey) setLink(null);
+  drawSheet();
   sheet.focus({ preventScroll: true });
 });
 document.addEventListener('click', e => {
+  if (e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;   // a new tab goes to the link itself
   const el = e.target.closest('[data-pk]');
-  if (!el || e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;   // a new tab goes to the link itself
+  if (el) {
+    e.preventDefault();
+    openProfile(el.dataset.pk, el.closest('a') || el.querySelector('a') || el, el.dataset.kind);
+    return;
+  }
+  const j = e.target.closest('[data-job]');            // an activity line (anywhere on it but a name), or a live-job link
+  if (!j || jobKey === j.dataset.job) return;
   e.preventDefault();
-  openProfile(el.dataset.pk, el.closest('a') || el.querySelector('a') || el, el.dataset.kind);
+  openJob(j.dataset.job, j.matches('a') ? j : j.querySelector('a') || j);
 });
 $('#sheet-x').addEventListener('click', closeSheet);
 $('#sheet-bg').addEventListener('click', closeSheet);
@@ -485,6 +567,7 @@ function show() {
   const query = new URLSearchParams(location.search), linked = query.get('expert') || query.get('seller');
   if (linked) openProfile(linked);
   else if (query.get('buyer')) openProfile(query.get('buyer'), null, 'buyer');
+  else if (query.get('job')) openJob(query.get('job'));     // a shared job link, or a live job linked from /swarm
 }
 const FACES = ['400 16px "Instrument Sans"', '500 16px "Instrument Sans"', 'italic 500 16px "Work Sans Logo"'];
 if (document.fonts && document.fonts.load) Promise.all(FACES.map(f => document.fonts.load(f))).then(show, show);
@@ -496,5 +579,5 @@ startMarket({
   // A status alone redraws when something on screen is still waiting on it: placeholders (no view for this period
   // yet), an open profile (it says "not found" or "not reachable" only once the read has ended), or a failure. Only
   // redrawing the lamp left All time and a profile on grey bars for good when the market failed after the week.
-  onStatus: s => { state = s; if (shown) (!cur() || profileKey || s === 'failed' ? draw : drawStatus)(); },
+  onStatus: s => { state = s; if (shown) (!cur() || profileKey || jobKey || s === 'failed' ? draw : drawStatus)(); },
 }).then(h => { handle = h; if (want !== 'week') pickWindow(want); }, err => { console.warn('[market] the reader did not start', err); failed = true; if (shown) draw(); });
