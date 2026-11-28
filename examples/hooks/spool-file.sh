@@ -79,6 +79,28 @@ NOTIFY_RETRY="${MAXPLAYER_SPOOL_NOTIFY_RETRY_SECS:-15}"
 [[ "$NOTIFY_RETRY" =~ ^[0-9]+$ ]] || fail "MAXPLAYER_SPOOL_NOTIFY_RETRY_SECS must be whole seconds"
 TIMEOUT="$(command -v timeout || command -v gtimeout || true)"
 
+# Run an operator command (notify, readiness check) for at most <seconds> plus a 2 s kill grace.
+# Its output goes to a file, then to our stderr, never straight onto the daemon's pipe: some
+# `timeout` builds kill only their direct child, and a process the command leaves running would
+# hold that pipe open past the deadline. Where setsid exists, it runs in its own process group,
+# which is killed once the call is over.
+bounded() { # <seconds> <command> [args...]
+  local secs="$1" out pid rc=0
+  shift
+  out="$(mktemp "$SPOOL/pending/.bounded.XXXXXX")"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$TIMEOUT" -k 2 "$secs" "$@" </dev/null >"$out" 2>&1 &
+  else
+    "$TIMEOUT" -k 2 "$secs" "$@" </dev/null >"$out" 2>&1 &
+  fi
+  pid=$!
+  wait "$pid" || rc=$?
+  kill -KILL -- "-$pid" 2>/dev/null || true
+  head -c 4000 -- "$out" >&2 || true
+  rm -f -- "$out"
+  return "$rc"
+}
+
 spool_dirs() {
   if [[ ! -d "$SPOOL" ]]; then (umask 077 && mkdir -p -- "$SPOOL"); fi
   mkdir -p -- "$SPOOL/pending" "$SPOOL/answers" "$SPOOL/expired"
@@ -97,7 +119,7 @@ case "$kind" in
     [[ -n "$TIMEOUT" ]] || { echo "needs timeout (GNU coreutils; gtimeout on macOS)" >&2; exit 1; }
     if [[ -n "${MAXPLAYER_SPOOL_READY:-}" ]]; then
       rc=0
-      "$TIMEOUT" -k 2 25 "$MAXPLAYER_SPOOL_READY" </dev/null >&2 || rc=$?
+      bounded 25 "$MAXPLAYER_SPOOL_READY" || rc=$?
       ((rc == 0)) || { echo "readiness check failed ($rc)" >&2; exit 1; }
     fi
     exit 0
@@ -161,7 +183,7 @@ renotify() { if [[ -n "${MAXPLAYER_SPOOL_NOTIFY:-}" ]]; then notified=no; next_n
 if [[ -e "$request" ]] && ! answered; then renotify; fi
 notify() { # <seconds allowed>
   local rc=0
-  "$TIMEOUT" -k 2 "$1" "$MAXPLAYER_SPOOL_NOTIFY" "$request" </dev/null >&2 || rc=$?
+  bounded "$1" "$MAXPLAYER_SPOOL_NOTIFY" "$request" || rc=$?
   if ((rc == 0)); then
     notified=yes
   else

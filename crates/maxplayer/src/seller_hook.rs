@@ -909,6 +909,41 @@ mv "$d/answers/.$k.tmp" "$d/answers/$k.txt"
         assert_eq!(answer_of(&out)["status"], "cannot_deliver", "{err}");
         assert!(now_unix() < deadline, "declined before the deadline ({:?} elapsed): {err}", started.elapsed());
 
+        // The same with a `timeout` that, like some builds (uutils), signals only its direct child:
+        // the hanging notify's own child (its `sleep`) survives that kill, and must not hold the
+        // hook's output open past the deadline.
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        executable(
+            &bin.join("timeout"),
+            "#!/bin/sh
+if [ \"$1\" = -k ]; then grace=$2; shift 2; else grace=0; fi
+secs=$1; shift
+\"$@\" & child=$!
+( sleep \"$secs\"; kill -TERM $child 2>/dev/null; sleep \"$grace\"; kill -KILL $child 2>/dev/null ) >/dev/null 2>&1 </dev/null &
+watcher=$!
+wait $child; rc=$?
+kill $watcher 2>/dev/null
+exit $rc
+",
+        );
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let job = "fe".repeat(32);
+        let deadline = now_unix() + 7;
+        let started = std::time::Instant::now();
+        let (code, out, err) = spool_call(
+            &spool,
+            &[("MAXPLAYER_SPOOL_NOTIFY", hang.display().to_string()), ("PATH", path)],
+            &spool_event(&job, &inv(2), 1, false, 100, deadline),
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(answer_of(&out)["status"], "cannot_deliver", "{err}");
+        assert!(
+            now_unix() < deadline,
+            "child-only timeout: declined before the deadline ({:?} elapsed): {err}",
+            started.elapsed()
+        );
+
         std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o770)).unwrap();
         let operator_file = spool.join("ready.sh");
         let old_answer = spool.join("answers").join("old.txt");
