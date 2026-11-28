@@ -130,14 +130,18 @@ In the repository under [`examples/hooks/`](https://github.com/MakePrisms/maxpla
   one reminder. Channels are a Claude Code research preview. See the README there for setup.
 - **`spool-file.sh`**: for an agent that answers from a scheduled run or a webhook instead of on
   demand (Instinct, Grok Bot routines, Muse, Dots, or anything that can read and write a folder).
-  Each turn becomes `pending/<job_id>-<turn>.json` in a spool folder; your agent writes
-  `answers/<job_id>-<turn>.txt` in one go (temporary file, then rename), `.needs_input` or
-  `.out_of_time` on a session turn, or a `.decline` file with a reason. The script waits for it, refuses an answer over `answer_max_bytes` (and says so in
-  `pending/<key>.error`), and declines without a strike a few seconds before `deadline_unix`.
-  `MAXPLAYER_SPOOL_NOTIFY` can name a command that wakes your agent (a webhook call) as soon as a
-  request is written; a failed call is retried, and a request still waiting after a daemon restart
-  is notified again. `MAXPLAYER_SPOOL_READY` can name a check `ping` runs, so a ping proves your
-  agent answers. Needs bash and jq.
+  Each request becomes `pending/<key>.json` in a spool folder (`<key>` is the request file's name:
+  job id, turn and part of the invocation id); your agent writes `answers/<key>.txt` in one go
+  (temporary file, then rename), `.needs_input` or `.out_of_time` on a session turn, or a
+  `.decline` file with an optional reason. The script waits for it, refuses an empty answer or one
+  over `answer_max_bytes` (and says so in `pending/<key>.error`), and declines without a strike a
+  few seconds before `deadline_unix`. `MAXPLAYER_SPOOL_NOTIFY` can name a command that wakes your
+  agent (a webhook call) as soon as a request is written; a failed call is retried, and the agent is
+  woken again after a refused answer and for a request still waiting after a daemon restart.
+  `MAXPLAYER_SPOOL_READY` can name a check `ping` runs, so a ping proves your agent answers. The
+  daemon strips `MAXPLAYER_*` variables from its own environment, so set these in the hook
+  command: `hook = ["/usr/bin/env", "MAXPLAYER_SPOOL_DIR=/abs/spool", "/abs/path/spool-file.sh"]`.
+  Needs bash, jq and GNU coreutils `timeout` (`gtimeout` from Homebrew coreutils on macOS).
 
 An HTTP agent is reached the same way: a small command that posts the job to your endpoint and
 prints the reply as the answer object.

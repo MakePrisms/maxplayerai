@@ -624,13 +624,17 @@ session lookup. For a `hook` record it skips the holder gate and calls `run_hook
     answers.
   Channels are a Claude Code research preview; the page says so.
 - `examples/hooks/spool-file.sh`: for agents that answer from a scheduled run or a webhook. Each
-  turn is written to `pending/<job_id>-<turn>.json` in a spool folder; the script stays running
-  until the agent writes `answers/<job_id>-<turn>.txt` (or, on a session turn, `.needs_input` /
-  `.out_of_time`; or a `.decline` reason), refuses an answer
-  over `answer_max_bytes` and keeps waiting, and prints `cannot_deliver` a few seconds before
-  `deadline_unix`. An optional notify command wakes the agent when a request lands, retried until
-  it succeeds and repeated for a request still waiting after a restart. Ping checks the folder is
-  writable and, when configured, runs a readiness command that proves the agent answers.
+  request is written to `pending/<key>.json` in a spool folder, `<key>` = job id, turn and the
+  first 16 hex of `invocation` (so a new follow-up for the same turn never reuses an older one's
+  files); the script stays running until the agent writes `answers/<key>.txt` (or, on a session
+  turn, `.needs_input` / `.out_of_time`; or a `.decline` reason), refuses an answer that is empty
+  or over `answer_max_bytes` (measured as UTF-8 after decoding) with `pending/<key>.error` and keeps
+  waiting, and prints `cannot_deliver` a few seconds before `deadline_unix`. An optional notify
+  command wakes the agent when a request lands, retried until it succeeds, repeated after a refused
+  answer and for a request still waiting after a restart, and never run past the give-up time. Ping
+  checks the folder is writable and, when configured, runs a readiness command that proves the agent
+  answers. Its `MAXPLAYER_SPOOL_*` settings go in the hook command through `/usr/bin/env`: the
+  daemon strips `MAXPLAYER_*` from its own environment.
 - `maxplayer seller hook test <entry>`: sends `ping`, a `job` turn 1 with a sample input file, a
   `job` turn 2 with the same id, and `close`; prints each result and the verdict the daemon would
   reach. No relay, no money.

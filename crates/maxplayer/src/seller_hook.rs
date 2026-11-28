@@ -653,13 +653,16 @@ mv "$d/answers/.$k.tmp" "$d/answers/$k.txt"
         assert_eq!(code, SUCCESS, "out:\n{out}\nerr:\n{err}");
         assert!(out.contains("spool answer turn 1"), "{out}");
         assert!(out.contains("spool answer turn 2"), "{out}");
-        // Nothing is left waiting: both turns were answered, none expired. (A single-turn job gets
-        // no `close`, so its answer stays until the weekly sweep on `ping`.)
+        // Nothing is left waiting: both turns were answered, none expired.
         let waiting: Vec<_> = walk(&spool.join("pending"))
             .into_iter()
             .chain(walk(&spool.join("expired")))
             .collect();
         assert!(waiting.is_empty(), "no request left pending or expired: {waiting:?}");
+        // `close` removed the session job's two answers; only the single-turn job's answer (it
+        // gets no `close`) is left for the weekly sweep on `ping`.
+        let answers = walk(&spool.join("answers"));
+        assert_eq!(answers.len(), 1, "close emptied the session job: {answers:?}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -721,10 +724,7 @@ echo "answered on call $n" > "$d/answers/.$k.tmp" && mv "$d/answers/.$k.tmp" "$d
         );
         let job = "ab".repeat(32);
         let deadline = now_unix() + 60;
-        let event = |turn: u32, session: bool| {
-            serde_json::json!({"v": 1, "event": "job", "job_id": job, "turn": turn, "session": session,
-                "prompt": "p", "answer_max_bytes": 100, "deadline_unix": deadline})
-        };
+        let event = |turn: u32, session: bool| spool_event(&job, &inv(turn), turn, session, 100, deadline);
         let env = [
             ("MAXPLAYER_SPOOL_NOTIFY", notify.display().to_string()),
             ("MAXPLAYER_SPOOL_NOTIFY_RETRY_SECS", "1".to_owned()),
@@ -736,7 +736,7 @@ echo "answered on call $n" > "$d/answers/.$k.tmp" && mv "$d/answers/.$k.tmp" "$d
         assert_eq!(err.matches("notify failed").count(), 2, "{err}");
 
         // A restart: turn 2's request is already pending from the earlier attempt, unanswered.
-        std::fs::write(spool.join("pending").join(format!("{job}-2.json")), "{}").unwrap();
+        std::fs::write(spool.join("pending").join(format!("{}.json", spool_key(&job, 2, &inv(2)))), "{}").unwrap();
         let (code, out, err) = spool_call(&spool, &env, &event(2, true));
         assert_eq!(code, 0, "{err}");
         assert_eq!(
@@ -746,17 +746,184 @@ echo "answered on call $n" > "$d/answers/.$k.tmp" && mv "$d/answers/.$k.tmp" "$d
         );
 
         // A session turn the agent answers with needs_input.
-        std::fs::write(spool.join("answers").join(format!("{job}-3.needs_input")), "which file?").unwrap();
+        std::fs::write(spool.join("answers").join(format!("{}.needs_input", spool_key(&job, 3, &inv(3)))), "which file?").unwrap();
         let (code, out, _) = spool_call(&spool, &[], &event(3, true));
         assert_eq!(code, 0);
         assert_eq!(answer(&out), serde_json::json!({"status": "needs_input", "answer": "which file?"}));
 
         let ping = serde_json::json!({"v": 1, "event": "ping", "reason": "boot"});
-        let (code, _, err) = spool_call(&spool, &[("MAXPLAYER_SPOOL_READY", "/bin/false".to_owned())], &ping);
+        // Readiness helpers of our own: /bin/true and /bin/false are not there on every platform.
+        let (ready_no, ready_yes) = (tmp.join("not-ready"), tmp.join("ready"));
+        executable(&ready_no, "#!/bin/sh\nexit 1\n");
+        executable(&ready_yes, "#!/bin/sh\nexit 0\n");
+        let (code, _, err) = spool_call(&spool, &[("MAXPLAYER_SPOOL_READY", ready_no.display().to_string())], &ping);
         assert_eq!(code, 1, "a failing readiness check fails the ping: {err}");
         assert!(err.contains("readiness check failed"), "{err}");
-        let (code, _, _) = spool_call(&spool, &[("MAXPLAYER_SPOOL_READY", "/bin/true".to_owned())], &ping);
+        let (code, _, _) = spool_call(&spool, &[("MAXPLAYER_SPOOL_READY", ready_yes.display().to_string())], &ping);
         assert_eq!(code, 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A 64-hex invocation for test turn `n`.
+    fn inv(n: u32) -> String {
+        format!("{n:02x}").repeat(32)
+    }
+
+    /// The spool key `spool-file.sh` uses: job, turn and the invocation's first 16 hex.
+    fn spool_key(job: &str, turn: u32, invocation: &str) -> String {
+        format!("{job}-{turn}-{}", &invocation[..16])
+    }
+
+    fn spool_event(job: &str, invocation: &str, turn: u32, session: bool, cap: usize, deadline: u64) -> serde_json::Value {
+        serde_json::json!({"v": 1, "event": "job", "invocation": invocation, "attempt": 1, "job_id": job,
+            "turn": turn, "session": session, "prompt": "p", "answer_max_bytes": cap, "deadline_unix": deadline})
+    }
+
+    fn answer_of(out: &str) -> serde_json::Value {
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("{e}: {out}"))
+    }
+
+    /// Advisor #1452 r1: answers the daemon would reject are refused in the spool (empty, too long
+    /// after UTF-8 decoding, a session-only status on a single-turn job), with an `.error` and a
+    /// new notify, never handed over; an empty `.decline` declines; a new invocation for the same
+    /// turn is not poisoned by an older decline; a restart whose answer is already written delivers
+    /// without notifying; the deadline moves the request to `expired/`.
+    #[test]
+    fn the_spool_file_adapter_refuses_bad_answers_and_keys_by_invocation() {
+        let tmp = scratch("spool-refuse");
+        let spool = tmp.join("spool");
+        let answers = spool.join("answers");
+        std::fs::create_dir_all(&answers).unwrap();
+        let job = "cd".repeat(32);
+        let far = now_unix() + 60;
+        let write_answer = |key: &str, ext: &str, body: &[u8]| {
+            let tmp_file = answers.join(format!(".{key}.tmp"));
+            std::fs::write(&tmp_file, body).unwrap();
+            std::fs::rename(&tmp_file, answers.join(format!("{key}.{ext}"))).unwrap();
+        };
+
+        // Empty answer: refused, the agent is notified again, and its corrected answer is delivered.
+        let calls = tmp.join("calls");
+        let notify = tmp.join("notify");
+        executable(
+            &notify,
+            &format!(
+                r#"#!/bin/sh
+n=$(($(cat '{calls}' 2>/dev/null || echo 0) + 1)); echo $n > '{calls}'
+f="$1"; d=$(dirname "$(dirname "$f")"); k=$(basename "$f" .json)
+if [ "$n" -eq 1 ]; then printf '  
+' > "$d/answers/.$k.tmp"; else echo "real answer" > "$d/answers/.$k.tmp"; fi
+mv "$d/answers/.$k.tmp" "$d/answers/$k.txt"
+"#,
+                calls = calls.display()
+            ),
+        );
+        let key1 = spool_key(&job, 1, &inv(1));
+        let (code, out, err) = spool_call(
+            &spool,
+            &[("MAXPLAYER_SPOOL_NOTIFY", notify.display().to_string())],
+            &spool_event(&job, &inv(1), 1, false, 100, far),
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(answer_of(&out), serde_json::json!({"status": "done", "answer": "real answer\n"}), "{err}");
+        assert!(err.contains("the answer is empty"), "{err}");
+        assert!(answers.join(format!("{key1}.txt.refused")).exists());
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().trim(), "2", "notified again after the refusal");
+
+        // Restart with the answer already written: delivered at once, the notify command never runs.
+        let (code, out, err) = spool_call(
+            &spool,
+            &[("MAXPLAYER_SPOOL_NOTIFY", tmp.join("missing-notify").display().to_string())],
+            &spool_event(&job, &inv(1), 1, false, 100, far),
+        );
+        assert_eq!((code, answer_of(&out)["answer"].clone()), (0, serde_json::json!("real answer\n")), "{err}");
+        assert!(!err.contains("notify"), "{err}");
+
+        // Invalid UTF-8: 4 bytes on disk, 12 once decoded, over a cap of 6. Refused, never handed
+        // over; at the deadline the request moves to expired/ and the turn declines.
+        let key2 = spool_key(&job, 2, &inv(2));
+        write_answer(&key2, "txt", b"\xff\xfe\xfd\xfc");
+        let (code, out, err) = spool_call(
+            &spool,
+            &[("MAXPLAYER_SPOOL_FINISH_SECS", "3".to_owned())],
+            &spool_event(&job, &inv(2), 2, true, 6, now_unix() + 5),
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(answer_of(&out), serde_json::json!({"status": "cannot_deliver", "reason": "no answer before the deadline"}));
+        let error = std::fs::read_to_string(spool.join("pending").join(format!("{key2}.error"))).unwrap();
+        assert!(error.contains("answer is 12 bytes; the limit is 6 bytes"), "{error}");
+        assert!(spool.join("expired").join(format!("{key2}.json")).exists());
+
+        // An empty .decline declines (the reason is optional).
+        let key3 = spool_key(&job, 3, &inv(3));
+        write_answer(&key3, "decline", b"");
+        let (code, out, _) = spool_call(&spool, &[], &spool_event(&job, &inv(3), 3, true, 100, far));
+        assert_eq!((code, answer_of(&out)), (0, serde_json::json!({"status": "cannot_deliver", "reason": ""})));
+
+        // A new follow-up for the same turn (new invocation) is not answered by that old decline.
+        write_answer(&spool_key(&job, 3, &inv(30)), "txt", b"the new follow-up's answer");
+        let (code, out, _) = spool_call(&spool, &[], &spool_event(&job, &inv(30), 3, true, 100, far));
+        assert_eq!(
+            (code, answer_of(&out)),
+            (0, serde_json::json!({"status": "done", "answer": "the new follow-up's answer"}))
+        );
+
+        // needs_input on a single-turn job is refused with an .error; the agent's decline then counts.
+        let key4 = spool_key(&job, 4, &inv(4));
+        write_answer(&key4, "needs_input", b"which file?");
+        let decline_later = tmp.join("decline-later");
+        executable(
+            &decline_later,
+            &format!(
+                "#!/bin/sh\nsleep 1; echo nope > '{a}/.d' && mv '{a}/.d' '{a}/{key4}.decline'\n",
+                a = answers.display()
+            ),
+        );
+        let mut writer = std::process::Command::new(&decline_later).spawn().unwrap();
+        let (code, out, err) = spool_call(&spool, &[], &spool_event(&job, &inv(4), 4, false, 100, far));
+        writer.wait().unwrap();
+        assert_eq!((code, answer_of(&out)), (0, serde_json::json!({"status": "cannot_deliver", "reason": "nope"})), "{err}");
+        assert!(err.contains("needs_input is for session jobs only"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Advisor #1452 r1: a notify command that hangs (and ignores SIGTERM) is cut so the hook still
+    /// declines before the deadline; `ping`'s weekly sweep touches only the spool's own folders and
+    /// leaves an existing folder's permissions alone.
+    #[test]
+    fn the_spool_file_adapter_stays_inside_its_deadline_and_its_folders() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = scratch("spool-bounds");
+        let spool = tmp.join("spool");
+        let hang = tmp.join("hang");
+        executable(&hang, "#!/bin/sh\ntrap '' TERM\nsleep 30\n");
+        let job = "ef".repeat(32);
+        let deadline = now_unix() + 7;
+        let started = std::time::Instant::now();
+        let (code, out, err) = spool_call(
+            &spool,
+            &[("MAXPLAYER_SPOOL_NOTIFY", hang.display().to_string())],
+            &spool_event(&job, &inv(1), 1, false, 100, deadline),
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(answer_of(&out)["status"], "cannot_deliver", "{err}");
+        assert!(now_unix() < deadline, "declined before the deadline ({:?} elapsed): {err}", started.elapsed());
+
+        std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let operator_file = spool.join("ready.sh");
+        let old_answer = spool.join("answers").join("old.txt");
+        std::fs::write(&operator_file, "#!/bin/sh\n").unwrap();
+        std::fs::write(&old_answer, "old").unwrap();
+        let week_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+        for path in [&operator_file, &old_answer] {
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(week_ago).unwrap();
+        }
+        let ping = serde_json::json!({"v": 1, "event": "ping", "reason": "boot"});
+        let (code, _, err) = spool_call(&spool, &[], &ping);
+        assert_eq!(code, 0, "{err}");
+        assert!(operator_file.exists(), "an operator's file next to the spool folders is kept");
+        assert!(!old_answer.exists(), "a week-old spool file is swept");
+        assert_eq!(std::fs::metadata(&spool).unwrap().permissions().mode() & 0o777, 0o770);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
