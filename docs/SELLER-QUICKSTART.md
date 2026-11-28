@@ -166,7 +166,7 @@ to `serve` when convenient.
 Usage:
   maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]
   maxplayer seller serve   # zero-prompt relaunch from config.toml
-  maxplayer seller serve   # hook seat (Muse, Grok Bot, Instinct or your own command): add [agents.<name>] hook = [...] and [seller] agents = ["<name>"] to a seat's config.toml (a first run with --rate-sats writes the rest), check it with `maxplayer seller hook test <name>`
+  maxplayer seller serve --agent <name> --rate-sats <n>   # hook seat (Muse, Grok Bot, Instinct or your own command): add only [agents.<name>] hook = [...] to config.toml, check it with `maxplayer seller hook test <name>`, then serve (the first serve writes [seller]; an existing seat sets [seller] agents = ["<name>"] instead)
   maxplayer seller serve --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
   maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted
   maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm
@@ -189,7 +189,7 @@ Notes:
 
 | Flag | Required | Meaning |
 |------|----------|---------|
-| `--agent <name>` | yes* | Named preset: `claude` \| `cursor` \| `codex`. Resolves the correct ACP command internally. |
+| `--agent <name>` | yes* | Named preset: `claude` \| `cursor` \| `codex` (resolves the correct ACP command internally), or an `[agents.<name>]` entry from `config.toml` (a hook seat: Muse, Grok Bot, Instinct; seller-hook skill). |
 | `--agent-argv <part>` | yes* (repeatable) | Build `agent_command` as an **argv array** (first entry = program). Shell strings refused. Pass either `--agent` **or** `--agent-argv`, not both. |
 | `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. The setup default is `100` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)). |
 | `--git-remote <url>` | no | Public https delivery remote (BYO). Omit → the hosted relay-git default. |
@@ -1668,8 +1668,8 @@ Lines worth knowing when something is slow:
 | `WORK-LANE clear: <what> finished after Ns` | The long-running work ended. |
 | `WORK-LANE queue full (1024 events): relay reads pause until it drains` | Back-pressure, logged once per episode. Anything dropped meanwhile is re-read by the next history backfill. |
 | `WORK-LANE queue empty again after Ns (it filled N time(s) meanwhile)` | The back-pressure episode above ended. |
-| `WORK-LANE boot replay done after Ns: the relay's stored events filled the queue N time(s) after start (…)` | The same back-pressure right after a start, while the relay is still handing back its stored events (until its end-of-stored-events reply on each subscription, at most 2 minutes). Printed only after a start whose replay filled the queue; that episode's `queue full` line prints only with `MAXPLAYER_VERBOSE=1`. |
-| `WORK-LANE queue full since the boot replay Ns ago and not drained yet (filled N time(s)) …` | A boot-replay episode still full after 2 minutes: reported like any other back-pressure, and its end prints the ordinary `queue empty again` line. |
+| `WORK-LANE boot replay done after Ns: the relay's stored events filled the queue N time(s) after start (…)` | The same back-pressure right after a start, while the relay is still handing back that subscription's stored events (until its end-of-stored-events reply or a CLOSED; a reconnect, failed sign-in or dropped notifications end it for all; at most 2 minutes). Printed only after a start whose replay filled the queue; that episode's `queue full` line prints only with `MAXPLAYER_VERBOSE=1`. |
+| `WORK-LANE boot replay not drained after Ns (N event(s) still queued; the queue filled N time(s))` | A boot-replay queue-full episode not drained 2 minutes after it began: still draining a large replay, or a stuck lane. Reported at default level; `: relay reads are paused until it drains` is added only while the queue is at its cap. Its end prints the ordinary `queue empty again` line. |
 | `outbox: the relay confirmed none of N pending publication(s); routine drains pause 5s, backing off to 30s` | The relay is not acknowledging what we publish. The rows stay pending and are retried with the same event ids; new claims still get their first attempt during the pause. |
 | `outbox drain: confirmed=… failed=… expired=… deferred=…` | One bounded publishing pass. `deferred` rows were not reached before the pass's 15 s budget and go first next time. |
 | `backfill INCOMPLETE: retrying in Ns` (and `WARN: wrap backfill INCOMPLETE …`) | The relay did not finish answering a history read. It is retried soon (30 s, doubling) and is never treated as "nothing there". |
@@ -1692,7 +1692,7 @@ first skip line this boot, a relay `CLOSED` for a subscription that is not ours,
 ended sessions. All but the first two are counted, and the status tick prints one
 `seller node routine (since last status): …` line with the counts when any happened. The boot
 replay's `WORK-LANE queue full` line is hidden too (not counted); its `boot replay done` line still
-prints, and a replay still full after 2 minutes is reported. A lapsed offer
+prints, and a replay not drained after 2 minutes is reported. A lapsed offer
 aimed at this seat and authored within the last hour still prints its `offer skip` line, once.
 Payment gift-wraps re-read by the periodic wrap backfill are summarised the same way (`wraps that are
 not payments`, `payments already collected`); the backfill still prints how many it read. A payment

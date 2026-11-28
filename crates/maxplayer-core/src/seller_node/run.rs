@@ -6518,18 +6518,25 @@ impl SellerNodeRunner {
     /// (see [`probe_relay_serves_our_reqs`]), so that REQ could only ever have returned nothing.
     /// Liveness is asserted by the probe instead.
     async fn subscribe_all(&self, since: Option<nostr_sdk::Timestamp>) -> Result<(), NodeError> {
-        for id in [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID] {
+        for id in self.long_lived_sub_ids() {
             self.subscribe_one(id, since).await?;
         }
+        Ok(())
+    }
+
+    /// The long-lived subscriptions [`Self::subscribe_all`] issues, in order (the boot replay tracks
+    /// the same set).
+    fn long_lived_sub_ids(&self) -> Vec<&'static str> {
+        let mut ids = vec![OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID];
         // #541: the settlement-receipt sub feeds the terminal-offer gate, and the gate only matters for
         // offers we can LOSE — the open pool. A targeted seller is covered by local claim idempotency
         // (its own settlements are in its store) and cannot lose a targeted-to-it offer to another
         // seat, so it never carries the sub. Registered here so boot AND the watchdog's reconnect keep
         // the same set.
         if self.claim_open_pool() {
-            self.subscribe_one(RECEIPT_SUB_ID, since).await?;
+            ids.push(RECEIPT_SUB_ID);
         }
-        Ok(())
+        ids
     }
 
     /// Issue (or re-issue) the REQ for ONE named subscription, so a single leg can be repaired
@@ -6767,10 +6774,7 @@ impl SellerNodeRunner {
         self.rehydrate_suppressions();
         // The boot replay (stored history on these subscriptions) is told apart from a live queue
         // fill by their EOSEs, not by a timer (#1444 advisor r1).
-        let mut boot_subs = vec![OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID];
-        if self.claim_open_pool() {
-            boot_subs.push(RECEIPT_SUB_ID);
-        }
+        let boot_subs = self.long_lived_sub_ids();
         let boot_replay_started = tokio::time::Instant::now();
         self.subscribe_all(None).await?;
         opline!(
@@ -7065,14 +7069,19 @@ impl SellerNodeRunner {
             if recovering.get() {
                 queue_full.end_boot_replay();
             }
-            if let Some(line) = queue_full.overdue(tokio::time::Instant::now()) {
-                opline!("{line}");
-            }
             if let Some((fills, took)) =
                 queue_full.after_take(queue.queued_events(), tokio::time::Instant::now())
             {
                 // The boot replay's end prints one line worded as the expected event it is.
                 opline!("{}", queue_full.ended_line(fills, took));
+            }
+            // After the end check, so an episode that drained on this turn is not called stuck.
+            if let Some(line) = queue_full.overdue(
+                tokio::time::Instant::now(),
+                queue.queued_events(),
+                queue.has_room(),
+            ) {
+                opline!("{line}");
             }
             tokio::select! {
                 // #747: leave the selling role. Breaking here — rather than exiting the process
@@ -7394,6 +7403,9 @@ impl SellerNodeRunner {
                     );
                     liveness = report.clock;
                     if report.recovered.is_some() {
+                        // A recovery ran (even one too quick for the loop to see it in flight):
+                        // what its resubscribe brings is not the boot replay.
+                        queue_full.end_boot_replay();
                         last_recovery_end = Some(tokio::time::Instant::now());
                     }
                     match report.recovered {
@@ -7523,7 +7535,11 @@ impl SellerNodeRunner {
                             if handled_event_kind(event.kind) {
                                 queue.push_event(event);
                                 if queue_full
-                                    .after_push(queue.has_room(), tokio::time::Instant::now())
+                                    .after_push(
+                                        queue.has_room(),
+                                        subscription_id.as_str(),
+                                        tokio::time::Instant::now(),
+                                    )
                                 {
                                     match queue_full.full_line(EVENT_QUEUE_CAP) {
                                         schedule::LaneLine::Default(line) => opline!("{line}"),
@@ -7547,6 +7563,9 @@ impl SellerNodeRunner {
                             ..
                         }) => {
                             let id = subscription_id.to_string();
+                            // No more of this subscription's stored history comes (a re-issued REQ's
+                            // replay then reads as live: louder, never hidden).
+                            queue_full.stored_history_ended(&id);
                             let label = subscription_label(&id);
                             if is_our_subscription(&id) {
                                 opline!(
@@ -7716,6 +7735,8 @@ impl SellerNodeRunner {
                         Ok(_) => {}
                         Err(error) => {
                             // A broadcast lag is recoverable — never go permanently deaf.
+                            // A lag may have dropped a boot EOSE.
+                            queue_full.end_boot_replay();
                             opline!("seller node WARN: notification stream {error}; continuing");
                             continue;
                         }
@@ -7785,18 +7806,23 @@ impl SellerNodeRunner {
                                      the money leg silently deaf",
                                     overlap.as_secs()
                                 ),
-                                Err(error) => opline!(
-                                    "seller node RELAY-AUTH RESUBSCRIBE failed ({error}); the next \
-                                     completed auth or the wrap backfill retries"
-                                ),
+                                Err(error) => {
+                                    queue_full.end_boot_replay();
+                                    opline!(
+                                        "seller node RELAY-AUTH RESUBSCRIBE failed ({error}); the \
+                                         next completed auth or the wrap backfill retries"
+                                    )
+                                }
                             }
                         }
-                        Ok(RelayNotification::AuthenticationFailed) => { nip42_authed = false; sign_in_known = true; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
+                        Ok(RelayNotification::AuthenticationFailed) => { queue_full.end_boot_replay(); nip42_authed = false; sign_in_known = true; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
                         // A socket that went away takes its NIP-42 state with it — whatever comes
                         // back starts unauthenticated.
                         Ok(RelayNotification::RelayStatus { status })
                             if status != nostr_sdk::prelude::RelayStatus::Connected =>
                         {
+                            // A reconnect follows: its resubscribe is not the boot replay.
+                            queue_full.end_boot_replay();
                             nip42_authed = false;
                             sign_in_known = true;
                             self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed);
