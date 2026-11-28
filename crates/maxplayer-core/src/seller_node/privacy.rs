@@ -257,10 +257,6 @@ pub fn contribution(pin: &pc::Contribution) -> pc::Result<crate::contribution::C
 pub fn input_cache(home: &MaxplayerHome, offer: &str) -> std::path::PathBuf {
     home.root.join("private-inputs").join(offer)
 }
-/// Prove the exact inputs are readable before CLAIM. Cache only verified Git
-/// objects; execution later uses this pinned baseline instead of fetching a new tip.
-/// Whether [`preflight`] has anything to stage. Offers without inputs or a contribution
-/// base skip the off-loop gate entirely.
 /// Whether a private job can run without its per-job Git repository. Only a HOOK seat qualifies:
 /// a hook delivers inline and nothing else (a hook job whose inline delivery is withdrawn refuses
 /// before the hook runs), so with inline accepted, no Git inputs and no contribution base nothing
@@ -288,10 +284,14 @@ pub(crate) fn delivers_without_job_repo(
         && accepts_delivery.iter().any(|mode| mode == crate::gateway::DELIVERY_MODE_INLINE)
 }
 
+/// Whether [`preflight`] has anything to stage. Offers without inputs or a contribution
+/// base skip the off-loop gate entirely.
 pub fn needs_preflight(resolved: &pc::lifecycle::ResolvedOffer) -> bool {
     !resolved.attachments.is_empty() || resolved.contribution.is_some()
 }
 
+/// Prove the exact inputs are readable before CLAIM. Cache only verified Git
+/// objects; execution later uses this pinned baseline instead of fetching a new tip.
 pub async fn preflight(
     home: &MaxplayerHome,
     signer: &super::signer::SignerHandle,

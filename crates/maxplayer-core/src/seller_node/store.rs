@@ -2111,14 +2111,28 @@ impl SellerStore {
             tx.commit()?;
             return Ok(false);
         }
-        tx.execute(
+        // The row keeps the re-claim's `created_at_unix`: nothing rebuilds an event from a
+        // `confirmed` row, and `published_event_id` (not draft + time) names the claim on record.
+        let outbox = tx.execute(
             "UPDATE nostr_event_outbox
              SET state = 'confirmed', published_event_id = ?2, draft_json = ?3, updated_at_unix = ?4
              WHERE dedup_key = ?1",
             params![format!("claim:{job_id}"), claim_id, draft_json, now_unix],
         )?;
+        if outbox == 0 {
+            // Dropping `tx` rolls the claim update back: the claim and its outbox row never disagree.
+            return Err(StoreError(format!("adopt_claim job_id={job_id}: no claim outbox row")));
+        }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// When the claim on record for `job_id` was made (its `created_at_unix`), if there is one.
+    pub fn claim_created_at(&self, job_id: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row("SELECT created_at_unix FROM claims WHERE job_id = ?1", [job_id], |row| row.get(0))
+            .optional()?)
     }
 
     /// The claim draft journaled for `job_id` (the claim on record), if any.
