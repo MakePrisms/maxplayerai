@@ -169,6 +169,7 @@ Usage:
   maxplayer seller serve --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
   maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted
   maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm
+  maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]   # each job this seat won and whether it was paid: free / paid (fee remitted?) / awaiting payment / unpaid
   maxplayer seller [flags]   # deprecated alias for `maxplayer seller serve [flags]` (still works)
 
 Notes:
@@ -1425,6 +1426,16 @@ into remitted and unremitted — and every remittance so far. The `seller node c
 carries the same figures (`amount_received=` is what the buyer paid, then `mint_fee=`, `fee_sats=`,
 `fee_bps=`, `kept=`). Jobs collected before the mint fee was recorded print `mint fee: not recorded`
 and no "you keep" figure, rather than a made-up zero.
+
+`seller fees` lists only jobs that were paid. To see every job this seat won and whether it was paid,
+run `maxplayer seller jobs [--home <dir>] [--limit <n>] [--json]`: each job prints as free, paid
+(with whether its platform fee was remitted), delivered and **awaiting payment** (the buyer can pay
+for 7 days after delivery, and the line names the date), or **unpaid** once that window closed. When
+the latest remittance attempt (automatic or `seller fees remit --confirm`) did not pay and its fee is still unsent, it prints that
+attempt's error as well, marks the jobs whose fee it covers, and with `--json` puts it in their
+`fee_error`. `fee_status` tells `spending` (the remittance's payment was sent and awaits the mint's answer)
+from `unremitted`; `fee_sent` is `true` on a paid job once nothing is owed, `false` otherwise. It opens the store read-only and lists a
+session job by its first turn.
 
 **How the automatic remittance behaves.** A 100-sat offer with a 1-sat mint fee, for example, records
 `amount_sats = 100, mint_fee_sats = 1, fee_bps = 1000, fee_sats = 10`, prints `you keep: 89 sats`, and

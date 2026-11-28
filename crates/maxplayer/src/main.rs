@@ -34,6 +34,9 @@ mod seller_fees;
 // `maxplayer seller drain` (#1299): signals the seller holding this home's lock. Same gate as `sell`.
 #[cfg(feature = "acp")]
 mod seller_drain;
+// `maxplayer seller jobs`: each won job and whether it was paid. Same gate as `sell`.
+#[cfg(feature = "acp")]
+mod seller_jobs;
 #[cfg(feature = "acp")]
 mod seller_hook;
 // The containment probe is compiled on every build, not only the seller one: the payload half runs
