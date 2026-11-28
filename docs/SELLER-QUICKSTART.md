@@ -1451,7 +1451,10 @@ its own:
   not configurable — a seller-editable address would let a seller pay the fee to itself), reads the
   destination's minimum, and **if the unremitted balance is below that minimum it does nothing**: a
   10% fee on payments under 10 sats owes under 1 sat, and small balances simply accumulate until they
-  clear the minimum. That is the expected steady state for small jobs, not an error.
+  clear the minimum. That is the expected steady state for small jobs, not an error. The same goes
+  for a balance that does not yet cover the cost of sending it — say 2 sats owed against a mint
+  whose melt fee reserve is 2 sats: nothing is sent, no attempt is journaled, and the balance waits
+  for the next collected fee.
 - Otherwise it takes a melt quote from your default mint and invoices **the largest amount the
   wallet can actually pay for at most the accrued fee**: the mint's melt fee reserve and the proof
   fees come out of it (a mint that charges per input proof, or one whose proofs do not fit the
@@ -1499,7 +1502,9 @@ its own:
   on the wait then doubles — 2, 4, 8, 16 minutes — up to once every 30 minutes, each delay
   randomised between zero and that ceiling so a fleet of sellers does not hit a recovering host in
   the same second. A success resets the clock to its 30-second base; a balance under the
-  destination's minimum is not a failure and does not lengthen it. Nothing runs at startup: the
+  destination's minimum is not a failure and does not lengthen it. A balance too small to cover the
+  mint's fees is not a failure either: the clock does not lengthen, but the tick checks again only
+  every 30 minutes, since only a new collected payment (which tries on its own) can change it. Nothing runs at startup: the
   first check comes between 30 and 60 seconds after boot, and a payment collected in those first
   seconds cannot pull it earlier — the 30-second floor holds. The retries live inside the node's
   main loop, so stopping the node stops them from being scheduled — and a payment already in flight
