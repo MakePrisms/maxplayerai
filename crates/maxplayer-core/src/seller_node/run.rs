@@ -5991,10 +5991,15 @@ pub(crate) fn rearm_deadline(
     now: tokio::time::Instant,
     streak: u32,
     drawn: Duration,
+    computed: Duration,
     boot_floor: tokio::time::Instant,
 ) -> tokio::time::Instant {
     let proposed = now + drawn;
-    let deadline = if streak == 0 {
+    // A pending deadline further out than the backoff now computes was armed under a LONGER
+    // ceiling — the fee-floor park at the cap (`RemitBackoff::is_parked`). Ordinary failures only
+    // lengthen the ceiling, so this never shortens a failure's own deadline; it pulls a parked
+    // timer back to the failure's backoff when a collect-path attempt un-parks it (#1460 r1 H1).
+    let deadline = if streak == 0 || current_deadline > now + computed {
         proposed
     } else {
         proposed.max(current_deadline)
@@ -7695,15 +7700,16 @@ impl SellerNodeRunner {
                 // make the live timer follow — a success pulls the pending sleep back to base, a
                 // failure pushes a too-short deadline out and never shortens a longer one.
                 () = self.remit_pacing_changed.notified(), if auto_remit => {
-                    let (streak, drawn) = {
+                    let (streak, drawn, computed) = {
                         let pacing = self.remit_pacing_lock();
-                        (pacing.streak(), pacing.next_delay())
+                        (pacing.streak(), pacing.next_delay(), pacing.computed_delay())
                     };
                     let deadline = rearm_deadline(
                         remit_retry.deadline(),
                         tokio::time::Instant::now(),
                         streak,
                         drawn,
+                        computed,
                         remit_boot_floor,
                     );
                     remit_retry.as_mut().reset(deadline);
@@ -14055,12 +14061,13 @@ impl SellerNodeRunner {
                     crate::fee_remit::RemitTrigger::Collect,
                     effects_factory,
                 );
-                let (pacing_change, computed) = {
+                let (pacing_change, computed, park_changed) = {
                     let mut guard = pacing
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let was_parked = guard.is_parked();
                     let change = guard.observe(&report, now_unix());
-                    (change, guard.computed_delay())
+                    (change, guard.computed_delay(), was_parked != guard.is_parked())
                 };
                 log_remit_outcome(
                     &format!("remit (after job_id={job_id})"),
@@ -14069,8 +14076,9 @@ impl SellerNodeRunner {
                     None,
                     computed,
                 );
-                // The shared backoff moved (a payment or a failure): the loop re-arms its timer.
-                if pacing_change != crate::fee_remit::Pacing::Idle {
+                // The shared backoff moved (a payment, a failure, or the fee-floor park was taken or
+                // lifted): the loop re-arms its timer.
+                if pacing_change != crate::fee_remit::Pacing::Idle || park_changed {
                     pacing_changed.notify_one();
                 }
             });
@@ -28132,7 +28140,7 @@ esac"#,
         let sleep = tokio::time::sleep(Duration::from_secs(900));
         tokio::pin!(sleep);
         // Success (streak 0): reset to the drawn delay, however far away the old deadline was.
-        let deadline = rearm_deadline(sleep.deadline(), now, 0, Duration::from_secs(12), floor);
+        let deadline = rearm_deadline(sleep.deadline(), now, 0, Duration::from_secs(12), crate::fee_remit::RETRY_BASE, floor);
         assert_eq!(deadline, now + Duration::from_secs(12));
         sleep.as_mut().reset(deadline);
         assert!(
@@ -28155,6 +28163,7 @@ esac"#,
                 now,
                 2,
                 Duration::from_secs(90),
+                crate::fee_remit::RETRY_CAP,
                 floor
             ),
             now + Duration::from_secs(600)
@@ -28165,6 +28174,7 @@ esac"#,
                 now,
                 2,
                 Duration::from_secs(90),
+                crate::fee_remit::RETRY_CAP,
                 floor
             ),
             now + Duration::from_secs(90)
@@ -28176,6 +28186,64 @@ esac"#,
     /// the floor the re-arm would fire the first retry at 13 s after boot. With it, the re-armed
     /// `Sleep` — a real one, under Tokio's paused clock — fires at 30 s after boot and not one
     /// second sooner. A failure re-arm inside the first 30 s is floored the same way.
+    /// #1460 r1 H1: a timer PARKED at the cap (a fee-floor refusal, streak 0, pending ~25 min) is
+    /// pulled back when a collect-path attempt un-parks it with a failure: the failure's backoff
+    /// (streak 1, computed 60 s, drawn 25 s) wins over the parked deadline, and the sleep fires at
+    /// 25 s, not at 25 min. Mid-streak the same holds (streak 2, computed 120 s). An ordinary
+    /// failure deadline (armed within its own ceiling) is still never shortened.
+    #[tokio::test(start_paused = true)]
+    async fn a_collect_failure_pulls_a_parked_retry_timer_back_to_the_failure_backoff() {
+        let now = tokio::time::Instant::now();
+        let floor = now;
+        let sleep = tokio::time::sleep(Duration::from_secs(1500));
+        tokio::pin!(sleep);
+        let deadline = rearm_deadline(
+            sleep.deadline(),
+            now,
+            1,
+            Duration::from_secs(25),
+            Duration::from_secs(60),
+            floor,
+        );
+        assert_eq!(deadline, now + Duration::from_secs(25));
+        sleep.as_mut().reset(deadline);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(24), sleep.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), sleep.as_mut())
+                .await
+                .is_ok(),
+            "the un-parked timer fires at the failure's draw, not the parked 25-minute deadline"
+        );
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            rearm_deadline(
+                now + Duration::from_secs(1500),
+                now,
+                2,
+                Duration::from_secs(70),
+                Duration::from_secs(120),
+                floor
+            ),
+            now + Duration::from_secs(70)
+        );
+        // Within the failure's own ceiling the longer pending deadline is kept, as before.
+        assert_eq!(
+            rearm_deadline(
+                now + Duration::from_secs(100),
+                now,
+                2,
+                Duration::from_secs(70),
+                Duration::from_secs(120),
+                floor
+            ),
+            now + Duration::from_secs(100)
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_first_retry_never_fires_before_thirty_seconds_after_boot_even_after_a_collect_success()
      {
@@ -28188,7 +28256,7 @@ esac"#,
         // 5 s after boot a collect-path attempt succeeds; the shared backoff draws 8 s.
         tokio::time::advance(Duration::from_secs(5)).await;
         let now = tokio::time::Instant::now();
-        let deadline = rearm_deadline(sleep.deadline(), now, 0, Duration::from_secs(8), floor);
+        let deadline = rearm_deadline(sleep.deadline(), now, 0, Duration::from_secs(8), crate::fee_remit::RETRY_BASE, floor);
         assert_eq!(
             deadline, floor,
             "8 s after a success at 5 s would be 13 s after boot: clamped to boot + 30 s"
@@ -28218,6 +28286,7 @@ esac"#,
                 at_ten,
                 1,
                 Duration::from_secs(12),
+                Duration::from_secs(60),
                 floor
             ),
             boot + Duration::from_secs(45)
@@ -28228,6 +28297,7 @@ esac"#,
                 at_ten,
                 1,
                 Duration::from_secs(12),
+                Duration::from_secs(60),
                 floor
             ),
             floor
@@ -28240,6 +28310,7 @@ esac"#,
                 later,
                 0,
                 Duration::from_secs(12),
+                crate::fee_remit::RETRY_BASE,
                 floor
             ),
             later + Duration::from_secs(12)
