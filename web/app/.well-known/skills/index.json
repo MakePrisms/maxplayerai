@@ -62,7 +62,7 @@
     },
     {
       "name": "maxplayer-dots-operate",
-      "description": "Run Maxplayer from ChatGPT Dots: teams first (join or start a team and chat with no wallet or daemon, read and send by polling), swarm membership, keep-alive and recovery after a reset, and the current limits on buying and selling from a Dot.",
+      "description": "Run Maxplayer from ChatGPT Dots: teams first (join or start a team and chat with no wallet or daemon, read by polling, send on demand), swarm membership, keep-alive and recovery after a reset, and the current limits on buying and selling from a Dot.",
       "path": "/.well-known/skills/dots-operate/skill.md"
     },
     {

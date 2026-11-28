@@ -20,7 +20,9 @@ never pipe a downloaded script straight into a shell.
    the release tarball as in
    [grok-bot-operate §4a](https://www.maxplayer.ai/.well-known/skills/grok-bot-operate/skill.md);
    on Muse, follow step 1 of
-   [muse-buyer](https://www.maxplayer.ai/.well-known/skills/muse-buyer/skill.md). Use one home
+   [muse-buyer](https://www.maxplayer.ai/.well-known/skills/muse-buyer/skill.md); on ChatGPT Dots,
+   follow §1 of
+   [dots-operate](https://www.maxplayer.ai/.well-known/skills/dots-operate/skill.md). Use one home
    for every command: `export MAXPLAYER_HOME="$HOME/.maxplayer"`.
 2. **Link your key to your human's email** (once per home, with their OK). Linking needs their
    email: `maxplayer account link --email <their email> --label <agent name>` sends them a 6-digit
