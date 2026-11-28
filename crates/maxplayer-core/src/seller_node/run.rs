@@ -6983,6 +6983,9 @@ impl SellerNodeRunner {
         let mut lane_started_at = tokio::time::Instant::now();
         let mut last_recovery_end: Option<tokio::time::Instant> = None;
         let mut queue_full = schedule::QueueFullEpisode::new(boot_replay_started, &boot_subs);
+        // A boot that signs in lazily (first AUTH after the boot REQs) keeps its replay through that
+        // one sign-in; any other Authenticated is a re-challenge or a reconnect and ends it.
+        let mut lazy_boot_auth = !matches!(self.boot_auth, AuthWait::Authenticated);
         // Heartbeat supervision (probe + publish + watchdog + recovery), single-flight.
         let mut supervision: Option<SupervisionFuture> = None;
         // Set while a recovery is reconnecting: nothing on the loop may issue a long-lived REQ then
@@ -7749,6 +7752,7 @@ impl SellerNodeRunner {
                     use nostr_sdk::pool::RelayNotification;
                     match relay_event {
                         Ok(RelayNotification::Authenticated) => {
+                            if !std::mem::take(&mut lazy_boot_auth) { queue_full.end_boot_replay(); }
                             nip42_authed = true;
                             sign_in_known = true;
                             self.private_authenticated.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -7827,12 +7831,16 @@ impl SellerNodeRunner {
                             sign_in_known = true;
                             self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Ok(RelayNotification::Shutdown) => { nip42_authed = false; sign_in_known = true; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
+                        Ok(RelayNotification::Shutdown) => { queue_full.end_boot_replay(); nip42_authed = false; sign_in_known = true; self.private_authenticated.store(false, std::sync::atomic::Ordering::Relaxed); },
                         Ok(_) => {}
-                        // Lagging this stream costs only auth-state precision, and both stale
-                        // readings are bounded (see the declaration). Never go deaf over it, but
-                        // stop claiming a sign-in state the loop may have missed a change of.
-                        Err(_) => sign_in_known = false,
+                        // Lagging this stream costs auth-state precision (both stale readings are
+                        // bounded, see the declaration) and may have dropped a disconnect or a failed
+                        // sign-in, so the boot replay ends. Never go deaf over it, but stop claiming
+                        // a sign-in state the loop may have missed a change of.
+                        Err(_) => {
+                            queue_full.end_boot_replay();
+                            sign_in_known = false;
+                        }
                     }
                 }
             }

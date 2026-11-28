@@ -161,6 +161,10 @@ pub(crate) struct QueueFullEpisode {
     /// Boot subscriptions whose stored history has not ended yet (no EOSE or CLOSED). Empty: the
     /// replay is over.
     replay_pending: Vec<String>,
+    /// A live event (not part of the boot replay) was queued since the queue was last empty. An
+    /// episode is the boot replay only if every event in the queue is: a live flood that a lone
+    /// replay event happens to tip over the cap stays loud.
+    live_since_empty: bool,
     /// An episode has started since the loop did: only the first can be the boot replay.
     seen: bool,
     /// The current (or, after [`Self::after_take`] ended it, the last) episode is the boot replay.
@@ -212,6 +216,9 @@ impl QueueFullEpisode {
     /// After an event from subscription `sub` was queued. `true` exactly once per episode: log
     /// [`Self::full_line`].
     pub(crate) fn after_push(&mut self, has_room: bool, sub: &str, now: Instant) -> bool {
+        if !self.replaying(sub, now) {
+            self.live_since_empty = true;
+        }
         if has_room {
             return false;
         }
@@ -220,7 +227,7 @@ impl QueueFullEpisode {
             return false;
         }
         self.started = Some(now);
-        self.boot = !self.seen && self.replaying(sub, now);
+        self.boot = !self.seen && !self.live_since_empty;
         self.seen = true;
         true
     }
@@ -274,6 +281,7 @@ impl QueueFullEpisode {
         if queued != 0 {
             return None;
         }
+        self.live_since_empty = false;
         let started = self.started.take()?;
         let fills = std::mem::take(&mut self.fills);
         Some((fills, now.saturating_duration_since(started)))
@@ -1242,6 +1250,40 @@ mod tests {
         assert!(!done.replaying("a-backfill-read", at), "no replay left");
     }
 
+    /// The whole queue decides, not the event that fills it: live events tipped over the cap by
+    /// one replay event are a live episode, and so is a replay with any live event in the queue
+    /// (fail loud). Once the queue has drained, earlier live events no longer count.
+    #[test]
+    fn every_queued_event_decides_whether_an_episode_is_the_boot_replay() {
+        let t0 = Instant::now();
+        let at = t0 + Duration::from_secs(5);
+        let mut live_flood = QueueFullEpisode::new(t0, BOOT_SUBS);
+        live_flood.stored_history_ended("offers");
+        for _ in 0..3 {
+            assert!(!live_flood.after_push(true, "offers", at));
+        }
+        assert!(live_flood.after_push(false, "wraps", at), "a replay event fills the queue");
+        assert!(!live_flood.boot(), "three live offers in the queue");
+
+        let mut mixed = QueueFullEpisode::new(t0, BOOT_SUBS);
+        mixed.stored_history_ended("awards");
+        for _ in 0..3 {
+            assert!(!mixed.after_push(true, "wraps", at));
+        }
+        assert!(mixed.after_push(false, "awards", at));
+        assert!(!mixed.boot(), "one live award in a replay: fail loud");
+
+        let mut drained = QueueFullEpisode::new(t0, BOOT_SUBS);
+        drained.stored_history_ended("offers");
+        assert!(!drained.after_push(true, "offers", at));
+        assert!(drained.after_take(0, at).is_none(), "no episode, but the queue is empty");
+        for _ in 0..3 {
+            assert!(!drained.after_push(true, "wraps", at));
+        }
+        assert!(drained.after_push(false, "wraps", at));
+        assert!(drained.boot(), "the live offer drained before the replay filled the queue");
+    }
+
     /// An episode that drains on the same turn the stuck threshold passes ends with one line:
     /// [`QueueFullEpisode::after_take`] runs first and [`QueueFullEpisode::overdue`] then sees no
     /// episode. With room in the queue the stuck line does not claim reads are paused.
@@ -1279,7 +1321,7 @@ mod tests {
         assert!(started < at("schedule::QueueFullEpisode::new(boot_replay_started, &boot_subs)"));
         // Every EOSE and every CLOSED ends that subscription's replay, unguarded.
         at("message: nostr_sdk::RelayMessage::EndOfStoredEvents(eose_id), .. }) => { queue_full.stored_history_ended(eose_id.as_str());");
-        at("queue_full.stored_history_ended(&id); let label = subscription_label(&id);");
+        at("message: nostr_sdk::RelayMessage::Closed { subscription_id, message: reason }, .. }) => { let id = subscription_id.to_string(); // No more of this subscription's stored history comes (a re-issued REQ's // replay then reads as live: louder, never hidden). queue_full.stored_history_ended(&id);");
         // Each event counts against its own subscription.
         at(".after_push( queue.has_room(), subscription_id.as_str(), tokio::time::Instant::now(), )");
         // The level comes from the episode.
@@ -1296,11 +1338,16 @@ mod tests {
             "Err(error) => { // A broadcast lag is recoverable — never go permanently deaf. // A lag may have dropped a boot EOSE. queue_full.end_boot_replay();",
             "Err(error) => { queue_full.end_boot_replay(); opline!( \"seller node RELAY-AUTH RESUBSCRIBE failed",
             "Ok(RelayNotification::AuthenticationFailed) => { queue_full.end_boot_replay();",
+            "Ok(RelayNotification::Shutdown) => { queue_full.end_boot_replay();",
+            "Err(_) => { queue_full.end_boot_replay(); sign_in_known = false; }",
+            "if !std::mem::take(&mut lazy_boot_auth) { queue_full.end_boot_replay(); }",
             "if status != nostr_sdk::prelude::RelayStatus::Connected => { // A reconnect follows: its resubscribe is not the boot replay. queue_full.end_boot_replay();",
         ] {
             at(needle);
         }
-        assert_eq!(src.matches("queue_full.end_boot_replay();").count(), 7);
+        assert_eq!(src.matches("queue_full.end_boot_replay();").count(), 10);
+        // Only a lazy-auth boot's first sign-in keeps the replay.
+        at("let mut lazy_boot_auth = !matches!(self.boot_auth, AuthWait::Authenticated);");
     }
 
     /// The status line's relay half names sign-in, the last heartbeat and how the last relay drop

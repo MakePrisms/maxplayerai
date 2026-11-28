@@ -1046,8 +1046,29 @@ mod tests {
         let base = std::fs::read_to_string(&config).unwrap_or_default();
         let entry = "[agents.my-hook]\nhook = [\"/bin/true\"]\n";
         std::fs::write(&config, format!("{base}\n{entry}")).unwrap();
-        let home = home::bootstrap(&root).expect("the usage's snippet loads");
+        let mut home = home::bootstrap(&root).expect("the usage's snippet loads");
         assert!(home.config.agents.contains_key("my-hook"));
+        // The usage's serve command then writes [seller] and the home reloads.
+        let options = SellOptions {
+            non_interactive: true,
+            agent: Some("my-hook".to_owned()),
+            agents: vec!["my-hook".to_owned()],
+            rate_sats: Some(100),
+            ..SellOptions::default()
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        ensure_seller_config(&mut home, &options, &mut out, &mut err).unwrap_or_else(|code| {
+            panic!("first serve failed code={code} err={}", String::from_utf8_lossy(&err))
+        });
+        let seller = home::bootstrap(&root)
+            .expect("reload after the first serve")
+            .config
+            .seller
+            .expect("[seller] written");
+        assert_eq!(seller.agents, vec!["my-hook".to_owned()]);
+        assert_eq!(seller.rate_sats, 100);
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert!(written.contains("[seller]"), "{written}");
         std::fs::write(&config, format!("{base}\n{entry}[seller]\nagents = [\"my-hook\"]\n")).unwrap();
         match home::bootstrap(&root) {
             Ok(_) => panic!("a [seller] table with only agents loaded"),
