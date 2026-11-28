@@ -5393,6 +5393,9 @@ pub struct SellerNodeRunner {
     /// any relay request ([`Self::pre_run_review_attempt`]).
     #[cfg(test)]
     pre_run_reviews_for_test: std::sync::Mutex<std::collections::VecDeque<(Duration, Result<Option<String>, String>)>>,
+    /// Test seam: seconds added to the pre-run review loop's clock ([`Self::pre_run_review_now`]).
+    #[cfg(test)]
+    pre_run_review_clock_skew_for_test: std::sync::atomic::AtomicI64,
     /// Pre-claim private input staging, off the event loop (#1096 review B2): a large base
     /// can take minutes for the relay to pack. Finished offers are re-driven on the drain tick.
     private_preflight: super::preflight::PreflightGate<nostr_sdk::Event>,
@@ -5944,6 +5947,8 @@ impl SellerNodeRunner {
             offer_deferred_lines: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             pre_run_reviews_for_test: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            pre_run_review_clock_skew_for_test: std::sync::atomic::AtomicI64::new(0),
             private_preflight: super::preflight::PreflightGate::new(),
             delivery_push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             session_rt: session_run::SessionRuntime::default(),
@@ -10413,8 +10418,6 @@ impl SellerNodeRunner {
         settled
     }
 
-    /// The offer review that must pass before the agent runs. It routes through the same
-    /// function as the claim-time review, so a private offer never gets a public request.
     /// Whether this process already holds a PASSED claim-time review for `job_id`. The claim-time
     /// check (`offer_review_ready`) and `review_offer_before_run` send the same request for the same
     /// immutable offer, so a pass this process recorded before claiming answers the pre-run review
@@ -10442,22 +10445,29 @@ impl SellerNodeRunner {
         if self.claim_time_review_passed(job_id) {
             return true;
         }
-        // A buyer this seat skips review for (`[review] skip_buyer_pubkeys`) needs no review: the
-        // claim-time check recorded "disabled" without a pass entry, so without this the loop below
-        // could fail the job on its deadline budget or hold it for a drain (advisor #1448 r2). An
-        // invalid config (`Err`) still goes through the review and fails there.
-        if matches!(
-            self.node.home().config.review.enabled(JOB_OFFER_KIND, buyer),
-            Ok(false)
-        ) {
-            return true;
-        }
         let subject = crate::review::Subject {
             offer: job_id.to_owned(),
             event: job_id.to_owned(),
             kind: JOB_OFFER_KIND,
             commit: None,
         };
+        // A buyer this seat skips review for (`[review] skip_buyer_pubkeys`) needs no review: the
+        // claim-time check recorded "disabled" without a pass entry, so without this the loop below
+        // could fail the job on its deadline budget or hold it for a drain (advisor #1448 r2). An
+        // invalid config (`Err`) still goes through the review and fails there. The status is
+        // rewritten as "disabled": a buyer added to the list after an earlier failed review would
+        // otherwise keep showing that stale error (advisor #1448 r3 L1).
+        if matches!(
+            self.node.home().config.review.enabled(JOB_OFFER_KIND, buyer),
+            Ok(false)
+        ) {
+            if let Err(error) =
+                crate::review::state::completed(&self.node.home().root, &subject, &Ok(None))
+            {
+                opline!("seller node job_id={job_id}: review status write failed ({error})");
+            }
+            return true;
+        }
         let mut attempt: u32 = 0;
         loop {
             // #1299: a draining node does not wait on the reviewer. Nothing has run, so the row
@@ -10471,7 +10481,7 @@ impl SellerNodeRunner {
             // Each attempt ends by `deadline - margin`: the review's own `timeout_seconds`
             // (default 300 s) could otherwise run past the deadline while holding the slot.
             let attempt_result = async {
-                match pre_run_review_budget(now_unix(), deadline_unix) {
+                match pre_run_review_budget(self.pre_run_review_now(), deadline_unix) {
                     Ok(None) => self.pre_run_review_attempt(job_id, buyer).await,
                     Ok(Some(budget)) => {
                         match tokio::time::timeout(budget, self.pre_run_review_attempt(job_id, buyer))
@@ -10484,8 +10494,9 @@ impl SellerNodeRunner {
                     Err(()) => Err(PRE_RUN_REVIEW_DEADLINE_TIMEOUT.to_owned()),
                 }
             };
-            // A drain also ends an attempt in flight (advisor #1448 r2): dropping it is safe (the
-            // review only reads the relay), nothing has run, and the job stays `awarded` for the
+            // A drain also ends an attempt in flight (advisor #1448 r2): dropping it is safe (at most
+            // it published an idempotent review request, and a verdict is content-addressed, so the
+            // restarted seller reuses it), nothing has run, and the job stays `awarded` for the
             // restarted seller. Polled first, so a pass and a drain at once does not start a run.
             let result = tokio::select! {
                 biased;
@@ -10502,9 +10513,11 @@ impl SellerNodeRunner {
             if !self.still_awaiting_execution(job_id) {
                 return false;
             }
+            // One clock reading decides both a late pass and the retry below.
+            let now = self.pre_run_review_now();
             // A pass that came too late to start the agent is no pass; record it as the error it is.
             let result = match result {
-                Ok(_) if pre_run_review_passed_too_late(now_unix(), deadline_unix) => {
+                Ok(_) if pre_run_review_passed_too_late(now, deadline_unix) => {
                     Err(PRE_RUN_REVIEW_PASSED_TOO_LATE.to_owned())
                 }
                 other => other,
@@ -10524,7 +10537,7 @@ impl SellerNodeRunner {
                 Ok(_) => return true,
                 Err(error) => error,
             };
-            match pre_run_review_next(&error, now_unix(), deadline_unix, attempt) {
+            match pre_run_review_next(&error, now, deadline_unix, attempt) {
                 PreRunReview::RetryIn(wait) => {
                     opline!(
                         "seller node review blocked job_id={job_id}: {error}; awarded job, retrying the review in {}s (attempt {})",
@@ -10600,6 +10613,22 @@ impl SellerNodeRunner {
         }
     }
 
+    /// The clock the pre-run review loop decides by: `now_unix()`, shifted in tests by
+    /// `pre_run_review_clock_skew_for_test` so a pass can land inside the deadline margin.
+    fn pre_run_review_now(&self) -> i64 {
+        #[cfg(test)]
+        {
+            now_unix().saturating_add(
+                self.pre_run_review_clock_skew_for_test
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+        #[cfg(not(test))]
+        {
+            now_unix()
+        }
+    }
+
     /// Resolves once a drain is requested (polled every [`PRE_RUN_REVIEW_DRAIN_POLL`]); never otherwise.
     async fn wait_for_drain(&self) {
         while !self.drain.is_requested() {
@@ -10624,6 +10653,8 @@ impl SellerNodeRunner {
         self.review_offer_before_run(job_id, buyer).await
     }
 
+    /// The offer review that must pass before the agent runs. It routes through the same
+    /// function as the claim-time review, so a private offer never gets a public request.
     async fn review_offer_before_run(
         &self,
         job_id: &str,
@@ -21045,6 +21076,12 @@ esac"#,
         );
         let status = crate::review::state::read(&runner.node.home().root, &job_id).unwrap();
         assert_eq!(status.state, "error", "review status names the failure: {status:?}");
+        // The relay request ran and timed out on its own `timeout_seconds`; the deadline budget
+        // did not cut it off before it left the process (advisor #1448 r3 L2).
+        assert_ne!(
+            status.detail, PRE_RUN_REVIEW_DEADLINE_TIMEOUT,
+            "a real review request ran: {status:?}"
+        );
         let feedback = pre_run_feedback(&relay_url, &job_id).await;
         assert_eq!(feedback.len(), 1, "the buyer is told once");
         assert_pre_run_failure_feedback(&feedback[0], &buyer_hex, PRE_RUN_REVIEW_FAILURE_FEEDBACK);
@@ -21335,15 +21372,69 @@ esac"#,
         let (relay, relay_url, runner, root, _buyer) =
             boot_pre_run_review_job_for("pre-run-review-skipped-buyer", &job_id, 3_600, vec![], true).await;
         runner.drain.request("test drain");
+        // An earlier failed review left an error; skipping the review rewrites it (advisor #1448 r3 L1).
+        let subject = crate::review::Subject {
+            offer: job_id.clone(),
+            event: job_id.clone(),
+            kind: JOB_OFFER_KIND,
+            commit: None,
+        };
+        crate::review::state::write(&runner.node.home().root, &subject, "error", "review: timeout")
+            .unwrap();
 
         runner.execute_job(&job_id, None, false).await;
 
+        assert_eq!(
+            crate::review::state::read(&runner.node.home().root, &job_id).unwrap().state,
+            "disabled",
+            "the stale error is replaced"
+        );
         assert_eq!(hook_events(&root).len(), 1, "the hook ran turn 1");
         assert_eq!(
             runner.node.store().job_state(&job_id).unwrap(),
             Some(crate::seller_node::store::JobState::Delivered)
         );
         assert!(pre_run_feedback(&relay_url, &job_id).await.is_empty());
+        runner.client.disconnect().await;
+        relay.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Advisor #1448 r3 L2: a pass that lands inside the deadline margin, through `execute_job`,
+    /// does not start the agent: it is recorded as `PRE_RUN_REVIEW_PASSED_TOO_LATE`, no retry fits,
+    /// and the job fails with the deadline feedback. The review clock is moved forward while the
+    /// scripted attempt is in flight, so the pass arrives `margin` seconds before the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_landing_inside_the_deadline_margin_fails_the_job() {
+        let job_id = "d".repeat(64);
+        let (relay, relay_url, runner, root, buyer_hex) = boot_pre_run_review_job(
+            "pre-run-review-late-pass",
+            &job_id,
+            3_600,
+            vec![(Duration::from_millis(1_500), Ok(Some("a".repeat(64))))],
+        )
+        .await;
+
+        tokio::join!(runner.execute_job(&job_id, None, false), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            runner.pre_run_review_clock_skew_for_test.store(
+                3_600 - PRE_RUN_REVIEW_DEADLINE_MARGIN_SECS,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        });
+
+        assert!(runner.pre_run_reviews_for_test.lock().unwrap().is_empty(), "the attempt ran");
+        assert!(hook_events(&root).is_empty(), "the hook never ran");
+        assert_eq!(
+            runner.node.store().job_state(&job_id).unwrap(),
+            Some(crate::seller_node::store::JobState::Failed)
+        );
+        let status = crate::review::state::read(&runner.node.home().root, &job_id).unwrap();
+        assert_eq!(status.state, "error", "{status:?}");
+        assert_eq!(status.detail, PRE_RUN_REVIEW_PASSED_TOO_LATE, "{status:?}");
+        let feedback = pre_run_feedback(&relay_url, &job_id).await;
+        assert_eq!(feedback.len(), 1, "the buyer is told once");
+        assert_pre_run_failure_feedback(&feedback[0], &buyer_hex, PRE_RUN_REVIEW_FAILURE_FEEDBACK);
         runner.client.disconnect().await;
         relay.shutdown();
         let _ = std::fs::remove_dir_all(&root);
