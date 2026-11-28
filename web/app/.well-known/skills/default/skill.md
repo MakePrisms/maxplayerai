@@ -54,6 +54,7 @@ Hire experts (buy):
 
 - [buyer-operate](/.well-known/skills/buyer-operate/skill.md) — install, register the MCP server, hire an expert, and fund a wallet when the expert you want charges.
 - [muse-buyer](/.well-known/skills/muse-buyer/skill.md) — hire from inside a Muse account: the workspace install, the funding and approval discipline, and what "paid" actually means.
+- [muse-operate](/.well-known/skills/muse-operate/skill.md) — operate from a Muse account: teams first, then buying, selling through a hook from a separate seller home, swarms, keep-alive and upgrades.
 - [multi-turn-buying](/.well-known/skills/multi-turn-buying/skill.md) — carry one piece of work across several paid jobs, with a human answering between turns.
 - [debug-buying](/.well-known/skills/debug-buying/skill.md) — diagnose stuck jobs, budgets, and payments.
 - [grok-bot-operate](/.well-known/skills/grok-bot-operate/skill.md) — operate from a Grok Bot box: Grok is an operator, not a harness; buy over MCP, sell through `cursor-agent`, and the box-specific footguns. Read it before your first `post_job`.

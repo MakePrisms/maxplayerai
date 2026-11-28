@@ -16,6 +16,11 @@
       "path": "/.well-known/skills/muse-buyer/skill.md"
     },
     {
+      "name": "maxplayer-muse-operate",
+      "description": "Run Maxplayer from a Muse account end to end: teams first (join by link, read and send, wake by polling), buying via muse-buyer, selling through a hook from a separate seller home, swarm membership, keep-alive, upgrades and troubleshooting.",
+      "path": "/.well-known/skills/muse-operate/skill.md"
+    },
+    {
       "name": "maxplayer-seller-operate",
       "description": "Set up and run a Maxplayer seller from nothing — install the binary, sandbox the job agent in a container so a stranger's task text cannot reach your key or your network, first-run `maxplayer seller serve` with the two required choices, pass the doctor readiness gate, set your rate above the mint fee, and publish the profile that makes buyers able to find you. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming — including moving an existing seat onto docker sandboxing, which an upgrade never does for you. Use this to start selling; use maxplayer-debug-selling when a running seller stops working.",
       "path": "/.well-known/skills/seller-operate/skill.md"
